@@ -2559,6 +2559,28 @@ def _icici_allowed_thesis_side(instrument) -> str:
         return "short"
     return ""
 
+
+def _is_icici_underlying_chain_instrument(instrument) -> bool:
+    try:
+        raw = getattr(getattr(instrument, "primary", None), "raw", {}) or {}
+        return bool(raw.get("icici_underlying_desk") and raw.get("chain_candidates"))
+    except Exception:
+        return False
+
+
+def _icici_select_contract_for_thesis(instrument, data_manager, thesis_side: str):
+    try:
+        primary = getattr(data_manager, "_primary", None)
+        selector = getattr(primary, "select_contract_for_thesis", None)
+        if callable(selector):
+            return selector(thesis_side, float(data_manager.get_last_price() or 0.0))
+    except Exception as exc:
+        try:
+            logger.warning("%s ICICI option-chain selection failed: %s", getattr(instrument, "asset_id", "ICICI"), exc)
+        except Exception:
+            pass
+    return None
+
 class QuantStrategy:
     def __init__(self, order_manager=None, instrument=None):
         self._instrument = instrument
@@ -6008,6 +6030,19 @@ class QuantStrategy:
         between the two calls — no position is open at this point).
         """
         self._last_execution_viability = None
+        if bool(getattr(config, "ICICI_LONG_PREMIUM_ONLY", True)) and _is_icici_underlying_chain_instrument(self._instrument):
+            # Underlying-first Indian options desk: the strategy analyses the
+            # underlying chart; once a bullish/bearish thesis exists, select the
+            # actual call/put contract before execution.
+            choice = _icici_select_contract_for_thesis(self._instrument, data_manager, str(side or ""))
+            if choice is None:
+                logger.info("%s ICICI chain desk has thesis=%s but no executable option contract selected", self._asset_id, side)
+                return
+            if str(side or "").lower() == "short":
+                logger.info("%s ICICI bearish thesis expressed as BUY PUT %s; internal side=long", self._asset_id, getattr(choice, "selected_symbol", ""))
+            elif str(side or "").lower() == "long":
+                logger.info("%s ICICI bullish thesis expressed as BUY CALL %s; internal side=long", self._asset_id, getattr(choice, "selected_symbol", ""))
+            side = "long"
         price = data_manager.get_last_price()
         if price < 1.0: return
         atr = self._atr_5m.atr

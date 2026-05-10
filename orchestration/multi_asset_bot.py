@@ -540,14 +540,22 @@ class MultiAssetQuantBot:
                 pass
         if got:
             lines.append(f"<code>ACCOUNT available {self._fmt_price(raw_avail):>12}  total {self._fmt_price(raw_total):>12}</code>")
-        lines.append(f"<code>SLOTS   used {self.guard.count_open(self.contexts):>2}/{self.guard.max_open_positions:<2}  mode {self._esc(self.guard.budget_mode)}</code>")
+        lines.append(f"<code>FIRM    open {self.guard.count_open(self.contexts):>2}/{self.guard.max_open_positions:<2}  mode {self._esc(getattr(self.guard, 'desk_budget_mode', self.guard.budget_mode))}</code>")
         for ctx in self.contexts:
             try:
                 bal = ctx.risk_manager.get_available_balance() or {}
                 pol = active_policy(ctx.instrument)
+                book = self.guard.book_for_context(ctx)
                 lines.append(
-                    f"<code>{self._esc(ctx.instrument.asset_id):<6} cash {self._fmt_price(float(bal.get('available',0) or 0)):>10} "
-                    f"riskbase {self._fmt_price(float(bal.get('risk_total',0) or 0)):>10} lev {pol.leverage:>2}x margin {pol.margin_pct:.0%} risk×{pol.risk_multiplier:.2f}</code>"
+                    f"<code>{self._esc(ctx.instrument.asset_id):<6} {self._esc(book.desk_id):<22} "
+                    f"book {int(bal.get('portfolio_desk_open',0) or 0):>1}/{int(bal.get('portfolio_desk_max_open',book.max_open) or book.max_open):<1} "
+                    f"cash {self._fmt_price(float(bal.get('available',0) or 0)):>10} "
+                    f"riskbase {self._fmt_price(float(bal.get('risk_total',0) or 0)):>10}</code>"
+                )
+                lines.append(
+                    f"<code>{'':<6} cap {float(bal.get('portfolio_desk_capital_weight', book.capital_weight) or 0):>5.0%} "
+                    f"risk {float(bal.get('portfolio_desk_risk_weight', book.risk_weight) or 0):>5.0%} "
+                    f"lev {pol.leverage:>2}x margin {pol.margin_pct:.0%} risk×{pol.risk_multiplier:.2f}</code>"
                 )
             except Exception:
                 continue
@@ -609,18 +617,20 @@ class MultiAssetQuantBot:
 
     def format_portfolio_risk_report(self) -> str:
         lines = ["🛡 <b>PORTFOLIO RISK</b>", "━━━━━━━━━━━━━━━━━━━━━━━━"]
-        lines.append(f"Slots used: {self.guard.count_open(self.contexts)}/{self.guard.max_open_positions} · Budget {self._esc(self.guard.budget_mode)}")
+        lines.append(f"Firm open: {self.guard.count_open(self.contexts)}/{self.guard.max_open_positions} · Budget {self._esc(getattr(self.guard, 'desk_budget_mode', self.guard.budget_mode))}")
         for ctx in self.contexts:
             try:
                 can, reason = ctx.risk_manager.can_trade()
             except Exception as e:
                 can, reason = False, str(e)
             pol = active_policy(ctx.instrument)
+            book = self.guard.book_for_context(ctx)
             pos = ctx.strategy.get_position()
             status = "LIVE" if pos else ("OPEN" if can else "LOCK")
             lines.append(
-                f"<code>{self._esc(ctx.instrument.asset_id):<6} {status:<5} lev {pol.leverage:>2}x "
-                f"margin {pol.margin_pct:.0%} risk×{pol.risk_multiplier:.2f} · {self._esc(reason)[:70]}</code>"
+                f"<code>{self._esc(ctx.instrument.asset_id):<6} {status:<5} {self._esc(book.desk_id):<22} "
+                f"book {self.guard.count_open_for_desk(book.desk_id, self.contexts)}/{book.max_open} "
+                f"lev {pol.leverage:>2}x risk×{pol.risk_multiplier:.2f} · {self._esc(reason)[:60]}</code>"
             )
         return "\n".join(lines)
 
@@ -1105,7 +1115,7 @@ class MultiAssetQuantBot:
                 cio_report = self._cio_report()
                 if cio_report is not None:
                     _now = time.time()
-                    report_sec = float(getattr(config, "FUND_CIO_REPORT_SEC", 30.0))
+                    report_sec = float(getattr(config, "INSTITUTIONAL_DESK_CYCLE_LOG_SEC", getattr(config, "FUND_CIO_REPORT_SEC", 30.0)))
                     if report_sec > 0 and _now - self._last_cio_report_log >= report_sec:
                         self._last_cio_report_log = _now
                         logger.info("%s", obs.format_cycle_log(self))
@@ -1185,11 +1195,14 @@ class MultiAssetQuantBot:
             pos = ctx.strategy.get_position()
             state = ctx.phase_name if pos else "SCANNING"
             with instrument_scope(inst):
+                book = self.guard.book_for_context(ctx)
+                desk_open = self.guard.count_open_for_desk(book.desk_id, self.contexts)
+                portfolio_open = self.guard.count_open(self.contexts)
                 if dt_ms > 250.0:
                     logger.info(
-                        "DESK_LATENCY asset=%s venue=%s symbol=%s state=%s price=%.4f eval_ms=%.1f slots=%d/%d policy=%s",
-                        inst.asset_id, inst.primary_exchange.value.upper(), inst.display_symbol,
-                        state, price, dt_ms, self.guard.count_open(self.contexts), self.guard.max_open_positions,
+                        "DESK_LATENCY asset=%s desk=%s venue=%s symbol=%s state=%s price=%.4f eval_ms=%.1f desk_open=%d/%d open=%d/%d policy=%s",
+                        inst.asset_id, book.desk_id, inst.primary_exchange.value.upper(), inst.display_symbol,
+                        state, price, dt_ms, desk_open, book.max_open, portfolio_open, self.guard.max_open_positions,
                         self.guard.report_line(ctx),
                     )
         except Exception as e:
@@ -1206,9 +1219,12 @@ class MultiAssetQuantBot:
             pos = ctx.strategy.get_position()
             state = "IN_POSITION" if pos else "SCANNING"
             with instrument_scope(ctx.instrument):
-                logger.info("DESK_HEARTBEAT asset=%s venue=%s symbol=%s price=%.4f state=%s open=%d/%d",
-                            ctx.instrument.asset_id, ctx.instrument.primary_exchange.value.upper(),
+                book = self.guard.book_for_context(ctx)
+                desk_open = self.guard.count_open_for_desk(book.desk_id, self.contexts)
+                logger.info("DESK_HEARTBEAT asset=%s desk=%s venue=%s symbol=%s price=%.4f state=%s desk_open=%d/%d open=%d/%d",
+                            ctx.instrument.asset_id, book.desk_id, ctx.instrument.primary_exchange.value.upper(),
                             ctx.instrument.display_symbol, price, state,
+                            desk_open, book.max_open,
                             self.guard.count_open(self.contexts), self.guard.max_open_positions)
         except Exception as e:
             logger.debug("heartbeat failed for %s: %s", ctx.instrument.asset_id, e)

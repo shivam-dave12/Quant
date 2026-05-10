@@ -375,7 +375,19 @@ class MarketAggregator:
     # ── Price — weighted average (display only) ────────────────────────────
 
     def get_last_price(self) -> float:
-        return self._primary.get_last_price()
+        price = self._primary.get_last_price()
+        if price > 0:
+            return price
+        # ICICI underlying-first option desks deliberately have no option
+        # premium until a call/put is selected after thesis.  For analysis and
+        # structural decisions, expose the underlying chart price from analysis_dm.
+        try:
+            raw = getattr(getattr(getattr(self, "instrument", None), "primary", None), "raw", {}) or {}
+            if raw.get("icici_underlying_desk") and self._analysis is not None:
+                return float(self._analysis.get_last_price() or 0.0)
+        except Exception:
+            pass
+        return price
 
     def get_consensus_price(self) -> float:
         """Weighted cross-venue price for display/diagnostics only."""

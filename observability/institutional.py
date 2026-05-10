@@ -10,12 +10,21 @@ import html
 import logging
 import math
 import re
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 LOG = logging.getLogger(__name__)
+
+
+def _cfg(name: str, default: Any) -> Any:
+    try:
+        import config
+        return getattr(config, name, default)
+    except Exception:
+        return default
 
 LEGACY_LOG_MARKERS = (
     "ANALYSIS_TICK",
@@ -108,9 +117,44 @@ def should_suppress_legacy_log(record: logging.LogRecord) -> bool:
 
 
 class InstitutionalLogFilter(logging.Filter):
-    """Remove old retail/tick-noise logs from terminal/file output."""
+    """Remove old retail/tick-noise logs and repeated low-signal chatter."""
+
+    _NUMBER_RE = re.compile(r"(?<![A-Za-z])[-+]?\$?\d[\d,]*(?:\.\d+)?%?")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._next_ok: Dict[Tuple[str, str, str], float] = {}
+        self._lock = threading.Lock()
+
     def filter(self, record: logging.LogRecord) -> bool:
-        return not should_suppress_legacy_log(record)
+        if should_suppress_legacy_log(record):
+            return False
+        if record.levelno >= logging.WARNING:
+            return True
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        upper = msg.upper()
+        if any(marker in upper for marker in CRITICAL_ALLOW_MARKERS):
+            return True
+        interval = float(_cfg("INSTITUTIONAL_LOG_DEDUPE_SEC", 45.0) or 0.0)
+        if interval <= 0.0:
+            return True
+        asset_ctx = str(getattr(record, "asset_ctx", "") or "")
+        normalised = self._NUMBER_RE.sub("#", msg)
+        key = (record.name, asset_ctx, normalised[:280])
+        now = time.time()
+        with self._lock:
+            next_ok = self._next_ok.get(key, 0.0)
+            if now < next_ok:
+                return False
+            self._next_ok[key] = now + interval
+            if len(self._next_ok) > 1500:
+                expired = [k for k, ts in self._next_ok.items() if ts < now]
+                for k in expired[:500]:
+                    self._next_ok.pop(k, None)
+            return True
 
 
 def desk_id(bot: Any, ctx: Any) -> str:
@@ -234,6 +278,18 @@ def context_snapshot(bot: Any, ctx: Any) -> Dict[str, Any]:
         "position": pos,
         "last_tick_age": max(0.0, time.time() - float(getattr(ctx, "last_tick_time", 0.0) or 0.0)) if getattr(ctx, "last_tick_time", 0.0) else None,
     }
+    try:
+        guard = getattr(bot, "guard", None)
+        book = guard.book_for_context(ctx) if guard is not None else None
+        if book is not None:
+            d.update({
+                "desk_open": guard.count_open_for_desk(book.desk_id, list(getattr(bot, "contexts", []) or [])),
+                "desk_max_open": getattr(book, "max_open", 0),
+                "desk_capital_weight": getattr(book, "capital_weight", 0.0),
+                "desk_risk_weight": getattr(book, "risk_weight", 0.0),
+            })
+    except Exception:
+        pass
     return d
 
 
@@ -298,7 +354,13 @@ def format_desks(bot: Any) -> str:
         ready = sum(1 for r in rows if r["ready"])
         pos = sum(1 for r in rows if r["has_position"])
         avg_loop = sum(float(r.get("loop_sec") or 0.0) for r in rows) / max(1, len(rows))
-        lines.append(f"\n📚 <b>{esc(desk)}</b> · ready {ready}/{len(rows)} · pos {pos} · cadence {avg_loop:.2f}s")
+        max_open = int(max([int(r.get("desk_max_open") or 0) for r in rows] or [0]))
+        cap_w = max(float(r.get("desk_capital_weight") or 0.0) for r in rows)
+        risk_w = max(float(r.get("desk_risk_weight") or 0.0) for r in rows)
+        lines.append(
+            f"\n📚 <b>{esc(desk)}</b> · ready {ready}/{len(rows)} · "
+            f"book {pos}/{max_open or len(rows)} · cap {cap_w:.0%} risk {risk_w:.0%} · cadence {avg_loop:.2f}s"
+        )
         for r in rows[:10]:
             p = _dictish(r.get("posterior"))
             ptxt = ""
@@ -671,10 +733,24 @@ def format_shutdown_diagnostics() -> str:
 
 def format_cycle_log(bot: Any) -> str:
     groups = group_snapshots(bot)
-    parts = ["🏛 DESK_CYCLE"]
+    guard = getattr(bot, "guard", None)
+    firm_open = 0
+    firm_max = 0
+    try:
+        firm_open = int(guard.count_open(list(getattr(bot, "contexts", []) or []))) if guard is not None else 0
+        firm_max = int(getattr(guard, "max_open_positions", 0) or 0)
+    except Exception:
+        pass
+    parts = [f"🏛 DESK_CYCLE firm_open={firm_open}/{firm_max}"]
     for desk, rows in groups.items():
         ready = sum(1 for r in rows if r["ready"])
         pos = sum(1 for r in rows if r["has_position"])
+        max_open = int(max([int(r.get("desk_max_open") or 0) for r in rows] or [0]))
+        cap_w = max(float(r.get("desk_capital_weight") or 0.0) for r in rows)
+        risk_w = max(float(r.get("desk_risk_weight") or 0.0) for r in rows)
         top = ", ".join(f"{r['asset']}@{price(r['price'])}" for r in rows[:4])
-        parts.append(f"[{desk}] ready={ready}/{len(rows)} pos={pos} :: {top}")
+        parts.append(
+            f"[{desk}] ready={ready}/{len(rows)} book={pos}/{max_open or len(rows)} "
+            f"cap_w={cap_w:.2f} risk_w={risk_w:.2f} :: {top}"
+        )
     return "\n".join(parts)

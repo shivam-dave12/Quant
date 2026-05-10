@@ -21,6 +21,7 @@ except Exception:  # pragma: no cover
 from .api import BreezeRestClient
 from .market_session import icici_market_session_state
 from .rate_limiter import breeze_throttle
+from agents.icici_chain_architect import is_chain_instrument, select_contract_for_thesis, apply_contract_choice
 
 logger = logging.getLogger(__name__)
 
@@ -46,13 +47,50 @@ class ICICIOptionDataManager:
         self._candles: dict[str, deque] = {tf: deque(maxlen=600) for tf in ("1m", "5m", "15m", "1h", "4h", "1d")}
         self._trades: deque = deque(maxlen=500)
         self.is_ready = False
+        self._selected_contract = None
         logger.info("ICICIOptionDataManager initialised [%s]", getattr(instrument, "asset_id", "ICICI"))
+
+    def _is_chain_mode(self) -> bool:
+        return is_chain_instrument(self.instrument)
+
+    def select_contract_for_thesis(self, thesis_side: str, underlying_spot: float = 0.0):
+        choice = select_contract_for_thesis(self.instrument, thesis_side, underlying_spot=underlying_spot)
+        if choice is None:
+            logger.warning("ICICI option-chain selector found no contract for %s thesis=%s", getattr(self.instrument, "asset_id", "?"), thesis_side)
+            return None
+        apply_contract_choice(self.instrument, choice)
+        self._selected_contract = choice
+        logger.info(
+            "ICICI option-chain selected %s for %s thesis=%s score=%.2f reasons=%s",
+            choice.selected_symbol, getattr(self.instrument, "asset_id", "?"), thesis_side, choice.score, ",".join(choice.reasons),
+        )
+        # After selection, fetch option quote/historical lazily. Failure keeps
+        # the context non-executable, but structure analysis remains on the
+        # underlying chart.
+        try:
+            self._warmup(historical_only=False)
+        except Exception as exc:
+            logger.warning("ICICI selected option warmup failed for %s: %s", choice.selected_symbol, exc)
+        return choice
 
     def register_strategy(self, strategy) -> None:
         self._strategy_ref = strategy
 
     def start(self) -> bool:
         try:
+            if self._is_chain_mode():
+                self.api.preflight_session()
+                # Underlying-desk mode: the executable option is deliberately
+                # not selected at startup.  The analysis data manager supplies
+                # the underlying candles; this primary manager becomes
+                # executable only after QuantStrategy produces a thesis and calls
+                # select_contract_for_thesis().
+                self.is_ready = True
+                logger.info(
+                    "ICICI option-chain DM ready in underlying-first mode [%s]; contract will be selected post-thesis",
+                    getattr(self.instrument, "asset_id", "?"),
+                )
+                return True
             session = icici_market_session_state()
             if not session.is_open:
                 if bool(_cfg("ICICI_ALLOW_CLOSED_MARKET_HISTORICAL_WARMUP", True)):
@@ -132,6 +170,9 @@ class ICICIOptionDataManager:
 
     def _load_historical(self, timeframe: str) -> None:
         raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
+        selected = raw.get("selected_option_contract") if isinstance(raw, dict) else None
+        if isinstance(selected, dict) and isinstance(selected.get("raw"), dict):
+            raw = selected.get("raw") or raw
         # Breeze historicalcharts accepts: minute, 5minute, 30minute, day.
         # There is no native 15m/1h interval; use 5m/30m source bars
         # rather than sending unsupported values and getting empty historicals.
@@ -189,6 +230,9 @@ class ICICIOptionDataManager:
                 self._last_price = float(parsed[-1]["close"])
 
     def _refresh_quote(self) -> None:
+        raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
+        if self._is_chain_mode() and not raw.get("selected_option_contract"):
+            return
         breeze_throttle(f"quote:{getattr(self.instrument, 'asset_id', '?')}")
         q = self.api.get_quote_for_instrument(getattr(self.instrument, "primary", None))
         row = q.get("Success") if isinstance(q, dict) else {}

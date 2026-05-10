@@ -18,6 +18,7 @@ from core.instruments import (
     AssetClass, AssetIntent, ExchangeInstrument, ExchangeName, TradableInstrument,
     configured_asset_intents, first_positive, normalise_symbol, slash_symbol,
 )
+from agents.icici_chain_architect import build_underlying_payload
 
 logger = logging.getLogger(__name__)
 
@@ -107,14 +108,19 @@ def _icici_option_chain_quality(rows: list[tuple[ExchangeInstrument, str, str, f
 
 
 def _select_icici_options_for_runtime(options: list[ExchangeInstrument]) -> list[ExchangeInstrument]:
-    """Build ICICI runtime candidates from the full security master by desk.
+    """Return ICICI *underlying desk assets*, not individual option strikes.
 
-    No fixed `1200` global cap and no approved-symbol list.  The full ICICI
-    option universe is inspected and grouped by desk/underlying.  Runtime
-    candidates are derived from configured desk capacity: an options desk only
-    needs enough representative contracts to run live Breeze quote validation
-    and Black-Scholes scoring for the active slots, not every Security Master
-    row as a live TradableInstrument.
+    Institutional design:
+      1. Evaluate the full Security Master option universe.
+      2. Group contracts by true underlying and desk (index-options/stock-options).
+      3. Rank underlyings by option-chain depth/coverage/near-term availability.
+      4. Expose one runtime asset per underlying; keep the viable chain in raw
+         metadata for post-thesis strike/expiry/right selection.
+
+    This intentionally avoids treating NIFTY_19MAY2026_22800_C and
+    NIFTY_19MAY2026_22900_C as two independent strategy desks.  NIFTY is the
+    strategy desk asset; the call/put/strike/expiry is selected after the
+    underlying chart creates an entry thesis.
     """
     try:
         import config as _cfg  # type: ignore
@@ -122,17 +128,11 @@ def _select_icici_options_for_runtime(options: list[ExchangeInstrument]) -> list
         stock_quota = max(0, int(getattr(_cfg, "DESK_ICICI_STOCK_OPTIONS_MAX_ACTIVE", 10)))
         min_dte = float(getattr(_cfg, "ICICI_OPTION_MIN_DTE", 2.0))
         max_dte = float(getattr(_cfg, "ICICI_OPTION_MAX_DTE", 21.0))
-        scan_mult = max(4.0, float(getattr(_cfg, "ICICI_OPTION_CHAIN_SCAN_MULTIPLIER", 10.0)))
-        per_under_mult = max(2.0, float(getattr(_cfg, "ICICI_OPTION_STRIKE_SCAN_MULTIPLIER", 3.0)))
     except Exception:
-        index_quota, stock_quota, min_dte, max_dte, scan_mult, per_under_mult = 10, 10, 2.0, 21.0, 10.0, 3.0
-
-    if index_quota <= 0 and stock_quota <= 0:
-        return []
+        index_quota, stock_quota, min_dte, max_dte = 10, 10, 2.0, 21.0
 
     now = datetime.now(timezone.utc)
-    # desk -> underlying -> rows(inst, expiry, right, strike, dte)
-    desk_under: dict[str, dict[str, list[tuple[ExchangeInstrument, str, str, float, float]]]] = {
+    desk_under: dict[str, dict[str, list[ExchangeInstrument]]] = {
         "ICICI_INDEX_OPTIONS": {},
         "ICICI_STOCK_OPTIONS": {},
     }
@@ -145,7 +145,6 @@ def _select_icici_options_for_runtime(options: list[ExchangeInstrument]) -> list
         right = "C" if right_raw in {"C", "CE", "CALL"} else "P" if right_raw in {"P", "PE", "PUT"} else ""
         strike = _safe_float(raw.get("strike_price") or raw.get("strike") or raw.get("StrikePrice") or raw.get("Strike"), 0.0)
         dte = _icici_dte(expiry, now)
-        # Reject corrupt metadata only; this is not symbol allow-listing.
         structural = {normalise_symbol(str(raw.get(k, ""))) for k in (
             "exchange_code", "ExchangeCode", "Exchange", "segment", "Segment", "product_type",
             "ProductType", "Product", "InstrumentType", "InstrumentName", "right", "option_type",
@@ -156,61 +155,68 @@ def _select_icici_options_for_runtime(options: list[ExchangeInstrument]) -> list
             rejected_bad_metadata += 1
             continue
         desk = _icici_option_desk_id(inst)
-        desk_under.setdefault(desk, {}).setdefault(underlying, []).append((inst, expiry, right, strike, dte))
+        desk_under.setdefault(desk, {}).setdefault(underlying, []).append(inst)
 
-    selected: list[ExchangeInstrument] = []
+    selected_underlyings: list[ExchangeInstrument] = []
     diagnostics: dict[str, dict[str, int | float]] = {}
     for desk, quota in (("ICICI_INDEX_OPTIONS", index_quota), ("ICICI_STOCK_OPTIONS", stock_quota)):
         under_map = desk_under.get(desk, {})
         if quota <= 0 or not under_map:
-            diagnostics[desk] = {"underlyings": len(under_map), "selected": 0}
+            diagnostics[desk] = {"underlyings": len(under_map), "selected_underlyings": 0, "contracts_indexed": sum(len(v) for v in under_map.values())}
             continue
-        scored = []
+        scored: list[tuple[float, str, list[ExchangeInstrument]]] = []
         for underlying, rows in under_map.items():
-            q = _icici_option_chain_quality(rows)
+            # Reuse the existing chain quality model. It is data-derived: chain
+            # breadth, expiries, strikes, both rights and near-term coverage.
+            tuples = []
+            for inst in rows:
+                raw = inst.raw or {}
+                exp = str(raw.get("expiry_date") or raw.get("ExpiryDate") or "")
+                rr = normalise_symbol(raw.get("right") or raw.get("option_type") or raw.get("OptionType") or "")
+                right = "C" if rr in {"C", "CE", "CALL"} else "P" if rr in {"P", "PE", "PUT"} else ""
+                strike = _safe_float(raw.get("strike_price") or raw.get("StrikePrice") or raw.get("Strike"), 0.0)
+                tuples.append((inst, exp, right, strike, _icici_dte(exp, now)))
+            q = _icici_option_chain_quality(tuples)
             scored.append((q, underlying, rows))
         scored.sort(reverse=True, key=lambda x: x[0])
 
-        # Dynamic breadth: derived from active desk quota and observed universe
-        # breadth, not a fixed max-underlyings constant.  Large security masters
-        # get a broader scan; small ones are fully represented.
-        observed_underlyings = len(scored)
-        target_underlyings = min(observed_underlyings, max(quota, int((observed_underlyings ** 0.5) * max(1.0, quota ** 0.25))))
-        # Candidate budget is derived from number of live slots.  It controls
-        # quote/Greek work, not discovery.  The full chain remains indexed above.
-        candidate_budget = max(quota * 6, int(quota * scan_mult))
-        per_under_budget = max(2, int((candidate_budget / max(1, target_underlyings)) * per_under_mult))
-        desk_selected: list[ExchangeInstrument] = []
-        for _quality, underlying, rows in scored[:target_underlyings]:
-            # Prefer nearest valid expiries; within each expiry/right choose a
-            # balanced ladder around chain median until live quote gives real spot.
-            chain_map: dict[tuple[str, str], list[tuple[ExchangeInstrument, float, float]]] = {}
-            for inst, expiry, right, strike, dte in rows:
-                chain_map.setdefault((expiry, right), []).append((inst, strike, dte))
-            per_under: list[ExchangeInstrument] = []
-            for (_expiry, _right), chain_rows in sorted(chain_map.items(), key=lambda kv: (min(x[2] for x in kv[1]), kv[0])):
-                strikes = sorted(x[1] for x in chain_rows)
-                median = strikes[len(strikes)//2] if strikes else 0.0
-                chain_rows.sort(key=lambda x: (abs(x[1] - median), x[1]))
-                for inst, _strike, _dte in chain_rows:
-                    if len(per_under) >= per_under_budget:
-                        break
-                    per_under.append(inst)
-                if len(per_under) >= per_under_budget:
-                    break
-            desk_selected.extend(per_under)
-            if len(desk_selected) >= candidate_budget:
-                break
-        selected.extend(desk_selected[:candidate_budget])
-        diagnostics[desk] = {"underlyings": observed_underlyings, "scan_underlyings": target_underlyings, "selected": len(desk_selected[:candidate_budget]), "quota": quota}
+        for quality, underlying, rows in scored[:quota]:
+            # One runtime instrument per underlying.  The full viable chain for
+            # that underlying remains attached for later option selection.
+            raw = build_underlying_payload(underlying, desk, rows)
+            raw["underlying_chain_quality_score"] = quality
+            sample = rows[0]
+            ei = ExchangeInstrument(
+                exchange=ExchangeName.ICICI,
+                symbol=normalise_symbol(underlying),
+                ws_symbol=normalise_symbol(underlying),
+                display_symbol=normalise_symbol(underlying),
+                asset_id=normalise_symbol(underlying),
+                asset_class=AssetClass.OPTION,
+                product_id=None,
+                quote_asset="INR",
+                base_asset=normalise_symbol(underlying),
+                contract_type="option_chain",
+                status="active",
+                tick_size=sample.tick_size,
+                lot_step=sample.lot_step,
+                min_qty=sample.min_qty,
+                raw=raw,
+            )
+            selected_underlyings.append(ei)
+        diagnostics[desk] = {
+            "underlyings": len(under_map),
+            "selected_underlyings": min(quota, len(scored)),
+            "contracts_indexed": sum(len(v) for v in under_map.values()),
+            "quota": quota,
+        }
 
     logger.info(
-        "ICICI chain-desk candidate build: total_options=%d selected=%d rejected_bad_metadata=%d index=%s stock=%s",
-        len(options), len(selected), rejected_bad_metadata,
+        "ICICI underlying-desk candidate build: contracts=%d selected_underlyings=%d rejected_bad_metadata=%d index=%s stock=%s",
+        len(options), len(selected_underlyings), rejected_bad_metadata,
         diagnostics.get("ICICI_INDEX_OPTIONS", {}), diagnostics.get("ICICI_STOCK_OPTIONS", {}),
     )
-    return selected
-
+    return selected_underlyings
 
 def _deep_first_float(obj, names) -> float:
     """Find the first positive numeric field in a nested exchange payload."""

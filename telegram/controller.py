@@ -31,7 +31,7 @@ import threading
 import requests
 import html as _html
 from typing import Optional
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import sys
 
 import sys, os as _os; sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
@@ -143,6 +143,11 @@ class TelegramBotController:
         self._icici_waiting_for_otp: bool = False
         self._icici_refresh_thread: Optional[threading.Thread] = None
         self._icici_refresh_result: str = ""
+        self._icici_renewal_stop = threading.Event()
+        self._icici_renewal_thread: Optional[threading.Thread] = None
+        self._icici_renewal_last_attempt_ts: float = 0.0
+        self._icici_renewal_last_attempt_date: str = ""
+        self._icici_renewal_last_success_date: str = ""
 
         if not self.bot_token or not self.chat_id:
             raise ValueError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set")
@@ -278,6 +283,8 @@ class TelegramBotController:
                 {"command": "pnl",    "description": "Portfolio PnL"},
                 {"command": "pause",  "description": "Pause trading; keep scanning"},
                 {"command": "resume", "description": "Resume trading"},
+                {"command": "icici_status", "description": "Breeze token freshness and scheduler"},
+                {"command": "icici_token", "description": "Start Breeze token renewal"},
                 {"command": "icici_login", "description": "Run ICICI login token generator"},
                 {"command": "icici_otp",   "description": "Submit ICICI OTP"},
                 {"command": "killswitch", "description": "Emergency close/cancel"},
@@ -311,7 +318,7 @@ class TelegramBotController:
             "learn", "watchdog", "watchdog_status", "watchdog_heal",
             "watchdog_heal_on", "watchdog_heal_off",
             "watchdog_freeze", "watchdog_unfreeze",
-            "fund", "icici_refresh", "icici_login", "icici_otp",
+            "fund", "icici_refresh", "icici_login", "icici_token", "icici_auth", "icici_status", "icici_otp",
         }
         if not t.startswith("/"):
             parts = t.split(None, 1)
@@ -363,8 +370,9 @@ class TelegramBotController:
             elif cmd == "/resetrisk":           return self._cmd_resetrisk(args)
             elif cmd == "/set":                 return self._cmd_set(args)
             elif cmd == "/setexchange":         return self._cmd_setexchange(args)
-            elif cmd in ("/icici_refresh", "/icici_login"):
+            elif cmd in ("/icici_refresh", "/icici_login", "/icici_token", "/icici_auth"):
                 return self._cmd_icici_refresh()
+            elif cmd == "/icici_status":        return self._cmd_icici_status()
             elif cmd == "/icici_otp":           return self._cmd_icici_otp(args)
             elif cmd == "/huntstatus":          return self._cmd_huntstatus()
             elif cmd == "/pnl":                 return self._cmd_pnl()
@@ -415,7 +423,7 @@ class TelegramBotController:
             "  /pnl — portfolio PnL\n\n"
             "⚙️ <b>CONTROL</b>\n"
             "  /start · /stop · /pause · /resume\n"
-            "  /icici_login · /icici_otp 123456\n"
+            "  /icici_status | /icici_token | /icici_otp 123456\n"
             "  /killswitch — emergency close/cancel\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
@@ -2028,15 +2036,170 @@ class TelegramBotController:
             self._icici_pending_otp = None
             self._icici_waiting_for_otp = False
 
+    def _icici_auth_tz(self) -> timezone:
+        offset_min = int(getattr(config, "ICICI_SESSION_TIMEZONE_OFFSET_MIN", 330) or 330)
+        return timezone(timedelta(minutes=offset_min))
+
+    def _icici_auth_now(self) -> datetime:
+        return datetime.now(self._icici_auth_tz())
+
+    def _icici_renewal_time_parts(self) -> tuple[int, int]:
+        raw = str(getattr(config, "ICICI_TOKEN_RENEWAL_TIME", "08:00") or "08:00").strip()
+        try:
+            hour_s, minute_s = raw.split(":", 1)
+            hour = max(0, min(23, int(hour_s)))
+            minute = max(0, min(59, int(minute_s)))
+            return hour, minute
+        except Exception:
+            return 8, 0
+
+    def _icici_renewal_target(self, now: datetime | None = None) -> datetime:
+        now = now or self._icici_auth_now()
+        hour, minute = self._icici_renewal_time_parts()
+        return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    def _icici_renewal_retry_sec(self) -> float:
+        return max(300.0, float(getattr(config, "ICICI_TOKEN_RENEWAL_RETRY_SEC", 30 * 60) or (30 * 60)))
+
+    def _icici_renewal_check_sec(self) -> float:
+        return max(15.0, min(300.0, float(getattr(config, "ICICI_TOKEN_RENEWAL_CHECK_SEC", 60.0) or 60.0)))
+
+    def _icici_renewal_enabled(self) -> bool:
+        return bool(getattr(config, "ICICI_TOKEN_RENEWAL_ENABLED", True)) and self._should_auto_icici_token_on_start()
+
+    def _icici_session_ready_for_today(self, *, notify: bool = False) -> bool:
+        try:
+            from exchanges.icici.breeze_auth import BreezeTokenService
+            service = BreezeTokenService()
+            cached = service.cached_session()
+            if cached and service.validate_session(cached):
+                self._icici_renewal_last_success_date = self._icici_auth_now().date().isoformat()
+                return True
+            if service.can_refresh_without_operator():
+                session = service.get_session(force_refresh=False)
+                if service.validate_session(session):
+                    self._icici_renewal_last_success_date = self._icici_auth_now().date().isoformat()
+                    if notify:
+                        self.send_message(self._format_icici_session_ok(session))
+                    return True
+        except Exception as exc:
+            logger.info("ICICI token readiness check requires operator renewal: %s", exc)
+        return False
+
+    def _icici_renewal_due(self, now: datetime | None = None) -> bool:
+        if not self._icici_renewal_enabled():
+            return False
+        now = now or self._icici_auth_now()
+        if now < self._icici_renewal_target(now):
+            return False
+        date_key = now.date().isoformat()
+        if self._icici_renewal_last_success_date == date_key:
+            return False
+        if self._icici_refresh_thread is not None and self._icici_refresh_thread.is_alive():
+            return False
+        if self._icici_session_ready_for_today():
+            return False
+        if (
+            self._icici_renewal_last_attempt_date == date_key
+            and time.time() - self._icici_renewal_last_attempt_ts < self._icici_renewal_retry_sec()
+        ):
+            return False
+        return True
+
+    def _icici_renewal_loop(self) -> None:
+        logger.info(
+            "ICICI_TOKEN_RENEWAL_SCHEDULER started time=%s retry_sec=%.0f check_sec=%.0f",
+            getattr(config, "ICICI_TOKEN_RENEWAL_TIME", "08:00"),
+            self._icici_renewal_retry_sec(),
+            self._icici_renewal_check_sec(),
+        )
+        while not self._icici_renewal_stop.is_set():
+            try:
+                now = self._icici_auth_now()
+                if self._icici_renewal_due(now):
+                    self._icici_renewal_last_attempt_date = now.date().isoformat()
+                    self._icici_renewal_last_attempt_ts = time.time()
+                    msg = self._start_icici_refresh(
+                        reason=f"scheduled_{self._icici_renewal_target(now).strftime('%H:%M')}_IST"
+                    )
+                    logger.info("ICICI_TOKEN_RENEWAL_TRIGGER date=%s result=%s", self._icici_renewal_last_attempt_date, msg)
+                self._icici_renewal_stop.wait(self._icici_renewal_check_sec())
+            except Exception as exc:
+                logger.warning("ICICI_TOKEN_RENEWAL_SCHEDULER error: %s", exc, exc_info=True)
+                self._icici_renewal_stop.wait(60.0)
+        logger.info("ICICI_TOKEN_RENEWAL_SCHEDULER stopped")
+
+    def _start_icici_renewal_scheduler(self) -> None:
+        if not self._icici_renewal_enabled():
+            logger.info("ICICI_TOKEN_RENEWAL_SCHEDULER disabled")
+            return
+        if self._icici_renewal_thread is not None and self._icici_renewal_thread.is_alive():
+            return
+        self._icici_renewal_stop.clear()
+        self._icici_renewal_thread = threading.Thread(
+            target=self._icici_renewal_loop,
+            name="icici-token-renewal-scheduler",
+            daemon=True,
+        )
+        self._icici_renewal_thread.start()
+
+    def _stop_icici_renewal_scheduler(self) -> None:
+        try:
+            self._icici_renewal_stop.set()
+            if self._icici_renewal_thread is not None and self._icici_renewal_thread.is_alive():
+                self._icici_renewal_thread.join(timeout=2.0)
+        except Exception:
+            pass
+
     def _format_icici_session_ok(self, session) -> str:
         masked = session.masked()
+        try:
+            from exchanges.icici.breeze_auth import BreezeTokenService
+            status = BreezeTokenService().session_status(session)
+            day_line = "same-day" if status.get("same_trading_day") else "stale-day"
+        except Exception:
+            day_line = "unknown"
         return (
             "✅ <b>ICICI Breeze token ready</b>\n"
             f"Session age: <code>{int(session.age_sec())}s</code>\n"
+            f"Trading day: <code>{_esc(day_line)}</code>\n"
             f"SessionToken: <code>{_esc(masked.get('session_token', '***'))}</code>"
         )
 
-    def _cmd_icici_refresh(self) -> str:
+    def _cmd_icici_status(self) -> str:
+        try:
+            from exchanges.icici.breeze_auth import BreezeTokenService
+            service = BreezeTokenService()
+            session = service.cached_session()
+            status = service.session_status(session)
+        except Exception as exc:
+            status = {
+                "valid": False,
+                "reason": str(exc),
+                "age_sec": None,
+                "created_local": "",
+                "now_local": self._icici_auth_now().isoformat(timespec="seconds"),
+            }
+        state = "READY" if status.get("valid") else "NEEDS RENEWAL"
+        age = status.get("age_sec")
+        age_text = "n/a" if age is None else f"{int(float(age))}s"
+        now = self._icici_auth_now()
+        running = self._icici_refresh_thread is not None and self._icici_refresh_thread.is_alive()
+        target = self._icici_renewal_target(now)
+        return (
+            "<b>ICICI Breeze Auth Desk</b>\n"
+            f"Token: <b>{_esc(state)}</b>\n"
+            f"Reason: <code>{_esc(status.get('reason', 'unknown'))}</code>\n"
+            f"Age: <code>{_esc(age_text)}</code>\n"
+            f"Created: <code>{_esc(status.get('created_local') or 'n/a')}</code>\n"
+            f"Now: <code>{_esc(status.get('now_local') or now.isoformat(timespec='seconds'))}</code>\n"
+            f"Scheduler: <code>{'ON' if self._icici_renewal_enabled() else 'OFF'}</code> "
+            f"at <code>{target.strftime('%H:%M')} IST</code>, retry <code>{int(self._icici_renewal_retry_sec() // 60)}m</code>\n"
+            f"Refresh running: <code>{'YES' if running else 'NO'}</code>\n"
+            "Manual renewal: <code>/icici_token</code>, then submit <code>/icici_otp 123456</code>."
+        )
+
+    def _start_icici_refresh(self, *, reason: str = "manual") -> str:
         if self._icici_refresh_thread is not None and self._icici_refresh_thread.is_alive():
             return "ICICI Breeze token refresh is already running. Send <code>/icici_otp 123456</code> when the OTP arrives."
 
@@ -2046,19 +2209,25 @@ class TelegramBotController:
                 self._clear_icici_pending_otp()
                 self.send_message(
                     "🔄 <b>ICICI Breeze token generator started</b>\n"
+                    f"Trigger: <code>{_esc(reason)}</code>\n"
                     "Launching ICICI login automation. Do not paste passwords or tokens in Telegram; only submit the OTP when asked."
                 )
                 service = BreezeTokenService()
                 session = service.refresh(otp_getter=self._telegram_icici_otp_getter)
                 self._icici_refresh_result = "ok"
+                self._icici_renewal_last_success_date = self._icici_auth_now().date().isoformat()
                 self.send_message(self._format_icici_session_ok(session))
             except Exception as exc:
                 self._icici_refresh_result = str(exc)
+                logger.warning("ICICI_TOKEN_REFRESH_FAILED reason=%s error=%s", reason, exc)
                 self.send_message(f"❌ ICICI Breeze token refresh failed: <code>{_esc(exc)}</code>")
 
         self._icici_refresh_thread = threading.Thread(target=_runner, name="icici-token-refresh", daemon=True)
         self._icici_refresh_thread.start()
         return "ICICI Breeze token generator started. I will ask for OTP here when ICICI requests it."
+
+    def _cmd_icici_refresh(self) -> str:
+        return self._start_icici_refresh(reason="manual_telegram")
 
     def _cmd_icici_otp(self, args: str) -> str:
         code = (args or "").strip()
@@ -2573,7 +2742,10 @@ class TelegramBotController:
             from exchanges.icici.breeze_auth import BreezeTokenService
             service = BreezeTokenService()
             try:
-                service.require_configured(for_login=True)
+                service.require_configured(for_login=False)
+                can_refresh_without_operator = getattr(service, "can_refresh_without_operator", lambda: False)
+                if not can_refresh_without_operator():
+                    service.require_configured(for_login=True)
             except Exception as exc:
                 self.send_message(
                     "⚠️ ICICI auto login skipped: "
@@ -2690,6 +2862,7 @@ class TelegramBotController:
         self.running = True
         self.clear_old_messages()
         self.set_my_commands()
+        self._start_icici_renewal_scheduler()
         self.send_message(
             "⚡ <b>Liquidity-First Quant Bot Controller Ready</b>\n"
             "Execution: " + getattr(config, "EXECUTION_EXCHANGE", "?").upper() + "\n\n"
@@ -2741,10 +2914,12 @@ class TelegramBotController:
                 logger.error(f"Command loop error: {e}", exc_info=True)
                 time.sleep(2.0)
 
+        self._stop_icici_renewal_scheduler()
         logger.info("Controller stopped")
 
     def stop(self):
         self.running = False
+        self._stop_icici_renewal_scheduler()
         global bot_instance, bot_running
         if bot_running and bot_instance:
             bot_instance.stop()

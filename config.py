@@ -648,20 +648,47 @@ SCANNER_TICK_SLEEP_SEC = 0.25
 SCANNER_ASSET_HEARTBEAT_SEC = 60.0
 SCANNER_ASSET_ANALYSIS_LOG_SEC = 15.0  # per-contract proof-of-analysis log cadence
 # Portfolio slots: the bot may hold multiple contracts at once, but each
-# contract gets only one ENTERING/ACTIVE/EXITING slot.  The existing BTC-style
-# risk model is preserved by giving each contract a slot-scoped balance view
-# before QuantStrategy applies RISK_PER_TRADE and BALANCE_USAGE_PERCENTAGE.
+# contract gets only one ENTERING/ACTIVE/EXITING slot. Desk books allocate
+# independent capital and aggregate-risk sleeves before QuantStrategy applies
+# RISK_PER_TRADE and BALANCE_USAGE_PERCENTAGE.
 PORTFOLIO_MAX_OPEN_POSITIONS = 6
 PORTFOLIO_MAX_OPEN_PER_CONTRACT = 1
 PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS = 6
-PORTFOLIO_BUDGET_MODE = "equal_slots"   # equal_slots | active_equal_slots
-# In multi-asset mode, margin/cash is slot-scoped but dollar-risk must remain
-# portfolio-aware.  This prevents BTC min-lot rejection when a valid minimum
-# order is inside the portfolio risk cap but above the confidence-haircut target.
-PORTFOLIO_RISK_BUDGET_MODE = "portfolio_equity"  # portfolio_equity | slot_equity
+PORTFOLIO_BUDGET_MODE = "desk_weighted"   # desk_weighted | equal_slots | active_equal_slots
+PORTFOLIO_DESK_BUDGET_MODE = "desk_weighted"
+# In multi-asset mode, margin/cash and risk are desk-book scoped by default.
+# portfolio_equity/slot_equity remain available for compatibility testing or controlled rollback.
+PORTFOLIO_RISK_BUDGET_MODE = "desk_weighted"  # desk_weighted | portfolio_equity | slot_equity
 PORTFOLIO_MIN_LOT_MAX_RISK_MULT = 1.15
-PORTFOLIO_MAX_AGGREGATE_RISK_PCT = 3.0  # six slots × 0.5% risk; aggregate account risk cap
+PORTFOLIO_MAX_AGGREGATE_RISK_PCT = 3.0  # firm aggregate risk cap shared by desk books
 PORTFOLIO_REPORT_CAPITAL_WEIGHTED_METRICS = True
+
+# Desk books are PM sleeves, not data-subscription quotas. Capital weights
+# govern margin/cash allocation; risk weights split PORTFOLIO_MAX_AGGREGATE_RISK_PCT.
+DESK_POSITION_LIMITS_BY_ID = (
+    "BTC_GLOBAL:1,"
+    "CRYPTO_ALTS:2,"
+    "US_STOCK_DERIVATIVES:1,"
+    "COMMODITIES_GLOBAL:1,"
+    "ICICI_INDEX_OPTIONS:1,"
+    "ICICI_STOCK_OPTIONS:1"
+)
+DESK_CAPITAL_WEIGHT_BY_ID = (
+    "BTC_GLOBAL:0.26,"
+    "CRYPTO_ALTS:0.22,"
+    "US_STOCK_DERIVATIVES:0.16,"
+    "COMMODITIES_GLOBAL:0.14,"
+    "ICICI_INDEX_OPTIONS:0.12,"
+    "ICICI_STOCK_OPTIONS:0.10"
+)
+DESK_RISK_WEIGHT_BY_ID = (
+    "BTC_GLOBAL:0.28,"
+    "CRYPTO_ALTS:0.24,"
+    "US_STOCK_DERIVATIVES:0.14,"
+    "COMMODITIES_GLOBAL:0.14,"
+    "ICICI_INDEX_OPTIONS:0.12,"
+    "ICICI_STOCK_OPTIONS:0.08"
+)
 
 # Agentic institutional fund runtime.
 # Agents select which desks may run entry logic. QuantStrategy still owns alpha
@@ -718,7 +745,9 @@ ICICI_API_SESSION_PATH = "data/icici_api_session.txt"
 BREEZE_API_SESSION = os.getenv("BREEZE_API_SESSION", os.getenv("ICICI_API_SESSION", ""))
 BREEZE_SESSION_TOKEN = os.getenv("BREEZE_SESSION_TOKEN", os.getenv("ICICI_SESSION_TOKEN", ""))
 ICICI_SESSION_CACHE_PATH = "data/icici_breeze_session.json"
-ICICI_SESSION_TTL_SEC = float(6 * 60 * 60)
+ICICI_SESSION_TTL_SEC = float(18 * 60 * 60)
+ICICI_SESSION_EXPIRES_DAILY = True
+ICICI_SESSION_TIMEZONE_OFFSET_MIN = 330
 ICICI_DEBUG_DIR = "data/icici_debug"
 ICICI_BREEZE_PREFLIGHT_ON_STARTUP = True
 # When the bot is started from Telegram and a Breeze API_Session is missing,
@@ -729,6 +758,10 @@ ICICI_AUTO_TOKEN_GENERATOR_ON_STARTUP = True
 ICICI_TOKEN_GENERATOR_HEADLESS = True
 ICICI_PLAYWRIGHT_AUTO_INSTALL = True
 ICICI_OTP_WAIT_SEC = 180.0
+ICICI_TOKEN_RENEWAL_ENABLED = True
+ICICI_TOKEN_RENEWAL_TIME = "08:00"
+ICICI_TOKEN_RENEWAL_RETRY_SEC = float(30 * 60)
+ICICI_TOKEN_RENEWAL_CHECK_SEC = 60.0
 ICICI_AUTH_REQUIRED_FOR_DETAILS = True
 
 COINDCX_ENABLED = False
@@ -943,5 +976,6 @@ INSTITUTIONAL_OBSERVABILITY_ENABLED = True
 TELEGRAM_FORWARD_RAW_LOGS = False
 TELEGRAM_LEGACY_STRATEGY_ALERTS_ENABLED = False
 INSTITUTIONAL_DESK_CYCLE_LOG_SEC = 60.0
+INSTITUTIONAL_LOG_DEDUPE_SEC = 45.0
 SCANNER_ASSET_ANALYSIS_LOG_SEC = 0.0
 SCANNER_ASSET_HEARTBEAT_SEC = 0.0

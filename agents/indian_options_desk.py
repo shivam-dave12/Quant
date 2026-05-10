@@ -201,6 +201,33 @@ class IndianOptionsDesk:
         if quote:
             raw.update(dict(quote))
         underlying = normalise_symbol(raw.get("stock_code") or raw.get("underlying") or raw.get("Underlying") or raw.get("UnderlyingSymbol") or getattr(inst, "asset_id", ""))
+        if raw.get("icici_underlying_desk"):
+            quality = raw.get("chain_quality") if isinstance(raw.get("chain_quality"), dict) else {}
+            q = float(quality.get("score", raw.get("underlying_chain_quality_score", 0.0)) or 0.0)
+            rows = int(quality.get("rows", len(raw.get("chain_candidates") or [])) or 0)
+            strikes = int(quality.get("strikes", 0) or 0)
+            expiries = int(quality.get("expiries", 0) or 0)
+            desk_id = str(raw.get("desk_id") or self.desk_id_for_underlying(underlying, raw))
+            reasons = (
+                desk_id.lower(),
+                "underlying_first",
+                "contract_selected_after_thesis",
+                f"underlying={underlying}",
+                f"chain_rows={rows}",
+                f"strikes={strikes}",
+                f"expiries={expiries}",
+            )
+            return OptionSelectionScore(
+                score=clamp(0.35 + 0.65 * q),
+                desk_id=desk_id,
+                underlying=underlying,
+                option_type="chain",
+                strike=0.0,
+                expiry="post_thesis",
+                dte=0.0,
+                bs=None,
+                reasons=reasons,
+            )
         structural = _structural_tokens(raw)
         if bool(_cfg("ICICI_OPTION_REJECT_STRUCTURAL_UNDERLYING", True)) and (not underlying or underlying in structural):
             return OptionSelectionScore(

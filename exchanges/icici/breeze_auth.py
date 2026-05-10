@@ -12,10 +12,12 @@ Security Master discovery remains public and does not require auth.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -27,6 +29,8 @@ except Exception:  # pragma: no cover
     config = None  # type: ignore
 
 from .token_generator import generate_api_session
+
+logger = logging.getLogger(__name__)
 
 
 def _cfg(name: str, default: Any) -> Any:
@@ -157,10 +161,19 @@ class BreezeTokenService:
 
             api_session = self._configured_api_session()
             if api_session:
-                session = self.exchange_api_session(api_session)
-                self._memory = session
-                self._save_cache(session)
-                return session
+                try:
+                    session = self.exchange_api_session(api_session)
+                    self._memory = session
+                    self._save_cache(session)
+                    return session
+                except Exception as exc:
+                    if otp_getter is None and otp_code is None:
+                        raise
+                    logger.info(
+                        "ICICI Breeze configured API_Session exchange failed; "
+                        "falling back to operator login: %s",
+                        exc,
+                    )
 
             if otp_getter is not None or otp_code is not None:
                 self.require_configured(for_login=True)
@@ -209,17 +222,75 @@ class BreezeTokenService:
         return BreezeSession(api_session=api_session, session_token=session_token, created_at=time.time(), raw_customer_details=data)
 
     def validate_session(self, session: BreezeSession) -> bool:
-        if not session.session_token:
-            return False
-        if session.age_sec() > self.ttl_sec:
-            return False
-        return True
+        return bool(self.session_status(session)["valid"])
 
     def can_refresh_without_operator(self) -> bool:
         return bool(self._configured_session_token() or self._configured_api_session())
 
+    def cached_session(self) -> Optional[BreezeSession]:
+        with self._lock:
+            if self._memory is not None:
+                return self._memory
+            self._memory = self._load_cache()
+            return self._memory
+
+    def session_status(self, session: BreezeSession | None = None) -> dict:
+        session = session or self.cached_session()
+        if session is None:
+            return {
+                "valid": False,
+                "reason": "missing",
+                "age_sec": None,
+                "same_trading_day": False,
+                "created_local": "",
+                "now_local": self._now_local().isoformat(timespec="seconds"),
+            }
+
+        age_sec = session.age_sec()
+        has_token = bool(session.session_token)
+        age_ok = age_sec <= self.ttl_sec
+        same_day = self._same_trading_day(session.created_at)
+        reason = ""
+        if not has_token:
+            reason = "missing_session_token"
+        elif not age_ok:
+            reason = "ttl_expired"
+        elif not same_day:
+            reason = "midnight_rollover"
+
+        return {
+            "valid": bool(has_token and age_ok and same_day),
+            "reason": reason or "ok",
+            "age_sec": age_sec,
+            "same_trading_day": same_day,
+            "created_local": self._local_dt(session.created_at).isoformat(timespec="seconds"),
+            "now_local": self._now_local().isoformat(timespec="seconds"),
+            "expires_daily": self._expires_daily(),
+            "ttl_sec": self.ttl_sec,
+        }
+
     def _is_fresh(self, session: BreezeSession) -> bool:
-        return bool(session.session_token and session.age_sec() <= self.ttl_sec)
+        return self.validate_session(session)
+
+    def _expires_daily(self) -> bool:
+        return bool(_cfg("ICICI_SESSION_EXPIRES_DAILY", True))
+
+    def _session_timezone(self) -> timezone:
+        offset_min = int(_cfg("ICICI_SESSION_TIMEZONE_OFFSET_MIN", 330) or 330)
+        return timezone(timedelta(minutes=offset_min))
+
+    def _local_dt(self, ts: float) -> datetime:
+        return datetime.fromtimestamp(float(ts or 0.0), tz=self._session_timezone())
+
+    def _now_local(self) -> datetime:
+        return datetime.now(self._session_timezone())
+
+    def _same_trading_day(self, created_at: float) -> bool:
+        if not self._expires_daily():
+            return True
+        created = self._local_dt(created_at)
+        now = self._now_local()
+        return created.date() == now.date()
 
     def _configured_session_token(self) -> str:
         if self._session_token_override:

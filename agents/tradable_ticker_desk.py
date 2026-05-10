@@ -362,7 +362,9 @@ class TradableTickerDesk:
             return {}
         candidates = [
             inst for inst in instruments
-            if inst.primary_exchange == ExchangeName.ICICI and inst.asset_class == AssetClass.OPTION
+            if inst.primary_exchange == ExchangeName.ICICI
+            and inst.asset_class == AssetClass.OPTION
+            and not bool((getattr(getattr(inst, "primary", None), "raw", {}) or {}).get("icici_underlying_desk"))
         ]
         # Quote probes are not symbol-approved. They are prioritised by row quality:
         # derivative segment, non-structural underlying, usable strike/expiry/right,
