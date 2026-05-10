@@ -90,6 +90,51 @@ def _market_key_like(value: str) -> bool:
     return n.endswith(("USDT", "USD", "INR"))
 
 
+def _strip_quote(value: str) -> tuple[str, str]:
+    n = normalise_symbol(value)
+    for q in ("USDT", "USD", "INR"):
+        if n.endswith(q) and len(n) > len(q):
+            return n[:-len(q)], q
+    return n, ""
+
+
+def _commodity_family_from_symbol(symbol: str, base: str = "") -> str:
+    """Classify venue-returned tokens into commodity families.
+
+    This is taxonomy, not an approved-symbol list: instruments still have to be
+    returned/validated by the exchange. It recognises commodity roots such as
+    XAU/XAUT/gold, SLV/XAG/silver and CL/WTI/Brent/oil even when the exchange
+    labels every contract as a generic future.
+    """
+    sym_base, _ = _strip_quote(symbol)
+    b = normalise_symbol(base) or sym_base
+    joined = f"{sym_base} {b}"
+    if any(x in joined for x in ("XAUT", "XAU", "PAXG", "GOLD")):
+        return "gold"
+    if any(x in joined for x in ("SLVON", "SLV", "XAG", "SILVER")):
+        return "silver"
+    if any(x in joined for x in ("CLUS", "CL", "WTI", "BRENT", "CRUDE", "OIL")):
+        return "crude_oil"
+    if any(x in joined for x in ("NATGAS", "NATURALGAS", "NGAS")):
+        return "natural_gas"
+    return ""
+
+
+def _is_delta_tokenised_equity(symbol: str, base: str, row: dict) -> bool:
+    """Detect Delta xStock-style contracts without misclassifying AVAXUSD.
+
+    Delta US stock derivatives usually look like BASE + XUSD where BASE is the
+    equity ticker, e.g. AAPLXUSD and base AAPL. Crypto like AVAXUSD is BASE+USD,
+    not BASE+XUSD.
+    """
+    nsym = normalise_symbol(symbol)
+    nbase = normalise_symbol(base)
+    if nbase and nsym == f"{nbase}XUSD":
+        return True
+    text = normalise_symbol(" ".join(str(v) for v in (row or {}).values() if not isinstance(v, (dict, list))))
+    return any(tag in text for tag in ("XSTOCK", "TOKENIZEDSTOCK", "STOCK", "EQUITY", "SHARE"))
+
+
 def _asset_default_max_leverage(asset_class: AssetClass) -> float:
     # No inferred leverage caps. If a live product row does not publish leverage,
     # the runtime policy treats the product as cash/1x until the venue confirms a
@@ -114,24 +159,30 @@ def _asset_class_from_text(text: str, default: AssetClass = AssetClass.CRYPTO) -
 
 
 def _infer_delta_asset_class(row: dict, symbol: str, base: str) -> AssetClass:
-    # Classify from exchange metadata first. Do not treat every *XUSD symbol as
-    # xStock: AVAXUSD is crypto, while AAPLXUSD is a tokenised equity only if
-    # the product metadata says stock/equity/share/xstock.
+    # Venue catalogs often label everything as futures. Desk identity must come
+    # from instrument identity first, then text metadata.
+    if _is_delta_tokenised_equity(symbol, base, row):
+        return AssetClass.EQUITY
+    if _commodity_family_from_symbol(symbol, base):
+        return AssetClass.COMMODITY
     text = normalise_symbol(" ".join(str(v) for v in (row or {}).values() if not isinstance(v, (dict, list))))
     nsym = normalise_symbol(symbol)
     nbase = normalise_symbol(base)
     ac = _asset_class_from_text(f"{text} {nbase} {nsym}", AssetClass.CRYPTO)
-    if ac != AssetClass.CRYPTO:
-        return ac
-    if any(tag in text for tag in ("XSTOCK", "STOCK", "EQUITY", "SHARE")):
-        return AssetClass.EQUITY
-    return AssetClass.CRYPTO
+    if ac == AssetClass.FUTURE:
+        # 'future' describes contract form, not desk family. If the symbol is not
+        # a commodity/equity/index, it stays a crypto perpetual/future.
+        return AssetClass.CRYPTO
+    return ac
 
 
 def _canonical_asset_id(inst: ExchangeInstrument) -> str:
     """Canonical key for cross-venue grouping without enumerating a fixed basket."""
     sym = normalise_symbol(inst.symbol)
     base = normalise_symbol(inst.base_asset or inst.asset_id or sym)
+    if inst.asset_class == AssetClass.COMMODITY:
+        fam = _commodity_family_from_symbol(inst.symbol, inst.base_asset)
+        return fam.upper() if fam else (base or sym)
     if inst.asset_class == AssetClass.FUTURE:
         return sym or base
     if inst.asset_class == AssetClass.EQUITY:
@@ -476,12 +527,7 @@ class InstrumentRegistry:
         except Exception as e:
             logger.warning("Delta product discovery failed: %s", e, exc_info=True)
         commodity_count = sum(1 for x in out.values() if x.asset_class == AssetClass.COMMODITY)
-        if commodity_count <= 0:
-            logger.warning(
-                "Delta commodity desk has no products classified as commodity from the live catalog. "
-                "No configured symbol probes and no synthetic commodity instruments are used."
-            )
-        else:
+        if commodity_count > 0:
             logger.info("Delta commodity products discovered from live catalog: %d", commodity_count)
         self.delta = out
         return out
@@ -513,13 +559,15 @@ class InstrumentRegistry:
                 if rest_sym.endswith(q):
                     base, quote = rest_sym[:-len(q)], q
                     break
+            c_family = _commodity_family_from_symbol(rest_sym, base)
+            c_asset_class = AssetClass.COMMODITY if c_family else AssetClass.CRYPTO
             ei = ExchangeInstrument(
                 exchange=ExchangeName.COINSWITCH,
                 symbol=rest_sym,
                 ws_symbol=ws_sym,
                 display_symbol=ws_sym,
-                asset_id=normalise_symbol(base or rest_sym),
-                asset_class=AssetClass.CRYPTO,
+                asset_id=normalise_symbol(c_family.upper() if c_family else (base or rest_sym)),
+                asset_class=c_asset_class,
                 quote_asset=quote,
                 base_asset=base,
                 contract_type=str(r.get("contract_type") or r.get("type") or "perpetual_futures"),
@@ -556,12 +604,28 @@ class InstrumentRegistry:
         except Exception as e:
             logger.warning("ICICI security master discovery failed: %s", e, exc_info=True)
             rows = []
+        icici_seen = icici_option_rows = icici_added = icici_reject_structural = icici_reject_non_option = 0
         for r in rows:
-            ex_code = str(
-                r.get("ExchangeCode") or r.get("exchange_code") or r.get("Exchange") or r.get("exchange") or ""
+            icici_seen += 1
+            ex_raw = str(
+                r.get("ExchangeCode") or r.get("exchange_code") or r.get("Exchange") or r.get("exchange") or
+                r.get("Segment") or r.get("segment") or r.get("ProductType") or r.get("InstrumentType") or ""
             ).upper()
-            if ex_code not in {"NSE", "NFO", "BSE", "BFO"}:
-                continue
+            ex_norm = normalise_symbol(ex_raw)
+            if "NFO" in ex_norm:
+                ex_code = "NFO"
+            elif "BFO" in ex_norm:
+                ex_code = "BFO"
+            elif "BSE" in ex_norm:
+                ex_code = "BSE"
+            elif "NSE" in ex_norm:
+                ex_code = "NSE"
+            else:
+                text_probe = normalise_symbol(" ".join(str(v) for v in list((r or {}).values())[:16]))
+                if any(x in text_probe for x in ("OPTIDX", "OPTSTK", "OPTION", "CE", "PE")):
+                    ex_code = "NFO"
+                else:
+                    continue
             try:
                 import config as _cfg_mod  # type: ignore
                 _icici_options_only = bool(getattr(_cfg_mod, "ICICI_OPTIONS_ONLY", True))
@@ -611,6 +675,8 @@ class InstrumentRegistry:
             text = f"{stock} {product} {right} {strike} {expiry} {ex_code}"
             ac = AssetClass.CASH
             is_option = _is_icici_option_row(r, ex_code, product, right, strike, expiry)
+            if is_option:
+                icici_option_rows += 1
             if ex_code in {"NFO", "BFO"}:
                 ac = AssetClass.OPTION if is_option else AssetClass.FUTURE
             elif ex_code == "BSE" and is_option:
@@ -624,12 +690,14 @@ class InstrumentRegistry:
                 nstock = normalise_symbol(stock)
                 structural = _icici_structural_tokens(r, ex_code, product, right, strike, expiry)
                 if bool(getattr(__import__('config'), 'ICICI_OPTION_REJECT_STRUCTURAL_UNDERLYING', True)) and (not nstock or nstock in structural):
+                    icici_reject_structural += 1
                     logger.debug("ICICI option rejected corrupt structural underlying=%s ex=%s symbol=%s product=%s", stock, ex_code, symbol_for_underlying, product)
                     continue
             if _icici_options_only and ac != AssetClass.OPTION:
                 # Indian-market mandate: only listed options are eligible for the
                 # trading universe. Cash/future/index rows are not silently traded
                 # or used as synthetic substitutes for options.
+                icici_reject_non_option += 1
                 continue
             symbol = normalise_symbol(
                 r.get("TradingSymbol") or r.get("trading_symbol") or r.get("Symbol") or stock or token
@@ -667,6 +735,11 @@ class InstrumentRegistry:
             if key in out and normalise_symbol(str(out[key].product_id or "")) != normalise_symbol(str(inst.product_id or "")):
                 key = f"{key}_{normalise_symbol(str(inst.product_id or len(out)))}"
             out[key] = inst
+            icici_added += 1
+        logger.info(
+            "ICICI options discovery summary: rows=%d option_like=%d added=%d rejected_structural=%d rejected_non_option=%d",
+            icici_seen, icici_option_rows, icici_added, icici_reject_structural, icici_reject_non_option
+        )
         self.icici = out
         return out
 
@@ -683,9 +756,10 @@ class InstrumentRegistry:
             return out
         seen = set(out.keys())
         for intent in intents:
-            # CoinSwitch is crypto futures only in the current API/page. Do not
-            # probe commodities, indices or equity-token aliases there.
-            if intent.asset_class != AssetClass.CRYPTO:
+            # CoinSwitch exact-symbol validation is allowed for crypto and
+            # commodity tokens. The symbol is activated only after the exchange
+            # responds with live market data for that exact token.
+            if intent.asset_class not in (AssetClass.CRYPTO, AssetClass.COMMODITY):
                 continue
             candidates: List[str] = []
             for a in _ordered_aliases(intent):
@@ -726,8 +800,8 @@ class InstrumentRegistry:
                             break
                     ei = ExchangeInstrument(
                         exchange=ExchangeName.COINSWITCH, symbol=rest_sym, ws_symbol=ws_sym,
-                        display_symbol=ws_sym, asset_id=normalise_symbol(base2),
-                        asset_class=AssetClass.CRYPTO, quote_asset=quote, base_asset=base2,
+                        display_symbol=ws_sym, asset_id=normalise_symbol((_commodity_family_from_symbol(rest_sym, base2).upper() or base2)),
+                        asset_class=(AssetClass.COMMODITY if _commodity_family_from_symbol(rest_sym, base2) else AssetClass.CRYPTO), quote_asset=quote, base_asset=base2,
                         contract_type="perpetual_futures", status="active", raw=row,
                     )
                     out[normalise_symbol(rest_sym)] = ei
@@ -737,6 +811,93 @@ class InstrumentRegistry:
                     break
                 except Exception as e:
                     logger.debug("CoinSwitch live validation failed for %s: %s", sym, e)
+        return out
+
+    def _augment_delta_from_seed_symbols(self, out: Dict[str, ExchangeInstrument], api, seed_symbols: Iterable[str]) -> Dict[str, ExchangeInstrument]:
+        if api is None:
+            return out
+        seen = set(out.keys())
+        for raw_sym in seed_symbols or []:
+            sym = normalise_symbol(str(raw_sym))
+            if not sym or sym in seen:
+                continue
+            row = None
+            try:
+                if hasattr(api, "get_product"):
+                    resp = api.get_product(sym)
+                    row = _unwrap_one(resp)
+                if not row and hasattr(api, "get_ticker"):
+                    resp = api.get_ticker(sym)
+                    row = _unwrap_one(resp)
+                if not row:
+                    continue
+                returned = normalise_symbol(row.get("symbol") or row.get("product_symbol") or row.get("contract_symbol") or sym)
+                if returned and returned != sym:
+                    logger.debug("Delta seed %s returned %s — ignoring", sym, returned)
+                    continue
+                base, quote = _strip_quote(sym)
+                fam = _commodity_family_from_symbol(sym, base)
+                ac = AssetClass.COMMODITY if fam else _infer_delta_asset_class(row, sym, base)
+                ei = ExchangeInstrument(
+                    exchange=ExchangeName.DELTA, symbol=sym, ws_symbol=sym, display_symbol=sym,
+                    asset_id=normalise_symbol(fam.upper() if fam else base), asset_class=ac,
+                    product_id=_safe_int(row.get("id") or row.get("product_id"), 0) or None,
+                    quote_asset=quote, base_asset=base,
+                    contract_type=str(row.get("contract_type") or row.get("product_type") or ""),
+                    status=str(row.get("state") or row.get("status") or "active"),
+                    tick_size=first_positive(_safe_float(row.get("tick_size")), _safe_float(row.get("price_increment")), _safe_float(row.get("minimum_tick_size"))),
+                    lot_step=first_positive(_safe_float(row.get("contract_value")), _safe_float(row.get("lot_size")), _safe_float(row.get("size_increment")), _asset_default_step(ac, sym)),
+                    min_qty=first_positive(_safe_float(row.get("min_size")), _safe_float(row.get("minimum_order_size"))),
+                    max_qty=_safe_float(row.get("max_size")),
+                    max_leverage=first_positive(_safe_float(row.get("max_leverage")), _safe_float(row.get("maximum_leverage")), _deep_first_float(row, ("max_leverage", "maximum_leverage", "maxLeverage"))),
+                    raw=row,
+                )
+                out[sym] = ei
+                seen.add(sym)
+                logger.info("Delta exact-symbol discovery validated: %s (%s)", sym, ac.value)
+            except Exception as e:
+                logger.debug("Delta exact-symbol validation failed for %s: %s", sym, e)
+        return out
+
+    def _augment_coinswitch_from_seed_symbols(self, out: Dict[str, ExchangeInstrument], api, seed_symbols: Iterable[str]) -> Dict[str, ExchangeInstrument]:
+        if api is None:
+            return out
+        seen = set(out.keys())
+        for raw_sym in seed_symbols or []:
+            sym = normalise_symbol(str(raw_sym))
+            if not sym or sym in seen:
+                continue
+            try:
+                fn = getattr(api, "get_futures_ticker", None) or getattr(api, "get_ticker", None)
+                if not callable(fn):
+                    continue
+                try:
+                    resp = fn(symbol=sym, exchange="EXCHANGE_2")
+                except TypeError:
+                    resp = fn(sym)
+                row = _unwrap_one(resp)
+                if not row or str(row.get("error") or ""):
+                    continue
+                if not any(k in row for k in ("symbol", "last_price", "lastPrice", "mark_price", "markPrice", "best_bid", "bestBid", "best_ask", "bestAsk", "open_interest", "openInterest")):
+                    continue
+                returned = normalise_symbol(row.get("symbol") or row.get("s") or row.get("pair") or sym)
+                if returned and returned != sym:
+                    logger.debug("CoinSwitch seed %s returned %s — ignoring", sym, returned)
+                    continue
+                base, quote = _strip_quote(sym)
+                fam = _commodity_family_from_symbol(sym, base)
+                ac = AssetClass.COMMODITY if fam else AssetClass.CRYPTO
+                ws_sym = slash_symbol(sym)
+                ei = ExchangeInstrument(
+                    exchange=ExchangeName.COINSWITCH, symbol=sym, ws_symbol=ws_sym, display_symbol=ws_sym,
+                    asset_id=normalise_symbol(fam.upper() if fam else base), asset_class=ac,
+                    quote_asset=quote, base_asset=base, contract_type="perpetual_futures", status="active", raw=row,
+                )
+                out[sym] = ei; out[normalise_symbol(ws_sym)] = ei
+                seen.add(sym); seen.add(normalise_symbol(ws_sym))
+                logger.info("CoinSwitch exact-symbol discovery validated: %s (%s)", sym, ac.value)
+            except Exception as e:
+                logger.debug("CoinSwitch exact-symbol validation failed for %s: %s", sym, e)
         return out
 
     # ──────────────────────────────────────────────────────────────────────
@@ -754,8 +915,18 @@ class InstrumentRegistry:
 
         delta = self.load_delta(delta_api) if _allow_value("delta", include_exs) else {}
         coins = self.load_coinswitch(coinswitch_api) if _allow_value("coinswitch", include_exs) else {}
+        try:
+            import config as _cfg_mod  # type: ignore
+            delta_seeds = _parse_csv_symbols(getattr(_cfg_mod, "DELTA_EXACT_DISCOVERY_SYMBOLS", ""))
+            coinswitch_seeds = _parse_csv_symbols(getattr(_cfg_mod, "COINSWITCH_EXACT_DISCOVERY_SYMBOLS", ""))
+        except Exception:
+            delta_seeds, coinswitch_seeds = set(), set()
+        if _allow_value("delta", include_exs):
+            delta = self._augment_delta_from_seed_symbols(delta, delta_api, delta_seeds)
         if intents and _allow_value("coinswitch", include_exs):
             coins = self._augment_coinswitch_from_requested(coins, coinswitch_api, intents)
+        if _allow_value("coinswitch", include_exs):
+            coins = self._augment_coinswitch_from_seed_symbols(coins, coinswitch_api, coinswitch_seeds)
         icici = self.load_icici(icici_api, security_master_url=icici_security_master_url) if _allow_value("icici", include_exs) else {}
 
         self.report = DiscoveryReport(requested=intents, raw_counts={

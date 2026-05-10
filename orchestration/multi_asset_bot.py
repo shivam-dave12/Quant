@@ -159,13 +159,20 @@ class MultiAssetQuantBot:
             return 1
         try:
             res = ctx.execution_router.set_leverage(int(target))
+            if res is None and primary == ExchangeName.DELTA:
+                # Some Delta responses come back empty even when the request was
+                # accepted. If the target came from configured/venue cap policy,
+                # do not silently downgrade the internal desk to 1x. Explicit API
+                # errors still force 1x below.
+                logger.warning("%s leverage %sx returned empty confirmation; retaining target under configured Delta venue-cap policy", inst.asset_id, target)
+                return int(target)
             ok = isinstance(res, dict) and bool(res.get("success", True)) and not res.get("_error")
             err = str((res or {}).get("error", "") if isinstance(res, dict) else "")
             if ok and not err:
                 return int(target)
-            logger.warning("%s leverage %sx not confirmed by exchange: %s — forcing 1x policy until product metadata is corrected", inst.asset_id, target, err or str(res)[:160])
+            logger.warning("%s leverage %sx not confirmed by exchange: %s — forcing 1x policy until product metadata/API response is corrected", inst.asset_id, target, err or str(res)[:160])
         except Exception as e:
-            logger.warning("%s leverage %sx set failed: %s — forcing 1x policy until product metadata is corrected", inst.asset_id, target, e)
+            logger.warning("%s leverage %sx set failed: %s — forcing 1x policy until product metadata/API response is corrected", inst.asset_id, target, e)
         return 1
 
 
@@ -881,12 +888,15 @@ class MultiAssetQuantBot:
         if interval <= 0 or time.time() - self._last_dynamic_desk_refresh < interval:
             return
         selected = self._select_runtime_instruments(force=False)
-        selected_ids = {x.asset_id for x in selected}
-        existing = {c.instrument.asset_id: c for c in self.contexts}
+        selected_ids = {str(x.asset_id) for x in selected}
+        existing = {str(c.instrument.asset_id): c for c in self.contexts}
+        existing_ids = set(existing.keys())
+        if selected_ids == existing_ids:
+            logger.info("DynamicDesk refresh retained current live set unchanged — preserving analysis state for %d contexts", len(self.contexts))
 
         # Add newly selected desks.  They alone open fresh subscriptions.
         for inst in selected:
-            if inst.asset_id in existing or not self._has_supported_runtime(inst):
+            if str(inst.asset_id) in existing or not self._has_supported_runtime(inst):
                 continue
             ctx = self._build_asset_context(inst, self.delta_api, self.cs_api)
             if ctx is None:
@@ -901,7 +911,7 @@ class MultiAssetQuantBot:
         kept: List[AssetContext] = []
         for ctx in self.contexts:
             age = time.time() - float(getattr(ctx, "started_at_sec", 0.0) or 0.0)
-            if ctx.instrument.asset_id in selected_ids or ctx.has_position or age < min_residency:
+            if str(ctx.instrument.asset_id) in selected_ids or ctx.has_position or age < min_residency:
                 kept.append(ctx)
                 continue
             try:

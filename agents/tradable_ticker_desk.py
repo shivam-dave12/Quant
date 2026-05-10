@@ -173,28 +173,124 @@ class TradableTickerDesk:
         out_rows: list[TradableDeskRow] = []
 
         global_rank_items: list[tuple[TradableInstrument, TradableDeskRow]] = []
+        monitor_all_ids = {
+            x.strip().upper()
+            for x in str(_cfg("DESK_MONITOR_ALL_IDS", "US_STOCK_DERIVATIVES,COMMODITIES_GLOBAL")).replace(";", ",").split(",")
+            if x.strip()
+        }
+        incumbent_min_score = float(_cfg("DYNAMIC_DESK_INCUMBENT_MIN_SCORE", 0.25))
+        replace_margin = max(0.0, float(_cfg("DYNAMIC_DESK_REPLACE_MARGIN_PCT", 0.12)))
+
+        def _row_valid_for_desk(row: TradableDeskRow, profile: Any, monitor_all: bool) -> bool:
+            if monitor_all:
+                return row.score > 0.0
+            return row.score >= max(profile.min_score, self.min_score)
+
         for desk_id, rows in grouped.items():
             profile = self.router.profile_for(desk_id)
             rows.sort(key=lambda x: x[1].score, reverse=True)
             quota = max(0, int(profile.quota))
+            monitor_all = desk_id in monitor_all_ids
             desk_selected = 0
-            for desk_rank, (inst, row) in enumerate(rows, 1):
+            desk_replaced = 0
+            desk_retained = 0
+            desk_ranked: list[tuple[TradableInstrument, TradableDeskRow]] = []
+
+            # 1) Institutional incumbent retention. Existing live contexts keep
+            # their analysis state while still valid. They are not destroyed just
+            # because a refresh ran and ranks shuffled slightly.
+            incumbents: list[tuple[TradableInstrument, TradableDeskRow]] = []
+            challengers: list[tuple[TradableInstrument, TradableDeskRow]] = []
+            for inst, row in rows:
+                asset_id = str(inst.asset_id)
+                if asset_id in active_set or asset_id in protected_set:
+                    incumbents.append((inst, row))
+                else:
+                    challengers.append((inst, row))
+            incumbents.sort(key=lambda x: x[1].score, reverse=True)
+            challengers.sort(key=lambda x: x[1].score, reverse=True)
+
+            retained: list[tuple[TradableInstrument, TradableDeskRow, str]] = []
+            for inst, row in incumbents:
+                asset_id = str(inst.asset_id)
+                protected = asset_id in protected_set
+                forced = normalise_symbol(asset_id) in self.always_include
+                still_valid = protected or forced or row.score >= incumbent_min_score or _row_valid_for_desk(row, profile, monitor_all)
+                if still_valid and len(retained) < quota:
+                    reason = "protected_position" if protected else ("forced_include" if forced else "incumbent_retained")
+                    retained.append((inst, row, reason))
+                    desk_retained += 1
+                else:
+                    challengers.append((inst, row))
+
+            # 2) Fill open slots from best new candidates. If the desk is already
+            # full, replace only the weakest idle incumbent when the challenger is
+            # materially better. This is the difference between institutional desk
+            # rotation and retail reset-on-every-refresh churn.
+            for inst, row in challengers:
                 asset_id = str(inst.asset_id)
                 forced = normalise_symbol(asset_id) in self.always_include
-                protected = asset_id in protected_set
-                has_room = desk_selected < quota and len(selected) < self.max_active
-                choose = protected or forced or (has_room and row.score >= max(profile.min_score, self.min_score))
-                if choose and asset_id not in selected_ids:
+                valid = forced or _row_valid_for_desk(row, profile, monitor_all)
+                if not valid:
+                    continue
+                if len(retained) < quota:
+                    retained.append((inst, row, "forced_include" if forced else row.reason))
+                    continue
+                if not retained:
+                    continue
+                # Do not replace protected/forced incumbents; choose weakest idle.
+                weakest_idx = None
+                weakest_score = math.inf
+                for i, (_old_inst, old_row, old_reason) in enumerate(retained):
+                    if old_reason in {"protected_position", "forced_include"}:
+                        continue
+                    if old_row.score < weakest_score:
+                        weakest_idx = i
+                        weakest_score = old_row.score
+                if weakest_idx is None:
+                    continue
+                if row.score >= weakest_score * (1.0 + replace_margin):
+                    old_inst, old_row, _old_reason = retained[weakest_idx]
+                    retained[weakest_idx] = (inst, row, f"rotation_replaced:{old_inst.asset_id}")
+                    desk_replaced += 1
+                    # Old incumbent becomes ranked but not selected.
+                    desk_ranked.append((old_inst, self._replace_row(old_row, reason=f"rotated_out_by:{asset_id}")))
+
+            # 3) Apply global cap only to new non-monitor desks. Already-running
+            # incumbents are stateful assets and should not be force-reset by cap
+            # math. Monitor-all desks bypass the cap by design.
+            for inst, row, reason in retained:
+                asset_id = str(inst.asset_id)
+                already_live = asset_id in active_set
+                bypass_global_cap = monitor_all or already_live or asset_id in protected_set
+                if not bypass_global_cap and len(selected) >= self.max_active:
+                    desk_ranked.append((inst, self._replace_row(row, reason="global_cap_deferred")))
+                    continue
+                if asset_id not in selected_ids:
                     selected.append(inst)
                     selected_ids.add(asset_id)
                     desk_selected += 1
+                desk_ranked.append((inst, self._replace_row(row, selected=True, reason=reason)))
+
+            selected_local = {str(inst.asset_id) for inst, row, _reason in retained if str(inst.asset_id) in selected_ids}
+            # Add all non-selected rows for visibility.
+            for inst, row in rows:
+                if str(inst.asset_id) in selected_local:
+                    continue
+                if any(str(inst.asset_id) == str(existing.asset_id) for existing, _ in desk_ranked):
+                    continue
+                desk_ranked.append((inst, row))
+
+            for desk_rank, (inst, row) in enumerate(desk_ranked, 1):
                 global_rank_items.append((inst, self._replace_row(
                     row,
                     desk_rank=desk_rank,
-                    selected=asset_id in selected_ids,
-                    reason=("protected_position" if protected else ("forced_include" if forced else row.reason)),
+                    selected=str(inst.asset_id) in selected_ids,
                 )))
-            notes.append(f"{desk_id}: quota={quota} selected={desk_selected}/{len(rows)}")
+            notes.append(
+                f"{desk_id}: quota={quota} selected={desk_selected}/{len(rows)} "
+                f"retained={desk_retained} replaced={desk_replaced}"
+            )
 
         global_rank_items.extend(rejected_rows)
         global_rank_items.sort(key=lambda x: (x[1].selected, x[1].score), reverse=True)
@@ -265,7 +361,7 @@ class TradableTickerDesk:
                 failures += 1
                 if failures == 1:
                     notes.append(f"icici option quote probe skipped/failed: {exc}")
-                break
+                continue
         if out:
             notes.append(f"icici authenticated option quote probes={len(out)}")
             notes.append(f"icici authenticated quote probes={len(out)}")
@@ -342,6 +438,8 @@ class TradableTickerDesk:
             if opt.bs:
                 option_greeks = f"Δ={opt.bs.delta:+.2f} θ/prem={opt.bs.theta_to_premium:.1%} dte={opt.dte:.1f}"
             raw["_option_selection"] = opt.as_dict()
+            if bool(_cfg("ICICI_OPTION_REQUIRE_LIVE_QUOTE", True)) and not quote_success:
+                score = 0.0
 
         details = self._icici_detail_text({**primary.raw, **quote_success}) if primary.exchange == ExchangeName.ICICI else ""
         preferred_route = venue_routes[0] if venue_routes else None

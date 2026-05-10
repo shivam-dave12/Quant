@@ -738,7 +738,7 @@ COINDCX_SECRET_KEY = os.getenv("COINDCX_SECRET_KEY", "")
 # Dynamic universe discovery. The scanner reads live venue catalogs by default;
 # this list is intentionally empty so old fixed baskets cannot cap coverage.
 UNIVERSE_DISCOVERY_MODE = "dynamic"
-UNIVERSE_INCLUDE_EXCHANGES = "delta,icici"
+UNIVERSE_INCLUDE_EXCHANGES = "delta,coinswitch,icici"
 UNIVERSE_INCLUDE_ASSET_CLASSES = "crypto,commodity,index,equity,option,future"
 MULTI_ASSET_REQUESTS = []
 DISCOVERY_REPORT_PREVIEW = 80
@@ -821,15 +821,15 @@ DASHBOARD_POSITION_UPDATE_SEC = 1.0
 # subscriptions are opened only for the desk-selected shortlist.  This prevents
 # Delta from being flooded with 100+ simultaneous candle streams at startup.
 DYNAMIC_TRADABLE_DESK_ENABLED = True
-DYNAMIC_DESK_MAX_ACTIVE_CONTEXTS = 14
+DYNAMIC_DESK_MAX_ACTIVE_CONTEXTS = 40
 DYNAMIC_DESK_MIN_SCORE = 0.38
 DYNAMIC_DESK_REFRESH_SEC = 180.0
 DYNAMIC_DESK_MIN_RESIDENCY_SEC = 600.0
 DYNAMIC_DESK_DELTA_BULK_TICKERS = True
 DYNAMIC_DESK_ICICI_DETAILS_ENABLED = True
-DYNAMIC_DESK_ICICI_QUOTE_PROBES = 8
+DYNAMIC_DESK_ICICI_QUOTE_PROBES = 80
 DYNAMIC_DESK_ALWAYS_INCLUDE = "BTCUSD,ETHUSD,SOLUSD"
-DYNAMIC_DESK_LOG_TOP_N = 12
+DYNAMIC_DESK_LOG_TOP_N = 30
 
 # Candle streaming policy for activated desks only.  HTF candles may still be
 # warmed through REST, but live WS candles should stay lean.  Empty value means
@@ -851,11 +851,28 @@ DESK_ENABLED_IDS = ""  # empty = enable every desk with quota > 0
 DESK_MAX_ACTIVE_BY_ID = ""
 DESK_BTC_GLOBAL_MAX_ACTIVE = 1
 DESK_CRYPTO_ALTS_MAX_ACTIVE = 5
-DESK_US_STOCK_DERIVATIVES_MAX_ACTIVE = 2
-DESK_COMMODITIES_GLOBAL_MAX_ACTIVE = 2
-DESK_ICICI_INDEX_OPTIONS_MAX_ACTIVE = 2
-DESK_ICICI_STOCK_OPTIONS_MAX_ACTIVE = 2
+DESK_US_STOCK_DERIVATIVES_MAX_ACTIVE = 32
+DESK_COMMODITIES_GLOBAL_MAX_ACTIVE = 8
+DESK_ICICI_INDEX_OPTIONS_MAX_ACTIVE = 10
+DESK_ICICI_STOCK_OPTIONS_MAX_ACTIVE = 10
 VENUE_ROUTE_PREFERENCE = "delta,icici,coindcx,coinswitch"
+
+# Stateful selector policy: never churn live contexts just because the desk
+# refresh ran. Active instruments are retained as incumbents while still valid;
+# a new candidate replaces an idle incumbent only when its score is materially
+# better. This protects candle state, liquidity maps, posterior context and
+# trailing/entry analysis from reset-on-refresh behaviour.
+DYNAMIC_DESK_INCUMBENT_MIN_SCORE = 0.25
+DYNAMIC_DESK_REPLACE_MARGIN_PCT = 0.12
+DYNAMIC_DESK_KEEP_ACTIVE_ON_TIE = True
+# Discovery seeds are exact-symbol validation probes, not approved lists. They
+# are used when an exchange's bulk catalog omits/mislabels a known live product;
+# the instrument is activated only after the venue returns real product/ticker data.
+DELTA_EXACT_DISCOVERY_SYMBOLS = "XAUTUSD,SLVONUSD"
+COINSWITCH_EXACT_DISCOVERY_SYMBOLS = "CLUSDT"
+# xStock/commodity desks are venue-listed and relatively small, so they are
+# monitored as desks instead of being starved by the crypto selector.
+DESK_MONITOR_ALL_IDS = "US_STOCK_DERIVATIVES,COMMODITIES_GLOBAL"
 
 # Backward-compatible env aliases only. Do not use these names in new logic;
 # they are preserved so old .env files don't crash while v85 migrates configs.
