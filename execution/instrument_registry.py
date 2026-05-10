@@ -114,12 +114,18 @@ def _asset_class_from_text(text: str, default: AssetClass = AssetClass.CRYPTO) -
 
 
 def _infer_delta_asset_class(row: dict, symbol: str, base: str) -> AssetClass:
-    text = " ".join(str(row.get(k, "")) for k in ("symbol", "description", "name", "contract_type", "product_type"))
+    # Classify from exchange metadata first. Do not treat every *XUSD symbol as
+    # xStock: AVAXUSD is crypto, while AAPLXUSD is a tokenised equity only if
+    # the product metadata says stock/equity/share/xstock.
+    text = normalise_symbol(" ".join(str(v) for v in (row or {}).values() if not isinstance(v, (dict, list))))
     nsym = normalise_symbol(symbol)
     nbase = normalise_symbol(base)
-    if nsym.endswith("XUSD") or nbase.endswith("X"):
+    ac = _asset_class_from_text(f"{text} {nbase} {nsym}", AssetClass.CRYPTO)
+    if ac != AssetClass.CRYPTO:
+        return ac
+    if any(tag in text for tag in ("XSTOCK", "STOCK", "EQUITY", "SHARE")):
         return AssetClass.EQUITY
-    return _asset_class_from_text(f"{text} {nbase} {nsym}", AssetClass.CRYPTO)
+    return AssetClass.CRYPTO
 
 
 def _canonical_asset_id(inst: ExchangeInstrument) -> str:
@@ -167,6 +173,77 @@ def _parse_csv_set(value: str | Iterable[str] | None) -> Set[str]:
     else:
         raw = list(value)
     return {str(x).strip().lower() for x in raw if str(x).strip()}
+
+
+def _parse_csv_symbols(value: str | Iterable[str] | None) -> Set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        raw = value.replace(";", ",").split(",")
+    else:
+        raw = list(value)
+    return {normalise_symbol(str(x)) for x in raw if normalise_symbol(str(x))}
+
+
+def _icici_structural_tokens(row: dict, ex_code: str = "", product: str = "", right: str = "", strike: str = "", expiry: str = "") -> Set[str]:
+    """Return row-local metadata tokens that cannot be an underlying.
+
+    This is not a symbol allow-list. It only prevents corrupt security-master
+    rows such as underlying=BSE/NFO/OPTIDX/CE/5200 from entering the universe.
+    """
+    vals = {ex_code, product, right, strike, expiry}
+    for name in (
+        "ExchangeCode", "exchange_code", "Exchange", "exchange", "Segment", "ProductType",
+        "product_type", "InstrumentType", "Instrument Name", "InstrumentName", "Series",
+        "Right", "OptionType", "CallPut", "StrikePrice", "Strike", "ExpiryDate", "Expiry",
+    ):
+        v = _pick(row, name)
+        if v:
+            vals.add(v)
+    out = {normalise_symbol(str(x)) for x in vals if normalise_symbol(str(x))}
+    out.update({"OPTION", "OPTIONS", "CALL", "PUT", "CE", "PE", "C", "P"})
+    return out
+
+
+def _icici_option_kind(row: dict, ex_code: str, product: str) -> str:
+    text = normalise_symbol(" ".join(str(x) for x in [
+        ex_code, product,
+        _pick(row, "InstrumentType", "InstrumentName", "Instrument Name", "Series", "Segment", "ProductType"),
+        _pick(row, "TradingSymbol", "Symbol", "SecurityName", "Security Name"),
+    ]))
+    if "OPTIDX" in text or "INDEXOPTION" in text or "INDEXOPTIONS" in text:
+        return "index"
+    if "OPTSTK" in text or "STOCKOPTION" in text or "STOCKOPTIONS" in text:
+        return "stock"
+    if normalise_symbol(ex_code) == "BFO":
+        return "index"
+    return "stock"
+
+
+def _derive_icici_underlying(row: dict, stock: str, ex_code: str, product: str, symbol: str) -> str:
+    """Derive underlying from ICICI row fields without approved-symbol lists."""
+    structural = _icici_structural_tokens(row, ex_code, product, "", "", "")
+    candidates: list[str] = []
+    for name in (
+        "Underlying", "UnderlyingSymbol", "UnderlyingName", "Underlying Asset", "underlying",
+        "StockCode", "stock_code", "CompanyName", "Company Name", "ScripName",
+        "SC_SYMBOL", "SC_NAME", "ShortName", "SecurityName", "Security Name",
+    ):
+        v = _pick(row, name)
+        if v:
+            candidates.append(v)
+    if stock:
+        candidates.append(stock)
+    if symbol:
+        candidates.append(symbol)
+    for c in candidates:
+        n = normalise_symbol(str(c))
+        if not n or n in structural:
+            continue
+        if _market_key_like(n) or any(tok in n for tok in ("CE", "PE", "CALL", "PUT", "OPTIDX", "OPTSTK")):
+            continue
+        return n
+    return ""
 
 
 def _allow_value(value: str, allowed: Set[str]) -> bool:
@@ -398,6 +475,14 @@ class InstrumentRegistry:
                 out[normalise_symbol(sym)] = ei
         except Exception as e:
             logger.warning("Delta product discovery failed: %s", e, exc_info=True)
+        commodity_count = sum(1 for x in out.values() if x.asset_class == AssetClass.COMMODITY)
+        if commodity_count <= 0:
+            logger.warning(
+                "Delta commodity desk has no products classified as commodity from the live catalog. "
+                "No configured symbol probes and no synthetic commodity instruments are used."
+            )
+        else:
+            logger.info("Delta commodity products discovered from live catalog: %d", commodity_count)
         self.delta = out
         return out
 
@@ -519,17 +604,28 @@ class InstrumentRegistry:
                 "SENSEX50": "SENSEX",
             }
             stock = icici_stock_alias.get(normalise_symbol(stock), stock)
+            symbol_for_underlying = str(r.get("TradingSymbol") or r.get("trading_symbol") or r.get("Symbol") or stock or token)
+            derived_stock = _derive_icici_underlying(r, stock, ex_code, product, symbol_for_underlying)
+            if derived_stock:
+                stock = icici_stock_alias.get(normalise_symbol(derived_stock), derived_stock)
             text = f"{stock} {product} {right} {strike} {expiry} {ex_code}"
             ac = AssetClass.CASH
             is_option = _is_icici_option_row(r, ex_code, product, right, strike, expiry)
             if ex_code in {"NFO", "BFO"}:
                 ac = AssetClass.OPTION if is_option else AssetClass.FUTURE
             elif ex_code == "BSE" and is_option:
-                ac = AssetClass.OPTION
-            elif ex_code == "BSE" and normalise_symbol(stock) in {"SENSEX", "BANKEX"}:
-                ac = AssetClass.INDEX
+                # BSE is the cash exchange segment. Listed BSE derivatives should
+                # arrive as BFO rows. Do not manufacture an option from BSE cash
+                # rows even if strike/right columns are present.
+                ac = AssetClass.CASH
             elif _asset_class_from_text(text, AssetClass.EQUITY) == AssetClass.INDEX:
                 ac = AssetClass.INDEX
+            if ac == AssetClass.OPTION:
+                nstock = normalise_symbol(stock)
+                structural = _icici_structural_tokens(r, ex_code, product, right, strike, expiry)
+                if bool(getattr(__import__('config'), 'ICICI_OPTION_REJECT_STRUCTURAL_UNDERLYING', True)) and (not nstock or nstock in structural):
+                    logger.debug("ICICI option rejected corrupt structural underlying=%s ex=%s symbol=%s product=%s", stock, ex_code, symbol_for_underlying, product)
+                    continue
             if _icici_options_only and ac != AssetClass.OPTION:
                 # Indian-market mandate: only listed options are eligible for the
                 # trading universe. Cash/future/index rows are not silently traded
@@ -544,6 +640,8 @@ class InstrumentRegistry:
             raw.setdefault("stock_code", stock)
             raw.setdefault("exchange_code", ex_code)
             raw.setdefault("product_type", "options" if ac == AssetClass.OPTION else ("futures" if ac == AssetClass.FUTURE else "cash"))
+            if ac == AssetClass.OPTION:
+                raw.setdefault("option_kind", _icici_option_kind(r, ex_code, product))
             raw.setdefault("right", right)
             raw.setdefault("option_type", right)
             raw.setdefault("strike_price", strike)

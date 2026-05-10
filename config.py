@@ -745,6 +745,19 @@ DISCOVERY_REPORT_PREVIEW = 80
 ICICI_DISCOVERY_ENABLED = True
 ICICI_SECURITY_MASTER_URL = "http://directlink.icicidirect.com/NewSecurityMaster/SecurityMaster.zip"
 
+# v93 dynamic discovery policy
+# No approved-symbol lists and no synthetic commodity probes. ICICI options are
+# discovered from Breeze/security-master derivative rows, then validated through
+# live quote/chain data before runtime activation.
+ICICI_OPTION_REQUIRE_LIVE_QUOTE = True
+ICICI_OPTION_REJECT_STRUCTURAL_UNDERLYING = True
+ICICI_OPTION_REQUIRE_DERIVATIVE_SEGMENT = True
+ICICI_OPTION_DYNAMIC_DESK_CLASSIFICATION = True
+ICICI_OPTION_MIN_DTE = 1.0
+ICICI_OPTION_MAX_DTE = 35.0
+DYNAMIC_DESK_ICICI_QUOTE_PROBES = 40
+DELTA_COMMODITY_DYNAMIC_DISCOVERY = True
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # v9 Institutional multi-asset runtime policy
@@ -808,7 +821,7 @@ DASHBOARD_POSITION_UPDATE_SEC = 1.0
 # subscriptions are opened only for the desk-selected shortlist.  This prevents
 # Delta from being flooded with 100+ simultaneous candle streams at startup.
 DYNAMIC_TRADABLE_DESK_ENABLED = True
-DYNAMIC_DESK_MAX_ACTIVE_CONTEXTS = 12
+DYNAMIC_DESK_MAX_ACTIVE_CONTEXTS = 14
 DYNAMIC_DESK_MIN_SCORE = 0.38
 DYNAMIC_DESK_REFRESH_SEC = 180.0
 DYNAMIC_DESK_MIN_RESIDENCY_SEC = 600.0
