@@ -889,6 +889,23 @@ DESK_COINDCX_CRYPTO_MAX_ACTIVE = 0
 # be discovered for reference but are rejected before runtime subscription.
 ICICI_OPTIONS_ONLY = True
 ICICI_OPTIONS_RUNTIME_ENABLED = True
+
+# ICICI/NSE/BSE live data session guard.  ICICI option chains may be discovered
+# from Security Master anytime, but live quote/candle adapters should start only
+# during the Indian F&O session.  Holidays can be supplied as YYYY-MM-DD values
+# without putting them in .env/secrets.
+ICICI_MARKET_SESSION_GUARD_ENABLED = True
+ICICI_MARKET_OPEN_TIME = "09:15"
+ICICI_MARKET_CLOSE_TIME = "15:30"
+ICICI_MARKET_HOLIDAYS = ()
+ICICI_ALLOW_CLOSED_MARKET_WARMUP = False
+# Even when the market is closed/weekend, Breeze historicalcharts should be
+# usable for research/warmup. Live quote polling and trading remain disabled
+# until the market session is open.
+ICICI_ALLOW_CLOSED_MARKET_HISTORICAL_WARMUP = True
+ICICI_CLOSED_MARKET_QUOTE_PROBE = False
+ICICI_HISTORICAL_V2_FALLBACK = True
+ICICI_DORMANT_RETRY_SEC = 300.0
 ICICI_OPTION_MIN_DTE = 2.0
 ICICI_OPTION_MAX_DTE = 21.0
 # ICICI options are selected by a desk-first chain pipeline. The full Security
@@ -905,3 +922,11 @@ ICICI_STOCK_OPTION_TARGET_ABS_DELTA = 0.50
 ICICI_OPTION_DELTA_BAND = 0.22
 ICICI_OPTION_IV_STRESS_PRIOR = 0.24
 INDIA_RISK_FREE_RATE = 0.065
+
+# v100 ICICI options architecture: analyse the underlying market chart for
+# liquidity/ICT/auction structure, but keep execution price/risk on the actual
+# call/put premium.  The bot is long-premium only: bullish thesis buys calls;
+# bearish thesis buys puts. It never sells/writes options to open.
+ICICI_USE_UNDERLYING_CHART_FOR_STRUCTURE = True
+ICICI_LONG_PREMIUM_ONLY = True
+ICICI_UNDERLYING_MIN_READY_1M_BARS = 20
