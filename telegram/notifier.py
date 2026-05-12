@@ -36,16 +36,6 @@ import telegram.config as telegram_config
 
 logger = logging.getLogger(__name__)
 
-_TELEGRAM_TOKEN_URL_RE = re.compile(r"/bot[0-9]{5,}:[A-Za-z0-9_-]+/")
-_TELEGRAM_TOKEN_RAW_RE = re.compile(r"\b[0-9]{5,}:[A-Za-z0-9_-]{20,}\b")
-
-
-def _redact_telegram_secret(value) -> str:
-    s = str(value)
-    s = _TELEGRAM_TOKEN_URL_RE.sub("/bot<redacted>/", s)
-    s = _TELEGRAM_TOKEN_RAW_RE.sub("<redacted-telegram-token>", s)
-    return s
-
 _MOJIBAKE_SENTINELS = ("ð", "â", "Ã", "Â", "Î", "Ï")
 _MOJIBAKE_RUN = re.compile(
     r"[\u0080-\u009f\u00a0-\u00ff\u0100-\u017f\u02c0-\u02ff"
@@ -296,7 +286,7 @@ def _send_worker() -> None:
                     last_send_ts = time.time()
                     if r2.status_code == 200:
                         break
-                    logger.warning("Plain-text fallback also failed: %s", _redact_telegram_secret(r2.text[:160]))
+                    logger.warning("Plain-text fallback also failed: %s", r2.text[:160])
                     break
 
                 # Rate-limit / transient — backoff
@@ -316,7 +306,7 @@ def _send_worker() -> None:
                     time.sleep(backoff)
                     continue
 
-                logger.warning("Telegram send failed: %s — %s", resp.status_code, _redact_telegram_secret(resp.text[:200]))
+                logger.warning(f"Telegram send failed: {resp.status_code} — {resp.text[:200]}")
                 break
 
             except _req.exceptions.Timeout:
@@ -326,7 +316,7 @@ def _send_worker() -> None:
                 logger.error("Telegram send timed out after all retries")
                 break
             except Exception as exc:
-                logger.error("Telegram send error: %s", _redact_telegram_secret(exc))
+                logger.error(f"Telegram send error: {exc}")
                 break
 
         _send_queue.task_done()
@@ -496,7 +486,7 @@ def send_telegram_message(message: str, parse_mode: str = "HTML", *, instrument=
                     "disable_web_page_preview": True,
                 }, timeout=10)
             except Exception as _ce:
-                logger.error("Critical Telegram send failed: %s", _redact_telegram_secret(_ce))
+                logger.error("Critical Telegram send failed: %s", _ce)
         t = threading.Thread(target=_send_critical_now, daemon=True,
                              name="telegram-critical")
         t.start()

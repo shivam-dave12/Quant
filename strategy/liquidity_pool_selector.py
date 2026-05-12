@@ -1159,42 +1159,25 @@ def diagnose_tp_pools(
             row.delivery_prob = delivery_prob
             row.cost_r = cost_r
             row.required_delivery_prob = _required_delivery_probability(row.rr, cost_r)
-            row.notes = []
-            rr_floor_for_scoring = rr_floor
             if row.rr < rr_floor:
-                # Terminal HTF liquidity should not be rejected solely because the
-                # first-sweep probability model underestimates a distant objective.
-                # For a significant terminal pool with durable R:R, treat delivery
-                # probability as an EV/selection haircut instead of a hard veto.
-                soft_terminal_delivery = (
-                    terminal_target
-                    and row.rr >= max(effective_min_rr, _TP_DURABLE_RR_FLOOR)
-                    and sig >= _TERMINAL_TP_MIN_SIG
-                    and delivery_prob > _TP_DELIVERY_PROB_FLOOR
+                row.reason = _tp_payoff_rejection_reason(
+                    row.rr,
+                    rr_floor,
+                    effective_min_rr,
+                    delivery_prob,
+                    row.required_delivery_prob,
+                    cost_r,
+                    terminal_target,
                 )
-                if not soft_terminal_delivery:
-                    row.reason = _tp_payoff_rejection_reason(
-                        row.rr,
-                        rr_floor,
-                        effective_min_rr,
-                        delivery_prob,
-                        row.required_delivery_prob,
-                        cost_r,
-                        terminal_target,
-                    )
-                    rows.append(row); continue
-                rr_floor_for_scoring = max(effective_min_rr, _TP_DURABLE_RR_FLOOR)
-                row.notes.append(
-                    f"terminal delivery soft-pass: P={delivery_prob:.4f}<req={row.required_delivery_prob:.4f}; EV haircut applied"
-                )
-
-            utility, comps = _target_utility(raw_prob, row.rr, rr_floor_for_scoring, row.distance_atr, row.reward, be_move)
+                rows.append(row); continue
+            utility, comps = _target_utility(raw_prob, row.rr, rr_floor, row.distance_atr, row.reward, be_move)
             utility *= reach_mult
             row.ev = utility * _W_PROBABILITY * confluence * gauntlet_mult
-            selection_ev = _tp_selection_value(row.ev, row.rr, rr_floor_for_scoring, row.distance_atr)
+            selection_ev = _tp_selection_value(row.ev, row.rr, rr_floor, row.distance_atr)
             row.selection_ev = selection_ev
             row.eligible = True
-            row.reason = "eligible; payoff-adjusted EV candidate" if not row.notes else "eligible terminal TP; delivery probability applied as EV haircut"
+            row.reason = "eligible; payoff-adjusted EV candidate"
+            row.notes = []
             if terminal_target:
                 row.notes.append(f"terminal TP; reach×{reach_mult:.2f}")
             if confluence > 1.30: row.notes.append(f"conf×{confluence:.2f}")

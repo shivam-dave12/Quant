@@ -26,7 +26,7 @@ class _Ctx:
 class MultiAssetPortfolioTests(unittest.TestCase):
     def test_one_position_per_contract_but_multiple_contracts_allowed(self):
         guard = PortfolioGuard()
-        guard.max_open_positions = 6
+        guard.max_open_positions = 4
         guard.max_same_class = 4
         guard.max_per_contract = 1
 
@@ -44,7 +44,7 @@ class MultiAssetPortfolioTests(unittest.TestCase):
 
     def test_equal_slot_balance_allocation_preserves_portfolio_budget(self):
         guard = PortfolioGuard()
-        guard.max_open_positions = 6
+        guard.max_open_positions = 4
         guard.budget_mode = "equal_slots"
         ctx = _Ctx("BTC", AssetClass.CRYPTO)
         raw = {"available": 100.0, "total": 100.0}
@@ -52,9 +52,9 @@ class MultiAssetPortfolioTests(unittest.TestCase):
         scoped = guard.allocate_balance(ctx, [ctx], raw)
 
         self.assertTrue(scoped["portfolio_scoped"])
-        self.assertEqual(scoped["portfolio_slot_count"], 6)
-        self.assertAlmostEqual(scoped["available"], 100.0 / 6.0)
-        self.assertAlmostEqual(scoped["total"], 100.0 / 6.0)
+        self.assertEqual(scoped["portfolio_slot_count"], 4)
+        self.assertAlmostEqual(scoped["available"], 25.0)
+        self.assertAlmostEqual(scoped["total"], 25.0)
         self.assertAlmostEqual(scoped["available_raw"], 100.0)
         self.assertAlmostEqual(scoped["risk_available"], 100.0)
         self.assertAlmostEqual(scoped["risk_total"], 100.0)

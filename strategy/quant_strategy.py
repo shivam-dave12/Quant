@@ -3894,23 +3894,14 @@ class QuantStrategy:
 
             _now = time.time()
             if hard_fail:
-                # Institutional policy: spread is an execution-cost impairment, not
-                # an alpha veto.  Do not kill the signal here.  Apply the maximum
-                # size haircut and let the downstream EV / fee-to-risk / bracket
-                # viability models decide whether the trade is still executable.
-                self._active_spread_cost_mult = min(
-                    float(getattr(self, "_active_spread_cost_mult", 1.0) or 1.0),
-                    float(getattr(config, "QUANT_SPREAD_HARD_IMPAIR_SIZE_MULT", 0.20)),
-                )
-                self._last_spread_gate_context["size_mult"] = self._active_spread_cost_mult
                 if _now - getattr(self, "_last_spread_gate_warn", 0.0) >= 60.0:
                     self._last_spread_gate_warn = _now
                     logger.info(
-                        f"⚖ Spread execution impairment [{asset_class or 'unknown'}]: "
+                        f"⛔ Spread/ATR gate [{asset_class or 'unknown'}]: "
                         f"ratio={ratio:.3f}>{hard_ratio:.2f} spread={spread_bps:.2f}bps "
                         f"ticks={spread_ticks:.1f}>{hard_ticks:.1f} ATR=${atr:.4f} "
-                        f"spread=${spread_usd:.4f} size_mult={self._active_spread_cost_mult:.2f} — no hard veto")
-                return True, ratio
+                        f"spread=${spread_usd:.4f} — hard block")
+                return False, ratio
 
             if ratio > soft_ratio:
                 if _now - getattr(self, "_last_spread_gate_soft_log", 0.0) >= 60.0:

@@ -10,7 +10,6 @@ multiple contracts without stacking correlated risk blindly.
 from __future__ import annotations
 
 import logging
-import os
 import signal
 import sys
 import threading
@@ -121,8 +120,8 @@ class _LegacyPortfolioGuard:
         to whatever `available` it receives.  Therefore the institutional way to
         preserve the current BTC sizing semantics across multiple simultaneous
         contracts is to give each contract an account-equity slice, not the full
-        account equity.  With 6 slots and 60% balance usage, each contract may use
-        about 10% of total equity as margin; all 6 together remain around the old
+        account equity.  With 4 slots and 60% balance usage, each contract may use
+        about 15% of total equity as margin; all 4 together remain around the old
         60% portfolio envelope.
         """
         if raw_balance is None:
@@ -678,10 +677,7 @@ class MultiAssetQuantBot:
                     self._maybe_asset_heartbeat(ctx)
                 time.sleep(float(getattr(config, "SCANNER_TICK_SLEEP_SEC", 0.25)))
             except KeyboardInterrupt:
-                # Telegram-only stop policy: ignore terminal Ctrl-C/SIGINT.
-                # Runtime shutdown must come from the authorised Telegram /stop path.
-                logger.warning("KeyboardInterrupt ignored by TELEGRAM_ONLY_STOP policy; use /stop")
-                continue
+                break
             except Exception:
                 logger.exception("Multi-asset loop error")
                 time.sleep(1.0)
@@ -753,14 +749,9 @@ def main() -> None:
     bot = MultiAssetQuantBot()
     if threading.current_thread() is threading.main_thread():
         def _signal_handler(signum, frame):
-            # Telegram-only stop policy:
-            # External process-manager signals must not stop trading. The only
-            # supported graceful runtime stop path is Telegram /stop.
-            # Do not call logger/sys.exit/bot.stop from a signal handler.
-            try:
-                os.write(2, f"Signal {signum} ignored; use Telegram /stop to stop bot\n".encode("utf-8", "replace"))
-            except Exception:
-                pass
+            logger.info("Shutdown signal %s received", signum)
+            bot.stop()
+            sys.exit(0)
         signal.signal(signal.SIGINT, _signal_handler)
         signal.signal(signal.SIGTERM, _signal_handler)
     if not bot.initialize():

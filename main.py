@@ -962,10 +962,8 @@ class QuantBot:
                     self._publish_tick_time()
 
             except KeyboardInterrupt:
-                # Telegram-only stop policy: ignore terminal Ctrl-C/SIGINT.
-                # Runtime shutdown must come from the authorised Telegram /stop path.
-                logger.warning("KeyboardInterrupt ignored by TELEGRAM_ONLY_STOP policy; use /stop")
-                continue
+                logger.info("Keyboard interrupt — shutting down")
+                break
             except Exception:
                 logger.exception("❌ Main loop error")
                 time.sleep(1.0)
@@ -1025,14 +1023,9 @@ def main() -> None:
 
     if threading.current_thread() is threading.main_thread():
         def _signal_handler(signum, frame):
-            # Telegram-only stop policy:
-            # External process-manager signals must not stop trading. The only
-            # supported graceful runtime stop path is Telegram /stop.
-            # Do not call logger/sys.exit/bot.stop from a signal handler.
-            try:
-                os.write(2, f"Signal {signum} ignored; use Telegram /stop to stop bot\n".encode("utf-8", "replace"))
-            except Exception:
-                pass
+            logger.info(f"Shutdown signal {signum} received")
+            bot.stop()
+            sys.exit(0)
         signal.signal(signal.SIGINT,  _signal_handler)
         signal.signal(signal.SIGTERM, _signal_handler)
 
