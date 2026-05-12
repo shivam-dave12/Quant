@@ -10,7 +10,6 @@ multiple contracts without stacking correlated risk blindly.
 from __future__ import annotations
 
 import logging
-import signal
 import sys
 import threading
 import time
@@ -27,6 +26,12 @@ from exchanges.coinswitch.api import FuturesAPI as CoinSwitchAPI
 from exchanges.coinswitch.data_manager import CoinSwitchDataManager
 from exchanges.delta.api import DeltaAPI
 from exchanges.delta.data_manager import DeltaDataManager
+try:
+    from exchanges.hyperliquid.api import HyperliquidAPI
+    from exchanges.hyperliquid.data_manager import HyperliquidDataManager
+except Exception:
+    HyperliquidAPI = None  # type: ignore
+    HyperliquidDataManager = None  # type: ignore
 try:
     from exchanges.icici.api import BreezeRestClient
     from exchanges.icici.market_session import icici_market_session_state
@@ -108,6 +113,7 @@ class MultiAssetQuantBot:
         self.registry: Optional[InstrumentRegistry] = None
         self.catalog_instruments: List[TradableInstrument] = []
         self.delta_api = None
+        self.hyperliquid_api = None
         self.cs_api = None
         self.icici_api = None
         self.ticker_desk = TradableTickerDesk() if TradableTickerDesk is not None and bool(getattr(config, "DYNAMIC_TRADABLE_DESK_ENABLED", True)) else None
@@ -128,11 +134,13 @@ class MultiAssetQuantBot:
         )
 
     def _build_api_clients(self):
+        wants_hl = bool(getattr(config, "HYPERLIQUID_ENABLED", True))
         has_delta = bool(config.DELTA_API_KEY and config.DELTA_SECRET_KEY)
         has_cs = bool(config.COINSWITCH_API_KEY and config.COINSWITCH_SECRET_KEY)
         has_icici_discovery = bool(getattr(config, "ICICI_DISCOVERY_ENABLED", False))
         wants_icici_details = bool(getattr(config, "DYNAMIC_DESK_ICICI_DETAILS_ENABLED", False))
         wants_icici_runtime = bool(getattr(config, "ICICI_ENABLED", False))
+        hl_api = HyperliquidAPI() if wants_hl and HyperliquidAPI is not None else None
         delta_api = DeltaAPI(config.DELTA_API_KEY, config.DELTA_SECRET_KEY,
                              testnet=getattr(config, "DELTA_TESTNET", False)) if has_delta else None
         cs_api = CoinSwitchAPI(config.COINSWITCH_API_KEY, config.COINSWITCH_SECRET_KEY) if has_cs else None
@@ -151,7 +159,7 @@ class MultiAssetQuantBot:
                     logger.error(msg, exc)
                     raise
                 logger.warning(msg, exc)
-        return delta_api, cs_api, icici_api
+        return hl_api, delta_api, cs_api, icici_api
 
 
     def _instrument_leverage(self, inst: TradableInstrument) -> int:
@@ -814,10 +822,11 @@ class MultiAssetQuantBot:
             logger.info("⚡ MULTI-ASSET INSTITUTIONAL LIQUIDITY SCANNER")
             logger.info("   Live exchange catalogs only — no synthetic commodity/index/equity feeds")
             logger.info("=" * 92)
-            delta_api, cs_api, icici_api = self._build_api_clients()
-            self.delta_api, self.cs_api, self.icici_api = delta_api, cs_api, icici_api
+            hl_api, delta_api, cs_api, icici_api = self._build_api_clients()
+            self.hyperliquid_api, self.delta_api, self.cs_api, self.icici_api = hl_api, delta_api, cs_api, icici_api
             self.registry = InstrumentRegistry(execution_preference=getattr(config, "EXECUTION_EXCHANGE", "delta"))
             self.discovery_report = self.registry.discover(
+                hyperliquid_api=hl_api,
                 delta_api=delta_api,
                 coinswitch_api=cs_api,
                 icici_api=icici_api,
@@ -844,7 +853,7 @@ class MultiAssetQuantBot:
                 if not self._has_supported_runtime(inst):
                     coverage_only += 1
                     continue
-                ctx = self._build_asset_context(inst, delta_api, cs_api)
+                ctx = self._build_asset_context(inst, hl_api, delta_api, cs_api)
                 if ctx is not None:
                     self.contexts.append(ctx)
             if coverage_only:
@@ -914,7 +923,7 @@ class MultiAssetQuantBot:
         for inst in selected:
             if str(inst.asset_id) in existing or not self._has_supported_runtime(inst):
                 continue
-            ctx = self._build_asset_context(inst, self.delta_api, self.cs_api)
+            ctx = self._build_asset_context(inst, self.hyperliquid_api, self.delta_api, self.cs_api)
             if ctx is None:
                 continue
             if self._start_one_context(ctx):
@@ -948,26 +957,32 @@ class MultiAssetQuantBot:
                 and getattr(inst, "asset_class", None).value == "option"
                 and ICICIOptionDataManager is not None
             )
-        return bool({ExchangeName.DELTA, ExchangeName.COINSWITCH}.intersection(set(inst.by_exchange.keys())))
+        return bool({ExchangeName.HYPERLIQUID, ExchangeName.DELTA, ExchangeName.COINSWITCH}.intersection(set(inst.by_exchange.keys())))
 
-    def _build_asset_context(self, inst: TradableInstrument, delta_api, cs_api) -> Optional[AssetContext]:
+    def _build_asset_context(self, inst: TradableInstrument, hl_api, delta_api, cs_api) -> Optional[AssetContext]:
         primary_ex = inst.primary_exchange
+        execution_primary = primary_ex
+        if primary_ex != ExchangeName.ICICI and ExchangeName.HYPERLIQUID in inst.by_exchange and hl_api is not None:
+            execution_primary = ExchangeName.HYPERLIQUID
+        hl_om = None
         cs_om = None
         delta_om = None
         icici_om = None
+        if ExchangeName.HYPERLIQUID in inst.by_exchange and hl_api is not None:
+            hl_om = OrderManager(hl_api, exchange_name="hyperliquid", instrument=inst)
         if ExchangeName.COINSWITCH in inst.by_exchange and cs_api is not None:
             cs_om = OrderManager(cs_api, exchange_name="coinswitch", instrument=inst)
         if ExchangeName.DELTA in inst.by_exchange and delta_api is not None:
             delta_om = OrderManager(delta_api, exchange_name="delta", instrument=inst)
         if ExchangeName.ICICI in inst.by_exchange and self.icici_api is not None:
             icici_om = OrderManager(self.icici_api, exchange_name="icici", instrument=inst)
-        if not cs_om and not delta_om and not icici_om:
+        if not hl_om and not cs_om and not delta_om and not icici_om:
             logger.warning("%s skipped: no executable order manager", inst.asset_id)
             return None
-        router = ExecutionRouter(coinswitch_om=cs_om, delta_om=delta_om, icici_om=icici_om, default=primary_ex.value)
+        router = ExecutionRouter(coinswitch_om=cs_om, delta_om=delta_om, icici_om=icici_om, hyperliquid_om=hl_om, default=execution_primary.value)
 
         analysis_dm = None
-        if primary_ex == ExchangeName.ICICI:
+        if execution_primary == ExchangeName.ICICI:
             if ICICIOptionDataManager is None:
                 logger.warning("%s skipped: ICICI option data manager unavailable", inst.asset_id)
                 return None
@@ -975,7 +990,13 @@ class MultiAssetQuantBot:
             secondary_dm = None
             if bool(getattr(config, "ICICI_USE_UNDERLYING_CHART_FOR_STRUCTURE", True)) and ICICIUnderlyingDataManager is not None:
                 analysis_dm = ICICIUnderlyingDataManager(instrument=inst, api=self.icici_api)
-        elif primary_ex == ExchangeName.DELTA:
+        elif execution_primary == ExchangeName.HYPERLIQUID:
+            if HyperliquidDataManager is None or hl_api is None:
+                logger.warning("%s skipped: Hyperliquid data manager unavailable", inst.asset_id)
+                return None
+            primary_dm = HyperliquidDataManager(instrument=inst, api=hl_api)
+            secondary_dm = DeltaDataManager(instrument=inst) if ExchangeName.DELTA in inst.by_exchange and delta_api else None
+        elif execution_primary == ExchangeName.DELTA:
             primary_dm = DeltaDataManager(instrument=inst)
             secondary_dm = CoinSwitchDataManager(instrument=inst) if ExchangeName.COINSWITCH in inst.by_exchange and cs_api else None
         else:
@@ -1339,27 +1360,8 @@ class MultiAssetQuantBot:
 
 def main() -> None:
     bot = MultiAssetQuantBot()
-    if threading.current_thread() is threading.main_thread():
-        def _signal_handler(signum, frame):
-            logger.info("Shutdown signal %s received", signum)
-            try:
-                import json, os, time as _time
-                from pathlib import Path
-                Path("data").mkdir(exist_ok=True)
-                Path("data/last_shutdown.json").write_text(json.dumps({
-                    "component": "multi_asset_bot",
-                    "signal": int(signum),
-                    "pid": os.getpid(),
-                    "ppid": os.getppid(),
-                    "time": _time.strftime("%Y-%m-%d %H:%M:%S %Z"),
-                    "note": "External SIGTERM/SIGINT received by Python process; sender not available via standard signal handler.",
-                }, indent=2))
-            except Exception:
-                pass
-            bot.stop()
-            sys.exit(0)
-        signal.signal(signal.SIGINT, _signal_handler)
-        signal.signal(signal.SIGTERM, _signal_handler)
+    from runtime.signal_guard import install_signal_handlers
+    install_signal_handlers("multi_asset_bot", shutdown=bot.stop)
     if not bot.initialize():
         sys.exit(1)
     if not bot.start():

@@ -4075,3 +4075,128 @@ def test_v107_multi_asset_operator_heartbeat_log_path_removed():
     assert not hasattr(MultiAssetQuantBot, "_maybe_asset_heartbeat")
     assert "_maybe_asset_heartbeat" not in inspect.getsource(MultiAssetQuantBot.run)
     assert "DESK_HEARTBEAT" not in inspect.getsource(MultiAssetQuantBot)
+
+
+def test_v108_runtime_signal_guard_ignores_protected_sigterm(monkeypatch, tmp_path):
+    import signal
+
+    import config
+    import runtime.signal_guard as signal_guard
+
+    captured = {}
+    stopped = []
+    notified = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(config, "RUNTIME_PROTECT_EXTERNAL_SIGTERM", True, raising=False)
+    monkeypatch.setattr(signal_guard.signal, "signal", lambda sig, handler: captured.setdefault(sig, handler))
+
+    signal_guard.install_signal_handlers("test_controller", shutdown=lambda: stopped.append(True), notify=notified.append)
+    captured[signal.SIGTERM](signal.SIGTERM, None)
+
+    assert stopped == []
+    assert notified and "ignored" in notified[0]
+    assert (tmp_path / "data" / "last_shutdown.json").exists()
+
+    monkeypatch.setattr(config, "RUNTIME_PROTECT_EXTERNAL_SIGTERM", False, raising=False)
+    with pytest.raises(SystemExit):
+        captured[signal.SIGTERM](signal.SIGTERM, None)
+    assert stopped == [True]
+
+
+def test_v108_hyperliquid_is_primary_with_delta_secondary_in_registry():
+    from execution.instrument_registry import InstrumentRegistry
+    from core.instruments import ExchangeName
+
+    class FakeHyperliquid:
+        def get_products(self):
+            return {"success": True, "result": [{
+                "symbol": "BTC",
+                "base": "BTC",
+                "quote": "USDC",
+                "status": "active",
+                "szDecimals": 5,
+                "maxLeverage": 40,
+                "midPx": "80000",
+                "dayNtlVlm": "1000000000",
+            }]}
+
+    class FakeDelta:
+        def get_products(self, contract_types=None):
+            return {"success": True, "result": [{
+                "symbol": "BTCUSD",
+                "underlying_asset": {"symbol": "BTC"},
+                "quoting_asset": {"symbol": "USD"},
+                "contract_type": "perpetual_futures",
+                "state": "active",
+                "max_leverage": "100",
+                "tick_size": "0.5",
+                "contract_value": "0.001",
+            }]}
+
+    reg = InstrumentRegistry(execution_preference="hyperliquid")
+    report = reg.discover(
+        hyperliquid_api=FakeHyperliquid(),
+        delta_api=FakeDelta(),
+        include_exchanges="hyperliquid,delta",
+        include_asset_classes="crypto",
+        discovery_mode="dynamic",
+    )
+    btc = next(x for x in report.matched if x.asset_id == "BTC")
+
+    assert btc.primary_exchange == ExchangeName.HYPERLIQUID
+    assert ExchangeName.HYPERLIQUID in btc.by_exchange
+    assert ExchangeName.DELTA in btc.by_exchange
+
+
+def test_v108_execution_router_accepts_hyperliquid_as_active_primary():
+    from execution.router import ExecutionRouter
+
+    class OM:
+        def __init__(self, name):
+            self.name = name
+
+        def get_balance(self):
+            return {"available": 100.0}
+
+    router = ExecutionRouter(
+        coinswitch_om=None,
+        delta_om=OM("delta"),
+        hyperliquid_om=OM("hyperliquid"),
+        default="hyperliquid",
+    )
+
+    assert router.active_exchange == "hyperliquid"
+    assert router.active.name == "hyperliquid"
+
+
+def test_v108_hyperliquid_order_manager_normalises_sdk_order_response():
+    from core.instruments import AssetClass, ExchangeInstrument, ExchangeName, TradableInstrument
+    from execution.order_manager import OrderManager
+
+    ei = ExchangeInstrument(
+        exchange=ExchangeName.HYPERLIQUID,
+        symbol="BTC",
+        ws_symbol="BTC",
+        display_symbol="BTC-PERP",
+        asset_id="BTC",
+        asset_class=AssetClass.CRYPTO,
+        tick_size=0.5,
+        lot_step=0.00001,
+        min_qty=0.00001,
+        max_leverage=40,
+    )
+    inst = TradableInstrument("BTC", "BTC", AssetClass.CRYPTO, ExchangeName.HYPERLIQUID, {ExchangeName.HYPERLIQUID: ei})
+
+    class FakeHL:
+        def place_order(self, **kwargs):
+            assert kwargs["symbol"] == "BTC"
+            return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 12345}}]}}}
+
+        def get_balance(self, currency="USDC"):
+            return {"available": 100.0}
+
+    om = OrderManager(FakeHL(), exchange_name="hyperliquid", instrument=inst)
+    data = om.place_limit_order("BUY", 0.001, 80000.0)
+
+    assert data["order_id"] == "12345"
+    assert data["quantity"] == 0.001

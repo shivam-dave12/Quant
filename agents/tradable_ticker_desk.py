@@ -426,7 +426,7 @@ class TradableTickerDesk:
             quote_success = {}
         merged = {**raw, **ticker, **quote_success}
 
-        price = self._first_float(merged, ("mark_price", "markPrice", "spot_price", "last_price", "lastPrice", "close", "close_price", "price", "ltp"))
+        price = self._first_float(merged, ("mark_price", "markPrice", "markPx", "midPx", "oraclePx", "spot_price", "last_price", "lastPrice", "close", "close_price", "price", "ltp"))
         bid = self._first_float(merged, ("best_bid", "bestBid", "bid", "bid_price", "best_bid_price"))
         ask = self._first_float(merged, ("best_ask", "bestAsk", "ask", "ask_price", "best_ask_price"))
         mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else price
@@ -526,10 +526,10 @@ class TradableTickerDesk:
         return 0.0
 
     def _turnover_proxy(self, row: Mapping[str, Any], price: float) -> float:
-        direct = self._first_float(row, ("turnover", "turnover_usd", "turnoverUsd", "quote_volume", "quoteVolume", "volume_usd", "volumeUsd", "notional_volume", "notionalVolume"))
+        direct = self._first_float(row, ("turnover", "turnover_usd", "turnoverUsd", "quote_volume", "quoteVolume", "volume_usd", "volumeUsd", "notional_volume", "notionalVolume", "dayNtlVlm"))
         if direct > 0:
             return direct
-        vol = self._first_float(row, ("volume", "volume_24h", "volume24h", "base_volume", "baseVolume", "total_quantity_traded", "total_traded_quantity"))
+        vol = self._first_float(row, ("volume", "volume_24h", "volume24h", "base_volume", "baseVolume", "dayBaseVlm", "total_quantity_traded", "total_traded_quantity"))
         if vol > 0 and price > 0:
             return vol * price
         oi = self._first_float(row, ("open_interest", "openInterest", "oi", "oi_value", "oiValue"))

@@ -50,7 +50,7 @@ def _venue_order(raw: str | None) -> list[ExchangeName]:
                 out.append(ex)
         except Exception:
             continue
-    return out or [ExchangeName.DELTA, ExchangeName.COINDCX, ExchangeName.COINSWITCH, ExchangeName.ICICI]
+    return out or [ExchangeName.HYPERLIQUID, ExchangeName.DELTA, ExchangeName.COINDCX, ExchangeName.COINSWITCH, ExchangeName.ICICI]
 
 
 @dataclass(frozen=True)
@@ -93,7 +93,7 @@ class InstitutionalDeskRouter:
         }
         self.default_quotas.update(configured)
         self.default_min_score = float(_cfg("DYNAMIC_DESK_MIN_SCORE", 0.38))
-        self.venue_preference = _venue_order(_cfg("VENUE_ROUTE_PREFERENCE", "delta,coindcx,coinswitch,icici"))
+        self.venue_preference = _venue_order(_cfg("VENUE_ROUTE_PREFERENCE", "hyperliquid,delta,coindcx,coinswitch,icici"))
 
     def desk_id_for(self, inst: TradableInstrument) -> str:
         ac = getattr(inst, "asset_class", None)
@@ -165,7 +165,7 @@ class InstitutionalDeskRouter:
             raw = {**(ex_inst.raw or {}), **snap}
             bid = self._first_float(raw, ("best_bid", "bestBid", "bid", "bid_price", "best_bid_price"))
             ask = self._first_float(raw, ("best_ask", "bestAsk", "ask", "ask_price", "best_ask_price"))
-            price = self._first_float(raw, ("mark_price", "markPrice", "last_price", "lastPrice", "close", "price", "ltp"))
+            price = self._first_float(raw, ("mark_price", "markPrice", "markPx", "midPx", "oraclePx", "last_price", "lastPrice", "close", "price", "ltp"))
             mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else price
             spread_bps = ((ask - bid) / mid * 10000.0) if ask > 0 and bid > 0 and mid > 0 else 0.0
             spread_score = 0.60 if spread_bps <= 0 else clamp(1.0 - spread_bps / 80.0)
@@ -199,6 +199,11 @@ class InstitutionalDeskRouter:
 
 
     def _configured_route_leverage_cap(self, ex: ExchangeName, symbol: str, asset_class: AssetClass) -> float:
+        if ex == ExchangeName.HYPERLIQUID:
+            try:
+                return float(_cfg("HYPERLIQUID_DEFAULT_MAX_LEVERAGE", 40.0) or 40.0)
+            except Exception:
+                return 40.0
         if ex != ExchangeName.DELTA:
             return 0.0
         keys = []
@@ -258,10 +263,10 @@ class InstitutionalDeskRouter:
 
     @staticmethod
     def _turnover_proxy(row: Mapping, price: float) -> float:
-        direct = InstitutionalDeskRouter._first_float(row, ("turnover", "turnover_usd", "turnoverUsd", "quote_volume", "quoteVolume", "volume_usd", "volumeUsd", "notional_volume", "notionalVolume"))
+        direct = InstitutionalDeskRouter._first_float(row, ("turnover", "turnover_usd", "turnoverUsd", "quote_volume", "quoteVolume", "volume_usd", "volumeUsd", "notional_volume", "notionalVolume", "dayNtlVlm"))
         if direct > 0:
             return direct
-        vol = InstitutionalDeskRouter._first_float(row, ("volume", "volume_24h", "volume24h", "base_volume", "baseVolume", "total_quantity_traded", "total_traded_quantity"))
+        vol = InstitutionalDeskRouter._first_float(row, ("volume", "volume_24h", "volume24h", "base_volume", "baseVolume", "dayBaseVlm", "total_quantity_traded", "total_traded_quantity"))
         if vol > 0 and price > 0:
             return vol * price
         oi = InstitutionalDeskRouter._first_float(row, ("open_interest", "openInterest", "oi", "oi_value", "oiValue"))

@@ -103,6 +103,7 @@ class _RateLimiter:
 _CS_LIMITER    = _RateLimiter(min_interval_sec=3.0)
 _DELTA_LIMITER = _RateLimiter(min_interval_sec=0.25)
 _ICICI_LIMITER = _RateLimiter(min_interval_sec=0.75)
+_HYPERLIQUID_LIMITER = _RateLimiter(min_interval_sec=float(getattr(config, "HYPERLIQUID_MIN_CALL_GAP_SEC", 0.20) or 0.20))
 
 # Also keep a module-level alias for compatibility imports (quant_strategy does
 # `from execution.order_manager import GlobalRateLimiter`)
@@ -700,6 +701,168 @@ class _DeltaAdapter:
                 "unrealized_pnl": 0.0}
 
 
+class _HyperliquidAdapter:
+    """Normalises Hyperliquid SDK responses to the OrderManager contract."""
+
+    def __init__(self, api, exchange_instrument=None) -> None:
+        self.api = api
+        self.limiter = _HYPERLIQUID_LIMITER
+        self.exchange_instrument = exchange_instrument
+        self.symbol = (exchange_instrument.symbol if exchange_instrument is not None else getattr(config, "HYPERLIQUID_SYMBOL", "BTC"))
+        self.display_symbol = (exchange_instrument.display_symbol if exchange_instrument is not None else f"{self.symbol}-PERP")
+        self.tick_size = float(getattr(exchange_instrument, "tick_size", 0.01) or 0.01) if exchange_instrument is not None else 0.01
+        self.lot_step = float(getattr(exchange_instrument, "lot_step", 0.0001) or 0.0001) if exchange_instrument is not None else 0.0001
+        self.min_qty = float(getattr(exchange_instrument, "min_qty", self.lot_step) or self.lot_step) if exchange_instrument is not None else self.lot_step
+        self.max_qty = float(getattr(exchange_instrument, "max_qty", 0.0) or 0.0) if exchange_instrument is not None else 0.0
+
+    def extract_order_id(self, resp: Dict) -> Optional[str]:
+        if not isinstance(resp, dict):
+            return None
+        if resp.get("oid") or resp.get("order_id"):
+            return str(resp.get("oid") or resp.get("order_id"))
+        data = resp.get("response", {}).get("data", {}) if isinstance(resp.get("response"), dict) else resp.get("data", {})
+        statuses = data.get("statuses") if isinstance(data, dict) else None
+        if isinstance(statuses, list) and statuses:
+            st = statuses[0]
+            if isinstance(st, dict):
+                resting = st.get("resting") if isinstance(st.get("resting"), dict) else {}
+                filled = st.get("filled") if isinstance(st.get("filled"), dict) else {}
+                oid = resting.get("oid") or filled.get("oid")
+                return str(oid) if oid else None
+        return None
+
+    def extract_status(self, order_data: Dict) -> str:
+        raw = str(order_data.get("status") or order_data.get("state") or "").upper()
+        if raw in {"FILLED", "CLOSED", "EXECUTED"}: return "FILLED"
+        if raw in {"OPEN", "RESTING", "TRIGGERED"}: return "PENDING"
+        if raw in {"CANCELED", "CANCELLED", "REJECTED"}: return "CANCELLED"
+        if "filled" in order_data:
+            return "FILLED"
+        if "resting" in order_data:
+            return "PENDING"
+        return "UNKNOWN"
+
+    def extract_fill_price(self, order_data: Dict) -> Optional[float]:
+        for f in ("avgPx", "avg_price", "average_price", "limitPx", "limit_px", "price"):
+            try:
+                p = float(order_data.get(f, 0) or 0)
+                if p > 0: return p
+            except Exception:
+                pass
+        filled = order_data.get("filled") if isinstance(order_data.get("filled"), dict) else {}
+        try:
+            p = float(filled.get("avgPx", 0) or 0)
+            return p if p > 0 else None
+        except Exception:
+            return None
+
+    def extract_filled_qty(self, order_data: Dict) -> float:
+        for f in ("totalSz", "sz", "size", "quantity"):
+            try:
+                q = abs(float(order_data.get(f, 0) or 0))
+                if q > 0: return q
+            except Exception:
+                pass
+        filled = order_data.get("filled") if isinstance(order_data.get("filled"), dict) else {}
+        try:
+            q = abs(float(filled.get("totalSz", 0) or 0))
+            return q if q > 0 else 0.0
+        except Exception:
+            return 0.0
+
+    def place_order(self, side: str, order_type: str, quantity: float,
+                    price: Optional[float] = None,
+                    trigger_price: Optional[float] = None,
+                    reduce_only: bool = False,
+                    stop_order_type: Optional[str] = None) -> Optional[Dict]:
+        self.limiter.wait()
+        resp = self.api.place_order(
+            symbol=self.symbol,
+            side=side,
+            order_type=order_type,
+            quantity=float(quantity),
+            price=float(price) if price is not None else None,
+            trigger_price=float(trigger_price) if trigger_price is not None else None,
+            reduce_only=reduce_only,
+            stop_order_type=stop_order_type,
+        )
+        oid = self.extract_order_id(resp)
+        if not oid:
+            return {"_raw": resp, "_sc": 0, "_error": True}
+        return {
+            "order_id": oid,
+            "status": "PENDING",
+            "quantity": float(quantity),
+            "_raw": resp,
+        }
+
+    def cancel_order(self, order_id: str) -> Dict:
+        self.limiter.wait()
+        return self.api.cancel_order(self.symbol, order_id) or {}
+
+    def get_order(self, order_id: str) -> Optional[Dict]:
+        self.limiter.wait()
+        data = self.api.query_order(order_id)
+        if isinstance(data, dict):
+            order = data.get("order") if isinstance(data.get("order"), dict) else data
+            return order
+        return None
+
+    def get_open_orders(self, symbol: str) -> Optional[list]:
+        self.limiter.wait()
+        return self.api.get_open_orders(self.symbol)
+
+    def get_positions(self, symbol: str) -> Optional[Dict]:
+        self.limiter.wait()
+        return self.api.get_positions(self.symbol)
+
+    def get_balance(self) -> Dict:
+        return self.api.get_balance(currency=getattr(config, "HYPERLIQUID_BALANCE_CURRENCY", "USDC"))
+
+    def set_leverage(self, leverage: int, product_id: Optional[int] = None) -> Dict:
+        self.limiter.wait()
+        return self.api.set_leverage(self.symbol, int(leverage), is_cross=True)
+
+    def normalise_position(self, raw) -> Optional[Dict]:
+        rows = raw if isinstance(raw, list) else ([raw] if isinstance(raw, dict) else [])
+        for pos in rows:
+            if not isinstance(pos, dict):
+                continue
+            coin = str(pos.get("coin") or "").upper()
+            if coin and coin != self.symbol.upper():
+                continue
+            szi = 0.0
+            for f in ("szi", "size", "sz"):
+                try:
+                    szi = float(pos.get(f, 0) or 0)
+                    if abs(szi) > 0:
+                        break
+                except Exception:
+                    pass
+            entry = 0.0
+            for f in ("entryPx", "entry_price", "avg_entry_price"):
+                try:
+                    entry = float(pos.get(f, 0) or 0)
+                    if entry > 0:
+                        break
+                except Exception:
+                    pass
+            upnl = 0.0
+            try:
+                upnl = float(pos.get("unrealizedPnl", 0) or 0)
+            except Exception:
+                pass
+            return {
+                "side": "LONG" if szi > 0 else "SHORT" if szi < 0 else None,
+                "size": abs(szi),
+                "size_signed": szi,
+                "entry_price": entry,
+                "unrealized_pnl": upnl,
+                "raw": pos,
+            }
+        return {"side": None, "size": 0.0, "size_signed": 0.0, "entry_price": 0.0, "unrealized_pnl": 0.0}
+
+
 # ── Main OrderManager ─────────────────────────────────────────────────────────
 
 class _ICICIAdapter:
@@ -856,7 +1019,9 @@ class OrderManager:
                 exchange_instrument = instrument.by_exchange.get(ex_key)
             except Exception:
                 exchange_instrument = None
-        if exch == "delta":
+        if exch == "hyperliquid":
+            self._adapter = _HyperliquidAdapter(api, exchange_instrument=exchange_instrument)
+        elif exch == "delta":
             self._adapter = _DeltaAdapter(api, exchange_instrument=exchange_instrument)
         elif exch == "icici":
             self._adapter = _ICICIAdapter(api, exchange_instrument=exchange_instrument)

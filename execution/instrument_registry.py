@@ -639,6 +639,9 @@ class InstrumentRegistry:
             self.execution_preference = ExchangeName(str(execution_preference).lower())
         except Exception:
             self.execution_preference = ExchangeName.DELTA
+        if str(execution_preference).lower() in {"hyperliquid", "hl", "hyper"}:
+            self.execution_preference = ExchangeName.HYPERLIQUID
+        self.hyperliquid: Dict[str, ExchangeInstrument] = {}
         self.delta: Dict[str, ExchangeInstrument] = {}
         self.coinswitch: Dict[str, ExchangeInstrument] = {}
         self.icici: Dict[str, ExchangeInstrument] = {}
@@ -647,6 +650,49 @@ class InstrumentRegistry:
     # ──────────────────────────────────────────────────────────────────────
     # Exchange catalog fetchers
     # ──────────────────────────────────────────────────────────────────────
+    def load_hyperliquid(self, api) -> Dict[str, ExchangeInstrument]:
+        out: Dict[str, ExchangeInstrument] = {}
+        if api is None:
+            self.hyperliquid = out
+            return out
+        try:
+            resp = api.get_products()
+            rows = _unwrap_list(resp)
+            for p in rows:
+                sym = normalise_symbol(p.get("symbol") or p.get("name") or "")
+                if not sym or sym.startswith("#"):
+                    continue
+                base = normalise_symbol(p.get("base") or sym)
+                sz_dec = _safe_int(p.get("szDecimals"), 4)
+                lot_step = 10 ** (-max(0, min(8, sz_dec)))
+                try:
+                    import config as _cfg_mod  # type: ignore
+                    default_lev = getattr(_cfg_mod, "HYPERLIQUID_DEFAULT_MAX_LEVERAGE", 40.0)
+                except Exception:
+                    default_lev = 40.0
+                ei = ExchangeInstrument(
+                    exchange=ExchangeName.HYPERLIQUID,
+                    symbol=sym,
+                    ws_symbol=sym,
+                    display_symbol=f"{sym}-PERP",
+                    asset_id=base,
+                    asset_class=AssetClass.CRYPTO,
+                    quote_asset=str(p.get("quote") or "USDC"),
+                    base_asset=base,
+                    contract_type="perpetual_futures",
+                    status=str(p.get("status") or "active"),
+                    tick_size=first_positive(_safe_float(p.get("tick_size")), 0.01),
+                    lot_step=lot_step,
+                    min_qty=lot_step,
+                    max_leverage=first_positive(_safe_float(p.get("maxLeverage")), _safe_float(p.get("max_leverage")), _safe_float(default_lev)),
+                    raw=p,
+                )
+                out[sym] = ei
+        except Exception as e:
+            logger.warning("Hyperliquid product discovery failed: %s", e, exc_info=True)
+        self.hyperliquid = out
+        return out
+
     def load_delta(self, api) -> Dict[str, ExchangeInstrument]:
         out: Dict[str, ExchangeInstrument] = {}
         if api is None:
@@ -1094,7 +1140,7 @@ class InstrumentRegistry:
     # ──────────────────────────────────────────────────────────────────────
     # Matching
     # ──────────────────────────────────────────────────────────────────────
-    def discover(self, delta_api=None, coinswitch_api=None, requested=None,
+    def discover(self, delta_api=None, coinswitch_api=None, hyperliquid_api=None, requested=None,
                  max_active: int = 0, require_primary: bool = True,
                  discovery_mode: str = "dynamic", include_asset_classes=None,
                  include_exchanges=None, icici_api=None,
@@ -1104,6 +1150,7 @@ class InstrumentRegistry:
         include_classes = _parse_csv_set(include_asset_classes)
         include_exs = _parse_csv_set(include_exchanges)
 
+        hyper = self.load_hyperliquid(hyperliquid_api) if _allow_value("hyperliquid", include_exs) else {}
         delta = self.load_delta(delta_api) if _allow_value("delta", include_exs) else {}
         coins = self.load_coinswitch(coinswitch_api) if _allow_value("coinswitch", include_exs) else {}
         try:
@@ -1121,15 +1168,16 @@ class InstrumentRegistry:
         icici = self.load_icici(icici_api, security_master_url=icici_security_master_url) if _allow_value("icici", include_exs) else {}
 
         self.report = DiscoveryReport(requested=intents, raw_counts={
+            "hyperliquid": len({id(v) for v in hyper.values()}),
             "delta": len({id(v) for v in delta.values()}),
             "coinswitch": len({id(v) for v in coins.values()}),
             "icici": len({id(v) for v in icici.values()}),
         })
 
         if mode in {"static", "requested", "legacy"}:
-            matched = self._discover_requested(intents, delta, coins, require_primary=require_primary)
+            matched = self._discover_requested(intents, delta, coins, hyper, require_primary=require_primary)
         else:
-            matched = self._discover_dynamic(delta, coins, icici, intents, include_classes=include_classes)
+            matched = self._discover_dynamic(hyper, delta, coins, icici, intents, include_classes=include_classes)
 
         matched.sort(key=lambda x: (
             x.priority,
@@ -1140,19 +1188,22 @@ class InstrumentRegistry:
         self.report.matched = matched if int(max_active or 0) <= 0 else matched[:max(1, int(max_active))]
         return self.report
 
-    def _discover_requested(self, intents: List[AssetIntent], delta, coins, *, require_primary: bool) -> List[TradableInstrument]:
+    def _discover_requested(self, intents: List[AssetIntent], delta, coins, hyper, *, require_primary: bool) -> List[TradableInstrument]:
         matched: List[TradableInstrument] = []
         for intent in sorted(intents, key=lambda x: x.priority):
             aliases = _ordered_aliases(intent)
             by_ex: Dict[ExchangeName, ExchangeInstrument] = {}
+            hmatch = self._match_one(hyper, aliases)
             dmatch = self._match_one(delta, aliases)
             cmatch = self._match_one(coins, aliases)
+            if hmatch is not None:
+                by_ex[ExchangeName.HYPERLIQUID] = self._retag(hmatch, intent)
             if dmatch is not None:
                 by_ex[ExchangeName.DELTA] = self._retag(dmatch, intent)
             if cmatch is not None:
                 by_ex[ExchangeName.COINSWITCH] = self._retag(cmatch, intent)
             if not by_ex:
-                self.report.unavailable[intent.asset_id] = "not present in live Delta/CoinSwitch catalog; not traded"
+                self.report.unavailable[intent.asset_id] = "not present in live Hyperliquid/Delta/CoinSwitch catalog; not traded"
                 continue
             primary = self.execution_preference if self.execution_preference in by_ex else next(iter(by_ex.keys()))
             if require_primary and self.execution_preference not in by_ex:
@@ -1167,7 +1218,7 @@ class InstrumentRegistry:
             ))
         return matched
 
-    def _discover_dynamic(self, delta, coins, icici, intents: List[AssetIntent], *, include_classes: Set[str]) -> List[TradableInstrument]:
+    def _discover_dynamic(self, hyper, delta, coins, icici, intents: List[AssetIntent], *, include_classes: Set[str]) -> List[TradableInstrument]:
         overlay: Dict[str, AssetIntent] = {}
         for intent in intents:
             for alias in _ordered_aliases(intent):
@@ -1177,7 +1228,7 @@ class InstrumentRegistry:
         grouped: Dict[str, Dict[ExchangeName, ExchangeInstrument]] = {}
         meta: Dict[str, Tuple[str, AssetClass, int]] = {}
         seen_ids: set[int] = set()
-        for catalog in (delta, coins, icici):
+        for catalog in (hyper, delta, coins, icici):
             for inst in catalog.values():
                 if id(inst) in seen_ids or not inst.is_active:
                     continue

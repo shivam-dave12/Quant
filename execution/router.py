@@ -25,7 +25,7 @@ import config
 from core.types  import Exchange
 from execution.order_manager import (
     OrderManager, CancelResult, GlobalRateLimiter,
-    _CS_LIMITER, _DELTA_LIMITER, _ICICI_LIMITER,
+    _CS_LIMITER, _DELTA_LIMITER, _ICICI_LIMITER, _HYPERLIQUID_LIMITER,
 )
 
 logger = logging.getLogger(__name__)
@@ -43,10 +43,13 @@ class ExecutionRouter:
         delta_om:      Optional[OrderManager],
         default:       str = "delta",
         icici_om:      Optional[OrderManager] = None,
+        hyperliquid_om: Optional[OrderManager] = None,
     ) -> None:
         self._lock        = threading.RLock()
         self._managers: Dict[str, OrderManager] = {}
 
+        if hyperliquid_om is not None:
+            self._managers[Exchange.HYPERLIQUID.value] = hyperliquid_om
         if coinswitch_om is not None:
             self._managers[Exchange.COINSWITCH.value] = coinswitch_om
         if delta_om is not None:
@@ -72,7 +75,9 @@ class ExecutionRouter:
 
     def _sync_global_limiter(self) -> None:
         """Make GlobalRateLimiter point at the active exchange's limiter."""
-        if self._active_key == Exchange.DELTA.value:
+        if self._active_key == Exchange.HYPERLIQUID.value:
+            limiter = _HYPERLIQUID_LIMITER
+        elif self._active_key == Exchange.DELTA.value:
             limiter = _DELTA_LIMITER
         elif self._active_key == Exchange.ICICI.value:
             limiter = _ICICI_LIMITER

@@ -17,7 +17,7 @@ All command handlers reflect the QuantPosterior authority model:
   /trail      — Adaptive exit override on/off/auto
   /config     — Show current config values
   /killswitch — Emergency: close all positions + cancel orders
-  /setexchange — Switch execution exchange (delta|coinswitch)
+  /setexchange — Switch execution exchange (hyperliquid|delta|coinswitch)
   /set <key> <val> — Live-adjust config
   /resetrisk  — Clear consecutive-loss lockout
   /huntstatus — Liquidity-draw telemetry only
@@ -1970,8 +1970,8 @@ class TelegramBotController:
             return (
                 f"Current execution exchange: <b>{active.upper()}</b>\n\n"
                 f"Usage: /setexchange &lt;exchange&gt;\n"
-                f"Valid values: <code>delta</code>, <code>coinswitch</code>\n\n"
-                f"<i>Data is aggregated from both exchanges regardless of this setting.</i>"
+                f"Valid values: <code>hyperliquid</code>, <code>delta</code>, <code>coinswitch</code>\n\n"
+                f"<i>Non-ICICI desks prefer Hyperliquid primary with Delta as secondary when both are listed.</i>"
             )
 
         target = args.strip().lower()
@@ -2946,7 +2946,7 @@ class TelegramBotController:
 
 
 def main():
-    import io, signal
+    import io
     from datetime import timezone, timedelta
 
     IST = timezone(timedelta(hours=5, minutes=30))
@@ -2970,30 +2970,16 @@ def main():
     _sh.setFormatter(_fmt)
     logging.basicConfig(level=getattr(config, "LOG_LEVEL", "INFO"), handlers=[_fh, _sh], force=True)
 
-    def _signal_handler(signum, frame):
-        logger.info(f"Signal {signum} — stopping controller")
-        try:
-            import json, os, time as _time
-            from pathlib import Path
-            Path("data").mkdir(exist_ok=True)
-            Path("data/last_shutdown.json").write_text(json.dumps({
-                "component": "telegram_controller",
-                "signal": int(signum),
-                "pid": os.getpid(),
-                "ppid": os.getppid(),
-                "time": _time.strftime("%Y-%m-%d %H:%M:%S %Z"),
-                "note": "External SIGTERM/SIGINT received by Python process; sender not available via standard signal handler.",
-            }, indent=2))
-        except Exception:
-            pass
-        raise SystemExit(0)
-
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGINT,  _signal_handler)
-        signal.signal(signal.SIGTERM, _signal_handler)
-
     try:
         controller = TelegramBotController()
+        from runtime.signal_guard import install_signal_handlers
+        install_signal_handlers(
+            "telegram_controller",
+            shutdown=controller.stop,
+            notify=lambda msg: controller.send_message(
+                f"Runtime protection\n<code>{_esc(msg)}</code>"
+            ),
+        )
         controller.start()
     except KeyboardInterrupt:
         logger.info("Shutdown requested")

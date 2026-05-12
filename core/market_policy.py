@@ -155,6 +155,14 @@ def _venue_configured_max_leverage(inst: Optional[TradableInstrument]) -> float:
                 pass
         if ac in (AssetClass.FUTURE, AssetClass.CRYPTO):
             return _f("DELTA_DEFAULT_FUTURE_MAX_LEVERAGE", 0.0)
+    if ex == ExchangeName.HYPERLIQUID:
+        try:
+            mx = float(getattr(inst, "max_leverage", 0.0) or 0.0)
+            if math.isfinite(mx) and mx > 0:
+                return mx
+        except Exception:
+            pass
+        return _f("HYPERLIQUID_DEFAULT_MAX_LEVERAGE", 40.0)
     return 0.0
 
 

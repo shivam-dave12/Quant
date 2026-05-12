@@ -28,6 +28,7 @@ class AssetClass(str, Enum):
 
 
 class ExchangeName(str, Enum):
+    HYPERLIQUID = "hyperliquid"
     DELTA = "delta"
     COINSWITCH = "coinswitch"
     ICICI = "icici"

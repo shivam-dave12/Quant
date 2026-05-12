@@ -13,6 +13,7 @@ from typing import Dict, List, Optional
 # ── Exchange identifiers ──────────────────────────────────────────────────────
 
 class Exchange(str, Enum):
+    HYPERLIQUID = "hyperliquid"
     DELTA      = "delta"
     COINSWITCH = "coinswitch"
     ICICI      = "icici"
@@ -21,6 +22,8 @@ class Exchange(str, Enum):
     @classmethod
     def from_str(cls, value: str) -> "Exchange":
         v = value.strip().lower()
+        if v in ("hyperliquid", "hl", "hyper"):
+            return cls.HYPERLIQUID
         if v in ("delta", "dx"):
             return cls.DELTA
         if v in ("coinswitch", "cs", "cs_pro"):
@@ -30,7 +33,7 @@ class Exchange(str, Enum):
         if v in ("coindcx", "dcx"):
             return cls.COINDCX
         raise ValueError(
-            f"Unknown exchange {value!r}. Valid values: 'delta', 'coinswitch', 'icici', 'coindcx'."
+            f"Unknown exchange {value!r}. Valid values: 'hyperliquid', 'delta', 'coinswitch', 'icici', 'coindcx'."
         )
 
 
