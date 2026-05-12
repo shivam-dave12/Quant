@@ -38,7 +38,6 @@ import io
 import logging
 import os
 import re
-import signal
 import sys
 import threading
 import time
@@ -1034,13 +1033,8 @@ def main() -> None:
     else:
         bot = QuantBot()
 
-    if threading.current_thread() is threading.main_thread():
-        def _signal_handler(signum, frame):
-            logger.info(f"Shutdown signal {signum} received")
-            bot.stop()
-            sys.exit(0)
-        signal.signal(signal.SIGINT,  _signal_handler)
-        signal.signal(signal.SIGTERM, _signal_handler)
+    from runtime.signal_guard import install_signal_handlers
+    install_signal_handlers("main", shutdown=bot.stop)
 
     if not bot.initialize():
         sys.exit(1)

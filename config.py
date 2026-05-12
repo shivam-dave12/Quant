@@ -26,8 +26,10 @@ def _raw_env(name: str, default: str = "") -> str:
     # For diagnostics only; runtime policy must not depend on env except secrets.
     return os.getenv(name, default)
 
+RUNTIME_PROTECT_EXTERNAL_SIGTERM = True
+
 # ── Exchange routing ──────────────────────────────────────────────────────────
-EXECUTION_EXCHANGE = "delta"
+EXECUTION_EXCHANGE = "hyperliquid"
 
 # ── Runtime profile: edit config.py, not .env ────────────────────────────────
 DELTA_TESTNET = False
@@ -42,6 +44,9 @@ os.environ.setdefault("HOME", RUNTIME_HOME)
 # ── Credentials/secrets only: these remain in .env or cloud secret manager ───
 DELTA_API_KEY             = os.getenv("DELTA_API_KEY",    "")
 DELTA_SECRET_KEY          = os.getenv("DELTA_SECRET_KEY", "")
+HYPERLIQUID_ACCOUNT_ADDRESS = os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS", os.getenv("HL_ACCOUNT_ADDRESS", ""))
+HYPERLIQUID_SECRET_KEY      = os.getenv("HYPERLIQUID_SECRET_KEY", os.getenv("HL_SECRET_KEY", ""))
+HYPERLIQUID_VAULT_ADDRESS   = os.getenv("HYPERLIQUID_VAULT_ADDRESS", os.getenv("HL_VAULT_ADDRESS", ""))
 COINSWITCH_API_KEY        = os.getenv("COINSWITCH_API_KEY",    "")
 COINSWITCH_SECRET_KEY     = os.getenv("COINSWITCH_SECRET_KEY", "")
 TELEGRAM_BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -94,6 +99,15 @@ POLICY_ICICI_CASH_MARGIN_PCT = 0.06
 DELTA_SYMBOL             = "BTCUSD"
 DELTA_CONTRACT_VALUE_BTC = 0.001
 DELTA_BALANCE_CURRENCY   = "USD"
+HYPERLIQUID_TESTNET = False
+HYPERLIQUID_BASE_URL = ""
+HYPERLIQUID_SYMBOL = "BTC"
+HYPERLIQUID_BALANCE_CURRENCY = "USDC"
+HYPERLIQUID_MIN_CALL_GAP_SEC = 0.20
+HYPERLIQUID_DEFAULT_MAX_LEVERAGE = 40.0
+HYPERLIQUID_SLIPPAGE = 0.015
+HYPERLIQUID_ENABLED = True
+HYPERLIQUID_POLL_SEC = 2.0
 COINSWITCH_SYMBOL        = "BTCUSDT"
 COINSWITCH_EXCHANGE      = "EXCHANGE_2"
 
@@ -716,6 +730,7 @@ def live_ordering_config_summary() -> str:
         f"FUND_PAPER_MODE={FUND_PAPER_MODE}; "
         f"FUND_LIVE_ORDERING_ENABLED={FUND_LIVE_ORDERING_ENABLED}; "
         f"EXECUTION_EXCHANGE={EXECUTION_EXCHANGE}; "
+        f"HYPERLIQUID_KEY={'set' if bool(HYPERLIQUID_SECRET_KEY and HYPERLIQUID_ACCOUNT_ADDRESS) else 'missing'}; "
         f"DELTA_KEY={'set' if bool(DELTA_API_KEY) else 'missing'}; "
         f"ICICI_ENABLED={globals().get('ICICI_ENABLED', '<late-init>')}"
     )
@@ -725,12 +740,14 @@ def assert_live_ordering_ready() -> tuple[bool, str]:
         return False, "FUND_PAPER_MODE is true"
     if not FUND_LIVE_ORDERING_ENABLED:
         return False, "FUND_LIVE_ORDERING_ENABLED is false"
+    if EXECUTION_EXCHANGE == "hyperliquid" and not (HYPERLIQUID_ACCOUNT_ADDRESS and HYPERLIQUID_SECRET_KEY):
+        return False, "Hyperliquid API wallet credentials are missing"
     if EXECUTION_EXCHANGE == "delta" and not (DELTA_API_KEY and DELTA_SECRET_KEY):
         return False, "Delta API credentials are missing"
     return True, "live ordering gates are open"
 
-# Optional venues. Delta/CoinSwitch are the current execution stack. ICICI and
-# CoinDCX are institutional adapters; enable only after credentials, static IP,
+# Optional venues. Hyperliquid is the primary non-ICICI execution venue; Delta is
+# the secondary/reference venue. ICICI and CoinDCX are institutional adapters; enable only after credentials, static IP,
 # and paper-mode validation are complete.
 ICICI_ENABLED = True
 BREEZE_API_KEY = os.getenv("BREEZE_API_KEY", "")
@@ -771,7 +788,7 @@ COINDCX_SECRET_KEY = os.getenv("COINDCX_SECRET_KEY", "")
 # Dynamic universe discovery. The scanner reads live venue catalogs by default;
 # this list is intentionally empty so old fixed baskets cannot cap coverage.
 UNIVERSE_DISCOVERY_MODE = "dynamic"
-UNIVERSE_INCLUDE_EXCHANGES = "delta,coinswitch,icici"
+UNIVERSE_INCLUDE_EXCHANGES = "hyperliquid,delta,coinswitch,icici"
 UNIVERSE_INCLUDE_ASSET_CLASSES = "crypto,commodity,index,equity,option,future"
 MULTI_ASSET_REQUESTS = []
 DISCOVERY_REPORT_PREVIEW = 80
@@ -888,7 +905,7 @@ DESK_US_STOCK_DERIVATIVES_MAX_ACTIVE = 32
 DESK_COMMODITIES_GLOBAL_MAX_ACTIVE = 8
 DESK_ICICI_INDEX_OPTIONS_MAX_ACTIVE = 10
 DESK_ICICI_STOCK_OPTIONS_MAX_ACTIVE = 10
-VENUE_ROUTE_PREFERENCE = "delta,icici,coindcx,coinswitch"
+VENUE_ROUTE_PREFERENCE = "hyperliquid,delta,icici,coindcx,coinswitch"
 
 # Stateful selector policy: never churn live contexts just because the desk
 # refresh ran. Active instruments are retained as incumbents while still valid;
