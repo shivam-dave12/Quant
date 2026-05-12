@@ -140,7 +140,18 @@ class MultiAssetQuantBot:
         has_icici_discovery = bool(getattr(config, "ICICI_DISCOVERY_ENABLED", False))
         wants_icici_details = bool(getattr(config, "DYNAMIC_DESK_ICICI_DETAILS_ENABLED", False))
         wants_icici_runtime = bool(getattr(config, "ICICI_ENABLED", False))
-        hl_api = HyperliquidAPI() if wants_hl and HyperliquidAPI is not None else None
+        hl_api = None
+        if wants_hl and HyperliquidAPI is not None:
+            try:
+                hl_api = HyperliquidAPI()
+                if not bool(getattr(hl_api, "can_trade", False)):
+                    logger.warning(
+                        "Hyperliquid public market-data mode only; signed trading unavailable. "
+                        "Set HYPERLIQUID_ACCOUNT_ADDRESS/HYPERLIQUID_SECRET_KEY and install hyperliquid-python-sdk for primary execution."
+                    )
+            except Exception as exc:
+                logger.warning("Hyperliquid client unavailable; continuing with Delta/ICICI fallback: %s", exc, exc_info=True)
+                hl_api = None
         delta_api = DeltaAPI(config.DELTA_API_KEY, config.DELTA_SECRET_KEY,
                              testnet=getattr(config, "DELTA_TESTNET", False)) if has_delta else None
         cs_api = CoinSwitchAPI(config.COINSWITCH_API_KEY, config.COINSWITCH_SECRET_KEY) if has_cs else None
@@ -979,7 +990,14 @@ class MultiAssetQuantBot:
         if not hl_om and not cs_om and not delta_om and not icici_om:
             logger.warning("%s skipped: no executable order manager", inst.asset_id)
             return None
-        router = ExecutionRouter(coinswitch_om=cs_om, delta_om=delta_om, icici_om=icici_om, hyperliquid_om=hl_om, default=execution_primary.value)
+        router_primary = execution_primary
+        if execution_primary == ExchangeName.HYPERLIQUID and not bool(getattr(hl_api, "can_trade", False)) and delta_om is not None:
+            router_primary = ExchangeName.DELTA
+            logger.warning(
+                "%s Hyperliquid is public-data only; routing execution to Delta fallback until Hyperliquid wallet+SDK are ready",
+                inst.asset_id,
+            )
+        router = ExecutionRouter(coinswitch_om=cs_om, delta_om=delta_om, icici_om=icici_om, hyperliquid_om=hl_om, default=router_primary.value)
 
         analysis_dm = None
         if execution_primary == ExchangeName.ICICI:

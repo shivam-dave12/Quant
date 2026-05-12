@@ -29,23 +29,33 @@ class HyperliquidAPI:
         base_url: str | None = None,
         timeout: float = 10.0,
     ) -> None:
+        self.timeout = float(timeout or 10.0)
         try:
             from hyperliquid.info import Info
             from hyperliquid.utils import constants
-        except Exception as exc:  # pragma: no cover - environment guard
-            raise RuntimeError("Install hyperliquid-python-sdk to enable Hyperliquid") from exc
+            self.sdk_available = True
+        except Exception:
+            Info = None  # type: ignore
+            constants = None  # type: ignore
+            self.sdk_available = False
 
         self.account_address = (account_address or getattr(config, "HYPERLIQUID_ACCOUNT_ADDRESS", "") or "").strip()
         self.secret_key = (secret_key or getattr(config, "HYPERLIQUID_SECRET_KEY", "") or "").strip()
         self.vault_address = (vault_address or getattr(config, "HYPERLIQUID_VAULT_ADDRESS", "") or "").strip() or None
         self.testnet = bool(getattr(config, "HYPERLIQUID_TESTNET", False) if testnet is None else testnet)
+        default_base_url = (
+            constants.TESTNET_API_URL if self.testnet else constants.MAINNET_API_URL
+        ) if constants is not None else (
+            "https://api.hyperliquid-testnet.xyz" if self.testnet else "https://api.hyperliquid.xyz"
+        )
         self.base_url = (
             base_url
             or getattr(config, "HYPERLIQUID_BASE_URL", "")
-            or (constants.TESTNET_API_URL if self.testnet else constants.MAINNET_API_URL)
+            or default_base_url
         )
-        self.info = Info(self.base_url, skip_ws=True, timeout=timeout)
+        self.info = Info(self.base_url, skip_ws=True, timeout=self.timeout) if Info is not None else None
         self.exchange = None
+        self.signed_error = ""
         self._last_call = 0.0
         self._meta_cache: Optional[dict] = None
         self._ctx_cache: Optional[list] = None
@@ -63,14 +73,20 @@ class HyperliquidAPI:
                     timeout=timeout,
                 )
             except Exception as exc:
-                raise RuntimeError(f"Hyperliquid signed exchange init failed: {exc}") from exc
+                self.signed_error = f"Hyperliquid signed exchange init failed: {exc}"
+                logger.warning(self.signed_error)
 
         logger.info(
-            "HyperliquidAPI initialised base=%s signed=%s account=%s",
+            "HyperliquidAPI initialised base=%s sdk=%s signed=%s account=%s",
             self.base_url,
+            bool(self.sdk_available),
             bool(self.exchange),
             self.account_address[:8] + "..." if self.account_address else "unset",
         )
+
+    @property
+    def can_trade(self) -> bool:
+        return bool(self.exchange is not None and self.account_address and self.secret_key)
 
     def _throttle(self) -> None:
         gap = max(0.05, float(getattr(config, "HYPERLIQUID_MIN_CALL_GAP_SEC", 0.20) or 0.20))
@@ -82,14 +98,24 @@ class HyperliquidAPI:
 
     def _require_signed(self):
         if self.exchange is None:
-            raise RuntimeError("Hyperliquid signed trading disabled: set HYPERLIQUID_SECRET_KEY and HYPERLIQUID_ACCOUNT_ADDRESS")
+            detail = self.signed_error or "set HYPERLIQUID_SECRET_KEY and HYPERLIQUID_ACCOUNT_ADDRESS and install hyperliquid-python-sdk"
+            raise RuntimeError(f"Hyperliquid signed trading disabled: {detail}")
         return self.exchange
+
+    def _post_info(self, payload: Dict[str, Any]) -> Any:
+        try:
+            import requests
+        except Exception as exc:
+            raise RuntimeError("requests is required for Hyperliquid public /info fallback") from exc
+        self._throttle()
+        resp = requests.post(f"{self.base_url.rstrip('/')}/info", json=payload, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
 
     def meta_and_asset_ctxs(self) -> tuple[dict, list]:
         if self._meta_cache is not None and self._ctx_cache is not None:
             return self._meta_cache, self._ctx_cache
-        self._throttle()
-        raw = self.info.meta_and_asset_ctxs()
+        raw = self.info.meta_and_asset_ctxs() if self.info is not None else self._post_info({"type": "metaAndAssetCtxs"})
         if not isinstance(raw, list) or len(raw) < 2:
             raise RuntimeError(f"Unexpected Hyperliquid meta response: {type(raw).__name__}")
         self._meta_cache = raw[0] if isinstance(raw[0], dict) else {}
@@ -133,24 +159,44 @@ class HyperliquidAPI:
         return self.get_products()
 
     def get_l2_book(self, symbol: str) -> Dict[str, Any]:
-        self._throttle()
-        return self.info.l2_snapshot(str(symbol).upper())
+        if self.info is not None:
+            self._throttle()
+            return self.info.l2_snapshot(str(symbol).upper())
+        out = self._post_info({"type": "l2Book", "coin": str(symbol).upper()})
+        return out if isinstance(out, dict) else {}
 
     def get_candles(self, symbol: str, interval: str, start_ms: int, end_ms: int) -> List[dict]:
-        self._throttle()
-        rows = self.info.candles_snapshot(str(symbol).upper(), interval, int(start_ms), int(end_ms))
+        if self.info is not None:
+            self._throttle()
+            rows = self.info.candles_snapshot(str(symbol).upper(), interval, int(start_ms), int(end_ms))
+        else:
+            rows = self._post_info({
+                "type": "candleSnapshot",
+                "req": {
+                    "coin": str(symbol).upper(),
+                    "interval": str(interval),
+                    "startTime": int(start_ms),
+                    "endTime": int(end_ms),
+                },
+            })
         return rows if isinstance(rows, list) else []
 
     def all_mids(self) -> Dict[str, str]:
-        self._throttle()
-        out = self.info.all_mids()
+        if self.info is not None:
+            self._throttle()
+            out = self.info.all_mids()
+        else:
+            out = self._post_info({"type": "allMids"})
         return out if isinstance(out, dict) else {}
 
     def get_balance(self, currency: str = "USDC") -> Dict[str, Any]:
         if not self.account_address:
             return {"available": 0.0, "error": "HYPERLIQUID_ACCOUNT_ADDRESS missing"}
-        self._throttle()
-        state = self.info.user_state(self.account_address)
+        if self.info is not None:
+            self._throttle()
+            state = self.info.user_state(self.account_address)
+        else:
+            state = self._post_info({"type": "clearinghouseState", "user": self.account_address})
         margin = state.get("marginSummary", {}) if isinstance(state, dict) else {}
         withdrawable = _float((state or {}).get("withdrawable")) if isinstance(state, dict) else 0.0
         account_value = _float(margin.get("accountValue"))
@@ -167,8 +213,11 @@ class HyperliquidAPI:
     def get_positions(self, symbol: str | None = None) -> List[dict]:
         if not self.account_address:
             return []
-        self._throttle()
-        state = self.info.user_state(self.account_address)
+        if self.info is not None:
+            self._throttle()
+            state = self.info.user_state(self.account_address)
+        else:
+            state = self._post_info({"type": "clearinghouseState", "user": self.account_address})
         rows = state.get("assetPositions", []) if isinstance(state, dict) else []
         out = []
         wanted = str(symbol or "").upper()
@@ -185,8 +234,11 @@ class HyperliquidAPI:
     def get_open_orders(self, symbol: str | None = None) -> List[dict]:
         if not self.account_address:
             return []
-        self._throttle()
-        rows = self.info.open_orders(self.account_address)
+        if self.info is not None:
+            self._throttle()
+            rows = self.info.open_orders(self.account_address)
+        else:
+            rows = self._post_info({"type": "openOrders", "user": self.account_address})
         wanted = str(symbol or "").upper()
         out = []
         for row in rows if isinstance(rows, list) else []:
@@ -198,9 +250,12 @@ class HyperliquidAPI:
     def query_order(self, oid: str | int) -> Dict[str, Any]:
         if not self.account_address:
             return {}
-        self._throttle()
         try:
-            return self.info.query_order_by_oid(self.account_address, int(oid)) or {}
+            if self.info is not None:
+                self._throttle()
+                return self.info.query_order_by_oid(self.account_address, int(oid)) or {}
+            out = self._post_info({"type": "orderStatus", "user": self.account_address, "oid": int(oid)})
+            return out if isinstance(out, dict) else {}
         except Exception:
             return {}
 

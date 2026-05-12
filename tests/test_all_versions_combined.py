@@ -4200,3 +4200,128 @@ def test_v108_hyperliquid_order_manager_normalises_sdk_order_response():
 
     assert data["order_id"] == "12345"
     assert data["quantity"] == 0.001
+
+
+def test_v109_hyperliquid_public_api_starts_without_sdk(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if str(name).startswith("hyperliquid"):
+            raise ModuleNotFoundError(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    from exchanges.hyperliquid.api import HyperliquidAPI
+
+    api = HyperliquidAPI(account_address="", secret_key="", base_url="https://example.invalid")
+
+    assert api.sdk_available is False
+    assert api.info is None
+    assert api.can_trade is False
+
+
+def test_v109_hyperliquid_missing_sdk_marks_live_gate_not_ready(monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "EXECUTION_EXCHANGE", "hyperliquid", raising=False)
+    monkeypatch.setattr(config, "FUND_PAPER_MODE", False, raising=False)
+    monkeypatch.setattr(config, "FUND_LIVE_ORDERING_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "HYPERLIQUID_ACCOUNT_ADDRESS", "0xabc", raising=False)
+    monkeypatch.setattr(config, "HYPERLIQUID_SECRET_KEY", "0xdef", raising=False)
+    monkeypatch.setattr(config, "hyperliquid_sdk_available", lambda: False, raising=False)
+
+    ready, reason = config.assert_live_ordering_ready()
+
+    assert ready is False
+    assert "hyperliquid-python-sdk" in reason
+
+
+def test_v109_hyperliquid_client_failure_does_not_abort_api_build(monkeypatch):
+    import config
+    import orchestration.multi_asset_bot as mb
+
+    class BrokenHyperliquid:
+        def __init__(self):
+            raise RuntimeError("sdk missing")
+
+    monkeypatch.setattr(config, "HYPERLIQUID_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "DELTA_API_KEY", "", raising=False)
+    monkeypatch.setattr(config, "DELTA_SECRET_KEY", "", raising=False)
+    monkeypatch.setattr(config, "COINSWITCH_API_KEY", "", raising=False)
+    monkeypatch.setattr(config, "COINSWITCH_SECRET_KEY", "", raising=False)
+    monkeypatch.setattr(config, "ICICI_DISCOVERY_ENABLED", False, raising=False)
+    monkeypatch.setattr(config, "DYNAMIC_DESK_ICICI_DETAILS_ENABLED", False, raising=False)
+    monkeypatch.setattr(config, "ICICI_ENABLED", False, raising=False)
+    monkeypatch.setattr(mb, "HyperliquidAPI", BrokenHyperliquid)
+
+    bot = object.__new__(mb.MultiAssetQuantBot)
+    hl_api, delta_api, cs_api, icici_api = mb.MultiAssetQuantBot._build_api_clients(bot)
+
+    assert hl_api is None
+    assert delta_api is None
+    assert cs_api is None
+    assert icici_api is None
+
+
+def test_v109_public_hyperliquid_data_uses_delta_execution_fallback(monkeypatch):
+    from types import SimpleNamespace
+
+    import orchestration.multi_asset_bot as mb
+    from core.instruments import AssetClass, ExchangeInstrument, ExchangeName, TradableInstrument
+
+    hl_ei = ExchangeInstrument(ExchangeName.HYPERLIQUID, "BTC", "BTC", "BTC-PERP", "BTC", AssetClass.CRYPTO, max_leverage=40)
+    delta_ei = ExchangeInstrument(ExchangeName.DELTA, "BTCUSD", "BTCUSD", "BTCUSD", "BTC", AssetClass.CRYPTO, max_leverage=100)
+    inst = TradableInstrument("BTC", "BTC", AssetClass.CRYPTO, ExchangeName.HYPERLIQUID, {
+        ExchangeName.HYPERLIQUID: hl_ei,
+        ExchangeName.DELTA: delta_ei,
+    })
+
+    class FakeOM:
+        def __init__(self, api, exchange_name="delta", instrument=None):
+            self.exchange_name = exchange_name
+
+        def get_balance(self):
+            return {"available": 100.0}
+
+    class FakeDM:
+        def __init__(self, instrument=None, api=None):
+            self.instrument = instrument
+            self.api = api
+
+    class FakeAgg:
+        def __init__(self, primary_dm, secondary_dm, instrument=None, analysis_dm=None):
+            self.primary_dm = primary_dm
+            self.secondary_dm = secondary_dm
+
+        def register_strategy(self, strategy):
+            self.strategy = strategy
+
+    class FakeRisk:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class FakeStrategy:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(mb, "OrderManager", FakeOM)
+    monkeypatch.setattr(mb, "HyperliquidDataManager", FakeDM)
+    monkeypatch.setattr(mb, "DeltaDataManager", FakeDM)
+    monkeypatch.setattr(mb, "MarketAggregator", FakeAgg)
+    monkeypatch.setattr(mb, "PortfolioRiskManager", FakeRisk)
+    monkeypatch.setattr(mb, "QuantStrategy", FakeStrategy)
+
+    bot = object.__new__(mb.MultiAssetQuantBot)
+    bot.icici_api = None
+    bot.contexts = []
+    bot.guard = SimpleNamespace(allocate_balance=lambda *a, **k: {})
+    hl_api = SimpleNamespace(can_trade=False)
+
+    ctx = mb.MultiAssetQuantBot._build_asset_context(bot, inst, hl_api, object(), None)
+
+    assert ctx.execution_router.active_exchange == "delta"
+    assert isinstance(ctx.data_manager.primary_dm, FakeDM)
+    assert isinstance(ctx.data_manager.secondary_dm, FakeDM)
