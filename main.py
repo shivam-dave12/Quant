@@ -38,6 +38,7 @@ import io
 import logging
 import os
 import re
+import signal
 import sys
 import threading
 import time
@@ -45,8 +46,6 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import config
-from core.market_policy import active_policy
-from observability.institutional import InstitutionalLogFilter
 
 # ── IST Timezone logging ──────────────────────────────────────────────────────
 
@@ -261,13 +260,16 @@ class TerminalBurstFilter(logging.Filter):
 
 _ist_fmt = ISTFormatter(fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(asset_ctx)s%(message)s")
 _term_fmt = TerminalFormatter(
-    enable_color=bool(getattr(sys.stdout, "isatty", lambda: False)())
+    enable_color=(
+        bool(getattr(sys.stdout, "isatty", lambda: False)())
+        or os.getenv("FORCE_COLOR", "").lower() in ("1", "true", "yes")
+        or os.getenv("PY_COLORS", "") == "1"
+    )
 )
 
 _file_handler = logging.FileHandler("quant_bot.log", encoding="utf-8")
 _file_handler.setFormatter(_ist_fmt)
 _file_handler.addFilter(AssetContextFilter())
-_file_handler.addFilter(InstitutionalLogFilter())
 
 _stream_handler = logging.StreamHandler(
     stream=io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -276,7 +278,6 @@ _stream_handler = logging.StreamHandler(
 _stream_handler.setFormatter(_term_fmt)
 _stream_handler.addFilter(AssetContextFilter())
 _stream_handler.addFilter(TerminalBurstFilter())
-_stream_handler.addFilter(InstitutionalLogFilter())
 
 logging.basicConfig(
     level=getattr(config, "LOG_LEVEL", "INFO"),
@@ -345,11 +346,10 @@ try:
 except ImportError:
     build_default_watchdog = None
 
-# Institutional v102: do not forward raw Python logs to Telegram.
-# Telegram is now an operator command-center only; critical crash alerts still
-# use send_telegram_message from the exception hook.
-if bool(getattr(config, "TELEGRAM_FORWARD_RAW_LOGS", False)):
-    install_global_telegram_log_handler(level=logging.WARNING, throttle_seconds=30.0)
+# Throttle raised 5 s → 30 s: pool-gate and other per-tick warnings
+# arrive faster than 5 s and would still flood Telegram even after
+# the primary dedup fixes.  30 s is a safe floor for operator paging.
+install_global_telegram_log_handler(level=logging.WARNING, throttle_seconds=30.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -409,7 +409,7 @@ class QuantBot:
             logger.info("=" * 80)
             logger.info("⚡ LIQUIDITY-FIRST QUANT BOT — DUAL-EXCHANGE")
             logger.info("   LiquidityMap → QuantPosterior → Risk/Execution → Adaptive Exit")
-            logger.info(f"   Symbol: {config.SYMBOL} | Max policy leverage cap: {getattr(config, 'MAX_POLICY_LEVERAGE', 1)}x | "
+            logger.info(f"   Symbol: {config.SYMBOL} | Leverage: {config.LEVERAGE}x | "
                         f"Execution: {config.EXECUTION_EXCHANGE.upper()}")
             logger.info("=" * 80)
 
@@ -418,14 +418,6 @@ class QuantBot:
 
             logger.info(f"Exchanges configured — Delta: {has_delta} | "
                         f"CoinSwitch: {has_coinswitch}")
-
-            if not (has_delta or has_coinswitch):
-                logger.error(
-                    "No exchange credentials configured. Runtime trading is disabled: "
-                    "set DELTA_API_KEY/DELTA_SECRET_KEY or "
-                    "COINSWITCH_API_KEY/COINSWITCH_SECRET_KEY before starting the bot."
-                )
-                return False
 
             # ── Build API clients ─────────────────────────────────────────────
             cs_api    = None
@@ -546,22 +538,18 @@ class QuantBot:
                 logger.error("Bot components not initialised — call initialize() first")
                 return False
 
-            # ── Set leverage on active exchange, only when policy > 1x ───────
+            # ── Set leverage on active exchange ───────────────────────────────
             active_exch = self.execution_router.active_exchange
-            target_lev = max(1, int(active_policy().leverage))
-            if target_lev <= 1:
-                logger.info(f"Leverage unchanged at 1x on {active_exch} — policy is fully funded/non-leveraged")
-            else:
-                logger.info(f"Setting policy leverage to {target_lev}x on {active_exch}...")
-                try:
-                    resp = self.execution_router.set_leverage(leverage=target_lev)
-                    if isinstance(resp, dict):
-                        if resp.get("success") or not resp.get("error"):
-                            logger.info(f"✅ Leverage set to {target_lev}x")
-                        else:
-                            logger.warning(f"⚠️  Leverage set rejected: {resp.get('error', resp)}; using 1x policy until product metadata is corrected")
-                except Exception as e:
-                    logger.warning(f"⚠️  Leverage set failed: {e}; using 1x policy until product metadata is corrected")
+            logger.info(f"Setting leverage to {config.LEVERAGE}x on {active_exch}...")
+            try:
+                resp = self.execution_router.set_leverage(leverage=int(config.LEVERAGE))
+                if isinstance(resp, dict):
+                    if resp.get("success") or not resp.get("error"):
+                        logger.info(f"✅ Leverage set to {config.LEVERAGE}x")
+                    else:
+                        logger.warning(f"⚠️  Leverage set: {resp.get('error', resp)}")
+            except Exception as e:
+                logger.warning(f"⚠️  Leverage set failed (non-fatal): {e}")
 
             # ── Query initial balance ─────────────────────────────────────────
             try:
@@ -1033,8 +1021,13 @@ def main() -> None:
     else:
         bot = QuantBot()
 
-    from runtime.signal_guard import install_signal_handlers
-    install_signal_handlers("main", shutdown=bot.stop)
+    if threading.current_thread() is threading.main_thread():
+        def _signal_handler(signum, frame):
+            logger.info(f"Shutdown signal {signum} received")
+            bot.stop()
+            sys.exit(0)
+        signal.signal(signal.SIGINT,  _signal_handler)
+        signal.signal(signal.SIGTERM, _signal_handler)
 
     if not bot.initialize():
         sys.exit(1)
