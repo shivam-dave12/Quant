@@ -562,6 +562,10 @@ class EntryEngine:
         candles_1m:   Optional[List[Dict]] = None,
         candles_5m:   Optional[List[Dict]] = None,
     ) -> None:
+        # Reset per-tick diagnostics so DESK_DECISION cannot keep reporting an
+        # old TP_plan after the market state has moved on.  _find_tp() repopulates
+        # this field when the current tick actually evaluates a TP plan.
+        self._last_pool_plan = None
         if atr < 1e-10:
             return
 
@@ -1048,7 +1052,7 @@ class EntryEngine:
             _bridge_low_q = 0
             _bridge_proc  = 0
             _bridge_future = 0
-            _future_tol_ms = int(float(_entry_cfg_value("ICT_BRIDGE_FUTURE_TOLERANCE_MS", 5_000)) or 5_000)
+            _future_tol_ms = int(float(_entry_cfg_value("ICT_BRIDGE_FUTURE_TOLERANCE_MS", 15_000)) or 15_000)
             _now_ms = int(now * 1000)
 
             for ev in ict_ctx.ict_sweeps:
@@ -1095,10 +1099,11 @@ class EntryEngine:
                     direction=direction,
                     detected_at=ev.sweep_ts / 1000.0,
                 ))
+                _age_s = max(0, int((now*1000 - ev.sweep_ts)/1000))
                 logger.info(
                     f"🔗 ICT SWEEP BRIDGED: {ev.pool_type} "
                     f"${ev.pool_price:,.1f} quality={quality:.2f} "
-                    f"age={int((now*1000 - ev.sweep_ts)/1000)}s")
+                    f"age={_age_s}s")
 
             # Expose bridge rejections via state-level counters (read by the
             # diagnostic THINK log in quant_strategy — also picked up by the

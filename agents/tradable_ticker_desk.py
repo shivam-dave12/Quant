@@ -105,10 +105,14 @@ class TradableDeskSelection:
                     break
                 tag = "ACTIVE" if row.selected else "PARK"
                 extra = f" opt={row.option_score:.2f} {row.option_greeks}" if row.option_score > 0 else ""
+                if row.desk_id == "ICICI_INDEX_OPTIONS" and "pre-thesis underlying" in (row.option_greeks or ""):
+                    micro = f"idx_liq_prior={row.turnover_score:.2f} idx_vol_prior={row.volatility_score:.2f} chain={row.option_score:.2f}"
+                else:
+                    micro = f"spread={row.spread_bps:.1f}bps liq={row.turnover_score:.2f} vol={row.volatility_score:.2f}{extra}"
                 lines.append(
                     f"{tag} {row.rank:02d}/{row.desk_rank:02d} {row.asset_id:<22} {row.venue.upper():<10} "
                     f"score={row.score:.2f} route={row.route_exchange.upper() or row.venue.upper()}:{row.route_score:.2f} "
-                    f"spread={row.spread_bps:.1f}bps liq={row.turnover_score:.2f} vol={row.volatility_score:.2f}{extra} "
+                    f"{micro} "
                     f"{row.reason} route_reason={row.route_reason}"
                 )
                 shown += 1
@@ -432,6 +436,9 @@ class TradableTickerDesk:
         mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else price
         spread_bps = ((ask - bid) / mid * 10_000.0) if ask > 0 and bid > 0 and mid > 0 else 0.0
 
+        underlying_chain_desk = bool(raw.get("icici_underlying_desk"))
+        underlying_key = normalise_symbol(raw.get("underlying") or raw.get("underlying_display") or raw.get("stock_code") or inst.asset_id)
+
         turnover = self._turnover_proxy(merged, price)
         turnover_score = clamp(math.log10(max(1.0, turnover)) / 9.0)
         volatility_score = self._volatility_score(merged, price)
@@ -440,6 +447,20 @@ class TradableTickerDesk:
         class_score = self._asset_class_score(inst.asset_class)
         priority_score = clamp(1.0 - max(0.0, float(getattr(inst, "priority", 10_000))) / 10_000.0)
         live_score = 1.0 if (ticker or quote_success) else (0.72 if raw else 0.35)
+
+        if primary.exchange == ExchangeName.ICICI and underlying_chain_desk:
+            # These rows are not executable option contracts yet.  They are
+            # Indian index thesis contexts; option quote/depth/greeks are checked
+            # after the thesis selects a call/put.  Do not show false zeros just
+            # because no option premium exists at discovery time.
+            liq_prior = _cfg("ICICI_INDEX_UNDERLYING_LIQUIDITY_PRIOR", {})
+            vol_prior = _cfg("ICICI_INDEX_UNDERLYING_VOL_PRIOR", {})
+            if isinstance(liq_prior, dict):
+                turnover_score = max(turnover_score, safe_float(liq_prior.get(underlying_key), 0.0))
+            if isinstance(vol_prior, dict):
+                volatility_score = max(volatility_score, safe_float(vol_prior.get(underlying_key), 0.0))
+            live_score = max(live_score, 0.78)
+            spread_score = max(spread_score, 0.72)  # pre-thesis; option spread checked post-contract
 
         score = clamp(
             0.25 * turnover_score +
@@ -456,9 +477,26 @@ class TradableTickerDesk:
             underlying_chain_desk = bool(raw.get("icici_underlying_desk"))
             opt = self.options.score_option(inst, quote_success)
             option_score = opt.score
-            score = clamp(0.62 * opt.score + 0.18 * execution_score + 0.12 * spread_score + 0.08 * live_score)
-            if opt.bs:
-                option_greeks = f"Δ={opt.bs.delta:+.2f} θ/prem={opt.bs.theta_to_premium:.1%} dte={opt.dte:.1f}"
+            if underlying_chain_desk:
+                # Underlying-first index desk: this is a thesis context, not a
+                # selected option.  Use chain availability/quality as a prior so
+                # operator logs do not display placeholder opt=0.40/liq=0.00.
+                chain_quality = safe_float(raw.get("chain_quality"), 0.0)
+                chain_prior = safe_float(_cfg("ICICI_INDEX_UNDERLYING_CHAIN_PRIOR", 0.68), 0.68)
+                option_score = max(option_score, chain_quality, chain_prior)
+                score = clamp(
+                    0.34 * turnover_score +
+                    0.22 * volatility_score +
+                    0.18 * execution_score +
+                    0.14 * option_score +
+                    0.07 * spread_score +
+                    0.05 * live_score
+                )
+                option_greeks = "pre-thesis underlying; option quote after signal"
+            else:
+                score = clamp(0.62 * opt.score + 0.18 * execution_score + 0.12 * spread_score + 0.08 * live_score)
+                if opt.bs:
+                    option_greeks = f"Δ={opt.bs.delta:+.2f} θ/prem={opt.bs.theta_to_premium:.1%} dte={opt.dte:.1f}"
             raw["_option_selection"] = opt.as_dict()
             if bool(_cfg("ICICI_OPTION_REQUIRE_LIVE_QUOTE", True)) and not quote_success and not underlying_chain_desk:
                 score = 0.0
@@ -485,6 +523,8 @@ class TradableTickerDesk:
         if spread_bps > self._max_spread(inst):
             reasons.append("wide_spread")
         if primary.exchange == ExchangeName.ICICI:
+            if bool(raw.get("icici_underlying_desk")):
+                reasons.append("underlying_pre_thesis")
             reasons.append("options_only" if inst.asset_class == AssetClass.OPTION else "icici_non_option")
 
         return TradableDeskRow(

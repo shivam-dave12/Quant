@@ -111,6 +111,66 @@ else:
     _mtf_engine = MTFPoolProbability()
 
 
+# ICICI/NSE option desks analyse the underlying index and execute option
+# premium.  Use index-session probability priors for TP delivery instead of
+# the BTC perpetual maps imported above.
+_INDIAN_INDEX_DECAY_LAMBDA: Dict[str, float] = {
+    "1m": 0.85, "2m": 0.80, "3m": 0.90,
+    "5m": 1.25, "15m": 2.00, "30m": 2.75,
+    "1h": 3.75, "2h": 4.75, "4h": 6.25, "1d": 8.00,
+}
+_INDIAN_INDEX_TF_BASE_PROB: Dict[str, float] = {
+    "1m": 0.42, "2m": 0.40, "3m": 0.42,
+    "5m": 0.58, "15m": 0.68, "30m": 0.70,
+    "1h": 0.74, "2h": 0.72, "4h": 0.64, "1d": 0.48,
+}
+_INDIAN_INDEX_MAX_REACH_ATR: Dict[str, float] = {
+    "1m": 2.0, "2m": 2.0, "3m": 2.25,
+    "5m": 3.75, "15m": 6.50, "30m": 8.00,
+    "1h": 10.00, "2h": 12.00, "4h": 14.00, "1d": 18.00,
+}
+
+
+def _current_instrument_context():
+    try:
+        from core.instruments import current_instrument  # type: ignore
+        return current_instrument()
+    except Exception:
+        return None
+
+
+def _is_indian_index_option_context() -> bool:
+    inst = _current_instrument_context()
+    if inst is None:
+        return False
+    try:
+        ex = str(getattr(getattr(inst, "primary_exchange", None), "value", getattr(inst, "primary_exchange", ""))).lower()
+        ac = str(getattr(getattr(inst, "asset_class", None), "value", getattr(inst, "asset_class", ""))).lower()
+        sym = str(getattr(inst, "symbol", "") or getattr(inst, "underlying", "")).upper()
+    except Exception:
+        return False
+    index_like = any(x in sym for x in ("NIFTY", "BANKNIFTY", "NIF", "SENSEX", "MIDCAP", "CNXBAN"))
+    return ex == "icici" or (index_like and ac in {"option", "index", "derivative"})
+
+
+def _profiled_decay_lambda(tf: str) -> float:
+    maps = _INDIAN_INDEX_DECAY_LAMBDA if _is_indian_index_option_context() else _DECAY_LAMBDA
+    t = str(tf)
+    return float(maps.get(t, maps.get(t.lower(), _DECAY_LAMBDA.get(t, 2.0))))
+
+
+def _profiled_tf_base_prob(tf: str) -> float:
+    maps = _INDIAN_INDEX_TF_BASE_PROB if _is_indian_index_option_context() else _TF_BASE_PROB
+    t = str(tf)
+    return float(maps.get(t, maps.get(t.lower(), _TF_BASE_PROB.get(t, 0.50))))
+
+
+def _profiled_max_reach_atr(tf: str) -> float:
+    maps = _INDIAN_INDEX_MAX_REACH_ATR if _is_indian_index_option_context() else _MAX_REACH_ATR
+    t = str(tf)
+    return float(maps.get(t, maps.get(t.lower(), _MAX_REACH_ATR.get(t, 12.0))))
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
 # ════════════════════════════════════════════════════════════════════════════
@@ -525,8 +585,8 @@ def _per_pool_sweep_prob(target, price: float, atr: float, now: float) -> Tuple[
     if not _MTF_AVAILABLE:
         # Fallback: pure exponential distance × tf_base_prob
         tf = str(_safe(target.pool, "timeframe", "5m"))
-        λ = _DECAY_LAMBDA.get(tf, 2.0)
-        base = _TF_BASE_PROB.get(tf, 0.5)
+        λ = _profiled_decay_lambda(tf)
+        base = _profiled_tf_base_prob(tf)
         d = max(float(target.distance_atr), 0.0)
         raw = math.exp(-d / λ) * base
         return raw, raw
@@ -544,8 +604,8 @@ def _per_pool_sweep_prob(target, price: float, atr: float, now: float) -> Tuple[
             # the candidate. Status/wrong-side pools are vetoed elsewhere.
             tf = str(_safe(target.pool, "timeframe", "5m"))
             d = max(float(_safe(target, "distance_atr", 0.0)), 0.0)
-            lam = float(_DECAY_LAMBDA.get(tf, 2.0))
-            base = float(_TF_BASE_PROB.get(tf, 0.50))
+            lam = _profiled_decay_lambda(tf)
+            base = _profiled_tf_base_prob(tf)
             sig = min(float(_safe(target, "significance", 0.0)) / 12.0, 1.0)
             raw = math.exp(-d / max(lam, 1e-9)) * base * (1.0 + sig * 0.6)
             norm = min(raw / 2.0, 1.0)
@@ -561,8 +621,8 @@ def _per_pool_sweep_prob(target, price: float, atr: float, now: float) -> Tuple[
         logger.debug("MTF probability scoring failed: %s — falling back", e)
         # Fallback — same as above
         tf = str(_safe(target.pool, "timeframe", "5m"))
-        λ = _DECAY_LAMBDA.get(tf, 2.0)
-        base = _TF_BASE_PROB.get(tf, 0.5)
+        λ = _profiled_decay_lambda(tf)
+        base = _profiled_tf_base_prob(tf)
         d = max(float(target.distance_atr), 0.0)
         raw = math.exp(-d / λ) * base
         return raw, raw
@@ -621,7 +681,7 @@ def _tf_rank(tf: str) -> int:
 
 
 def _max_reach_for_tf(tf: str) -> float:
-    return float(_MAX_REACH_ATR.get(str(tf), _MAX_REACH_ATR.get(str(tf).lower(), 12.0)))
+    return _profiled_max_reach_atr(str(tf))
 
 
 def _is_terminal_tp_candidate(target: Any, distance_atr: float) -> bool:
@@ -643,7 +703,7 @@ def _terminal_reach_multiplier(distance_atr: float, tf: str) -> float:
     max_reach = _max_reach_for_tf(tf)
     if distance_atr <= max_reach:
         return 1.0
-    lam = max(float(_DECAY_LAMBDA.get(str(tf), 2.0)), 1.25)
+    lam = max(_profiled_decay_lambda(str(tf)), 1.25)
     overshoot = max(0.0, distance_atr - max_reach)
     return max(_TERMINAL_REACH_FLOOR, math.exp(-overshoot / lam))
 
@@ -1162,6 +1222,21 @@ def score_sl_pool(
 # INSTITUTIONAL DIAGNOSTICS — why visible pools were/weren't selected
 # ════════════════════════════════════════════════════════════════════════════
 
+
+def _candidate_brief(row: PoolCandidateDiagnostic) -> str:
+    """Compact pool identity for logs/Telegram; avoids opaque TP_plan lines."""
+    try:
+        price = row.pool_price
+        side = row.pool_side or "?"
+        tf = row.timeframe or "?"
+        return (
+            f"{side} ${price:,.1f}@{tf} dist={row.distance_atr:.1f}ATR "
+            f"RR={row.rr:.2f} P={row.delivery_prob:.4f}/{row.required_delivery_prob:.4f}"
+        )
+    except Exception:
+        return "pool=?"
+
+
 def diagnose_tp_pools(
     snap,
     side:    str,
@@ -1331,13 +1406,13 @@ def diagnose_tp_pools(
         selected.selected = True
         selected.reason = "selected by payoff-adjusted EV after all institutional gates"
         report.selected = selected
-        report.summary = (f"selected ${selected.tp_price:,.1f}; RR={selected.rr:.2f}; "
-                          f"EV={selected.ev:.3f}; P={selected.sweep_prob:.2f}")
+        report.summary = (f"selected {_candidate_brief(selected)} tp=${selected.tp_price:,.1f}; "
+                          f"EV={selected.ev:.3f}; sweepP={selected.sweep_prob:.2f}")
     else:
         if rows:
             # Surface the most relevant rejection, not just "no TP".
             best_reject = max(rows, key=_candidate_report_priority)
-            report.summary = f"no eligible TP pool; best visible pool rejected: {best_reject.reason}"
+            report.summary = f"no eligible TP pool; best visible pool rejected: {_candidate_brief(best_reject)} :: {best_reject.reason}"
         else:
             report.summary = "no TP candidates found"
 

@@ -840,24 +840,44 @@ class CVDEngine:
             self._tick_count += 1
 
     def update(self, candles: List[Dict]) -> None:
-        """Update candle-based OHLCV delta (fallback path)."""
+        """Update candle-based OHLCV delta (fallback path).
+
+        Some ICICI/Breeze index historical endpoints return valid OHLC candles
+        with volume missing/zero.  The old fallback multiplied the candle impulse
+        by V, so every CVD/trend calculation became exactly zero even when the
+        index was moving.  Real tick CVD is still preferred whenever available;
+        for zero-volume candles we use OHLC impulse as the activity weight so
+        Indian index desks do not lose all flow information.
+        """
         if not candles: return
+
+        def _bar_delta(c: Dict) -> float:
+            hi=float(c.get('h', c.get('high', 0.0)) or 0.0)
+            lo=float(c.get('l', c.get('low', 0.0)) or 0.0)
+            cl=float(c.get('c', c.get('close', 0.0)) or 0.0)
+            op=float(c.get('o', c.get('open', cl)) or cl)
+            vol=float(c.get('v', c.get('volume', 0.0)) or 0.0)
+            rng = hi - lo
+            if rng <= 1e-10:
+                return 0.0
+            if vol <= 0.0 and bool(getattr(config, 'QUANT_CVD_ZERO_VOLUME_CANDLE_PROXY', True)):
+                # Not fake tick volume: this is a scale weight for the OHLC impulse
+                # fallback.  The sign still comes only from real candle geometry.
+                min_activity = float(getattr(config, 'QUANT_CVD_ZERO_VOLUME_PROXY_MIN_ACTIVITY', 1.0))
+                vol = max(min_activity, abs(cl - op), rng * 0.25)
+            return vol * ((2.0*cl-hi-lo)/rng)
+
         new_start = 0
         if self._last_bar_ts > 0:
             for i, c in enumerate(candles):
                 if int(c['t']) > self._last_bar_ts:
                     new_start = i; break
             else:
-                if candles:
-                    c = candles[-1]; hi=float(c['h']); lo=float(c['l']); cl=float(c['c']); vol=float(c['v'])
-                    rng = hi - lo
-                    if self._deltas:
-                        self._deltas[-1] = vol * ((2.0*cl-hi-lo)/rng if rng > 1e-10 else 0.0)
+                if candles and self._deltas:
+                    self._deltas[-1] = _bar_delta(candles[-1])
                 return
         for c in candles[new_start:]:
-            hi=float(c['h']); lo=float(c['l']); cl=float(c['c']); vol=float(c['v'])
-            rng = hi - lo
-            self._deltas.append(vol * ((2.0*cl-hi-lo)/rng if rng > 1e-10 else 0.0))
+            self._deltas.append(_bar_delta(c))
             self._last_bar_ts = int(c['t'])
 
     def _get_true_cvd_array(self, window_sec: float = 600.0) -> Optional[List[float]]:

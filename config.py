@@ -974,9 +974,39 @@ ICICI_INDEX_STREAM_ENABLED = True
 ICICI_INDEX_STREAM_CHANNELS = "1MIN,5MIN"
 ICICI_INDEX_STREAM_SCRIPT_CODES = {
     # ICICI's OHLCV stream docs use this as the NIFTY script example.
+    # Other index script ids vary by Breeze account/master data; do not invent
+    # hardcoded ids. They are kept on REST refresh unless configured with a
+    # verified script id.
     "NIFTY": "4.1!1594",
 }
 ICICI_INDEX_WEBSOCKET_REQUIRED = False
+# Index desks are underlying-first. Before a contract is selected there is no
+# option quote/orderbook, so selector diagnostics must use explicit pre-thesis
+# Indian-index priors instead of displaying false liq=0/vol=0 placeholders.
+ICICI_INDEX_UNDERLYING_LIQUIDITY_PRIOR = {
+    "NIFTY": 0.92,
+    "BANKNIFTY": 0.90,
+    "NIFFIN": 0.82,
+    "NIFNEX": 0.78,
+    "SENSEX": 0.88,
+}
+ICICI_INDEX_UNDERLYING_VOL_PRIOR = {
+    "NIFTY": 0.58,
+    "BANKNIFTY": 0.66,
+    "NIFFIN": 0.54,
+    "NIFNEX": 0.60,
+    "SENSEX": 0.60,
+}
+ICICI_INDEX_UNDERLYING_CHAIN_PRIOR = 0.68
+ICICI_UNDERLYING_REST_REFRESH_SEC = 10.0
+# ICICI/Breeze timestamps can arrive a few seconds ahead of the host clock after
+# REST/WS merge. Treat small clock skew as age=0; reject only real future data.
+ICT_BRIDGE_FUTURE_TOLERANCE_MS = 15000
+# Breeze index historicals frequently have missing/zero volume. For fallback CVD,
+# use OHLC impulse as the activity weight instead of letting every CVD/trend
+# calculation collapse to zero. Real tick CVD remains preferred whenever present.
+QUANT_CVD_ZERO_VOLUME_CANDLE_PROXY = True
+QUANT_CVD_ZERO_VOLUME_PROXY_MIN_ACTIVITY = 1.0
 
 # ICICI/NSE/BSE live data session guard.  ICICI option chains may be discovered
 # from Security Master anytime, but live quote/candle adapters should start only

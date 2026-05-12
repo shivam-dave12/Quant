@@ -512,18 +512,26 @@ class MarketAggregator:
             and getattr(self._secondary, "is_ready", True)
         )
         sources = 1 + int(secondary_ready)
-        microstructure_weight = 1.0 if secondary_ready else 0.62
+        analysis_only = False
+        try:
+            raw = getattr(getattr(getattr(self, "instrument", None), "primary", None), "raw", {}) or {}
+            analysis_only = bool(raw.get("icici_underlying_desk")) and self._analysis is not None
+        except Exception:
+            analysis_only = False
+        microstructure_weight = 1.0 if secondary_ready else (0.50 if analysis_only else 0.62)
+        note = (
+            "dual-feed microstructure" if secondary_ready
+            else "ICICI underlying thesis: candle-derived flow, no executable L2 until option contract selection" if analysis_only
+            else "single-feed microstructure; posterior should discount CVD/OB"
+        )
         return {
             "primary_ready": primary_ready,
             "secondary_configured": secondary_configured,
             "secondary_alive": secondary_ready,
             "sources": sources,
             "microstructure_weight": microstructure_weight,
-            "mode": "dual" if secondary_ready else "single",
-            "note": (
-                "dual-feed microstructure" if secondary_ready
-                else "single-feed microstructure; posterior should discount CVD/OB"
-            ),
+            "mode": "analysis_underlying" if analysis_only else ("dual" if secondary_ready else "single"),
+            "note": note,
         }
 
     def get_data_quality(self) -> Dict:

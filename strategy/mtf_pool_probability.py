@@ -60,6 +60,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from datetime import datetime, time as dt_time, timezone, timedelta
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -142,6 +143,99 @@ _SESSION_MULT: Dict[str, Dict[str, float]] = {
 }
 
 
+# Indian index/F&O options are not BTC perpetuals.  They trade in a finite NSE
+# session, gap at the open, show clustered intraday stop runs around 5m/15m
+# structures, and the bot executes option premium after analysing the
+# underlying index.  Keep the BTC maps as the default, but switch to this
+# profile automatically when the active instrument context is ICICI/NFO.
+_INDIAN_INDEX_DECAY_LAMBDA: Dict[str, float] = {
+    "1m": 0.85, "2m": 0.80, "3m": 0.90,
+    "5m": 1.25, "15m": 2.00, "30m": 2.75,
+    "1h": 3.75, "2h": 4.75, "4h": 6.25, "1d": 8.00,
+}
+_INDIAN_INDEX_TF_BASE_PROB: Dict[str, float] = {
+    "1m": 0.42, "2m": 0.40, "3m": 0.42,
+    "5m": 0.58, "15m": 0.68, "30m": 0.70,
+    "1h": 0.74, "2h": 0.72, "4h": 0.64, "1d": 0.48,
+}
+_INDIAN_INDEX_MAX_REACH_ATR: Dict[str, float] = {
+    "1m": 2.0, "2m": 2.0, "3m": 2.25,
+    "5m": 3.75, "15m": 6.50, "30m": 8.00,
+    "1h": 10.00, "2h": 12.00, "4h": 14.00, "1d": 18.00,
+}
+_INDIAN_SESSION_MULT: Dict[str, Dict[str, float]] = {
+    # NSE options flows are two-sided intraday; do not import London/NY bias.
+    "NSE_OPEN":  {"BSL": 1.08, "SSL": 1.08},
+    "NSE":       {"BSL": 1.00, "SSL": 1.00},
+    "NSE_CLOSE": {"BSL": 1.06, "SSL": 1.06},
+}
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _current_instrument_context():
+    try:
+        from core.instruments import current_instrument  # type: ignore
+        return current_instrument()
+    except Exception:
+        return None
+
+
+def _is_indian_index_option_context() -> bool:
+    inst = _current_instrument_context()
+    if inst is None:
+        return False
+    try:
+        ex = str(getattr(getattr(inst, "primary_exchange", None), "value", getattr(inst, "primary_exchange", ""))).lower()
+        ac = str(getattr(getattr(inst, "asset_class", None), "value", getattr(inst, "asset_class", ""))).lower()
+        sym = str(getattr(inst, "symbol", "") or getattr(inst, "underlying", "")).upper()
+    except Exception:
+        return False
+    index_like = any(x in sym for x in ("NIFTY", "BANKNIFTY", "NIF", "SENSEX", "MIDCAP", "CNXBAN"))
+    return ex == "icici" or (index_like and ac in {"option", "index", "derivative"})
+
+
+def _decay_lambda_for_tf(tf: str) -> float:
+    maps = _INDIAN_INDEX_DECAY_LAMBDA if _is_indian_index_option_context() else _DECAY_LAMBDA
+    t = str(tf)
+    return float(maps.get(t, maps.get(t.lower(), _DECAY_LAMBDA.get(t, 2.0))))
+
+
+def _tf_base_prob_for_tf(tf: str) -> float:
+    maps = _INDIAN_INDEX_TF_BASE_PROB if _is_indian_index_option_context() else _TF_BASE_PROB
+    t = str(tf)
+    return float(maps.get(t, maps.get(t.lower(), _TF_BASE_PROB.get(t, 0.50))))
+
+
+def _max_reach_atr_for_tf(tf: str) -> float:
+    maps = _INDIAN_INDEX_MAX_REACH_ATR if _is_indian_index_option_context() else _MAX_REACH_ATR
+    t = str(tf)
+    return float(maps.get(t, maps.get(t.lower(), _MAX_REACH_ATR.get(t, 6.0))))
+
+
+def _session_mult_for_key(session_key: str) -> Dict[str, float]:
+    key = str(session_key or "").upper()
+    if _is_indian_index_option_context() and key.startswith("NSE"):
+        return _INDIAN_SESSION_MULT.get(key, _INDIAN_SESSION_MULT["NSE"])
+    return _SESSION_MULT.get(key, _SESSION_MULT[""])
+
+
+def _nse_session_from_now(now: Optional[float] = None) -> str:
+    try:
+        dt = datetime.fromtimestamp(float(now if now is not None else time.time()), tz=_IST)
+        if dt.weekday() >= 5:
+            return ""
+        t = dt.time()
+        if t < dt_time(9, 15) or t > dt_time(15, 30):
+            return ""
+        if t <= dt_time(10, 15):
+            return "NSE_OPEN"
+        if t >= dt_time(14, 30):
+            return "NSE_CLOSE"
+        return "NSE"
+    except Exception:
+        return "NSE"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA STRUCTURES
 # ─────────────────────────────────────────────────────────────────────────────
@@ -217,7 +311,7 @@ class MTFPoolProbability:
         )
 
         # Detect active session for multipliers
-        sess_key = self._detect_session(session, ict_engine)
+        sess_key = self._detect_session(session, ict_engine, now)
 
         # Collect all pool candidates
         bsl_candidates: List[PoolProbability] = []
@@ -329,20 +423,20 @@ class MTFPoolProbability:
         dist_atr = abs(pool_price - price) / atr
 
         # Skip pools outside max reach for their TF
-        max_reach = _MAX_REACH_ATR.get(tf, 6.0)
+        max_reach = _max_reach_atr_for_tf(tf)
         if profile is not None:
             max_reach *= max(0.85, min(1.35, profile.breathing_mult))
         if dist_atr > max_reach:
             return None
 
         # ── Component 1: Distance decay ───────────────────────────────
-        λ = _DECAY_LAMBDA.get(tf, 2.0)
+        λ = _decay_lambda_for_tf(tf)
         if profile is not None:
             λ *= max(0.80, min(1.40, profile.breathing_mult))
         c_distance = math.exp(-dist_atr / λ)
 
         # ── Component 2: TF base probability ─────────────────────────
-        c_tf = _TF_BASE_PROB.get(tf, 0.50)
+        c_tf = _tf_base_prob_for_tf(tf)
 
         # ── Component 3: Significance ─────────────────────────────────
         # Use PoolTarget.adjusted_sig() if available (richest data)
@@ -426,12 +520,12 @@ class MTFPoolProbability:
                     continue
                 pool_price = float(getattr(p, 'price', 0.0))
                 dist_atr   = abs(pool_price - price) / atr
-                if dist_atr > _MAX_REACH_ATR.get(tf, 3.0):
+                if dist_atr > _max_reach_atr_for_tf(tf):
                     continue
 
-                λ        = _DECAY_LAMBDA.get(tf, 0.8)
+                λ        = _decay_lambda_for_tf(tf)
                 c_dist   = math.exp(-dist_atr / λ)
-                c_tf     = _TF_BASE_PROB.get(tf, 0.45)
+                c_tf     = _tf_base_prob_for_tf(tf)
                 touches  = int(getattr(p, 'touch_count', 1))
                 c_touch  = 1.0 + min(_TOUCH_BONUS_PER * max(0, touches - 1),
                                       _TOUCH_BONUS_CAP)
@@ -466,7 +560,7 @@ class MTFPoolProbability:
             logger.debug(f"MTF micro-pool extraction non-fatal: {e}")
 
     @staticmethod
-    def _detect_session(session_hint: str, ict_engine) -> str:
+    def _detect_session(session_hint: str, ict_engine, now: Optional[float] = None) -> str:
         """
         Resolve session string from hint or ICT engine.
 
@@ -475,6 +569,16 @@ class MTFPoolProbability:
         ict._session (canonical, full-window string) first so probability
         weights apply for the entire London/NY/Asia session, not just KZ windows.
         """
+        if _is_indian_index_option_context():
+            if session_hint:
+                su = session_hint.upper()
+                if "NSE" in su or "ICICI" in su or "NFO" in su:
+                    sess = _nse_session_from_now(now)
+                    return sess or "NSE"
+            sess = _nse_session_from_now(now)
+            if sess:
+                return sess
+
         # Priority 1: session_hint from caller
         if session_hint:
             su = session_hint.upper()
