@@ -359,6 +359,7 @@ QUANT_MAX_SPREAD_BPS_COMMODITY        = 45.0
 QUANT_MAX_SPREAD_TICKS_COMMODITY      = 10.0
 QUANT_SPREAD_MIN_SIZE_MULT            = 0.35
 QUANT_SPREAD_SIZE_HAIRCUT_MAX         = 0.55
+QUANT_SPREAD_HARD_IMPAIR_SIZE_MULT     = 0.20  # hard-spread condition becomes max size impairment, not signal veto
 QUANT_REVERSION_MIN_RR         = 2.0      # single authoritative R:R floor
 QUANT_REVERSION_MAX_RR         = 5.0
 QUANT_TREND_MIN_RR             = 2.0
@@ -585,13 +586,15 @@ SCANNER_MAX_ACTIVE_INSTRUMENTS = 14
 SCANNER_TICK_SLEEP_SEC = 0.25
 SCANNER_ASSET_HEARTBEAT_SEC = 60.0
 SCANNER_ASSET_ANALYSIS_LOG_SEC = 15.0  # per-contract proof-of-analysis log cadence
+TELEGRAM_RETRY_BASE_SEC = float(os.getenv("TELEGRAM_RETRY_BASE_SEC", "2"))
+TELEGRAM_RETRY_MAX_SEC = float(os.getenv("TELEGRAM_RETRY_MAX_SEC", "60"))
 # Portfolio slots: the bot may hold multiple contracts at once, but each
 # contract gets only one ENTERING/ACTIVE/EXITING slot.  The existing BTC-style
 # risk model is preserved by giving each contract a slot-scoped balance view
 # before QuantStrategy applies RISK_PER_TRADE and BALANCE_USAGE_PERCENTAGE.
-PORTFOLIO_MAX_OPEN_POSITIONS = 4
+PORTFOLIO_MAX_OPEN_POSITIONS = int(os.getenv("PORTFOLIO_MAX_OPEN_POSITIONS", "6"))
 PORTFOLIO_MAX_OPEN_PER_CONTRACT = 1
-PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS = 4
+PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS = int(os.getenv("PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS", "6"))
 PORTFOLIO_BUDGET_MODE = "equal_slots"   # equal_slots | active_equal_slots
 # In multi-asset mode, margin/cash is slot-scoped but dollar-risk must remain
 # portfolio-aware.  This prevents BTC min-lot rejection when a valid minimum

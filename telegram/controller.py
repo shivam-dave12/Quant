@@ -33,6 +33,7 @@ import html as _html
 from typing import Optional
 from datetime import datetime, timezone
 import sys
+import socket
 
 import sys, os as _os; sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import telegram.config as telegram_config
@@ -40,6 +41,17 @@ import config
 from telegram.notifier import _sanitize_html
 
 logger = logging.getLogger(__name__)
+
+_TELEGRAM_TOKEN_URL_RE = re.compile(r"/bot[0-9]{5,}:[A-Za-z0-9_-]+/")
+_TELEGRAM_TOKEN_RAW_RE = re.compile(r"\b[0-9]{5,}:[A-Za-z0-9_-]{20,}\b")
+
+
+def _redact_telegram_secret(value) -> str:
+    """Return a log-safe Telegram error string without leaking bot tokens."""
+    s = str(value)
+    s = _TELEGRAM_TOKEN_URL_RE.sub("/bot<redacted>/", s)
+    s = _TELEGRAM_TOKEN_RAW_RE.sub("<redacted-telegram-token>", s)
+    return s
 
 _MOJIBAKE_SENTINELS = ("ð", "â", "Ã", "Â", "Î", "Ï")
 _MOJIBAKE_RUN = re.compile(
@@ -139,10 +151,70 @@ class TelegramBotController:
         self._getupdates_warn_throttle: float = 60.0
         self._last_getupdates_conn_warn_ts: float = 0.0
 
+        # Institutional Telegram resilience: Telegram is an observability/control
+        # plane, not a trading dependency.  If DNS/network is degraded, the
+        # controller backs off and stays alive without flooding logs or stopping
+        # the trading engine.  Successful polls immediately reset the backoff.
+        self._tg_failures: int = 0
+        self._tg_backoff_s: float = 0.0
+        self._tg_next_poll_ts: float = 0.0
+        self._tg_backoff_base_s: float = float(getattr(config, "TELEGRAM_RETRY_BASE_SEC", 2.0))
+        self._tg_backoff_max_s: float = float(getattr(config, "TELEGRAM_RETRY_MAX_SEC", 60.0))
+        self._tg_degraded: bool = False
+        self._poller_lock = threading.Lock()
+        self._poller_started: bool = False
+
         if not self.bot_token or not self.chat_id:
             raise ValueError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set")
 
         logger.info("TelegramBotController (liquidity-first) initialized")
+
+    def _mark_telegram_ok(self) -> None:
+        if self._tg_degraded:
+            logger.info("Telegram control plane recovered; polling backoff reset")
+        self._tg_failures = 0
+        self._tg_backoff_s = 0.0
+        self._tg_next_poll_ts = 0.0
+        self._tg_degraded = False
+
+    def _mark_telegram_degraded(self, reason: str, exc: Exception | None = None) -> None:
+        self._tg_failures += 1
+        if self._tg_backoff_s <= 0:
+            self._tg_backoff_s = self._tg_backoff_base_s
+        else:
+            self._tg_backoff_s = min(self._tg_backoff_s * 2.0, self._tg_backoff_max_s)
+        self._tg_next_poll_ts = time.time() + self._tg_backoff_s
+        safe_reason = _redact_telegram_secret(reason)
+        safe_exc = _redact_telegram_secret(exc) if exc is not None else ""
+        if not self._tg_degraded:
+            self._tg_degraded = True
+            logger.warning(
+                "Telegram control plane DEGRADED: %s%s; retrying in %.1fs. Trading engine stays live.",
+                safe_reason,
+                f" — {safe_exc}" if safe_exc else "",
+                self._tg_backoff_s,
+            )
+        elif time.time() - self._last_getupdates_conn_warn_ts >= self._getupdates_warn_throttle:
+            self._last_getupdates_conn_warn_ts = time.time()
+            logger.warning(
+                "Telegram still degraded after %d failures: %s; next poll in %.1fs",
+                self._tg_failures,
+                safe_reason,
+                self._tg_backoff_s,
+            )
+
+    def _sleep_until_next_telegram_poll(self) -> None:
+        delay = self._tg_next_poll_ts - time.time()
+        if delay > 0:
+            time.sleep(min(delay, self._tg_backoff_max_s))
+
+    def _telegram_dns_preflight(self) -> bool:
+        try:
+            socket.getaddrinfo("api.telegram.org", 443, type=socket.SOCK_STREAM)
+            return True
+        except OSError as exc:
+            self._mark_telegram_degraded("DNS resolve failed for api.telegram.org", exc)
+            return False
 
     # ================================================================
     # MESSAGING
@@ -169,7 +241,7 @@ class TelegramBotController:
                 return True
             return self._send_raw(message, parse_mode)
         except Exception as e:
-            logger.error(f"Send error: {e}")
+            logger.error("Send error: %s", _redact_telegram_secret(e))
             try:
                 return self._send_raw(message, parse_mode=None)
             except Exception:
@@ -187,14 +259,30 @@ class TelegramBotController:
         }
         if parse_mode:
             payload["parse_mode"] = parse_mode
-        resp = requests.post(url, json=payload, timeout=10)
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+        except requests.exceptions.RequestException as exc:
+            self._mark_telegram_degraded("sendMessage request failed", exc)
+            return False
         if resp.status_code != 200:
-            logger.error(f"Telegram API error {resp.status_code}: {resp.text[:200]}")
+            logger.error("Telegram API error %d: %s", resp.status_code, _redact_telegram_secret(resp.text[:200]))
+        else:
+            self._mark_telegram_ok()
         return resp.status_code == 200
 
     def get_updates(self, timeout: int = 30) -> list:
+        """Poll Telegram safely.
+
+        Design rule: Telegram must never become a bot-killer or log-amplifier.
+        DNS/connectivity errors put the controller in DEGRADED mode with
+        exponential backoff. The trading engine keeps running; /stop becomes
+        available again as soon as Telegram recovers.
+        """
+        self._sleep_until_next_telegram_poll()
         _read_timeout = min(timeout, 15) + 2
         try:
+            if not self._telegram_dns_preflight():
+                return []
             url    = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
             params = {
                 "offset":          self.last_update_id + 1,
@@ -203,43 +291,33 @@ class TelegramBotController:
             }
             resp = requests.get(url, params=params, timeout=(5.0, _read_timeout))
             if resp.status_code != 200:
-                # SPAM-FIX 2026-04-26: throttled per-status-code logging.
-                # See __init__ comment. Net effect: at most 1 WARN per
-                # status_code per 60s; the rest are INFO-level and stay out
-                # of Telegram entirely.
                 _now = time.time()
                 _last = self._last_getupdates_warn_ts.get(resp.status_code, 0.0)
+                self._mark_telegram_degraded(f"getUpdates HTTP {resp.status_code}")
                 if _now - _last >= self._getupdates_warn_throttle:
                     self._last_getupdates_warn_ts[resp.status_code] = _now
                     logger.warning(
-                        "Telegram API HTTP %d — getUpdates skipped (further "
-                        "occurrences within %.0fs will be logged at INFO)",
-                        resp.status_code, self._getupdates_warn_throttle,
-                    )
-                else:
-                    logger.info(
-                        "Telegram API HTTP %d — getUpdates skipped",
+                        "Telegram API HTTP %d — getUpdates skipped; next retry in %.1fs",
                         resp.status_code,
+                        self._tg_backoff_s,
                     )
                 return []
             data = resp.json()
+            self._mark_telegram_ok()
             return data.get("result", []) if data.get("ok") else []
         except requests.exceptions.Timeout:
+            # Long-poll timeout is normal; no degradation/backoff required.
             return []
         except requests.exceptions.ConnectionError as e:
-            # Same throttling treatment for connection-reset bursts.
-            _now = time.time()
-            if _now - self._last_getupdates_conn_warn_ts >= self._getupdates_warn_throttle:
-                self._last_getupdates_conn_warn_ts = _now
-                logger.warning("Telegram connection error (will retry): %s", e)
-            else:
-                logger.info("Telegram connection error (will retry): %s", e)
+            self._mark_telegram_degraded("getUpdates connection error", e)
             return []
         except ValueError as e:
-            logger.error("Telegram JSON parse error in getUpdates: %s", e)
+            logger.error("Telegram JSON parse error in getUpdates: %s", _redact_telegram_secret(e))
+            self._mark_telegram_degraded("getUpdates JSON parse error", e)
             return []
         except Exception as e:
-            logger.error("Telegram getUpdates unexpected error: %s", e, exc_info=True)
+            logger.error("Telegram getUpdates unexpected error: %s", _redact_telegram_secret(e), exc_info=True)
+            self._mark_telegram_degraded("getUpdates unexpected error", e)
             return []
 
     def clear_old_messages(self):
@@ -294,11 +372,14 @@ class TelegramBotController:
             }
             resp = requests.post(url, json=payload, timeout=10)
             if resp.status_code != 200:
-                logger.error(f"Command registration failed: {resp.text}")
+                logger.error("Command registration failed: %s", _redact_telegram_secret(resp.text[:300]))
+                self._mark_telegram_degraded(f"setMyCommands HTTP {resp.status_code}")
             else:
                 logger.info("Telegram commands registered")
+                self._mark_telegram_ok()
         except Exception as e:
-            logger.error(f"Error setting commands: {e}")
+            logger.error("Error setting commands: %s", _redact_telegram_secret(e))
+            self._mark_telegram_degraded("setMyCommands exception", e)
 
     # ================================================================
     # COMMAND ROUTING
@@ -2454,6 +2535,11 @@ class TelegramBotController:
     # ================================================================
 
     def start(self):
+        with self._poller_lock:
+            if self._poller_started:
+                logger.warning("Telegram controller poller already running; refusing duplicate start")
+                return
+            self._poller_started = True
         self.running = True
         self.clear_old_messages()
         self.set_my_commands()
@@ -2512,9 +2598,13 @@ class TelegramBotController:
                 time.sleep(2.0)
 
         logger.info("Controller stopped")
+        with self._poller_lock:
+            self._poller_started = False
 
     def stop(self):
         self.running = False
+        with self._poller_lock:
+            self._poller_started = False
         global bot_instance, bot_running
         if bot_running and bot_instance:
             bot_instance.stop()

@@ -121,8 +121,8 @@ class _LegacyPortfolioGuard:
         to whatever `available` it receives.  Therefore the institutional way to
         preserve the current BTC sizing semantics across multiple simultaneous
         contracts is to give each contract an account-equity slice, not the full
-        account equity.  With 4 slots and 60% balance usage, each contract may use
-        about 15% of total equity as margin; all 4 together remain around the old
+        account equity.  With 6 slots and 60% balance usage, each contract may use
+        about 10% of total equity as margin; all 6 together remain around the old
         60% portfolio envelope.
         """
         if raw_balance is None:
