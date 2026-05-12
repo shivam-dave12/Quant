@@ -828,8 +828,8 @@ class _HyperliquidAdapter:
         for pos in rows:
             if not isinstance(pos, dict):
                 continue
-            coin = str(pos.get("coin") or "").upper()
-            if coin and coin != self.symbol.upper():
+            coin = str(pos.get("coin") or "").strip()
+            if coin and coin != str(self.symbol).strip():
                 continue
             szi = 0.0
             for f in ("szi", "size", "sz"):

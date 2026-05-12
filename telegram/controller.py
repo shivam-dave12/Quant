@@ -116,6 +116,41 @@ def _esc(s) -> str:
     return _html.escape(str(s), quote=False)
 
 
+def _normalise_telegram_id(value) -> str:
+    """Return canonical Telegram numeric id text, or empty for malformed IDs."""
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        if not value.is_integer():
+            return ""
+        return str(int(value))
+    text = str(value).strip()
+    if not text:
+        return ""
+    if re.fullmatch(r"[+-]?\d+", text):
+        try:
+            return str(int(text))
+        except Exception:
+            return ""
+    return ""
+
+
+def _parse_telegram_id_csv(raw) -> tuple[set[str], list[str]]:
+    """Parse comma/semicolon separated Telegram user IDs without throwing."""
+    ids: set[str] = set()
+    bad: list[str] = []
+    for part in re.split(r"[,;]", str(raw or "")):
+        item = part.strip()
+        if not item:
+            continue
+        ident = _normalise_telegram_id(item)
+        if ident:
+            ids.add(ident)
+        else:
+            bad.append(item)
+    return ids, bad
+
+
 bot_instance = None
 bot_thread   = None
 bot_running  = False
@@ -124,7 +159,7 @@ bot_running  = False
 class TelegramBotController:
     def __init__(self):
         self.bot_token      = telegram_config.TELEGRAM_BOT_TOKEN
-        self.chat_id        = str(telegram_config.TELEGRAM_CHAT_ID)
+        self.chat_id        = _normalise_telegram_id(telegram_config.TELEGRAM_CHAT_ID)
         self.last_update_id = 0
         self.running        = False
 
@@ -2895,7 +2930,7 @@ class TelegramBotController:
                 for upd in updates:
                     self.last_update_id = upd.get("update_id", self.last_update_id)
                     msg     = upd.get("message") or {}
-                    chat_id = str((msg.get("chat") or {}).get("id", ""))
+                    chat_id = _normalise_telegram_id((msg.get("chat") or {}).get("id"))
                     text    = (msg.get("text") or "").strip()
                     if chat_id != self.chat_id or not text:
                         continue
@@ -2908,19 +2943,24 @@ class TelegramBotController:
                     # (backward-compatible for private-chat bots where chat_id == user_id).
                     _raw_allowed = str(getattr(config, "TELEGRAM_ALLOWED_USER_IDS", "") or "")
                     if _raw_allowed.strip():
-                        try:
-                            _allowed_ids = {
-                                int(x.strip()) for x in _raw_allowed.split(",")
-                                if x.strip().lstrip("-").isdigit()
-                            }
-                        except Exception:
-                            _allowed_ids = set()
-                        _sender_id = int((msg.get("from") or {}).get("id", 0))
-                        if _allowed_ids and _sender_id not in _allowed_ids:
+                        _allowed_ids, _bad_allowed = _parse_telegram_id_csv(_raw_allowed)
+                        if _bad_allowed:
                             logger.warning(
-                                "Telegram command REJECTED from user_id=%d "
+                                "Ignoring malformed TELEGRAM_ALLOWED_USER_IDS entries: %s",
+                                ", ".join(_bad_allowed[:5]),
+                            )
+                        _sender_id = _normalise_telegram_id((msg.get("from") or {}).get("id"))
+                        if not _allowed_ids:
+                            logger.error(
+                                "TELEGRAM_ALLOWED_USER_IDS is configured but contains no valid numeric IDs; rejecting command: %s",
+                                text[:80],
+                            )
+                            continue
+                        if not _sender_id or _sender_id not in _allowed_ids:
+                            logger.warning(
+                                "Telegram command REJECTED from user_id=%s "
                                 "(not in TELEGRAM_ALLOWED_USER_IDS): %s",
-                                _sender_id, text[:80]
+                                _sender_id or "<missing>", text[:80]
                             )
                             continue
 

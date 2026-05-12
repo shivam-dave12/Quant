@@ -130,7 +130,7 @@ class HyperliquidAPI:
             if not isinstance(coin, dict):
                 continue
             ctx = ctxs[idx] if idx < len(ctxs) and isinstance(ctxs[idx], dict) else {}
-            name = str(coin.get("name") or "").upper()
+            name = str(coin.get("name") or "").strip()
             if not name:
                 continue
             mid = _float(ctx.get("midPx") or ctx.get("markPx") or ctx.get("oraclePx"))
@@ -159,21 +159,23 @@ class HyperliquidAPI:
         return self.get_products()
 
     def get_l2_book(self, symbol: str) -> Dict[str, Any]:
+        coin = str(symbol or "").strip()
         if self.info is not None:
             self._throttle()
-            return self.info.l2_snapshot(str(symbol).upper())
-        out = self._post_info({"type": "l2Book", "coin": str(symbol).upper()})
+            return self.info.l2_snapshot(coin)
+        out = self._post_info({"type": "l2Book", "coin": coin})
         return out if isinstance(out, dict) else {}
 
     def get_candles(self, symbol: str, interval: str, start_ms: int, end_ms: int) -> List[dict]:
+        coin = str(symbol or "").strip()
         if self.info is not None:
             self._throttle()
-            rows = self.info.candles_snapshot(str(symbol).upper(), interval, int(start_ms), int(end_ms))
+            rows = self.info.candles_snapshot(coin, interval, int(start_ms), int(end_ms))
         else:
             rows = self._post_info({
                 "type": "candleSnapshot",
                 "req": {
-                    "coin": str(symbol).upper(),
+                    "coin": coin,
                     "interval": str(interval),
                     "startTime": int(start_ms),
                     "endTime": int(end_ms),
@@ -220,12 +222,12 @@ class HyperliquidAPI:
             state = self._post_info({"type": "clearinghouseState", "user": self.account_address})
         rows = state.get("assetPositions", []) if isinstance(state, dict) else []
         out = []
-        wanted = str(symbol or "").upper()
+        wanted = str(symbol or "").strip()
         for row in rows:
             pos = row.get("position", row) if isinstance(row, dict) else {}
             if not isinstance(pos, dict):
                 continue
-            coin = str(pos.get("coin") or "").upper()
+            coin = str(pos.get("coin") or "").strip()
             if wanted and coin != wanted:
                 continue
             out.append(pos)
@@ -239,10 +241,10 @@ class HyperliquidAPI:
             rows = self.info.open_orders(self.account_address)
         else:
             rows = self._post_info({"type": "openOrders", "user": self.account_address})
-        wanted = str(symbol or "").upper()
+        wanted = str(symbol or "").strip()
         out = []
         for row in rows if isinstance(rows, list) else []:
-            if wanted and str(row.get("coin") or "").upper() != wanted:
+            if wanted and str(row.get("coin") or "").strip() != wanted:
                 continue
             out.append(row)
         return out
@@ -272,7 +274,7 @@ class HyperliquidAPI:
         stop_order_type: str | None = None,
     ) -> Dict[str, Any]:
         ex = self._require_signed()
-        coin = str(symbol).upper()
+        coin = str(symbol or "").strip()
         is_buy = str(side).upper() in {"BUY", "LONG"}
         qty = float(quantity)
         ot = str(order_type or "").lower()
@@ -291,9 +293,9 @@ class HyperliquidAPI:
     def cancel_order(self, symbol: str, order_id: str | int) -> Dict[str, Any]:
         ex = self._require_signed()
         self._throttle()
-        return ex.cancel(str(symbol).upper(), int(order_id))
+        return ex.cancel(str(symbol or "").strip(), int(order_id))
 
     def set_leverage(self, symbol: str, leverage: int, is_cross: bool = True) -> Dict[str, Any]:
         ex = self._require_signed()
         self._throttle()
-        return ex.update_leverage(int(leverage), str(symbol).upper(), is_cross=bool(is_cross))
+        return ex.update_leverage(int(leverage), str(symbol or "").strip(), is_cross=bool(is_cross))

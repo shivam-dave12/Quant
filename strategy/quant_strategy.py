@@ -4898,6 +4898,13 @@ class QuantStrategy:
                     f"need {QCfg.MIN_5M_BARS()} — waiting for warmup)")
             return
 
+        try:
+            _sig = self._compute_signals(data_manager)
+            if _sig is not None:
+                self._last_sig = _sig
+        except Exception as _sig_e:
+            logger.debug(f"sweep-posterior signal attribution update error (non-fatal): {_sig_e}")
+
         # Step 3: Update ICT engine (preserved -- provides structural context)
         if self._ict is not None:
             try:

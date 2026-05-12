@@ -963,6 +963,18 @@ class MultiAssetQuantBot:
         # options-only and requires the Breeze polling data manager; cash/futures
         # never become runtime desks.
         if inst.primary_exchange == ExchangeName.ICICI:
+            raw = getattr(getattr(inst, "primary", None), "raw", {}) or {}
+            desk_id = str(raw.get("desk_id") or "").strip().upper()
+            if desk_id == "ICICI_STOCK_OPTIONS" and bool(getattr(config, "ICICI_STOCK_OPTIONS_PAUSED", False)):
+                return False
+            allowed = {
+                x.strip().upper()
+                for x in str(getattr(config, "ICICI_INDEX_UNDERLYINGS", "") or "").replace(";", ",").split(",")
+                if x.strip()
+            }
+            if bool(getattr(config, "ICICI_INDEX_OPTIONS_FROM_CONFIG_ONLY", False)):
+                if desk_id != "ICICI_INDEX_OPTIONS" or (allowed and str(inst.asset_id).upper() not in allowed):
+                    return False
             return bool(
                 getattr(config, "ICICI_OPTIONS_RUNTIME_ENABLED", True)
                 and getattr(inst, "asset_class", None).value == "option"

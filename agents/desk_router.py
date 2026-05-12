@@ -89,7 +89,10 @@ class InstitutionalDeskRouter:
             "US_STOCK_DERIVATIVES": int(_cfg("DESK_US_STOCK_DERIVATIVES_MAX_ACTIVE", 2)),
             "COMMODITIES_GLOBAL": int(_cfg("DESK_COMMODITIES_GLOBAL_MAX_ACTIVE", 2)),
             "ICICI_INDEX_OPTIONS": int(_cfg("DESK_ICICI_INDEX_OPTIONS_MAX_ACTIVE", 4)),
-            "ICICI_STOCK_OPTIONS": int(_cfg("DESK_ICICI_STOCK_OPTIONS_MAX_ACTIVE", 6)),
+            "ICICI_STOCK_OPTIONS": (
+                0 if bool(_cfg("ICICI_STOCK_OPTIONS_PAUSED", False))
+                else int(_cfg("DESK_ICICI_STOCK_OPTIONS_MAX_ACTIVE", 6))
+            ),
         }
         self.default_quotas.update(configured)
         self.default_min_score = float(_cfg("DYNAMIC_DESK_MIN_SCORE", 0.38))

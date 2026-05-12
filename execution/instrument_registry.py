@@ -38,6 +38,92 @@ def _safe_int(v, default: int = 0) -> int:
         return default
 
 
+def _config(name: str, default: Any = None) -> Any:
+    try:
+        import config as _cfg_mod  # type: ignore
+        return getattr(_cfg_mod, name, default)
+    except Exception:
+        return default
+
+
+def _csv_symbols(raw: Any) -> set[str]:
+    if isinstance(raw, str):
+        values = raw.replace(";", ",").split(",")
+    elif raw is None:
+        values = []
+    else:
+        values = list(raw)
+    return {normalise_symbol(str(x)) for x in values if normalise_symbol(str(x))}
+
+
+def _csv_symbol_list(raw: Any) -> list[str]:
+    if isinstance(raw, str):
+        values = raw.replace(";", ",").split(",")
+    elif raw is None:
+        values = []
+    else:
+        values = list(raw)
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        sym = normalise_symbol(str(value))
+        if sym and sym not in seen:
+            out.append(sym)
+            seen.add(sym)
+    return out
+
+
+def _configured_icici_index_underlying_list() -> list[str]:
+    return _csv_symbol_list(_config("ICICI_INDEX_UNDERLYINGS", ""))
+
+
+def _configured_icici_index_underlyings() -> set[str]:
+    return set(_configured_icici_index_underlying_list())
+
+
+def _configured_hyperliquid_equity_symbols() -> set[str]:
+    return _csv_symbols(_config("HYPERLIQUID_EQUITY_SYMBOLS", ""))
+
+
+def _configured_icici_breeze_code(underlying: str) -> str:
+    key = normalise_symbol(underlying)
+    raw = _config("ICICI_INDEX_BREEZE_STOCK_CODE_BY_UNDERLYING", {})
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if normalise_symbol(str(k)) == key and normalise_symbol(str(v)):
+                return normalise_symbol(str(v))
+    return key
+
+
+def _configured_icici_index_instruments() -> Dict[str, ExchangeInstrument]:
+    out: Dict[str, ExchangeInstrument] = {}
+    for priority, underlying in enumerate(_configured_icici_index_underlying_list(), 1):
+        raw = build_underlying_payload(underlying, "ICICI_INDEX_OPTIONS", [])
+        raw["underlying_display"] = underlying
+        raw["breeze_stock_code"] = _configured_icici_breeze_code(underlying)
+        raw["chain_source"] = "configured_index"
+        raw["chain_candidates_deferred"] = True
+        ei = ExchangeInstrument(
+            exchange=ExchangeName.ICICI,
+            symbol=underlying,
+            ws_symbol=underlying,
+            display_symbol=underlying,
+            asset_id=underlying,
+            asset_class=AssetClass.OPTION,
+            product_id=None,
+            quote_asset="INR",
+            base_asset=underlying,
+            contract_type="option_chain",
+            status="active",
+            tick_size=0.05,
+            lot_step=1.0,
+            min_qty=1.0,
+            raw={**raw, "configured_priority": priority},
+        )
+        out[underlying] = ei
+    return out
+
+
 def _parse_icici_expiry(value: str) -> datetime | None:
     """Parse common ICICI security-master expiry formats without assuming one schema."""
     raw = str(value or "").strip()
@@ -123,15 +209,17 @@ def _select_icici_options_for_runtime(options: list[ExchangeInstrument]) -> list
     underlying chart creates an entry thesis.
     """
     try:
-        import config as _cfg  # type: ignore
-        index_quota = max(0, int(getattr(_cfg, "DESK_ICICI_INDEX_OPTIONS_MAX_ACTIVE", 10)))
-        stock_quota = max(0, int(getattr(_cfg, "DESK_ICICI_STOCK_OPTIONS_MAX_ACTIVE", 10)))
-        min_dte = float(getattr(_cfg, "ICICI_OPTION_MIN_DTE", 2.0))
-        max_dte = float(getattr(_cfg, "ICICI_OPTION_MAX_DTE", 21.0))
+        index_quota = max(0, int(_config("DESK_ICICI_INDEX_OPTIONS_MAX_ACTIVE", 10)))
+        stock_quota = max(0, int(_config("DESK_ICICI_STOCK_OPTIONS_MAX_ACTIVE", 10)))
+        if bool(_config("ICICI_STOCK_OPTIONS_PAUSED", False)):
+            stock_quota = 0
+        min_dte = float(_config("ICICI_OPTION_MIN_DTE", 2.0))
+        max_dte = float(_config("ICICI_OPTION_MAX_DTE", 21.0))
     except Exception:
         index_quota, stock_quota, min_dte, max_dte = 10, 10, 2.0, 21.0
 
     now = datetime.now(timezone.utc)
+    allowed_index_underlyings = _configured_icici_index_underlyings()
     desk_under: dict[str, dict[str, list[ExchangeInstrument]]] = {
         "ICICI_INDEX_OPTIONS": {},
         "ICICI_STOCK_OPTIONS": {},
@@ -155,6 +243,10 @@ def _select_icici_options_for_runtime(options: list[ExchangeInstrument]) -> list
             rejected_bad_metadata += 1
             continue
         desk = _icici_option_desk_id(inst)
+        if desk == "ICICI_STOCK_OPTIONS" and stock_quota <= 0:
+            continue
+        if desk == "ICICI_INDEX_OPTIONS" and allowed_index_underlyings and underlying not in allowed_index_underlyings:
+            continue
         desk_under.setdefault(desk, {}).setdefault(underlying, []).append(inst)
 
     selected_underlyings: list[ExchangeInstrument] = []
@@ -185,6 +277,8 @@ def _select_icici_options_for_runtime(options: list[ExchangeInstrument]) -> list
             # that underlying remains attached for later option selection.
             raw = build_underlying_payload(underlying, desk, rows)
             raw["underlying_chain_quality_score"] = quality
+            raw["underlying_display"] = normalise_symbol(underlying)
+            raw["breeze_stock_code"] = _configured_icici_breeze_code(underlying)
             sample = rows[0]
             ei = ExchangeInstrument(
                 exchange=ExchangeName.ICICI,
@@ -315,6 +409,33 @@ def _is_delta_tokenised_equity(symbol: str, base: str, row: dict) -> bool:
         return True
     text = normalise_symbol(" ".join(str(v) for v in (row or {}).values() if not isinstance(v, (dict, list))))
     return any(tag in text for tag in ("XSTOCK", "TOKENIZEDSTOCK", "STOCK", "EQUITY", "SHARE"))
+
+
+def _is_hyperliquid_equity_symbol(symbol: str, base: str, row: dict) -> bool:
+    nsym = normalise_symbol(symbol)
+    nbase = normalise_symbol(base)
+    configured = _configured_hyperliquid_equity_symbols()
+    if nsym in configured or nbase in configured:
+        return True
+    text = normalise_symbol(" ".join(str(v) for v in (row or {}).values() if not isinstance(v, (dict, list))))
+    return any(tag in text for tag in ("EQUITY", "STOCK", "SHARE", "XSTOCK", "ETF"))
+
+
+def _infer_hyperliquid_asset(symbol: str, base: str, row: dict) -> tuple[str, AssetClass]:
+    fam = _commodity_family_from_symbol(symbol, base)
+    if fam:
+        return normalise_symbol(fam.upper()), AssetClass.COMMODITY
+    if _is_hyperliquid_equity_symbol(symbol, base, row):
+        return normalise_symbol(base or symbol), AssetClass.EQUITY
+    return normalise_symbol(base or symbol), AssetClass.CRYPTO
+
+
+def _asset_class_specificity(ac: AssetClass) -> int:
+    if ac in (AssetClass.EQUITY, AssetClass.COMMODITY, AssetClass.INDEX, AssetClass.OPTION, AssetClass.CASH):
+        return 3
+    if ac == AssetClass.FUTURE:
+        return 2
+    return 1
 
 
 def _asset_default_max_leverage(asset_class: AssetClass) -> float:
@@ -659,10 +780,13 @@ class InstrumentRegistry:
             resp = api.get_products()
             rows = _unwrap_list(resp)
             for p in rows:
-                sym = normalise_symbol(p.get("symbol") or p.get("name") or "")
-                if not sym or sym.startswith("#"):
+                raw_symbol = str(p.get("symbol") or p.get("name") or "").strip()
+                sym_key = normalise_symbol(raw_symbol)
+                if not raw_symbol or sym_key.startswith("#"):
                     continue
-                base = normalise_symbol(p.get("base") or sym)
+                raw_base = str(p.get("base") or raw_symbol).strip()
+                base_key = normalise_symbol(raw_base)
+                asset_id, asset_class = _infer_hyperliquid_asset(raw_symbol, raw_base, p)
                 sz_dec = _safe_int(p.get("szDecimals"), 4)
                 lot_step = 10 ** (-max(0, min(8, sz_dec)))
                 try:
@@ -672,22 +796,22 @@ class InstrumentRegistry:
                     default_lev = 40.0
                 ei = ExchangeInstrument(
                     exchange=ExchangeName.HYPERLIQUID,
-                    symbol=sym,
-                    ws_symbol=sym,
-                    display_symbol=f"{sym}-PERP",
-                    asset_id=base,
-                    asset_class=AssetClass.CRYPTO,
+                    symbol=raw_symbol,
+                    ws_symbol=raw_symbol,
+                    display_symbol=f"{raw_symbol}-PERP",
+                    asset_id=asset_id or base_key or sym_key,
+                    asset_class=asset_class,
                     quote_asset=str(p.get("quote") or "USDC"),
-                    base_asset=base,
+                    base_asset=base_key or sym_key,
                     contract_type="perpetual_futures",
                     status=str(p.get("status") or "active"),
                     tick_size=first_positive(_safe_float(p.get("tick_size")), 0.01),
                     lot_step=lot_step,
                     min_qty=lot_step,
                     max_leverage=first_positive(_safe_float(p.get("maxLeverage")), _safe_float(p.get("max_leverage")), _safe_float(default_lev)),
-                    raw=p,
+                    raw={**p, "_asset_class_source": "hyperliquid_taxonomy"},
                 )
-                out[sym] = ei
+                out[sym_key] = ei
         except Exception as e:
             logger.warning("Hyperliquid product discovery failed: %s", e, exc_info=True)
         self.hyperliquid = out
@@ -814,13 +938,24 @@ class InstrumentRegistry:
 
     def load_icici(self, api, *, security_master_url: str | None = None) -> Dict[str, ExchangeInstrument]:
         out: Dict[str, ExchangeInstrument] = {}
-        if api is None or not hasattr(api, "get_security_master_rows"):
+        if api is None:
+            self.icici = out
+            return out
+        if bool(_config("ICICI_INDEX_OPTIONS_FROM_CONFIG_ONLY", False)):
+            out = _configured_icici_index_instruments()
+            logger.info(
+                "ICICI configured-index discovery active: underlyings=%s; security master scan skipped",
+                ",".join(out.keys()) or "none",
+            )
+            self.icici = out
+            return out
+        if not hasattr(api, "get_security_master_rows"):
             self.icici = out
             return out
         try:
             try:
-                import config as _config  # type: ignore
-                cache_path = getattr(_config, "ICICI_SECURITY_MASTER_CACHE_PATH", None)
+                import config as _cfg_mod  # type: ignore
+                cache_path = getattr(_cfg_mod, "ICICI_SECURITY_MASTER_CACHE_PATH", None)
             except Exception:
                 cache_path = None
             try:
@@ -921,6 +1056,28 @@ class InstrumentRegistry:
                 if bool(getattr(__import__('config'), 'ICICI_OPTION_REJECT_STRUCTURAL_UNDERLYING', True)) and (not nstock or nstock in structural):
                     icici_reject_structural += 1
                     logger.debug("ICICI option rejected corrupt structural underlying=%s ex=%s symbol=%s product=%s", stock, ex_code, symbol_for_underlying, product)
+                    continue
+                desk_id = _icici_option_desk_id(ExchangeInstrument(
+                    exchange=ExchangeName.ICICI,
+                    symbol=symbol_for_underlying,
+                    ws_symbol=symbol_for_underlying,
+                    display_symbol=symbol_for_underlying,
+                    asset_id=nstock,
+                    asset_class=AssetClass.OPTION,
+                    raw={
+                        "stock_code": nstock,
+                        "exchange_code": ex_code,
+                        "product_type": product,
+                        "option_kind": _icici_option_kind(r, ex_code, product),
+                    },
+                ))
+                if desk_id == "ICICI_STOCK_OPTIONS" and (
+                    bool(_config("ICICI_STOCK_OPTIONS_PAUSED", False))
+                    or int(_config("DESK_ICICI_STOCK_OPTIONS_MAX_ACTIVE", 0) or 0) <= 0
+                ):
+                    continue
+                allowed_index_underlyings = _configured_icici_index_underlyings()
+                if desk_id == "ICICI_INDEX_OPTIONS" and allowed_index_underlyings and nstock not in allowed_index_underlyings:
                     continue
             if _icici_options_only and ac != AssetClass.OPTION:
                 # Indian-market mandate: only listed options are eligible for the
@@ -1205,7 +1362,7 @@ class InstrumentRegistry:
             if not by_ex:
                 self.report.unavailable[intent.asset_id] = "not present in live Hyperliquid/Delta/CoinSwitch catalog; not traded"
                 continue
-            primary = self.execution_preference if self.execution_preference in by_ex else next(iter(by_ex.keys()))
+            primary = self._choose_primary(intent.asset_id, intent.asset_class, by_ex)
             if require_primary and self.execution_preference not in by_ex:
                 pass
             matched.append(TradableInstrument(
@@ -1265,13 +1422,20 @@ class InstrumentRegistry:
                 priority = intent.priority if intent else 10_000
                 display = intent.display_name if intent else _display_name_for(effective, asset_id)
                 ac = intent.asset_class if intent else effective.asset_class
-                if prev is None or priority < prev[2]:
+                if (
+                    prev is None
+                    or priority < prev[2]
+                    or (
+                        priority == prev[2]
+                        and _asset_class_specificity(ac) > _asset_class_specificity(prev[1])
+                    )
+                ):
                     meta[asset_id] = (display, ac, priority)
 
         out: List[TradableInstrument] = []
         for asset_id, by_ex in grouped.items():
-            primary = self.execution_preference if self.execution_preference in by_ex else next(iter(by_ex.keys()))
             display, ac, priority = meta.get(asset_id, (asset_id, next(iter(by_ex.values())).asset_class, 10_000))
+            primary = self._choose_primary(asset_id, ac, by_ex)
             out.append(TradableInstrument(
                 asset_id=asset_id,
                 display_name=display,
@@ -1281,6 +1445,23 @@ class InstrumentRegistry:
                 priority=priority,
             ))
         return out
+
+    def _choose_primary(
+        self,
+        asset_id: str,
+        asset_class: AssetClass,
+        by_ex: Dict[ExchangeName, ExchangeInstrument],
+    ) -> ExchangeName:
+        if ExchangeName.HYPERLIQUID in by_ex:
+            pref = _parse_csv_set(_config("HYPERLIQUID_PRIMARY_ASSET_CLASSES", "btc,commodity,equity"))
+            aid = normalise_symbol(asset_id)
+            if "all" in pref:
+                return ExchangeName.HYPERLIQUID
+            if "btc" in pref and aid in {"BTC", "BTCUSD", "BTCUSDT", "BTCUSDC"}:
+                return ExchangeName.HYPERLIQUID
+            if str(asset_class.value).lower() in pref:
+                return ExchangeName.HYPERLIQUID
+        return self.execution_preference if self.execution_preference in by_ex else next(iter(by_ex.keys()))
 
     def _match_one(self, catalog: Dict[str, ExchangeInstrument], aliases) -> Optional[ExchangeInstrument]:
         # exact match first, preserving configured alias priority

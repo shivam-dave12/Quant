@@ -21,7 +21,7 @@ except Exception:  # pragma: no cover
 from .api import BreezeRestClient
 from .market_session import icici_market_session_state
 from .rate_limiter import breeze_throttle
-from agents.icici_chain_architect import is_chain_instrument, select_contract_for_thesis, apply_contract_choice
+from agents.icici_chain_architect import chain_quality, is_chain_instrument, select_contract_for_thesis, apply_contract_choice
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +53,59 @@ class ICICIOptionDataManager:
     def _is_chain_mode(self) -> bool:
         return is_chain_instrument(self.instrument)
 
+    def _hydrate_chain_candidates(self) -> None:
+        raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
+        if not isinstance(raw, dict) or raw.get("chain_candidates"):
+            return
+        if not raw.get("chain_candidates_deferred"):
+            return
+        stock_code = str(raw.get("breeze_stock_code") or raw.get("stock_code") or getattr(self.instrument, "asset_id", "")).upper()
+        exchange_code = str(raw.get("exchange_code") or "NFO").upper()
+        if not stock_code:
+            return
+        try:
+            self.api.preflight_session()
+            breeze_throttle(f"option_chain:{stock_code}")
+            resp = self.api.get_option_chain_quotes(
+                stock_code=stock_code,
+                exchange_code=exchange_code,
+                product_type="options",
+            )
+            rows = self._chain_rows(resp)
+        except Exception as exc:
+            logger.warning("ICICI deferred option-chain fetch failed for %s: %s", stock_code, exc)
+            return
+        candidates: list[dict[str, Any]] = []
+        underlying = str(raw.get("underlying") or getattr(self.instrument, "asset_id", "")).upper()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            candidate = dict(row)
+            candidate.setdefault("stock_code", underlying or stock_code)
+            candidate.setdefault("exchange_code", exchange_code)
+            candidate.setdefault("product_type", "options")
+            candidates.append(candidate)
+        if not candidates:
+            logger.warning("ICICI deferred option-chain fetch returned no candidates for %s", stock_code)
+            return
+        raw["chain_candidates"] = candidates
+        raw["chain_candidates_deferred"] = False
+        raw["chain_quality"] = chain_quality(candidates)
+        logger.info("ICICI deferred option-chain hydrated for %s: rows=%d", stock_code, len(candidates))
+
+    @staticmethod
+    def _chain_rows(resp: Dict[str, Any]) -> list[Any]:
+        rows = resp.get("Success") or resp.get("data") or resp.get("result") or [] if isinstance(resp, dict) else []
+        if isinstance(rows, dict):
+            for key in ("data", "candles", "option_chain", "OptionChain", "records"):
+                value = rows.get(key)
+                if isinstance(value, list):
+                    return value
+            rows = list(rows.values())
+        return rows if isinstance(rows, list) else []
+
     def select_contract_for_thesis(self, thesis_side: str, underlying_spot: float = 0.0):
+        self._hydrate_chain_candidates()
         choice = select_contract_for_thesis(self.instrument, thesis_side, underlying_spot=underlying_spot)
         if choice is None:
             logger.warning("ICICI option-chain selector found no contract for %s thesis=%s", getattr(self.instrument, "asset_id", "?"), thesis_side)
@@ -223,11 +275,56 @@ class ICICIOptionDataManager:
             if c <= 0:
                 continue
             ts = r.get("datetime") or r.get("date") or r.get("time") or time.time()
-            parsed.append({"timestamp": ts, "open": o or c, "high": h or c, "low": l or c, "close": c, "volume": v})
+            ts_ms = self._parse_ts_ms(ts)
+            high = max(float(h or c), float(o or c), float(c))
+            low = min(float(l or c), float(o or c), float(c))
+            parsed.append({
+                "t": ts_ms,
+                "o": float(o or c),
+                "h": high,
+                "l": low,
+                "c": float(c),
+                "v": float(v or 0.0),
+                "timestamp": ts_ms / 1000.0,
+                "open": float(o or c),
+                "high": high,
+                "low": low,
+                "close": float(c),
+                "volume": float(v or 0.0),
+            })
         if parsed:
             with self._lock:
                 self._candles[timeframe].clear(); self._candles[timeframe].extend(parsed[-600:])
                 self._last_price = float(parsed[-1]["close"])
+
+    @staticmethod
+    def _parse_ts_ms(value: Any) -> int:
+        if isinstance(value, (int, float)):
+            f = float(value)
+            return int(f * 1000) if f < 1e12 else int(f)
+        text = str(value or "").strip()
+        if not text:
+            return int(time.time() * 1000)
+        try:
+            f = float(text)
+            return int(f * 1000) if f < 1e12 else int(f)
+        except Exception:
+            pass
+        for fmt in (
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%d %H:%M:%S",
+            "%d-%b-%Y %H:%M:%S",
+            "%Y-%m-%d",
+        ):
+            try:
+                return int(datetime.strptime(text, fmt).replace(tzinfo=timezone.utc).timestamp() * 1000)
+            except Exception:
+                pass
+        try:
+            return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp() * 1000)
+        except Exception:
+            return int(time.time() * 1000)
 
     def _refresh_quote(self) -> None:
         raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}

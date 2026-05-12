@@ -64,6 +64,7 @@ import logging
 import threading
 import time
 from collections import deque
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -94,6 +95,77 @@ def _norm_levels(raw_levels: list) -> list:
         except Exception:
             continue
     return result
+
+
+def _num(value, default: float = 0.0) -> float:
+    try:
+        f = float(value)
+        return f if f == f else default
+    except Exception:
+        return default
+
+
+def _ts_ms(value) -> int:
+    if isinstance(value, (int, float)):
+        f = float(value)
+        return int(f * 1000) if f < 1e12 else int(f)
+    text = str(value or "").strip()
+    if not text:
+        return int(time.time() * 1000)
+    try:
+        f = float(text)
+        return int(f * 1000) if f < 1e12 else int(f)
+    except Exception:
+        pass
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%d %H:%M:%S",
+        "%d-%b-%Y %H:%M:%S",
+        "%Y-%m-%d",
+    ):
+        try:
+            return int(datetime.strptime(text, fmt).replace(tzinfo=timezone.utc).timestamp() * 1000)
+        except Exception:
+            pass
+    try:
+        return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp() * 1000)
+    except Exception:
+        return int(time.time() * 1000)
+
+
+def _normalise_candles(rows: list) -> list:
+    out = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        c = _num(row.get("c", row.get("close", row.get("Close"))))
+        if c <= 0:
+            continue
+        o = _num(row.get("o", row.get("open", row.get("Open"))), c) or c
+        h = _num(row.get("h", row.get("high", row.get("High"))), c) or c
+        l = _num(row.get("l", row.get("low", row.get("Low"))), c) or c
+        v = _num(row.get("v", row.get("volume", row.get("Volume"))), 0.0)
+        high = max(h, o, c)
+        low = min(l, o, c)
+        t = _ts_ms(row.get("t", row.get("timestamp", row.get("datetime", row.get("date", row.get("time"))))))
+        normalised = dict(row)
+        normalised.update({
+            "t": t,
+            "o": float(o),
+            "h": float(high),
+            "l": float(low),
+            "c": float(c),
+            "v": float(v),
+            "timestamp": t / 1000.0,
+            "open": float(o),
+            "high": float(high),
+            "low": float(low),
+            "close": float(c),
+            "volume": float(v),
+        })
+        out.append(normalised)
+    return out
 
 
 class MarketAggregator:
@@ -366,11 +438,11 @@ class MarketAggregator:
         # while price/orderbook/execution remain on the option contract.  Other
         # venues use primary executable candles exactly as before.
         if self._analysis is not None:
-            return self._analysis.get_candles(timeframe, limit)
-        return self._primary.get_candles(timeframe, limit)
+            return _normalise_candles(self._analysis.get_candles(timeframe, limit))
+        return _normalise_candles(self._primary.get_candles(timeframe, limit))
 
     def get_execution_candles(self, timeframe: str = "5m", limit: int = 100) -> List[Dict]:
-        return self._primary.get_candles(timeframe, limit)
+        return _normalise_candles(self._primary.get_candles(timeframe, limit))
 
     # ── Price — weighted average (display only) ────────────────────────────
 

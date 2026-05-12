@@ -9,6 +9,7 @@ call/put option contract.
 from __future__ import annotations
 
 import logging
+import base64
 import threading
 import time
 from collections import deque
@@ -39,6 +40,8 @@ class ICICIUnderlyingDataManager:
         self._trades: deque = deque(maxlen=100)
         self.is_ready = False
         self._strategy_ref = None
+        self._sio = None
+        self._stream_script = ""
         logger.info(
             "ICICIUnderlyingDataManager initialised [%s -> underlying=%s]",
             getattr(instrument, "asset_id", "ICICI"),
@@ -54,6 +57,8 @@ class ICICIUnderlyingDataManager:
             self._warmup()
             min_bars = int(_cfg("ICICI_UNDERLYING_MIN_READY_1M_BARS", 20))
             self.is_ready = len(self._candles.get("1m", ())) >= min_bars or len(self._candles.get("5m", ())) >= min_bars
+            if self.is_ready:
+                self._start_websocket()
             if not self.is_ready:
                 logger.warning(
                     "ICICI underlying chart not ready for %s: %s",
@@ -81,6 +86,12 @@ class ICICIUnderlyingDataManager:
             logger.warning("ICICI closed-market underlying warmup failed for %s: %s", getattr(self.instrument, "asset_id", "?"), exc)
 
     def stop(self) -> None:
+        try:
+            if self._sio is not None:
+                self._sio.disconnect()
+        except Exception:
+            pass
+        self._sio = None
         return None
 
     def restart_streams(self) -> bool:
@@ -93,7 +104,19 @@ class ICICIUnderlyingDataManager:
 
     def _underlying_code(self) -> str:
         raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
-        return str(raw.get("underlying") or raw.get("Underlying") or raw.get("stock_code") or raw.get("ShortName") or getattr(self.instrument, "asset_id", "")).upper()
+        return str(
+            raw.get("breeze_stock_code")
+            or raw.get("underlying_stock_code")
+            or raw.get("stock_code")
+            or raw.get("ShortName")
+            or raw.get("underlying")
+            or raw.get("Underlying")
+            or getattr(self.instrument, "asset_id", "")
+        ).upper()
+
+    def _display_underlying(self) -> str:
+        raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
+        return str(raw.get("underlying_display") or raw.get("underlying") or getattr(self.instrument, "asset_id", "")).upper()
 
     def _underlying_exchange(self) -> str:
         raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
@@ -114,9 +137,17 @@ class ICICIUnderlyingDataManager:
                 logger.debug("ICICI underlying historical warmup %s failed for %s: %s", tf, self._underlying_code(), exc)
 
     def _load_historical(self, timeframe: str) -> None:
-        interval = {"1m": "minute", "5m": "5minute", "15m": "5minute", "1h": "30minute", "4h": "day", "1d": "day"}.get(timeframe, "minute")
+        source = {
+            "1m": ("minute", 1),
+            "5m": ("5minute", 5),
+            "15m": ("5minute", 15),
+            "1h": ("30minute", 60),
+            "4h": ("30minute", 240),
+            "1d": ("day", 1440),
+        }.get(timeframe, ("minute", 1))
+        interval, target_minutes = source
         to_dt = datetime.now(timezone.utc)
-        from_dt = to_dt - timedelta(days=7 if timeframe in {"1m", "5m", "15m"} else 90)
+        from_dt = to_dt - timedelta(days=7 if timeframe in {"1m", "5m", "15m"} else 45 if timeframe in {"1h", "4h"} else 180)
         base_req = {
             "interval": interval,
             "from_date": from_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
@@ -151,10 +182,11 @@ class ICICIUnderlyingDataManager:
             except Exception:
                 rows = []
         parsed = self._parse_rows(rows)
+        parsed = self._resample(parsed, target_minutes) if target_minutes not in (1, 5, 1440) else parsed
         if parsed:
             with self._lock:
                 self._candles[timeframe].clear(); self._candles[timeframe].extend(parsed[-800:])
-                self._last_price = float(parsed[-1]["close"])
+                self._last_price = float(parsed[-1]["c"])
                 self._last_quote_ts = time.time()
 
     @staticmethod
@@ -177,8 +209,158 @@ class ICICIUnderlyingDataManager:
             l = self._float_first(r, ("low", "Low")) or c
             v = self._float_first(r, ("volume", "Volume"))
             ts = r.get("datetime") or r.get("date") or r.get("time") or time.time()
-            parsed.append({"timestamp": ts, "open": o, "high": h, "low": l, "close": c, "volume": v})
-        return parsed
+            parsed.append(self._canonical_candle(ts, o, h, l, c, v))
+        return sorted(parsed, key=lambda x: int(x.get("t", 0) or 0))
+
+    @classmethod
+    def _canonical_candle(cls, ts: Any, o: float, h: float, l: float, c: float, v: float = 0.0) -> Dict[str, Any]:
+        ts_ms = cls._parse_ts_ms(ts)
+        high = max(float(h or c), float(o or c), float(c or 0.0))
+        low = min(float(l or c), float(o or c), float(c or 0.0))
+        return {
+            "t": ts_ms, "o": float(o or c), "h": high, "l": low, "c": float(c), "v": float(v or 0.0),
+            "timestamp": ts_ms / 1000.0, "open": float(o or c), "high": high, "low": low, "close": float(c), "volume": float(v or 0.0),
+        }
+
+    @staticmethod
+    def _parse_ts_ms(value: Any) -> int:
+        if isinstance(value, (int, float)):
+            f = float(value)
+            return int(f * 1000) if f < 1e12 else int(f)
+        text = str(value or "").strip()
+        if not text:
+            return int(time.time() * 1000)
+        for fmt in (
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%d %H:%M:%S",
+            "%d-%b-%Y %H:%M:%S",
+            "%Y-%m-%d",
+        ):
+            try:
+                return int(datetime.strptime(text, fmt).replace(tzinfo=timezone.utc).timestamp() * 1000)
+            except Exception:
+                pass
+        try:
+            return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp() * 1000)
+        except Exception:
+            return int(time.time() * 1000)
+
+    @staticmethod
+    def _resample(rows: List[Dict[str, Any]], target_minutes: int) -> List[Dict[str, Any]]:
+        if not rows or target_minutes <= 0:
+            return rows
+        bucket_ms = target_minutes * 60 * 1000
+        buckets: Dict[int, List[Dict[str, Any]]] = {}
+        for row in rows:
+            ts = int(row.get("t", 0) or 0)
+            if ts <= 0:
+                continue
+            buckets.setdefault((ts // bucket_ms) * bucket_ms, []).append(row)
+        out: List[Dict[str, Any]] = []
+        for bucket in sorted(buckets):
+            chunk = sorted(buckets[bucket], key=lambda x: int(x.get("t", 0) or 0))
+            if not chunk:
+                continue
+            out.append({
+                "t": bucket,
+                "o": float(chunk[0]["o"]),
+                "h": max(float(x["h"]) for x in chunk),
+                "l": min(float(x["l"]) for x in chunk),
+                "c": float(chunk[-1]["c"]),
+                "v": sum(float(x.get("v", 0.0) or 0.0) for x in chunk),
+                "timestamp": bucket / 1000.0,
+                "open": float(chunk[0]["o"]),
+                "high": max(float(x["h"]) for x in chunk),
+                "low": min(float(x["l"]) for x in chunk),
+                "close": float(chunk[-1]["c"]),
+                "volume": sum(float(x.get("v", 0.0) or 0.0) for x in chunk),
+            })
+        return out
+
+    def _start_websocket(self) -> None:
+        if not bool(_cfg("ICICI_INDEX_STREAM_ENABLED", True)):
+            return
+        script_code = self._stream_script_code()
+        if not script_code:
+            if bool(_cfg("ICICI_INDEX_WEBSOCKET_REQUIRED", False)):
+                logger.warning("ICICI underlying websocket script code missing for %s", self._display_underlying())
+            return
+        if self._sio is not None:
+            return
+        try:
+            import socketio  # type: ignore
+            session = self.api.auth.get_session(force_refresh=False)
+            user_id, token = base64.b64decode(session.session_token.encode("ascii")).decode("ascii").split(":", 1)
+            sio = socketio.Client(logger=False, engineio_logger=False, reconnection=True)
+
+            def _handle(data):
+                self._on_stream_candle(data)
+
+            for channel in self._stream_channels():
+                sio.on(channel, _handle)
+            sio.connect(
+                "https://breezeapi.icicidirect.com",
+                headers={"User-Agent": "python-socketio[client]/socket"},
+                auth={"user": user_id, "token": token},
+                transports=["websocket"],
+                socketio_path="ohlcvstream",
+                wait_timeout=5,
+            )
+            sio.emit("join", script_code)
+            self._sio = sio
+            self._stream_script = script_code
+            logger.info("ICICI underlying websocket live for %s script=%s channels=%s", self._display_underlying(), script_code, ",".join(self._stream_channels()))
+        except Exception as exc:
+            logger.warning("ICICI underlying websocket unavailable for %s: %s; REST warmup remains active", self._display_underlying(), exc)
+
+    def _stream_channels(self) -> list[str]:
+        raw = str(_cfg("ICICI_INDEX_STREAM_CHANNELS", "1MIN,5MIN") or "")
+        return [x.strip().upper() for x in raw.replace(";", ",").split(",") if x.strip()]
+
+    def _stream_script_code(self) -> str:
+        raw = _cfg("ICICI_INDEX_STREAM_SCRIPT_CODES", {})
+        keys = {self._display_underlying(), self._underlying_code(), str(getattr(self.instrument, "asset_id", "")).upper()}
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                if str(k).upper() in keys and str(v or "").strip():
+                    return str(v).strip()
+        return ""
+
+    def _on_stream_candle(self, data: Any) -> None:
+        try:
+            row = data[0] if isinstance(data, list) and data and isinstance(data[0], (list, tuple, dict)) else data
+            if isinstance(row, dict):
+                c = self._float_first(row, ("close", "Close", "c"))
+                o = self._float_first(row, ("open", "Open", "o")) or c
+                h = self._float_first(row, ("high", "High", "h")) or c
+                l = self._float_first(row, ("low", "Low", "l")) or c
+                v = self._float_first(row, ("volume", "Volume", "v"))
+                ts = row.get("datetime") or row.get("time") or row.get("t") or time.time()
+                interval = str(row.get("interval") or row.get("Interval") or "").upper()
+            elif isinstance(row, (list, tuple)) and len(row) >= 9:
+                # ICICI StreamLiveOHLCV positional payload:
+                # exchange, stock, low, high, open, close, volume, datetime, interval.
+                l = self._num(row[2]); h = self._num(row[3]); o = self._num(row[4]); c = self._num(row[5]); v = self._num(row[6])
+                ts = row[7]; interval = str(row[8] or "").upper()
+            else:
+                return
+            if c <= 0:
+                return
+            tf = "1m" if "1" in interval else "5m" if "5" in interval else ""
+            if not tf:
+                return
+            candle = self._canonical_candle(ts, o, h, l, c, v)
+            with self._lock:
+                target = self._candles[tf]
+                if target and int(target[-1].get("t", 0)) == int(candle["t"]):
+                    target[-1] = candle
+                else:
+                    target.append(candle)
+                self._last_price = float(candle["c"])
+                self._last_quote_ts = time.time()
+        except Exception:
+            return
 
     def _count_summary(self) -> str:
         with self._lock:
@@ -214,3 +396,10 @@ class ICICIUnderlyingDataManager:
             except Exception:
                 continue
         return 0.0
+
+    @staticmethod
+    def _num(value: Any) -> float:
+        try:
+            return float(value or 0.0)
+        except Exception:
+            return 0.0

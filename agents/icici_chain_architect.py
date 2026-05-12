@@ -124,7 +124,10 @@ def build_underlying_payload(underlying: str, desk_id: str, rows: list[Any]) -> 
 
 def is_chain_instrument(instrument: Any) -> bool:
     raw = getattr(getattr(instrument, "primary", None), "raw", {}) or {}
-    return bool(raw.get("icici_underlying_desk") and raw.get("chain_candidates"))
+    return bool(
+        raw.get("icici_underlying_desk")
+        and str(raw.get("contract_selector_mode") or "").lower() == "post_thesis"
+    )
 
 
 def select_contract_for_thesis(

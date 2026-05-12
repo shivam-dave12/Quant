@@ -3457,6 +3457,51 @@ def test_plain_six_digit_otp_is_accepted_when_icici_waiting():
     assert c._icici_pending_otp == "123456"
 
 
+def test_telegram_id_parser_rejects_malformed_ids_without_throwing():
+    from telegram.controller import _normalise_telegram_id, _parse_telegram_id_csv
+
+    assert _normalise_telegram_id("+001234") == "1234"
+    assert _normalise_telegram_id("-100123") == "-100123"
+    assert _normalise_telegram_id("abc") == ""
+    ids, bad = _parse_telegram_id_csv("123, abc; -100")
+    assert ids == {"123", "-100"}
+    assert bad == ["abc"]
+
+
+def test_telegram_allowed_user_auth_rejects_missing_sender_id_without_crashing(monkeypatch):
+    import threading
+
+    c = object.__new__(TelegramBotController)
+    c.chat_id = "12345"
+    c.last_update_id = 0
+    c.running = False
+    c._icici_otp_cv = threading.Condition()
+    c._icici_pending_otp = None
+    c._icici_waiting_for_otp = False
+    c._icici_renewal_stop = threading.Event()
+    c.clear_old_messages = lambda: None
+    c.set_my_commands = lambda: None
+    c._start_icici_renewal_scheduler = lambda: None
+    c._stop_icici_renewal_scheduler = lambda: None
+    c.send_message = lambda *args, **kwargs: True
+    monkeypatch.setattr(config, "TELEGRAM_ALLOWED_USER_IDS", "98765", raising=False)
+
+    calls = {"n": 0, "handled": False}
+
+    def fake_updates(timeout=10):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return [{"update_id": 1, "message": {"chat": {"id": "12345"}, "text": "/status", "from": {"id": ""}}}]
+        c.running = False
+        return []
+
+    c.get_updates = fake_updates
+    c.handle_command = lambda text: calls.__setitem__("handled", True) or "handled"
+
+    c.start()
+    assert calls["handled"] is False
+
+
 def test_startup_auto_runs_icici_token_generator_with_telegram_otp(monkeypatch):
     c = _controller_stub()
     monkeypatch.setattr(config, "ICICI_AUTO_TOKEN_GENERATOR_ON_STARTUP", True, raising=False)
@@ -3521,9 +3566,9 @@ def test_icici_cash_and_options_are_one_x():
     assert active_policy(cash).margin_pct <= 0.06
 
 
-def test_delta_equity_uses_configured_venue_schedule_when_product_row_omits_cap():
+def test_delta_equity_stays_one_x_when_product_row_omits_cap():
     equity = _inst(ExchangeName.DELTA, AssetClass.EQUITY, max_lev=0, symbol="AAPLXUSD")
-    assert active_policy(equity).leverage == 8  # 25x venue schedule * 32% utilisation
+    assert active_policy(equity).leverage == 1
 
 
 def test_delta_btc_uses_institutional_slice_of_venue_cap():
@@ -4066,6 +4111,89 @@ def test_v107_icici_underlying_chain_desk_is_selectable_without_quote(monkeypatc
     assert row.score >= 0.38
 
 
+def test_v110_icici_configured_index_discovery_skips_security_master(monkeypatch):
+    from execution.instrument_registry import InstrumentRegistry
+
+    class FailingSecurityMasterApi:
+        def get_security_master_rows(self, *args, **kwargs):
+            raise AssertionError("security master should not be scanned")
+
+    monkeypatch.setattr("config.ICICI_INDEX_OPTIONS_FROM_CONFIG_ONLY", True, raising=False)
+    monkeypatch.setattr("config.ICICI_INDEX_UNDERLYINGS", "NIFTY,BANKNIFTY", raising=False)
+    monkeypatch.setattr("config.ICICI_INDEX_BREEZE_STOCK_CODE_BY_UNDERLYING", {"BANKNIFTY": "CNXBAN"}, raising=False)
+
+    out = InstrumentRegistry().load_icici(FailingSecurityMasterApi())
+
+    assert set(out) == {"NIFTY", "BANKNIFTY"}
+    assert out["NIFTY"].raw["icici_underlying_desk"] is True
+    assert out["BANKNIFTY"].raw["breeze_stock_code"] == "CNXBAN"
+    assert out["NIFTY"].raw["chain_candidates_deferred"] is True
+
+
+def test_v110_aggregator_normalises_rest_candles_for_strategy_atr():
+    from aggregator.market_aggregator import MarketAggregator
+    from strategy.quant_strategy import ATREngine
+
+    class RestShapeDM:
+        is_ready = True
+
+        def get_candles(self, timeframe="5m", limit=100):
+            rows = []
+            base = 100.0
+            for i in range(100):
+                close = base + i * 0.5
+                rows.append({
+                    "timestamp": 1_700_000_000 + i * 300,
+                    "open": close - 0.2,
+                    "high": close + 0.4,
+                    "low": close - 0.6,
+                    "close": close,
+                    "volume": 1000 + i,
+                })
+            return rows[-limit:]
+
+    candles = MarketAggregator(RestShapeDM(), None).get_candles("5m", limit=100)
+
+    assert {"t", "o", "h", "l", "c", "v"}.issubset(candles[-1])
+    assert ATREngine().compute(candles) > 0
+
+
+def test_v110_delta_non_crypto_tokens_default_to_one_x_leverage():
+    from core.instruments import AssetClass, ExchangeInstrument, ExchangeName, TradableInstrument
+    from core.market_policy import active_policy
+
+    def inst(asset_id, symbol, asset_class):
+        ei = ExchangeInstrument(
+            ExchangeName.DELTA,
+            symbol,
+            symbol,
+            symbol,
+            asset_id,
+            asset_class,
+            max_leverage=0.0,
+        )
+        return TradableInstrument(asset_id, asset_id, asset_class, ExchangeName.DELTA, {ExchangeName.DELTA: ei})
+
+    assert active_policy(inst("AAPL", "AAPLXUSD", AssetClass.EQUITY)).leverage == 1
+    assert active_policy(inst("GOLD", "XAUTUSD", AssetClass.COMMODITY)).leverage == 1
+    assert active_policy(inst("M", "MUSD", AssetClass.CRYPTO)).leverage == 5
+
+
+def test_v110_paused_icici_stock_options_are_not_runtime_supported(monkeypatch):
+    import orchestration.multi_asset_bot as mb
+    from core.instruments import AssetClass, ExchangeInstrument, ExchangeName, TradableInstrument
+
+    raw = {"icici_underlying_desk": True, "contract_selector_mode": "post_thesis", "desk_id": "ICICI_STOCK_OPTIONS"}
+    ei = ExchangeInstrument(ExchangeName.ICICI, "RELIANCE", "RELIANCE", "RELIANCE", "RELIANCE", AssetClass.OPTION, raw=raw)
+    inst = TradableInstrument("RELIANCE", "RELIANCE", AssetClass.OPTION, ExchangeName.ICICI, {ExchangeName.ICICI: ei})
+
+    monkeypatch.setattr("config.ICICI_STOCK_OPTIONS_PAUSED", True, raising=False)
+    monkeypatch.setattr("config.ICICI_OPTIONS_RUNTIME_ENABLED", True, raising=False)
+    monkeypatch.setattr(mb, "ICICIOptionDataManager", object, raising=False)
+
+    assert mb.MultiAssetQuantBot._has_supported_runtime(inst) is False
+
+
 def test_v107_multi_asset_operator_heartbeat_log_path_removed():
     import inspect
 
@@ -4325,3 +4453,114 @@ def test_v109_public_hyperliquid_data_uses_delta_execution_fallback(monkeypatch)
     assert ctx.execution_router.active_exchange == "delta"
     assert isinstance(ctx.data_manager.primary_dm, FakeDM)
     assert isinstance(ctx.data_manager.secondary_dm, FakeDM)
+
+
+def test_v111_hyperliquid_primary_for_btc_commodities_and_us_stocks(monkeypatch):
+    import config
+    from core.instruments import AssetClass, ExchangeName
+    from execution.instrument_registry import InstrumentRegistry
+
+    monkeypatch.setattr(config, "HYPERLIQUID_PRIMARY_ASSET_CLASSES", "btc,commodity,equity", raising=False)
+    monkeypatch.setattr(config, "HYPERLIQUID_EQUITY_SYMBOLS", "AAPL,NVDA,SPY", raising=False)
+
+    class FakeHyperliquid:
+        def get_products(self):
+            return {"success": True, "result": [
+                {"symbol": "BTC", "base": "BTC", "quote": "USDC", "status": "active", "szDecimals": 5, "maxLeverage": 40, "midPx": "80000"},
+                {"symbol": "XAU", "base": "XAU", "quote": "USDC", "status": "active", "szDecimals": 3, "maxLeverage": 20, "midPx": "4700"},
+                {"symbol": "AAPL", "base": "AAPL", "quote": "USDC", "status": "active", "szDecimals": 2, "maxLeverage": 5, "midPx": "300"},
+                {"symbol": "kPEPE", "base": "kPEPE", "quote": "USDC", "status": "active", "szDecimals": 0, "maxLeverage": 10, "midPx": "1.2"},
+            ]}
+
+    class FakeDelta:
+        def get_products(self, contract_types=None):
+            return {"success": True, "result": [
+                {"symbol": "BTCUSD", "underlying_asset": {"symbol": "BTC"}, "quoting_asset": {"symbol": "USD"}, "state": "active", "max_leverage": "100"},
+                {"symbol": "XAUTUSD", "underlying_asset": {"symbol": "XAUT"}, "quoting_asset": {"symbol": "USD"}, "state": "active"},
+                {"symbol": "AAPLXUSD", "underlying_asset": {"symbol": "AAPL"}, "quoting_asset": {"symbol": "USD"}, "state": "active"},
+            ]}
+
+    report = InstrumentRegistry(execution_preference="delta").discover(
+        hyperliquid_api=FakeHyperliquid(),
+        delta_api=FakeDelta(),
+        include_exchanges="hyperliquid,delta",
+        include_asset_classes="crypto,commodity,equity",
+        discovery_mode="dynamic",
+    )
+    by_id = {inst.asset_id: inst for inst in report.matched}
+
+    assert by_id["BTC"].primary_exchange == ExchangeName.HYPERLIQUID
+    assert by_id["GOLD"].asset_class == AssetClass.COMMODITY
+    assert by_id["GOLD"].primary_exchange == ExchangeName.HYPERLIQUID
+    assert by_id["AAPL"].asset_class == AssetClass.EQUITY
+    assert by_id["AAPL"].primary_exchange == ExchangeName.HYPERLIQUID
+    assert by_id["AAPL"].by_exchange[ExchangeName.HYPERLIQUID].symbol == "AAPL"
+    assert by_id["KPEPE"].by_exchange[ExchangeName.HYPERLIQUID].symbol == "kPEPE"
+    assert [inst.asset_id for inst in report.matched].count("AAPL") == 1
+    assert [inst.asset_id for inst in report.matched].count("GOLD") == 1
+
+
+def test_v111_hyperliquid_data_manager_updates_recent_candles_without_duplicates():
+    from core.instruments import AssetClass, ExchangeInstrument, ExchangeName, TradableInstrument
+    from exchanges.hyperliquid.data_manager import HyperliquidDataManager
+
+    ei = ExchangeInstrument(ExchangeName.HYPERLIQUID, "kPEPE", "kPEPE", "kPEPE-PERP", "KPEPE", AssetClass.CRYPTO)
+    inst = TradableInstrument("KPEPE", "kPEPE", AssetClass.CRYPTO, ExchangeName.HYPERLIQUID, {ExchangeName.HYPERLIQUID: ei})
+
+    class FakeAPI:
+        def __init__(self):
+            self.calls = []
+            self.second = False
+
+        def get_candles(self, symbol, interval, start_ms, end_ms):
+            self.calls.append((symbol, interval))
+            if not self.second:
+                return [
+                    {"t": 1_000, "o": "1", "h": "2", "l": "0.8", "c": "1.5", "v": "10"},
+                    {"t": 61_000, "o": "1.5", "h": "1.8", "l": "1.2", "c": "1.6", "v": "11"},
+                ]
+            return [
+                {"t": 61_000, "o": "1.6", "h": "2.1", "l": "1.3", "c": "2.0", "v": "12"},
+                {"t": 121_000, "o": "2.0", "h": "2.3", "l": "1.9", "c": "2.2", "v": "13"},
+            ]
+
+    api = FakeAPI()
+    dm = HyperliquidDataManager(instrument=inst, api=api)
+    dm._warmup("1m")
+    api.second = True
+    dm._refresh_recent_tf("1m")
+    candles = dm.get_candles("1m", 10)
+
+    assert api.calls[0][0] == "kPEPE"
+    assert [c["t"] for c in candles] == [1_000, 61_000, 121_000]
+    assert candles[1]["c"] == 2.0
+    assert {"timestamp", "open", "high", "low", "close", "volume"}.issubset(candles[-1])
+    assert dm.get_last_price() == 2.2
+    assert dm.is_price_fresh()
+
+
+def test_v111_hyperliquid_api_preserves_case_sensitive_symbols():
+    from exchanges.hyperliquid.api import HyperliquidAPI
+
+    class FakeInfo:
+        def __init__(self):
+            self.l2_symbol = None
+            self.candle_symbol = None
+
+        def l2_snapshot(self, symbol):
+            self.l2_symbol = symbol
+            return {"levels": [[], []]}
+
+        def candles_snapshot(self, symbol, interval, start_ms, end_ms):
+            self.candle_symbol = symbol
+            return []
+
+    api = object.__new__(HyperliquidAPI)
+    api.info = FakeInfo()
+    api._throttle = lambda: None
+
+    api.get_l2_book("kPEPE")
+    api.get_candles("kPEPE", "1m", 0, 1)
+
+    assert api.info.l2_symbol == "kPEPE"
+    assert api.info.candle_symbol == "kPEPE"
