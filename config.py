@@ -50,8 +50,9 @@ HYPERLIQUID_SECRET_KEY      = os.getenv("HYPERLIQUID_SECRET_KEY", os.getenv("HL_
 HYPERLIQUID_VAULT_ADDRESS   = os.getenv("HYPERLIQUID_VAULT_ADDRESS", os.getenv("HL_VAULT_ADDRESS", ""))
 COINSWITCH_API_KEY        = os.getenv("COINSWITCH_API_KEY",    "")
 COINSWITCH_SECRET_KEY     = os.getenv("COINSWITCH_SECRET_KEY", "")
-TELEGRAM_BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID          = os.getenv("TELEGRAM_CHAT_ID",   "")
+TELEGRAM_BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID          = os.getenv("TELEGRAM_CHAT_ID",   "").strip()
+TELEGRAM_ALLOWED_USER_IDS = os.getenv("TELEGRAM_ALLOWED_USER_IDS", "").strip()
 
 # Keep imports/test tooling/dashboard safe without live secrets. Live startup and
 # scripts/live_preflight.py enforce credentials through assert_live_ordering_ready().
@@ -77,10 +78,13 @@ DELTA_SYMBOL_MAX_LEVERAGE = {
 }
 DELTA_ASSET_CLASS_MAX_LEVERAGE = {
     "future": 100.0,
-    "crypto": 100.0,
-    "commodity": 50.0,
-    "equity": 25.0,
-    "index": 25.0,
+    "crypto": 25.0,
+    # Tokenised stocks/metals/index products in the current Delta catalogue do
+    # not reliably confirm product-level leverage. Keep them fully funded until
+    # a live product row publishes an explicit max_leverage.
+    "commodity": 1.0,
+    "equity": 1.0,
+    "index": 1.0,
 }
 # Utilisation deliberately uses only a slice of the exchange cap.  Example:
 # BTC cap 200x × 0.20 = 40x target, bounded by MAX_POLICY_LEVERAGE=40.
@@ -90,7 +94,7 @@ DELTA_SYMBOL_LEVERAGE_UTIL = {
     "ETHUSD": 0.28,
     "ETH": 0.28,
 }
-POLICY_CRYPTO_LEVERAGE_UTIL = 0.28
+POLICY_CRYPTO_LEVERAGE_UTIL = 0.20
 POLICY_FUTURE_LEVERAGE_UTIL = 0.28
 POLICY_COMMODITY_LEVERAGE_UTIL = 0.40
 POLICY_EQUITY_LEVERAGE_UTIL = 0.32
@@ -109,6 +113,14 @@ HYPERLIQUID_DEFAULT_MAX_LEVERAGE = 40.0
 HYPERLIQUID_SLIPPAGE = 0.015
 HYPERLIQUID_ENABLED = True
 HYPERLIQUID_POLL_SEC = 2.0
+# Hyperliquid remains live-catalog gated: these taxonomy hints never create
+# instruments by themselves. They only classify and route markets that
+# Hyperliquid returns from metaAndAssetCtxs.
+HYPERLIQUID_PRIMARY_ASSET_CLASSES = "btc,commodity,equity"
+HYPERLIQUID_EQUITY_SYMBOLS = (
+    "AAPL,AMZN,GOOGL,META,MSFT,NVDA,TSLA,COIN,CRCL,HOOD,"
+    "SPY,QQQ,IWM,DIA"
+)
 COINSWITCH_SYMBOL        = "BTCUSDT"
 COINSWITCH_EXCHANGE      = "EXCHANGE_2"
 
@@ -684,23 +696,23 @@ DESK_POSITION_LIMITS_BY_ID = (
     "US_STOCK_DERIVATIVES:1,"
     "COMMODITIES_GLOBAL:1,"
     "ICICI_INDEX_OPTIONS:1,"
-    "ICICI_STOCK_OPTIONS:1"
+    "ICICI_STOCK_OPTIONS:0"
 )
 DESK_CAPITAL_WEIGHT_BY_ID = (
     "BTC_GLOBAL:0.26,"
     "CRYPTO_ALTS:0.22,"
     "US_STOCK_DERIVATIVES:0.16,"
     "COMMODITIES_GLOBAL:0.14,"
-    "ICICI_INDEX_OPTIONS:0.12,"
-    "ICICI_STOCK_OPTIONS:0.10"
+    "ICICI_INDEX_OPTIONS:0.22,"
+    "ICICI_STOCK_OPTIONS:0.00"
 )
 DESK_RISK_WEIGHT_BY_ID = (
     "BTC_GLOBAL:0.28,"
     "CRYPTO_ALTS:0.24,"
     "US_STOCK_DERIVATIVES:0.14,"
     "COMMODITIES_GLOBAL:0.14,"
-    "ICICI_INDEX_OPTIONS:0.12,"
-    "ICICI_STOCK_OPTIONS:0.08"
+    "ICICI_INDEX_OPTIONS:0.20,"
+    "ICICI_STOCK_OPTIONS:0.00"
 )
 
 # Agentic institutional fund runtime.
@@ -810,9 +822,10 @@ ICICI_OPTION_REQUIRE_LIVE_QUOTE = True
 ICICI_OPTION_REJECT_STRUCTURAL_UNDERLYING = True
 ICICI_OPTION_REQUIRE_DERIVATIVE_SEGMENT = True
 ICICI_OPTION_DYNAMIC_DESK_CLASSIFICATION = True
+ICICI_INDEX_OPTIONS_FROM_CONFIG_ONLY = True
 ICICI_OPTION_MIN_DTE = 1.0
 ICICI_OPTION_MAX_DTE = 35.0
-DYNAMIC_DESK_ICICI_QUOTE_PROBES = 40
+DYNAMIC_DESK_ICICI_QUOTE_PROBES = 0
 DELTA_COMMODITY_DYNAMIC_DISCOVERY = True
 
 
@@ -884,7 +897,7 @@ DYNAMIC_DESK_REFRESH_SEC = 180.0
 DYNAMIC_DESK_MIN_RESIDENCY_SEC = 600.0
 DYNAMIC_DESK_DELTA_BULK_TICKERS = True
 DYNAMIC_DESK_ICICI_DETAILS_ENABLED = True
-DYNAMIC_DESK_ICICI_QUOTE_PROBES = 80
+DYNAMIC_DESK_ICICI_QUOTE_PROBES = 0
 DYNAMIC_DESK_ALWAYS_INCLUDE = "BTCUSD,ETHUSD,SOLUSD"
 DYNAMIC_DESK_LOG_TOP_N = 30
 
@@ -910,8 +923,8 @@ DESK_BTC_GLOBAL_MAX_ACTIVE = 1
 DESK_CRYPTO_ALTS_MAX_ACTIVE = 5
 DESK_US_STOCK_DERIVATIVES_MAX_ACTIVE = 32
 DESK_COMMODITIES_GLOBAL_MAX_ACTIVE = 8
-DESK_ICICI_INDEX_OPTIONS_MAX_ACTIVE = 10
-DESK_ICICI_STOCK_OPTIONS_MAX_ACTIVE = 10
+DESK_ICICI_INDEX_OPTIONS_MAX_ACTIVE = 4
+DESK_ICICI_STOCK_OPTIONS_MAX_ACTIVE = 0
 VENUE_ROUTE_PREFERENCE = "hyperliquid,delta,icici,coindcx,coinswitch"
 
 # Stateful selector policy: never churn live contexts just because the desk
@@ -946,6 +959,21 @@ DESK_COINDCX_CRYPTO_MAX_ACTIVE = 0
 # be discovered for reference but are rejected before runtime subscription.
 ICICI_OPTIONS_ONLY = True
 ICICI_OPTIONS_RUNTIME_ENABLED = True
+ICICI_STOCK_OPTIONS_PAUSED = True
+ICICI_INDEX_UNDERLYINGS = "NIFTY,BANKNIFTY,NIFNEX,NIFFIN"
+ICICI_INDEX_BREEZE_STOCK_CODE_BY_UNDERLYING = {
+    "NIFTY": "NIFTY",
+    "BANKNIFTY": "CNXBAN",
+    "NIFNEX": "NIFNEX",
+    "NIFFIN": "NIFFIN",
+}
+ICICI_INDEX_STREAM_ENABLED = True
+ICICI_INDEX_STREAM_CHANNELS = "1MIN,5MIN"
+ICICI_INDEX_STREAM_SCRIPT_CODES = {
+    # ICICI's OHLCV stream docs use this as the NIFTY script example.
+    "NIFTY": "4.1!1594",
+}
+ICICI_INDEX_WEBSOCKET_REQUIRED = False
 
 # ICICI/NSE/BSE live data session guard.  ICICI option chains may be discovered
 # from Security Master anytime, but live quote/candle adapters should start only
