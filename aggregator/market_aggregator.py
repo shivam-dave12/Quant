@@ -461,6 +461,29 @@ class MarketAggregator:
             pass
         return price
 
+    def get_last_update(self) -> float:
+        """Freshest timestamp from the executable feed or analysis feed.
+
+        Universe/CIO uses this to avoid evaluating desks on frozen warmup
+        candles.  ICICI option desks keep executable option selection deferred,
+        so the underlying analysis manager must be allowed to report freshness.
+        """
+        stamps = []
+        for dm in (self._primary, self._analysis, self._secondary if self._secondary_alive else None):
+            if dm is None:
+                continue
+            try:
+                fn = getattr(dm, "get_last_update", None)
+                if callable(fn):
+                    ts = float(fn() or 0.0)
+                else:
+                    ts = float(getattr(dm, "last_update", 0.0) or getattr(dm, "_last_quote_ts", 0.0) or 0.0)
+                if ts > 0:
+                    stamps.append(ts)
+            except Exception:
+                continue
+        return max(stamps) if stamps else 0.0
+
     def get_consensus_price(self) -> float:
         """Weighted cross-venue price for display/diagnostics only."""
         p_price = self._primary.get_last_price()

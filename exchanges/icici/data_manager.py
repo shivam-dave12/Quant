@@ -11,6 +11,12 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover
+    ZoneInfo = None  # type: ignore
+
+_ICICI_LOCAL_TZ = ZoneInfo("Asia/Kolkata") if ZoneInfo is not None else timezone(timedelta(hours=5, minutes=30))
 from typing import Any, Dict, List
 
 try:
@@ -310,21 +316,27 @@ class ICICIOptionDataManager:
             return int(f * 1000) if f < 1e12 else int(f)
         except Exception:
             pass
-        for fmt in (
-            "%Y-%m-%dT%H:%M:%S.%fZ",
-            "%Y-%m-%dT%H:%M:%SZ",
-            "%Y-%m-%d %H:%M:%S",
-            "%d-%b-%Y %H:%M:%S",
-            "%Y-%m-%d",
-        ):
+
+        # Breeze returns many NSE/NFO timestamps without timezone.  These are
+        # exchange-local IST values, not UTC.  Parsing them as UTC makes candles
+        # appear in the future and poisons sweep-age logic.
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
             try:
                 return int(datetime.strptime(text, fmt).replace(tzinfo=timezone.utc).timestamp() * 1000)
             except Exception:
                 pass
         try:
-            return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp() * 1000)
+            iso = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if iso.tzinfo is not None:
+                return int(iso.timestamp() * 1000)
         except Exception:
-            return int(time.time() * 1000)
+            pass
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d-%b-%Y %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return int(datetime.strptime(text, fmt).replace(tzinfo=_ICICI_LOCAL_TZ).timestamp() * 1000)
+            except Exception:
+                pass
+        return int(time.time() * 1000)
 
     def _refresh_quote(self) -> None:
         raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
@@ -349,6 +361,10 @@ class ICICIOptionDataManager:
             self._best_ask = ask
             self._last_quote_ts = now
             self._trades.append({"price": px, "quantity": self._float_first(row, ("quantity", "volume", "total_quantity_traded")), "side": "buy", "timestamp": now, "source": "icici_quote"})
+
+    def get_last_update(self) -> float:
+        with self._lock:
+            return float(self._last_quote_ts or 0.0)
 
     def get_candles(self, timeframe: str = "5m", limit: int = 100) -> List[Dict]:
         with self._lock:

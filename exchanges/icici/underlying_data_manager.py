@@ -14,6 +14,12 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover
+    ZoneInfo = None  # type: ignore
+
+_ICICI_LOCAL_TZ = ZoneInfo("Asia/Kolkata") if ZoneInfo is not None else timezone(timedelta(hours=5, minutes=30))
 from typing import Any, Dict, List
 
 import config
@@ -42,6 +48,7 @@ class ICICIUnderlyingDataManager:
         self._strategy_ref = None
         self._sio = None
         self._stream_script = ""
+        self._last_rest_refresh_attempt = 0.0
         logger.info(
             "ICICIUnderlyingDataManager initialised [%s -> underlying=%s]",
             getattr(instrument, "asset_id", "ICICI"),
@@ -230,21 +237,33 @@ class ICICIUnderlyingDataManager:
         text = str(value or "").strip()
         if not text:
             return int(time.time() * 1000)
-        for fmt in (
-            "%Y-%m-%dT%H:%M:%S.%fZ",
-            "%Y-%m-%dT%H:%M:%SZ",
-            "%Y-%m-%d %H:%M:%S",
-            "%d-%b-%Y %H:%M:%S",
-            "%Y-%m-%d",
-        ):
+        try:
+            f = float(text)
+            return int(f * 1000) if f < 1e12 else int(f)
+        except Exception:
+            pass
+
+        # Breeze often returns timezone-less Indian market timestamps.  Treating
+        # those as UTC pushes NSE/BSE candles 5h30m into the future, which creates
+        # negative sweep ages and stale/future liquidity events.  Explicit `Z` or
+        # offset-bearing strings remain UTC/offset-aware; naive strings are IST.
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
             try:
                 return int(datetime.strptime(text, fmt).replace(tzinfo=timezone.utc).timestamp() * 1000)
             except Exception:
                 pass
         try:
-            return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp() * 1000)
+            iso = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if iso.tzinfo is not None:
+                return int(iso.timestamp() * 1000)
         except Exception:
-            return int(time.time() * 1000)
+            pass
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d-%b-%Y %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return int(datetime.strptime(text, fmt).replace(tzinfo=_ICICI_LOCAL_TZ).timestamp() * 1000)
+            except Exception:
+                pass
+        return int(time.time() * 1000)
 
     @staticmethod
     def _resample(rows: List[Dict[str, Any]], target_minutes: int) -> List[Dict[str, Any]]:
@@ -366,11 +385,38 @@ class ICICIUnderlyingDataManager:
         with self._lock:
             return " ".join(f"{tf}={len(self._candles.get(tf, ())) }" for tf in ("1m", "5m", "15m", "1h", "4h", "1d"))
 
+    def _maybe_refresh_live(self) -> None:
+        interval = float(_cfg("ICICI_UNDERLYING_REST_REFRESH_SEC", 30.0) or 0.0)
+        if interval <= 0:
+            return
+        now = time.time()
+        with self._lock:
+            age = now - float(self._last_quote_ts or 0.0) if self._last_quote_ts else 999999.0
+        # If the stream is updating, do not add REST load.  If it is silent or no
+        # script code exists for this index, refresh the latest candles on a
+        # throttled cadence so ICICI desks do not trade frozen warmup prices.
+        if self._sio is not None and age <= max(interval * 2.0, 15.0):
+            return
+        if now - float(self._last_rest_refresh_attempt or 0.0) < interval:
+            return
+        self._last_rest_refresh_attempt = now
+        try:
+            self._load_historical("1m")
+            self._load_historical("5m")
+        except Exception as exc:
+            logger.debug("ICICI underlying REST refresh skipped for %s: %s", self._display_underlying(), exc)
+
+    def get_last_update(self) -> float:
+        with self._lock:
+            return float(self._last_quote_ts or 0.0)
+
     def get_candles(self, timeframe: str = "5m", limit: int = 100) -> List[Dict]:
+        self._maybe_refresh_live()
         with self._lock:
             return list(self._candles.get(timeframe, deque()))[-int(limit):]
 
     def get_last_price(self) -> float:
+        self._maybe_refresh_live()
         with self._lock:
             return float(self._last_price or 0.0)
 

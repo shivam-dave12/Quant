@@ -2545,7 +2545,12 @@ def _icici_option_right(instrument) -> str:
 
 def _is_icici_option_instrument(instrument) -> bool:
     try:
-        return str(getattr(getattr(instrument, "primary_exchange", None), "value", getattr(instrument, "primary_exchange", ""))).lower() == "icici"
+        if str(getattr(getattr(instrument, "primary_exchange", None), "value", getattr(instrument, "primary_exchange", ""))).lower() != "icici":
+            return False
+        raw = getattr(getattr(instrument, "primary", None), "raw", {}) or {}
+        if raw.get("icici_underlying_desk") and not raw.get("selected_option_contract"):
+            return False
+        return True
     except Exception:
         return False
 
@@ -2580,6 +2585,128 @@ def _icici_select_contract_for_thesis(instrument, data_manager, thesis_side: str
         except Exception:
             pass
     return None
+
+def _icici_selected_contract_dict(instrument) -> dict:
+    try:
+        raw = getattr(getattr(instrument, "primary", None), "raw", {}) or {}
+        selected = raw.get("selected_option_contract") or {}
+        return selected if isinstance(selected, dict) else {}
+    except Exception:
+        return {}
+
+
+def _icici_execution_atr(data_manager, fallback_price: float = 0.0) -> float:
+    """Return option-premium ATR for execution checks after contract selection."""
+    try:
+        getter = getattr(data_manager, "get_execution_candles", None)
+        candles = getter("5m", 80) if callable(getter) else data_manager.get_candles("5m", 80)
+        trs = []
+        prev_close = 0.0
+        for c in candles[-32:]:
+            h = float(c.get("h", c.get("high", 0.0)) or 0.0)
+            l = float(c.get("l", c.get("low", 0.0)) or 0.0)
+            cl = float(c.get("c", c.get("close", 0.0)) or 0.0)
+            if h <= 0 or l <= 0 or cl <= 0:
+                continue
+            if prev_close > 0:
+                trs.append(max(h - l, abs(h - prev_close), abs(l - prev_close)))
+            else:
+                trs.append(h - l)
+            prev_close = cl
+        if trs:
+            val = sum(trs[-14:]) / max(1, min(14, len(trs)))
+            if val > 0:
+                return float(val)
+    except Exception:
+        pass
+    try:
+        # Fallback: option premiums are noisy; use a conservative 8% premium ATR
+        # when Breeze has no post-selection option candle series yet.
+        p = float(fallback_price or 0.0)
+        return max(p * 0.08, 0.05) if p > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _icici_option_premium_levels(
+    instrument,
+    thesis_side: str,
+    option_entry: float,
+    underlying_entry: float,
+    underlying_sl: float,
+    underlying_tp: float,
+    tick: float,
+) -> tuple[float, float, str] | tuple[None, None, str]:
+    """Convert underlying-index structural SL/TP into option premium levels.
+
+    ICICI index options are analysed on the underlying chart but executed on the
+    selected call/put premium.  Sending NIFTY/BANKNIFTY point levels as premium
+    stops is invalid.  This conversion prices the same underlying thesis through
+    the selected option's delta and premium-risk envelope.
+    """
+    try:
+        opt_entry = float(option_entry)
+        u_entry = float(underlying_entry)
+        u_sl = float(underlying_sl)
+        u_tp = float(underlying_tp)
+        tick = max(float(tick or 0.05), 0.01)
+        if opt_entry <= 0 or u_entry <= 0 or u_sl <= 0 or u_tp <= 0:
+            return None, None, "missing underlying/option price for ICICI premium conversion"
+        side = str(thesis_side or "").lower()
+        if side == "long" and not (u_sl < u_entry < u_tp):
+            return None, None, f"bad bullish underlying geometry sl={u_sl:.2f} entry={u_entry:.2f} tp={u_tp:.2f}"
+        if side == "short" and not (u_sl > u_entry > u_tp):
+            return None, None, f"bad bearish underlying geometry sl={u_sl:.2f} entry={u_entry:.2f} tp={u_tp:.2f}"
+        if side not in ("long", "short"):
+            return None, None, "unknown ICICI thesis side"
+
+        selected = _icici_selected_contract_dict(instrument)
+        delta = 0.0
+        try:
+            delta = abs(float(selected.get("delta", 0.0) or 0.0))
+        except Exception:
+            delta = 0.0
+        if delta <= 0.05:
+            try:
+                raw = getattr(getattr(instrument, "primary", None), "raw", {}) or {}
+                target = (getattr(config, "ICICI_INDEX_OPTION_TARGET_ABS_DELTA", 0.45)
+                          if raw.get("desk_id") == "ICICI_INDEX_OPTIONS"
+                          else getattr(config, "ICICI_STOCK_OPTION_TARGET_ABS_DELTA", 0.50))
+                delta = abs(float(target or 0.45))
+            except Exception:
+                delta = 0.45
+        delta = max(0.20, min(delta, 0.85)) * float(getattr(config, "ICICI_OPTION_SLTP_DELTA_MULT", 1.0))
+
+        u_risk = abs(u_entry - u_sl)
+        u_reward = abs(u_tp - u_entry)
+        conv_risk = max(delta * u_risk, tick * 4.0)
+        conv_reward = max(delta * u_reward, tick * 6.0)
+
+        min_risk = max(opt_entry * float(getattr(config, "ICICI_OPTION_MIN_PREMIUM_RISK_PCT", 0.14)), tick * 4.0)
+        max_risk = max(min_risk, opt_entry * float(getattr(config, "ICICI_OPTION_MAX_PREMIUM_RISK_PCT", 0.58)))
+        risk_premium = min(max(conv_risk, min_risk), max_risk)
+
+        # A far underlying target should not be reduced to a tiny option premium
+        # TP.  Preserve underlying RR after any premium-risk cap, with a small
+        # convexity bonus for long-gamma exposure.
+        underlying_rr = u_reward / max(u_risk, 1e-9)
+        convexity = 1.0 + max(0.0, float(getattr(config, "ICICI_OPTION_PREMIUM_TP_CONVEXITY_BONUS", 0.08)))
+        min_tp = max(opt_entry * float(getattr(config, "ICICI_OPTION_MIN_TP_PREMIUM_PCT", 0.18)), tick * 6.0)
+        reward_premium = max(conv_reward * convexity, risk_premium * max(1.0, underlying_rr), min_tp)
+
+        opt_sl = max(tick, opt_entry - risk_premium)
+        opt_tp = opt_entry + reward_premium
+        # Keep levels on the correct side in option-premium space: long premium
+        # positions are always BUY-to-open, SELL-to-exit.
+        if not (opt_sl < opt_entry < opt_tp):
+            return None, None, f"converted premium geometry invalid sl={opt_sl:.2f} entry={opt_entry:.2f} tp={opt_tp:.2f}"
+        return opt_sl, opt_tp, (
+            f"underlying {side} SL/TP converted to long-premium option levels "
+            f"delta={delta:.2f} uRisk={u_risk:.1f} uReward={u_reward:.1f} "
+            f"premiumRisk={risk_premium:.2f} premiumReward={reward_premium:.2f}"
+        )
+    except Exception as exc:
+        return None, None, f"ICICI premium conversion error: {exc}"
 
 class QuantStrategy:
     def __init__(self, order_manager=None, instrument=None):
@@ -6037,22 +6164,35 @@ class QuantStrategy:
         between the two calls — no position is open at this point).
         """
         self._last_execution_viability = None
-        if bool(getattr(config, "ICICI_LONG_PREMIUM_ONLY", True)) and _is_icici_underlying_chain_instrument(self._instrument):
+        _icici_chain_mode = bool(getattr(config, "ICICI_LONG_PREMIUM_ONLY", True)) and _is_icici_underlying_chain_instrument(self._instrument)
+        _icici_thesis_side = str(side or "").lower()
+        _icici_underlying_entry = float(getattr(getattr(self, "_last_entry_signal", None), "entry_price", 0.0) or 0.0)
+        _icici_selected_choice = None
+        if _icici_chain_mode:
+            if _icici_underlying_entry <= 0:
+                try:
+                    _icici_underlying_entry = float(data_manager.get_last_price() or 0.0)
+                except Exception:
+                    _icici_underlying_entry = 0.0
             # Underlying-first Indian options desk: the strategy analyses the
             # underlying chart; once a bullish/bearish thesis exists, select the
             # actual call/put contract before execution.
-            choice = _icici_select_contract_for_thesis(self._instrument, data_manager, str(side or ""))
-            if choice is None:
+            _icici_selected_choice = _icici_select_contract_for_thesis(self._instrument, data_manager, _icici_thesis_side)
+            if _icici_selected_choice is None:
                 logger.info("%s ICICI chain desk has thesis=%s but no executable option contract selected", self._asset_id, side)
                 return
-            if str(side or "").lower() == "short":
-                logger.info("%s ICICI bearish thesis expressed as BUY PUT %s; internal side=long", self._asset_id, getattr(choice, "selected_symbol", ""))
-            elif str(side or "").lower() == "long":
-                logger.info("%s ICICI bullish thesis expressed as BUY CALL %s; internal side=long", self._asset_id, getattr(choice, "selected_symbol", ""))
+            if _icici_thesis_side == "short":
+                logger.info("%s ICICI bearish thesis expressed as BUY PUT %s; internal side=long", self._asset_id, getattr(_icici_selected_choice, "selected_symbol", ""))
+            elif _icici_thesis_side == "long":
+                logger.info("%s ICICI bullish thesis expressed as BUY CALL %s; internal side=long", self._asset_id, getattr(_icici_selected_choice, "selected_symbol", ""))
             side = "long"
         price = data_manager.get_last_price()
         if price < 1.0: return
         atr = self._atr_5m.atr
+        if _icici_chain_mode or _is_icici_option_instrument(self._instrument):
+            _exec_atr = _icici_execution_atr(data_manager, price)
+            if _exec_atr > 0:
+                atr = _exec_atr
         if atr < 1e-10: return
 
         # ICICI options are long-premium only by design.  Liquidity/structure may
@@ -6060,7 +6200,7 @@ class QuantStrategy:
         # option position is always a BUY: bullish thesis buys calls, bearish
         # thesis buys puts.  We never sell/write an option to open.
         if bool(getattr(config, "ICICI_LONG_PREMIUM_ONLY", True)) and _is_icici_option_instrument(self._instrument):
-            thesis_side = str(side or "").lower()
+            thesis_side = _icici_thesis_side if _icici_chain_mode else str(side or "").lower()
             allowed_thesis = _icici_allowed_thesis_side(self._instrument)
             if allowed_thesis and thesis_side != allowed_thesis:
                 logger.info(
@@ -6126,6 +6266,11 @@ class QuantStrategy:
         offset    = float(getattr(config, 'LIMIT_ORDER_OFFSET_TICKS', 3)) * tick
 
         _sig_entry = getattr(self._last_entry_signal, 'entry_price', 0.0) or 0.0
+        if _icici_chain_mode or _is_icici_option_instrument(self._instrument):
+            # ICICI signal.entry_price is the underlying index level.  Do not use
+            # it as an option-premium limit order price.  Entry is priced from the
+            # selected option's live book after contract selection.
+            _sig_entry = 0.0
         _stale_threshold = 2.0 * atr if atr > 1e-10 else float('inf')
         _sig_is_valid = (
             _sig_entry > 0
@@ -6271,8 +6416,27 @@ class QuantStrategy:
         _force_tp = getattr(self, '_force_tp', None)
         _using_force_levels = False
         if _force_sl is not None and _force_tp is not None and _force_sl > 0 and _force_tp > 0:
-            _fsl = _round_to_tick(_force_sl)
-            _ftp = _round_to_tick(_force_tp)
+            if _icici_chain_mode or _is_icici_option_instrument(self._instrument):
+                _conv_sl, _conv_tp, _conv_reason = _icici_option_premium_levels(
+                    self._instrument,
+                    _icici_thesis_side if _icici_chain_mode else str(getattr(self._last_entry_signal, "side", side) or side).lower(),
+                    entry_ref,
+                    _icici_underlying_entry or float(getattr(getattr(self, "_last_entry_signal", None), "entry_price", 0.0) or 0.0),
+                    float(_force_sl),
+                    float(_force_tp),
+                    tick,
+                )
+                if _conv_sl is None or _conv_tp is None:
+                    logger.warning("ICICI entry rejected: %s", _conv_reason)
+                    self._force_sl = None
+                    self._force_tp = None
+                    return
+                _fsl = _round_to_tick(_conv_sl)
+                _ftp = _round_to_tick(_conv_tp)
+                logger.info("ICICI premium SL/TP conversion: %s | SL=%.2f TP=%.2f", _conv_reason, _fsl, _ftp)
+            else:
+                _fsl = _round_to_tick(_force_sl)
+                _ftp = _round_to_tick(_force_tp)
             _dir_ok = False
             if side == "long" and _fsl < entry_ref and _ftp > entry_ref:
                 _dir_ok = True

@@ -116,6 +116,23 @@ _CONT_SL_BUFFER_ATR = 0.40
 _TP_RR_SAFETY_BUFFER = float(getattr(_cfg, "ENTRY_TP_RR_SAFETY_BUFFER", 0.20)) if '_cfg' in globals() else 0.20
 _TP_MIN_NET_ATR      = float(getattr(_cfg, "ENTRY_TP_MIN_NET_ATR", 0.20)) if '_cfg' in globals() else 0.20
 
+
+def _active_min_rr_ratio() -> float:
+    """Instrument-native TP floor.
+
+    The strategy was originally calibrated on BTC.  In multi-asset mode the
+    current instrument policy must drive the RR sanity floor so ICICI/index
+    options use option-native expectancy instead of the BTC global prior.
+    """
+    try:
+        from core.market_policy import policy_value as _policy_value
+        v = float(_policy_value("min_rr", _MIN_RR_RATIO) or _MIN_RR_RATIO)
+        if math.isfinite(v) and v > 0:
+            return v
+    except Exception:
+        pass
+    return float(_MIN_RR_RATIO)
+
 try:
     import config as _sl_cfg
     # Institutional SL geometry: structure first, ATR noise floor second,
@@ -1030,8 +1047,14 @@ class EntryEngine:
             _bridge_stale = 0
             _bridge_low_q = 0
             _bridge_proc  = 0
+            _bridge_future = 0
+            _future_tol_ms = int(float(_entry_cfg_value("ICT_BRIDGE_FUTURE_TOLERANCE_MS", 5_000)) or 5_000)
+            _now_ms = int(now * 1000)
 
             for ev in ict_ctx.ict_sweeps:
+                if int(getattr(ev, "sweep_ts", 0) or 0) > _now_ms + _future_tol_ms:
+                    _bridge_future += 1
+                    continue
                 if ev.sweep_ts < _base_age_limit and ev.sweep_ts < _bar_age_limit:
                     _bridge_stale += 1
                     continue
@@ -1080,9 +1103,10 @@ class EntryEngine:
             # Expose bridge rejections via state-level counters (read by the
             # diagnostic THINK log in quant_strategy — also picked up by the
             # mark_signal_deferred telemetry).
-            if _bridge_stale or _bridge_low_q or _bridge_proc:
+            if _bridge_stale or _bridge_low_q or _bridge_proc or _bridge_future:
                 self._last_bridge_skip = {
                     "stale":       _bridge_stale,
+                    "future":      _bridge_future,
                     "low_quality": _bridge_low_q,
                     "processed":   _bridge_proc,
                     "ict_sweeps":  len(ict_ctx.ict_sweeps),
@@ -2325,12 +2349,12 @@ class EntryEngine:
                 f"{_REFINE_RISK_IMPROVE:.0%} of initial {p.initial_risk:.1f}pts")
             return
 
-        tp, target = self._find_tp(snap, side, price, atr, sl, _MIN_RR_RATIO)
+        tp, target = self._find_tp(snap, side, price, atr, sl, _active_min_rr_ratio())
         if tp is None or target is None:
             p.last_reason = f"refined TP unavailable: {self._last_pool_plan_summary()}"
             return
         rr = abs(tp - price) / max(risk, 1e-10)
-        rr_floor = self._last_selected_tp_rr_floor(_MIN_RR_RATIO)
+        rr_floor = self._last_selected_tp_rr_floor(_active_min_rr_ratio())
         if rr < rr_floor:
             p.last_reason = f"refined R:R {rr:.2f} < institutional floor {rr_floor:.2f}"
             return
@@ -2453,7 +2477,7 @@ class EntryEngine:
         self._last_sweep_reversal_time = now
 
         # TP: pool → HTF → 2R (only if CISD)
-        tp, target = self._find_tp(snap, side, price, atr, sl, _MIN_RR_RATIO)
+        tp, target = self._find_tp(snap, side, price, atr, sl, _active_min_rr_ratio())
         if tp is None:
             logger.info(
                 f"CANDIDATE DEFERRED [no_liquidity_tp]: side={side} "
@@ -2464,7 +2488,7 @@ class EntryEngine:
             return
 
         rr = abs(tp - price) / risk
-        rr_floor = self._last_selected_tp_rr_floor(_MIN_RR_RATIO)
+        rr_floor = self._last_selected_tp_rr_floor(_active_min_rr_ratio())
         if rr < rr_floor:
             logger.info(
                 f"⚠️ ENTRY CANDIDATE DEFERRED [payoff_geometry]: rr={rr:.2f} < institutional_floor={rr_floor:.2f} "
@@ -2585,7 +2609,7 @@ class EntryEngine:
         # hint, not an execution TP.  This prevents "visible pool = TP" shortcut
         # shortcuts and forces every continuation target through R:R, probability,
         # gauntlet, freshness, and execution-cost gates.
-        tp2, target2 = self._find_tp(snap, side, price, atr, sl, _MIN_RR_RATIO)
+        tp2, target2 = self._find_tp(snap, side, price, atr, sl, _active_min_rr_ratio())
         if tp2 is not None:
             tp, target = tp2, target2
             rr = abs(tp - price) / risk
@@ -2599,7 +2623,7 @@ class EntryEngine:
             self._reset(now)
             return
 
-        rr_floor = self._last_selected_tp_rr_floor(_MIN_RR_RATIO)
+        rr_floor = self._last_selected_tp_rr_floor(_active_min_rr_ratio())
         if rr < rr_floor:
             logger.info(
                 f"⚠️ ENTRY CANDIDATE DEFERRED [payoff_geometry]: rr={rr:.2f} < institutional_floor={rr_floor:.2f} "

@@ -725,6 +725,9 @@ FUND_TOP_N_EXECUTION_DESKS = 0
 FUND_TOP_N_DEPTH_SCAN = 0
 FUND_MIN_TICKER_SCORE = 0.52
 FUND_MIN_EXECUTION_SCORE = 0.58
+# ICICI underlying-first desks do not have an executable option book until thesis selection.
+# Let them run the analysis stage with a lower pre-thesis floor; contract quote/depth is checked after selection.
+FUND_ICICI_PRE_THESIS_SCORE_FLOOR = 0.52
 FUND_MIN_SETUP_SCORE = 0.50
 FUND_MAX_SPREAD_BPS_CRYPTO = 18.0
 FUND_MAX_SPREAD_BPS_EQUITY = 45.0
@@ -1007,6 +1010,19 @@ ICICI_STOCK_OPTION_TARGET_ABS_DELTA = 0.50
 ICICI_OPTION_DELTA_BAND = 0.22
 ICICI_OPTION_IV_STRESS_PRIOR = 0.24
 INDIA_RISK_FREE_RATE = 0.065
+# ICICI option execution is long-premium, but structure is read from the
+# underlying index. These controls convert underlying invalidation/target into
+# executable option-premium SL/TP using delta-adjusted exposure and premium-risk
+# boundaries. They prevent BTC/index point levels from being sent as option
+# premium stops/targets.
+POLICY_OPTION_MIN_RR = 1.60
+POLICY_OPTION_MAX_RR = 4.00
+POLICY_OPTION_SL_BUFFER_ATR = 0.75
+ICICI_OPTION_SLTP_DELTA_MULT = 1.00
+ICICI_OPTION_MIN_PREMIUM_RISK_PCT = 0.14
+ICICI_OPTION_MAX_PREMIUM_RISK_PCT = 0.58
+ICICI_OPTION_MIN_TP_PREMIUM_PCT = 0.18
+ICICI_OPTION_PREMIUM_TP_CONVEXITY_BONUS = 0.08
 
 # v100 ICICI options architecture: analyse the underlying market chart for
 # liquidity/ICT/auction structure, but keep execution price/risk on the actual
