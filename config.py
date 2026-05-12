@@ -7,6 +7,7 @@ No config_overrides.py — everything lives here.
 Calibrated for 65-75% WR, 3-6 trades per session.
 """
 import os
+import importlib.util
 from pathlib import Path
 try:
     from dotenv import load_dotenv
@@ -730,10 +731,14 @@ def live_ordering_config_summary() -> str:
         f"FUND_PAPER_MODE={FUND_PAPER_MODE}; "
         f"FUND_LIVE_ORDERING_ENABLED={FUND_LIVE_ORDERING_ENABLED}; "
         f"EXECUTION_EXCHANGE={EXECUTION_EXCHANGE}; "
+        f"HYPERLIQUID_SDK={'set' if hyperliquid_sdk_available() else 'missing'}; "
         f"HYPERLIQUID_KEY={'set' if bool(HYPERLIQUID_SECRET_KEY and HYPERLIQUID_ACCOUNT_ADDRESS) else 'missing'}; "
         f"DELTA_KEY={'set' if bool(DELTA_API_KEY) else 'missing'}; "
         f"ICICI_ENABLED={globals().get('ICICI_ENABLED', '<late-init>')}"
     )
+
+def hyperliquid_sdk_available() -> bool:
+    return importlib.util.find_spec("hyperliquid") is not None and importlib.util.find_spec("eth_account") is not None
 
 def assert_live_ordering_ready() -> tuple[bool, str]:
     if FUND_PAPER_MODE:
@@ -742,6 +747,8 @@ def assert_live_ordering_ready() -> tuple[bool, str]:
         return False, "FUND_LIVE_ORDERING_ENABLED is false"
     if EXECUTION_EXCHANGE == "hyperliquid" and not (HYPERLIQUID_ACCOUNT_ADDRESS and HYPERLIQUID_SECRET_KEY):
         return False, "Hyperliquid API wallet credentials are missing"
+    if EXECUTION_EXCHANGE == "hyperliquid" and not hyperliquid_sdk_available():
+        return False, "hyperliquid-python-sdk is missing for signed Hyperliquid trading"
     if EXECUTION_EXCHANGE == "delta" and not (DELTA_API_KEY and DELTA_SECRET_KEY):
         return False, "Delta API credentials are missing"
     return True, "live ordering gates are open"

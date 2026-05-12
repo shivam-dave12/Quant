@@ -4,6 +4,7 @@
 requests>=2.31,<3
 python-dotenv>=1.0,<2
 websocket-client>=1.7,<2
+hyperliquid-python-sdk>=0.23,<1
 python-socketio[client]>=5.11,<6
 cryptography>=42,<47
 pydantic>=2.7,<3
