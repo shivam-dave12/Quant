@@ -677,7 +677,11 @@ class MultiAssetQuantBot:
                     self._maybe_asset_heartbeat(ctx)
                 time.sleep(float(getattr(config, "SCANNER_TICK_SLEEP_SEC", 0.25)))
             except KeyboardInterrupt:
-                break
+                logger.warning(
+                    "KeyboardInterrupt ignored by Telegram-only shutdown guard; "
+                    "use /stop from Telegram to stop the bot."
+                )
+                continue
             except Exception:
                 logger.exception("Multi-asset loop error")
                 time.sleep(1.0)
@@ -748,12 +752,9 @@ class MultiAssetQuantBot:
 def main() -> None:
     bot = MultiAssetQuantBot()
     if threading.current_thread() is threading.main_thread():
-        def _signal_handler(signum, frame):
-            logger.info("Shutdown signal %s received", signum)
-            bot.stop()
-            sys.exit(0)
-        signal.signal(signal.SIGINT, _signal_handler)
-        signal.signal(signal.SIGTERM, _signal_handler)
+        from runtime_shutdown_guard import install_telegram_only_shutdown_guard
+
+        install_telegram_only_shutdown_guard(logger, "multi-asset-main")
     if not bot.initialize():
         sys.exit(1)
     if not bot.start():

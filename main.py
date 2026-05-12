@@ -962,8 +962,11 @@ class QuantBot:
                     self._publish_tick_time()
 
             except KeyboardInterrupt:
-                logger.info("Keyboard interrupt — shutting down")
-                break
+                logger.warning(
+                    "KeyboardInterrupt ignored by Telegram-only shutdown guard; "
+                    "use /stop from Telegram to stop the bot."
+                )
+                continue
             except Exception:
                 logger.exception("❌ Main loop error")
                 time.sleep(1.0)
@@ -1022,12 +1025,9 @@ def main() -> None:
         bot = QuantBot()
 
     if threading.current_thread() is threading.main_thread():
-        def _signal_handler(signum, frame):
-            logger.info(f"Shutdown signal {signum} received")
-            bot.stop()
-            sys.exit(0)
-        signal.signal(signal.SIGINT,  _signal_handler)
-        signal.signal(signal.SIGTERM, _signal_handler)
+        from runtime_shutdown_guard import install_telegram_only_shutdown_guard
+
+        install_telegram_only_shutdown_guard(logger, "single/multi-asset-main")
 
     if not bot.initialize():
         sys.exit(1)

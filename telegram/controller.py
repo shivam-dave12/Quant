@@ -2432,7 +2432,10 @@ class TelegramBotController:
         if bot_running and bot_thread and bot_thread.is_alive():
             return "Bot already running."
         logger.info("Starting bot from Telegram...")
-        bot_thread = threading.Thread(target=self._run_bot_thread, daemon=True)
+        # Keep the trading runtime non-daemon so the process cannot silently
+        # drop live risk if the controller loop is interrupted. /stop is the
+        # only authorised path that calls bot_instance.stop().
+        bot_thread = threading.Thread(target=self._run_bot_thread, daemon=False)
         bot_thread.start()
         time.sleep(2.0)
         if bot_thread.is_alive():
@@ -2503,7 +2506,11 @@ class TelegramBotController:
                     if response:
                         self.send_message(response)
             except KeyboardInterrupt:
-                break
+                logger.warning(
+                    "KeyboardInterrupt ignored by Telegram-only shutdown guard; "
+                    "use /stop from Telegram to stop the bot."
+                )
+                continue
             except Exception as e:
                 logger.error(f"Command loop error: {e}", exc_info=True)
                 time.sleep(2.0)
@@ -2542,13 +2549,10 @@ def main():
     _sh.setFormatter(_fmt)
     logging.basicConfig(level=getattr(config, "LOG_LEVEL", "INFO"), handlers=[_fh, _sh], force=True)
 
-    def _signal_handler(signum, frame):
-        logger.info(f"Signal {signum} — stopping controller")
-        sys.exit(0)
-
     if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGINT,  _signal_handler)
-        signal.signal(signal.SIGTERM, _signal_handler)
+        from runtime_shutdown_guard import install_telegram_only_shutdown_guard
+
+        install_telegram_only_shutdown_guard(logger, "telegram-controller")
 
     try:
         controller = TelegramBotController()
