@@ -1,2 +1,0 @@
-"""Hyperliquid exchange integration."""
-
