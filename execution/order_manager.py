@@ -43,7 +43,7 @@ import time
 from collections import deque
 from datetime import datetime
 from enum import Enum
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
@@ -977,22 +977,170 @@ class _ICICIAdapter:
         except Exception:
             return None
 
-    def get_balance(self) -> Dict:
+    @staticmethod
+    def _num(value: Any, default: float = 0.0) -> float:
+        """Parse Breeze numeric fields safely.
+
+        Breeze frequently returns balances as strings and may include commas or
+        empty/None values.  Balance parsing must be strict enough to avoid
+        hallucinating funds, but tolerant enough not to turn valid F&O funds into
+        zero just because the field type changed.
+        """
         try:
-            resp = self.api.get_funds()
-            data = resp.get("Success") if isinstance(resp, dict) else resp
-            if isinstance(data, list) and data: data = data[0]
-            if not isinstance(data, dict): data = {}
-            avail = 0.0
-            for k in ("available_margin", "AvailableLimit", "cash_limit", "available", "balance"):
-                try:
-                    avail = float(data.get(k, 0) or 0)
-                    if avail > 0: break
-                except Exception:
-                    pass
-            return {"available": avail, "available_raw": avail, "currency": "INR", "raw": resp}
+            if value is None:
+                return default
+            if isinstance(value, str):
+                cleaned = value.strip().replace(',', '')
+                if cleaned == '' or cleaned.lower() in {'none', 'null', 'nan'}:
+                    return default
+                return float(cleaned)
+            return float(value)
+        except Exception:
+            return default
+
+    @staticmethod
+    def _success_payload(resp: Any) -> Dict[str, Any]:
+        data = resp.get("Success") if isinstance(resp, dict) else resp
+        if isinstance(data, list):
+            data = data[0] if data else {}
+        return data if isinstance(data, dict) else {}
+
+    def _parse_fno_funds(self, resp: Dict[str, Any]) -> Dict[str, Any]:
+        data = self._success_payload(resp)
+
+        allocated = self._num(
+            data.get("allocated_fno", data.get("allocated_FNO", data.get("allocated_derivatives")))
+        )
+        blocked = self._num(
+            data.get("block_by_trade_fno", data.get("blocked_fno", data.get("block_by_trade_derivatives")))
+        )
+        unallocated = self._num(data.get("unallocated_balance"))
+        bank_total = self._num(data.get("total_bank_balance"))
+
+        # Official Breeze funds response reports F&O buying power as allocated_fno
+        # less block_by_trade_fno.  Do NOT use total_bank_balance as tradable F&O
+        # balance; cash must be allocated to the F&O segment before options can be
+        # bought through the F&O wallet.
+        available = max(0.0, allocated - max(0.0, blocked))
+        return {
+            "allocated": allocated,
+            "blocked": max(0.0, blocked),
+            "available": available,
+            "unallocated": max(0.0, unallocated),
+            "bank_total": max(0.0, bank_total),
+            "source": "funds.allocated_fno_minus_block_by_trade_fno",
+            "raw": resp,
+        }
+
+    def _parse_nfo_margin(self, resp: Dict[str, Any]) -> Dict[str, Any]:
+        data = self._success_payload(resp)
+        cash_limit = self._num(data.get("cash_limit"))
+        amount_allocated = self._num(data.get("amount_allocated"))
+        blocked = self._num(data.get("block_by_trade"))
+        isec_margin = self._num(data.get("isec_margin"))
+
+        # /margin is account/segment buying-power view.  Prefer cash_limit when
+        # positive because it is the executable NFO limit ICICI exposes there.
+        base = cash_limit if cash_limit > 0 else amount_allocated
+        available = max(0.0, base - max(0.0, blocked))
+        return {
+            "cash_limit": max(0.0, cash_limit),
+            "amount_allocated": max(0.0, amount_allocated),
+            "blocked": max(0.0, blocked),
+            "isec_margin": max(0.0, isec_margin),
+            "available": available,
+            "source": "margin.NFO.cash_limit_minus_block_by_trade" if cash_limit > 0 else "margin.NFO.amount_allocated_minus_block_by_trade",
+            "raw": resp,
+        }
+
+    def get_balance(self) -> Dict:
+        """Return ICICI F&O wallet balance, not generic equity/bank balance.
+
+        Breeze `/funds` exposes segment allocations as `allocated_fno` and
+        blocked F&O funds as `block_by_trade_fno`.  The old adapter searched
+        for crypto/futures-style keys (`available_margin`, `cash_limit`,
+        `available`) inside `/funds`, so valid F&O balances were reported as 0.
+
+        We now parse `/funds` first, then verify/fallback with `/margin` for
+        exchange_code=NFO.  Bank/unallocated cash is reported for visibility but
+        is not treated as tradable F&O buying power.
+        """
+        funds_resp: Dict[str, Any] = {}
+        margin_resp: Dict[str, Any] = {}
+        errors = []
+        try:
+            self.limiter.wait()
+            funds_resp = self.api.get_funds()
         except Exception as exc:
-            return {"available": 0.0, "error": str(exc)}
+            errors.append(f"funds: {exc}")
+
+        fno = self._parse_fno_funds(funds_resp) if funds_resp else {
+            "allocated": 0.0, "blocked": 0.0, "available": 0.0,
+            "unallocated": 0.0, "bank_total": 0.0, "source": "funds.unavailable", "raw": funds_resp,
+        }
+
+        try:
+            # NFO margin is the best executable fallback if `/funds` is present
+            # but segment allocation fields are absent/renamed by ICICI.
+            self.limiter.wait()
+            margin_resp = self.api.get_margin(exchange_code="NFO")
+        except Exception as exc:
+            errors.append(f"margin.NFO: {exc}")
+
+        margin = self._parse_nfo_margin(margin_resp) if margin_resp else {
+            "cash_limit": 0.0, "amount_allocated": 0.0, "blocked": 0.0,
+            "isec_margin": 0.0, "available": 0.0, "source": "margin.NFO.unavailable", "raw": margin_resp,
+        }
+
+        # Prefer funds because it is explicitly F&O wallet allocation.  If funds
+        # has no F&O allocation fields or returns zero while NFO margin reports a
+        # positive executable limit, use NFO margin as fallback.
+        if fno["available"] > 0 or fno["allocated"] > 0:
+            available = fno["available"]
+            locked = fno["blocked"]
+            total = fno["allocated"]
+            source = fno["source"]
+        elif margin["available"] > 0:
+            available = margin["available"]
+            locked = margin["blocked"]
+            total = max(margin["cash_limit"], margin["amount_allocated"], available + locked)
+            source = margin["source"]
+        else:
+            available = 0.0
+            locked = max(fno["blocked"], margin["blocked"])
+            total = max(fno["allocated"], margin["cash_limit"], margin["amount_allocated"], available + locked)
+            source = "zero_fno_allocation_or_unavailable"
+
+        out = {
+            "available": max(0.0, available),
+            "available_raw": max(0.0, available),
+            "locked": max(0.0, locked),
+            "total": max(0.0, total),
+            "currency": "INR",
+            "segment": "FNO",
+            "source": source,
+            "fno_allocated": fno["allocated"],
+            "fno_blocked": fno["blocked"],
+            "fno_available": fno["available"],
+            "unallocated_balance": fno["unallocated"],
+            "bank_total": fno["bank_total"],
+            "nfo_cash_limit": margin["cash_limit"],
+            "nfo_amount_allocated": margin["amount_allocated"],
+            "nfo_blocked": margin["blocked"],
+            "nfo_available": margin["available"],
+            "raw": {"funds": funds_resp, "margin_nfo": margin_resp},
+        }
+        if errors:
+            out["warning"] = "; ".join(errors)
+            if not funds_resp and not margin_resp:
+                out["error"] = out["warning"]
+        logger.info(
+            "ICICI F&O balance source=%s available=₹%.2f allocated=₹%.2f blocked=₹%.2f "
+            "nfo_cash_limit=₹%.2f unallocated=₹%.2f",
+            out["source"], out["available"], out["fno_allocated"], out["fno_blocked"],
+            out["nfo_cash_limit"], out["unallocated_balance"],
+        )
+        return out
 
     def set_leverage(self, leverage: int, product_id: Optional[int] = None) -> Dict:
         return {"success": True, "leverage": 1, "message": "ICICI options are fully funded; leverage is not applicable"}
