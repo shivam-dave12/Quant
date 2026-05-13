@@ -116,6 +116,19 @@ def _esc(s) -> str:
     return _html.escape(str(s), quote=False)
 
 
+def _redact_telegram_token(value) -> str:
+    """Never leak bot tokens through request exception strings/log URLs."""
+    text = str(value)
+    try:
+        token = str(getattr(telegram_config, "TELEGRAM_BOT_TOKEN", "") or "")
+        if token:
+            text = text.replace(token, "<TELEGRAM_BOT_TOKEN_REDACTED>")
+    except Exception:
+        pass
+    # Defensive fallback for any Telegram bot-token shaped URL fragment.
+    return re.sub(r"/bot[^/\s?]+", "/bot<TELEGRAM_BOT_TOKEN_REDACTED>", text)
+
+
 bot_instance = None
 bot_thread   = None
 bot_running  = False
@@ -138,6 +151,10 @@ class TelegramBotController:
         self._last_getupdates_warn_ts: dict = {}   # status_code -> last warn ts
         self._getupdates_warn_throttle: float = 60.0
         self._last_getupdates_conn_warn_ts: float = 0.0
+        self._getupdates_conn_failures: int = 0
+        self._getupdates_http_failures: int = 0
+        self._getupdates_backoff_base: float = float(getattr(config, "TELEGRAM_GETUPDATES_BACKOFF_BASE_SEC", 2.0))
+        self._getupdates_backoff_max: float = float(getattr(config, "TELEGRAM_GETUPDATES_BACKOFF_MAX_SEC", 30.0))
 
         if not self.bot_token or not self.chat_id:
             raise ValueError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set")
@@ -169,7 +186,7 @@ class TelegramBotController:
                 return True
             return self._send_raw(message, parse_mode)
         except Exception as e:
-            logger.error(f"Send error: {e}")
+            logger.error("Send error: %s", _redact_telegram_token(e))
             try:
                 return self._send_raw(message, parse_mode=None)
             except Exception:
@@ -203,37 +220,51 @@ class TelegramBotController:
             }
             resp = requests.get(url, params=params, timeout=(5.0, _read_timeout))
             if resp.status_code != 200:
-                # SPAM-FIX 2026-04-26: throttled per-status-code logging.
-                # See __init__ comment. Net effect: at most 1 WARN per
-                # status_code per 60s; the rest are INFO-level and stay out
-                # of Telegram entirely.
+                # SPAM-FIX 2026-05-12: external container/network events can make
+                # getUpdates fail immediately.  A tight loop here can flood logs,
+                # burn CPU, and make PID-1 look unhealthy to the supervisor.  Back
+                # off exponentially and only keep one warning per throttle window.
+                self._getupdates_http_failures += 1
+                delay = min(
+                    self._getupdates_backoff_max,
+                    max(0.5, self._getupdates_backoff_base) * (2 ** min(self._getupdates_http_failures - 1, 5)),
+                )
                 _now = time.time()
                 _last = self._last_getupdates_warn_ts.get(resp.status_code, 0.0)
                 if _now - _last >= self._getupdates_warn_throttle:
                     self._last_getupdates_warn_ts[resp.status_code] = _now
                     logger.warning(
-                        "Telegram API HTTP %d — getUpdates skipped (further "
-                        "occurrences within %.0fs will be logged at INFO)",
-                        resp.status_code, self._getupdates_warn_throttle,
+                        "Telegram API HTTP %d — getUpdates skipped; retrying in %.1fs "
+                        "(further occurrences within %.0fs stay DEBUG)",
+                        resp.status_code, delay, self._getupdates_warn_throttle,
                     )
                 else:
-                    logger.info(
-                        "Telegram API HTTP %d — getUpdates skipped",
-                        resp.status_code,
-                    )
+                    logger.debug("Telegram API HTTP %d — getUpdates skipped; retrying in %.1fs", resp.status_code, delay)
+                time.sleep(delay)
                 return []
+            self._getupdates_conn_failures = 0
+            self._getupdates_http_failures = 0
             data = resp.json()
             return data.get("result", []) if data.get("ok") else []
         except requests.exceptions.Timeout:
             return []
         except requests.exceptions.ConnectionError as e:
-            # Same throttling treatment for connection-reset bursts.
+            # Institutional resilience: DNS/proxy/network drops must degrade the
+            # command channel only.  Trading keeps running; Telegram polling backs
+            # off, logs are token-redacted, and no tight retry loop is allowed.
+            self._getupdates_conn_failures += 1
+            delay = min(
+                self._getupdates_backoff_max,
+                max(0.5, self._getupdates_backoff_base) * (2 ** min(self._getupdates_conn_failures - 1, 5)),
+            )
             _now = time.time()
+            safe_err = _redact_telegram_token(e)
             if _now - self._last_getupdates_conn_warn_ts >= self._getupdates_warn_throttle:
                 self._last_getupdates_conn_warn_ts = _now
-                logger.warning("Telegram connection error (will retry): %s", e)
+                logger.warning("Telegram connection error; command channel retrying in %.1fs: %s", delay, safe_err)
             else:
-                logger.info("Telegram connection error (will retry): %s", e)
+                logger.debug("Telegram connection error; command channel retrying in %.1fs: %s", delay, safe_err)
+            time.sleep(delay)
             return []
         except ValueError as e:
             logger.error("Telegram JSON parse error in getUpdates: %s", e)
@@ -298,7 +329,7 @@ class TelegramBotController:
             else:
                 logger.info("Telegram commands registered")
         except Exception as e:
-            logger.error(f"Error setting commands: {e}")
+            logger.error("Error setting commands: %s", _redact_telegram_token(e))
 
     # ================================================================
     # COMMAND ROUTING

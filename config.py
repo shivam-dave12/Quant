@@ -39,7 +39,7 @@ COINSWITCH_SYMBOL        = "BTCUSDT"
 COINSWITCH_EXCHANGE      = "EXCHANGE_2"
 
 # ── Position sizing ───────────────────────────────────────────────────────────
-BALANCE_USAGE_PERCENTAGE = 60
+BALANCE_USAGE_PERCENTAGE = 80
 MAX_ENTRY_MARGIN_USAGE_PCT = BALANCE_USAGE_PERCENTAGE  # single-trade margin ceiling
 MIN_MARGIN_PER_TRADE     = 1
 MAX_MARGIN_PER_TRADE     = 10_000
@@ -56,14 +56,14 @@ REMAINDER_MIN_QTY        = 0.001
 #   The inconsistency caused 100× over-sizing (entire balance at risk per trade),
 #   triggering the "required margin > available — scaling down" warnings in logs.
 #   Fix: one convention (fraction), both consumers agree. See risk_manager.py line 266.
-RISK_PER_TRADE           = 0.05    # 0.05 (5%) of available balance per trade
+RISK_PER_TRADE           = 0.05    # 5% of available balance per trade
 MAX_DAILY_LOSS           = 10000
-MAX_DAILY_LOSS_PCT       = 3.0       # day circuit breaker
+MAX_DAILY_LOSS_PCT       = 5.0       # day circuit breaker
 MAX_DRAWDOWN_PCT         = 15.0      # realistic drawdown limit
-MAX_CONSECUTIVE_LOSSES   = 2
+MAX_CONSECUTIVE_LOSSES   = 10
 ALLOW_TIME_BASED_CONSEC_LOSS_RESET = False
-CONSEC_LOSS_AUTO_RESET_HOURS = 2.0
-MAX_DAILY_TRADES         = 10        # institutional selectivity over frequency
+CONSEC_LOSS_AUTO_RESET_HOURS = 1.0
+MAX_DAILY_TRADES         = 20        # institutional selectivity over frequency
 ONE_POSITION_AT_A_TIME   = True
 MIN_TIME_BETWEEN_TRADES  = 5.0       # minutes; compatibility alias for 300 seconds
 MIN_TIME_BETWEEN_TRADES_SEC = 300.0
@@ -672,3 +672,13 @@ DELTA_BRACKET_CHILD_PRICE_TOL_TICKS = 6.0
 DELTA_BRACKET_CHILD_PRICE_TOL_PCT = 0.0025
 DELTA_EMERGENCY_FLATTEN_ON_BRACKET_MISMATCH = True
 TELEGRAM_ALERT_PROTECTION_FAILURE = True
+
+# Telegram command-channel network resilience
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return float(default)
+
+TELEGRAM_GETUPDATES_BACKOFF_BASE_SEC = _float_env("TELEGRAM_GETUPDATES_BACKOFF_BASE_SEC", 2.0)
+TELEGRAM_GETUPDATES_BACKOFF_MAX_SEC = _float_env("TELEGRAM_GETUPDATES_BACKOFF_MAX_SEC", 30.0)

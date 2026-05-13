@@ -113,8 +113,15 @@ class PortfolioManager:
         adjusted['total_raw'] = raw_total
         adjusted['available'] = max(0.0, slot_available)
         adjusted['total'] = max(0.0, slot_equity)
-        adjusted['risk_available'] = raw_available if self.risk_budget_mode == 'portfolio_equity' else slot_available
+        # Risk sizing must be based on portfolio equity, not exchange free cash.
+        # Free cash shrinks as earlier brackets reserve margin; using it as the
+        # risk base makes the 2nd/3rd trade mechanically smaller even when the
+        # portfolio equity is unchanged.  Margin feasibility remains protected by
+        # the slot-scoped `available` field above, so we do not fabricate spendable
+        # cash; we only keep dollar-risk sizing anchored to the account equity.
+        adjusted['risk_available'] = raw_total if self.risk_budget_mode == 'portfolio_equity' else slot_available
         adjusted['risk_total'] = raw_total if self.risk_budget_mode == 'portfolio_equity' else slot_equity
+        adjusted['portfolio_free_cash_after_reserves'] = raw_available
         adjusted['portfolio_scoped'] = True
         adjusted['portfolio_budget_mode'] = self.budget_mode
         adjusted['portfolio_risk_budget_mode'] = self.risk_budget_mode

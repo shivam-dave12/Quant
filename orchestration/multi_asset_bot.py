@@ -169,8 +169,12 @@ class _LegacyPortfolioGuard:
         #     the number of portfolio slots before the exchange lot floor is
         #     considered.  PortfolioGuard still limits total concurrent slots;
         #     QuantStrategy still limits actual cash/margin by the slot view.
-        adjusted["risk_available"] = raw_available
+        # Keep risk dollars anchored to portfolio equity; do not shrink the
+        # second signal only because the first signal has reserved margin.
+        # Actual spendable cash remains slot-scoped through `available`.
+        adjusted["risk_available"] = raw_total
         adjusted["risk_total"] = raw_total
+        adjusted["portfolio_free_cash_after_reserves"] = raw_available
         if ctx is not None:
             adjusted["portfolio_asset_id"] = ctx.instrument.asset_id
         return adjusted
