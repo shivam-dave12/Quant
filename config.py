@@ -589,7 +589,7 @@ SCANNER_ASSET_ANALYSIS_LOG_SEC = 15.0  # per-contract proof-of-analysis log cade
 # contract gets only one ENTERING/ACTIVE/EXITING slot.  The existing BTC-style
 # risk model is preserved by giving each contract a slot-scoped balance view
 # before QuantStrategy applies RISK_PER_TRADE and BALANCE_USAGE_PERCENTAGE.
-PORTFOLIO_MAX_OPEN_POSITIONS = 4
+PORTFOLIO_MAX_OPEN_POSITIONS = 8
 PORTFOLIO_MAX_OPEN_PER_CONTRACT = 1
 PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS = 4
 PORTFOLIO_BUDGET_MODE = "equal_slots"   # equal_slots | active_equal_slots
