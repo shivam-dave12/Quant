@@ -42,6 +42,11 @@ except Exception:  # pragma: no cover
     def logit_adjust_probability(p, logit_delta):
         return p
 try:
+    from strategy.tp_ladder import build_tp_ladder, TPLadderPlan
+except Exception:  # pragma: no cover
+    build_tp_ladder = None  # type: ignore
+    TPLadderPlan = None  # type: ignore
+try:
     from strategy.ict_engine import ICTEngine, ICTConfluence
     _ICT_AVAILABLE = True
 except ImportError:
@@ -135,20 +140,13 @@ except ImportError:
         ConvictionFilter = None   # type: ignore
         ConvictionResult = None   # type: ignore
 
-# ── ISSUE-3 FIX: Liquidity-Only Trailing SL ──────────────────────────────────
-# SL anchors to swept/unswept pool structure instead of fixed ATR ratchets.
-# Significance-based buffer; session-aware (London tighter, Asia disabled).
+# ── Fixed-SL TP ladder exit model ──────────────────────────────────────────
+# The previous SL-migration engine is not loaded in this strategy build.
+# Exits are handled by the original exchange-side SL plus dynamic reduce-only
+# TP ladder legs and the selected final TP.
 _LIQ_TRAIL_AVAILABLE = False
-try:
-    from strategy.liquidity_trail import LiquidityTrailEngine, LiquidityTrailResult
-    _LIQ_TRAIL_AVAILABLE = True
-except ImportError:
-    try:
-        from liquidity_trail import LiquidityTrailEngine, LiquidityTrailResult
-        _LIQ_TRAIL_AVAILABLE = True
-    except ImportError:
-        LiquidityTrailEngine  = None   # type: ignore
-        LiquidityTrailResult  = None   # type: ignore
+DisabledSLMigrationEngine = None   # type: ignore
+LiquidityTrailResult = None   # type: ignore
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -415,7 +413,7 @@ class QCfg:
     def TP_MAX_ATR_MULT() -> float: return float(_cfg("QUANT_TP_MAX_ATR_MULT", 6.0))
     @staticmethod
     def REVERSION_REJECT_RR() -> float: return float(_cfg("QUANT_REVERSION_REJECT_RR", 0.20))
-    # ── v4.9: ICT-anchored trailing SL ─────────────────────────────
+    # ── v4.9: ICT-anchored SL migration ─────────────────────────────
     @staticmethod
     def ICT_ZONE_FREEZE_ENABLED() -> bool: return bool(_cfg("QUANT_ICT_ZONE_FREEZE_ENABLED", True))
     @staticmethod
@@ -1863,7 +1861,7 @@ class _DynamicStructureTrail:
     The v7.0 trail logic that used to live here (retired ATR fallback,
     dynamic-buffer computation, liquidity-first anchor selection,
     ATR-percentile-scaled multipliers, etc.) was REMOVED as part of the
-    move to pure-Fibonacci trailing via LiquidityTrailEngine v5.0.
+    move to pure-Fibonacci trailing via DisabledSLMigrationEngine v5.0.
 
     Retained here (as classmethods / static methods) are ONLY the pure
     ICT-state query helpers used by the display layer:
@@ -1873,7 +1871,7 @@ class _DynamicStructureTrail:
       _phase         — simple phase label (R-multiple driven)
       _session_mult  — DST-aware session buffer multiplier
 
-    All SL trailing decisions are made by LiquidityTrailEngine in
+    All SL migration decisions are made by DisabledSLMigrationEngine in
     strategy/liquidity_trail.py.  This class NO LONGER drives SL moves.
     """
 
@@ -2468,6 +2466,12 @@ class PositionState:
     side: str = ""; quantity: float = 0.0; entry_price: float = 0.0
     sl_price: float = 0.0; tp_price: float = 0.0
     sl_order_id: Optional[str] = None; tp_order_id: Optional[str] = None
+    # TP ladder: internal liquidity reduce-only targets + original final TP.
+    # SL price is fixed at original invalidation; no trailing/BE migration.
+    tp_ladder: List[Dict[str, object]] = field(default_factory=list)
+    tp_ladder_order_ids: List[str] = field(default_factory=list)
+    tp_ladder_active: bool = False
+    tp_ladder_last_sync_qty: float = 0.0
     entry_order_id: Optional[str] = None; entry_time: float = 0.0
     initial_risk: float = 0.0; initial_sl_dist: float = 0.0
     trail_active: bool = False; last_trail_time: float = 0.0
@@ -2516,7 +2520,9 @@ class PositionState:
     def to_dict(self):
         return {"side": self.side, "quantity": self.quantity,
                 "entry_price": self.entry_price,
-                "sl_price": self.sl_price, "tp_price": self.tp_price}
+                "sl_price": self.sl_price, "tp_price": self.tp_price,
+                "tp_ladder": list(self.tp_ladder or []),
+                "tp_ladder_active": bool(self.tp_ladder_active)}
 
 # ═══════════════════════════════════════════════════════════════
 # DAILY RISK GATE with consecutive loss lockout
@@ -2692,9 +2698,8 @@ class QuantStrategy:
         # main loop (trail, heartbeat, signals) is never blocked waiting for REST.
         self._pos_sync_in_progress  = False   # ACTIVE sync thread running
         self._exit_sync_in_progress = False   # EXITING sync thread running
-        self._trail_in_progress     = False   # trail REST call running in background
-        self._trail_started_at      = 0.0     # sweep-posterior: timestamp for self-heal of stuck flag
-        self._trail_runtime_override: Optional[bool] = None
+        self._tp_ladder_sync_in_progress = False
+        self._trail_runtime_override: Optional[bool] = False  # legacy compatibility only; always inactive
         self._last_exit_side = ""; self._last_think_log = 0.0; self._think_interval = 120.0
         self._last_fed_trade_ts = 0.0
 
@@ -2726,11 +2731,8 @@ class QuantStrategy:
         self._last_data_warn       = 0.0
         self._last_atr_warn        = 0.0
         self._last_price_warn      = 0.0
-        self._last_trail_block_log = 0.0
-        # v6.0: Structure-event-driven trail variables
-        self._last_trail_check_price    = 0.0   # price at last trail computation
-        self._last_trail_rest_time      = 0.0   # timestamp of last successful trail REST move
-        self._last_structure_fingerprint = None  # structural state fingerprint for change detection
+        self._last_exit_policy_log = 0.0
+        self._last_structure_fingerprint = None
         self._last_maxhold_check   = 0.0
 
 
@@ -2740,7 +2742,7 @@ class QuantStrategy:
             EntryEngine(on_self_recovery=self._on_entry_engine_self_recovery)
             if _ENTRY_ENGINE_AVAILABLE else None
         )
-        self._ict_trail = ICTTrailManager() if _ENTRY_ENGINE_AVAILABLE else None
+        self._ict_trail = None  # fixed-SL TP ladder build: no SL migration helper
 
         # ── ISSUE-4 FIX: Advisory/Safety Model ─────────────────────────────────────
         # Evaluates 7 ICT factors before any entry order is placed.
@@ -2750,12 +2752,7 @@ class QuantStrategy:
             ConvictionFilter() if _CONVICTION_FILTER_AVAILABLE else None
         )
 
-        # ── ISSUE-3 FIX: Liquidity-Only Trailing SL ──────────────────────────
-        # SL anchors to swept/unswept pool structure; significance-based buffer.
-        # Sole live exit manager: liquidity/structure trail. No retired ATR fallback path is used.
-        self._liq_trail: Optional[object] = (
-            LiquidityTrailEngine() if _LIQ_TRAIL_AVAILABLE else None
-        )
+        self._liq_trail: Optional[object] = None
         self._flow_streak_dir_v2 = ""
         self._flow_streak_count_v2 = 0
         # BUG-FIX-3: These attrs are read by main.py heartbeat via getattr().
@@ -2928,8 +2925,7 @@ class QuantStrategy:
         logger.info(f"   DirectionEngine: {dir_status}")
         conv_status = "ADVISORY/SAFETY" if self._conviction else "UNAVAILABLE"
         logger.info(f"   ConvictionModel: {conv_status}")
-        liq_trail = "ACTIVE" if self._liq_trail else "UNAVAILABLE"
-        logger.info(f"   LiquidityTrail: {liq_trail}")
+        logger.info("   ExitModel: FIXED_SL + dynamic liquidity TP ladder")
         pta_status = "ACTIVE" if self._post_trade_agent else "UNAVAILABLE"
         logger.info(f"   PostTradeAgent: {pta_status}")
         logger.info("=" * 72)
@@ -3820,33 +3816,16 @@ class QuantStrategy:
             logger.info("♻️ Strategy engines soft-reset after stream restart (ATR values preserved)")
 
     def set_trail_override(self, enabled: Optional[bool]):
-        """v4.3: Telegram command to override trailing SL on/off, even mid-position.
-        None = use config default, True = force on, False = force off."""
+        """Legacy compatibility: SL migration is removed in TP-ladder build."""
         with self._lock:
-            if enabled is False and self._pos.is_active():
-                self._pos.trail_override = None
-                logger.warning(
-                    "Trail override OFF ignored while position is active; "
-                    "protective management remains on")
-                return False
-            self._trail_runtime_override = enabled
-            self._pos.trail_override = enabled
-            if enabled is None:
-                logger.info("Trail override cleared → using config default")
-            else:
-                logger.info(f"Trail override set → {'ENABLED' if enabled else 'DISABLED'}")
-
-        return True
+            self._trail_runtime_override = False
+            self._pos.trail_override = False
+        logger.info("Exit override ignored: fixed original SL + dynamic TP ladder is enforced")
+        return False
 
     def get_trail_enabled(self) -> bool:
-        """Check if trailing is enabled considering override."""
-        override = self._pos.trail_override
-        if override is not None:
-            return override
-        runtime_override = getattr(self, "_trail_runtime_override", None)
-        if runtime_override is not None:
-            return bool(runtime_override)
-        return QCfg.TRAIL_ENABLED()
+        """SL migration is disabled; retained only for legacy callers."""
+        return False
 
     def _spread_atr_gate(self, data_manager) -> tuple:
         """
@@ -6044,6 +6023,148 @@ class QuantStrategy:
 
             logger.info(f"[THINK] {' | '.join(parts)}")
 
+    def _build_tp_ladder_plan(self, side: str, entry_price: float, sl_price: float,
+                              final_tp: float, quantity: float, atr: float):
+        """Build TP1..TPn from internal liquidity; final TP remains unchanged."""
+        if build_tp_ladder is None:
+            return None
+        try:
+            pool_report = None
+            if getattr(self, "_entry_engine", None) is not None:
+                try:
+                    pool_report = self._entry_engine.pool_plan_info
+                except Exception:
+                    pool_report = None
+            plan = build_tp_ladder(
+                side=side,
+                entry=float(entry_price),
+                sl=float(sl_price),
+                final_tp=float(final_tp),
+                atr=float(atr or 0.0),
+                total_quantity=float(quantity or 0.0),
+                pool_report=pool_report,
+                target_surface=getattr(getattr(self, "_last_entry_signal", None), "target_surface", None),
+                cross_asset_state=getattr(self, "_cross_asset_state", None),
+                asset_id=str(getattr(getattr(self, "_instrument", None), "asset_id", "") or ""),
+            )
+            if plan is not None and getattr(plan, "legs", None):
+                logger.info(
+                    "🎯 TP_LADDER PLAN [%s] %s | notes=%s",
+                    side.upper(), plan.compact(), "; ".join(getattr(plan, "regime_notes", []) or []) or "none",
+                )
+            return plan
+        except Exception as _e:
+            logger.error("TP ladder build failed — falling back to final TP only: %s", _e, exc_info=True)
+            return None
+
+    def _place_internal_tp_ladder(self, order_manager, side: str, quantity: float,
+                                  final_tp: float, native_final_tp_order_id: str,
+                                  ladder_plan) -> tuple:
+        """
+        Place reduce-only internal TP1..TPn orders while leaving the native
+        bracket final TP/SL untouched. The SL price is never moved.
+
+        The native bracket TP remains the final/terminal target. Internal legs
+        are standalone reduce-only take-profit orders. If Delta rejects them,
+        the bot keeps the original bracket as fallback and logs ladder_degraded.
+        """
+        if ladder_plan is None or not getattr(ladder_plan, "legs", None):
+            return [], []
+        exit_side = "sell" if side == "long" else "buy"
+        placed_ids = []
+        leg_dicts = []
+        # Place only internal legs. FINAL is already represented by native bracket TP.
+        internal_legs = [l for l in ladder_plan.legs if str(getattr(l, "role", "")).upper() != "FINAL"]
+        if not internal_legs:
+            leg_dicts = [l.as_dict() for l in ladder_plan.legs]
+            return leg_dicts, placed_ids
+        for leg in internal_legs:
+            try:
+                leg_qty = float(getattr(leg, "quantity", 0.0) or 0.0)
+                leg_px = float(getattr(leg, "price", 0.0) or 0.0)
+                if leg_qty <= 0 or leg_px <= 0:
+                    continue
+                # Avoid dust orders. If one leg is below min qty, do not send it;
+                # its size remains covered by the native final TP.
+                if leg_qty < QCfg.MIN_QTY():
+                    logger.info(
+                        "TP_LADDER skip %s dust qty %.8f < min %.8f; qty remains for final TP",
+                        getattr(leg, "role", "TP"), leg_qty, QCfg.MIN_QTY())
+                    continue
+                res = order_manager.place_take_profit(
+                    side=exit_side,
+                    quantity=leg_qty,
+                    trigger_price=leg_px,
+                )
+                if res and not (isinstance(res, dict) and res.get("_error")):
+                    oid = str(res.get("order_id") or res.get("id") or "")
+                    if oid:
+                        leg.order_id = oid
+                        leg.placed = True
+                        placed_ids.append(oid)
+                        logger.info(
+                            "✅ TP_LADDER %s placed reduce-only %s qty=%.8g trigger=$%.2f oid=%s",
+                            getattr(leg, "role", "TP"), exit_side.upper(), leg_qty, leg_px, oid[:10])
+                else:
+                    logger.warning(
+                        "TP_LADDER %s placement failed; native final TP remains live. raw=%s",
+                        getattr(leg, "role", "TP"), res)
+            except Exception as _e:
+                logger.error("TP_LADDER leg placement error — continuing with native final TP: %s", _e, exc_info=True)
+        leg_dicts = [l.as_dict() for l in ladder_plan.legs]
+        return leg_dicts, placed_ids
+
+    def _cancel_tp_ladder_orders(self, order_manager, pos=None) -> None:
+        """Cancel standalone internal TP ladder orders; native bracket cancel is handled separately."""
+        p = pos or self._pos
+        ids = list(getattr(p, "tp_ladder_order_ids", []) or [])
+        if not ids:
+            return
+        for oid in ids:
+            try:
+                if oid and oid != getattr(p, "tp_order_id", ""):
+                    result = order_manager.cancel_order(oid)
+                    logger.info("TP_LADDER cancel %s: %s", str(oid)[:10], getattr(result, "value", result))
+            except Exception as _e:
+                logger.warning("TP_LADDER cancel error %s: %s", str(oid)[:10], _e)
+
+    def _reconcile_tp_ladder_quantity(self, order_manager, ex_size: float) -> None:
+        """
+        After TP1/TP2 fills, exchange position size drops while SL price must stay
+        fixed. We update local size and ladder state only. We do not trail or
+        migrate SL to breakeven.
+        """
+        try:
+            if self._pos.phase != PositionPhase.ACTIVE:
+                return
+            old_qty = float(self._pos.quantity or 0.0)
+            new_qty = abs(float(ex_size or 0.0))
+            if old_qty <= 0 or new_qty <= 0:
+                return
+            min_delta = max(QCfg.MIN_QTY(), old_qty * 0.005)
+            if new_qty < old_qty - min_delta:
+                closed = old_qty - new_qty
+                with self._lock:
+                    self._pos.quantity = new_qty
+                    self._pos.tp_ladder_last_sync_qty = new_qty
+                logger.info(
+                    "🎯 TP_LADDER partial exit detected: qty %.8g → %.8g (closed %.8g). "
+                    "SL price remains fixed at $%.2f; fixed-SL policy; TP ladder manages monetisation.",
+                    old_qty, new_qty, closed, float(self._pos.sl_price or 0.0))
+                try:
+                    self._send_telegram(
+                        f"🎯 <b>TP LADDER PARTIAL</b>\n"
+                        f"Closed: <code>{closed:.8g}</code>\n"
+                        f"Remaining: <code>{new_qty:.8g}</code>\n"
+                        f"SL unchanged: <b>${float(self._pos.sl_price or 0.0):,.2f}</b>\n"
+                        f"Final TP unchanged: <b>${float(self._pos.tp_price or 0.0):,.2f}</b>",
+                        event_type="tp_ladder",
+                    )
+                except Exception:
+                    pass
+        except Exception as _e:
+            logger.debug("TP ladder quantity reconcile error: %s", _e)
+
 
     def _enter_trade(self, data_manager, order_manager, risk_manager, side, sig, mode="reversion",
                      ict_tier: str = "", prefetched_bal_info: dict = None,
@@ -6568,7 +6689,7 @@ class QuantStrategy:
             if not sl_order_id_raw or not tp_order_id_raw:
                 logger.warning(
                     "⚠️ Bracket child order IDs not found after fill — "
-                    "trailing SL may not work. Check open orders manually.")
+                    "TP ladder cannot be verified; check open orders manually.")
         else:
             # CoinSwitch (and non-bracket) path: place SL/TP as separate orders
             sweep = order_manager.cancel_symbol_conditionals()
@@ -6598,6 +6719,16 @@ class QuantStrategy:
                 order_manager.place_market_order(side=exit_side, quantity=qty, reduce_only=True)
                 self._last_exit_time = time.time()
                 return
+
+        # ── Dynamic TP ladder: internal liquidity TP1..TPn, final TP unchanged ─────
+        tp_ladder_plan = self._build_tp_ladder_plan(
+            side=side, entry_price=fill_price, sl_price=sl_price,
+            final_tp=tp_price, quantity=qty, atr=atr)
+        tp_ladder_dicts, tp_ladder_order_ids = self._place_internal_tp_ladder(
+            order_manager=order_manager, side=side, quantity=qty, final_tp=tp_price,
+            native_final_tp_order_id=(tp_data or {}).get("order_id", ""),
+            ladder_plan=tp_ladder_plan,
+        )
 
         # ── Log execution cost snapshot (PATCH 5g) ────────────────────────────────
         if self._fee_engine is not None:
@@ -6663,6 +6794,10 @@ class QuantStrategy:
             quant_posterior = _quant_posterior,
             quant_ev        = _quant_ev,
             quant_components = _quant_components,
+            tp_ladder = tp_ladder_dicts,
+            tp_ladder_order_ids = tp_ladder_order_ids,
+            tp_ladder_active = bool(tp_ladder_order_ids),
+            tp_ladder_last_sync_qty = qty,
         )
         # ── Reconcile safety: discard any in-flight reconcile data ────────────────
         self._reconcile_data        = None
@@ -6875,8 +7010,8 @@ class QuantStrategy:
             f"<code>{_runner_model}</code>\n"
             f"{_swept_str}\n"
             f"{_sep}\n"
-            f"Adaptive exit: expected-adverse-excursion → true net BE → structure/liquidity trail\n"
-            f"Monitor: /position  /thinking  /trail"
+            f"Exit model: fixed SL + dynamic liquidity TP ladder (TP1..TPn → final TP)\n"
+            f"Monitor: /position  /thinking"
         )
         logger.info(
             f"✅ ACTIVE {side.upper()} [{mode}] @ ${fill_price:,.2f} | "
@@ -6947,7 +7082,7 @@ class QuantStrategy:
                         logger.info(f"🔄 Regime flip → exit {pos.side.upper()} [{pos.trade_mode}]")
                         self._exit_trade(order_manager, price, "regime_flip"); return
 
-            # Liquidity-hunt trades exit via SL, TP, or trailing SL only.
+            # Liquidity-hunt trades exit via SL, TP, or SL migration only.
             # No premature composite-based exit while the liquidity-delivery thesis is active.
 
             # v5.1: Flow trades exit when order flow structurally reverses.
@@ -6982,7 +7117,7 @@ class QuantStrategy:
                         return
 
         # v5.0: max-hold time exit REMOVED.
-        # Trades exit via SL, TP, trailing SL, regime flip, or breakout expiry only.
+        # Trades exit via SL, TP, SL migration, regime flip, or breakout expiry only.
         # A timer cannot know if the trade is working.
 
         # ── DirectionEngine: pool-hit gate ────────────────────────────────────
@@ -7088,8 +7223,9 @@ class QuantStrategy:
                             logger.debug(
                                 f"POOL-GATE BE still blocked: desired=${_be_tick:,.2f} "
                                 f"price=${price:,.2f} gap={_gap_atr:.2f}ATR")
+                    # SL breakeven migration removed: fixed SL only.
                     _be_upgrade_allowed = (
-                        _be_needed and pos.sl_order_id and (
+                        False and _be_needed and pos.sl_order_id and (
                             (not pos.be_ratchet_applied) or
                             (pos.side == "long" and
                              _safe_be_tick > pos.sl_price + max(QCfg.TICK_SIZE(), 0.1)) or
@@ -7154,7 +7290,7 @@ class QuantStrategy:
                                 self._send_telegram(
                                     f"⚠️ <b>POOL-GATE: STRUCTURAL REVERSAL SIGNAL</b>\n"
                                     f"Pool hit with contra AMD flow — <b>no exit taken</b>\n"
-                                    f"SL migrated to breakeven: <b>${_safe_be_tick:,.2f}</b>\n"
+                                    f"SL unchanged by fixed-SL policy; TP ladder/final TP manages monetisation.\n"
                                     f"Conf: {_gate.confidence:.0%} | {_gate.reason[:150]}")
                             else:
                                 logger.debug(
@@ -7182,7 +7318,7 @@ class QuantStrategy:
                         except Exception:
                             self._send_telegram(
                                 f"⚠️ <b>POOL-GATE: REVERSE SIGNAL (no exit)</b>\n"
-                                f"SL already at/beyond BE — bracket manages\n"
+                                f"SL unchanged — fixed SL + TP ladder manage exits\n"
                                 f"Conf: {_gate.confidence:.0%} | {_gate.reason[:150]}")
                     # NOTE: no early return — trail engine must still run this tick.
                 elif _gate is not None and _gate.action == "continue" and _gate.next_target:
@@ -7194,7 +7330,7 @@ class QuantStrategy:
                     # WHY:
                     #   In production, 23/24 trades exited via SL.  Only 1 hit TP.
                     #   Extending TP further when the first target isn't reached
-                    #   guarantees the trade dies to a trailing SL instead.
+                    #   guarantees the trade dies to a SL migration instead.
                     #
                     #   The original TP was set at the opposing liquidity pool —
                     #   the structural delivery target.  If the market doesn't
@@ -7221,123 +7357,10 @@ class QuantStrategy:
             except Exception as _pg:
                 logger.debug(f"DirectionEngine.pool_hit_gate error: {_pg}")
 
-                # ── Trailing SL — v6.0 STRUCTURE-EVENT-DRIVEN ──────────────────────
-        # Trail checks are structure-event driven.
-        #
-        # Old problem: The 10s timer missed critical structure events. A BOS could
-        # form at t=1s, but trail wouldn't check until t=10s — by which time price
-        # had already reversed past the structure level. The timer also fired during
-        # quiet periods when nothing changed, wasting REST calls.
-        #
-        # New approach: STRUCTURE-EVENT-DRIVEN trailing.
-        #   1. On EVERY tick: detect if ICT structure state has changed since last
-        #      trail computation (new BOS, CHoCH, swing, OB, or significant price move).
-        #   2. If structure changed OR price made new high/low: compute new trail SL
-        #      locally (pure math, no REST call — sub-millisecond).
-        #   3. Only dispatch REST call to exchange when computation yields an actual
-        #      SL improvement. One-in-flight guard prevents duplicate edits.
-        #   4. Minimum 3s cooldown between successful REST trail moves to prevent
-        #      exchange rate-limit exhaustion during rapid structural cascades.
-        #
-        # This gives us:
-        #   - ZERO missed structure events (every BOS/CHoCH/swing detected immediately)
-        #   - ZERO wasted REST calls (only fires when SL actually needs to move)
-        #   - Institutional-grade responsiveness to market structure shifts
-        if self.get_trail_enabled():
-            # ── Step 1: Detect structure change or new price extreme ──────
-            _structure_changed = self._detect_structure_change(data_manager, price, pos, now)
-            _new_extreme = bool(_observed_new_extreme)
-
-            # Also trigger on significant price moves (>0.15 ATR since last trail check)
-            _atr_now = self._atr_5m.atr if self._atr_5m else 0.0
-            _price_moved = False
-            if _atr_now > 1e-10:
-                _last_trail_px = getattr(self, '_last_trail_check_price', 0.0)
-                if abs(price - _last_trail_px) > 0.15 * _atr_now:
-                    _price_moved = True
-
-            _should_trail = _structure_changed or _new_extreme or _price_moved
-
-            if _should_trail:
-                self._last_trail_check_price = price
-                # ── Step 2: Check minimum REST cooldown (3s between moves) ────
-                _min_trail_rest_cd = 3.0
-                _last_trail_success = getattr(self, '_last_trail_rest_time', 0.0)
-                _rest_ok = (now - _last_trail_success) >= _min_trail_rest_cd
-
-                if _rest_ok:
-                    # ── Step 3: One-in-flight guard ───────────────────────────
-                    # BUG-FIX A: the original code did `return` when in-flight,
-                    # which aborted ALL of _manage_active (pool-gate, max-hold,
-                    # everything) for the duration of the REST call (~3–30s on
-                    # exchange timeout).  Replaced with a _can_launch flag so only
-                    # the trail thread dispatch is gated; _manage_active continues
-                    # normally regardless of whether a trail thread is in flight.
-                    _can_launch = False
-                    with self._lock:
-                        # sweep-posterior FIX: self-heal a stuck _trail_in_progress flag.
-                        # Production logs (2026-04-25 10:34:46) showed watchdog
-                        # firing `stuck_trail_flag` after a thread had been
-                        # "alive" for 61s. If the bg-thread is killed (OOM,
-                        # signal) between the try-body and the finally, the
-                        # flag is stuck. Pre-empt the watchdog: if flag set
-                        # for >60s with no live trail thread, clear it before
-                        # checking. This eliminates the race that caused the
-                        # watchdog WARN.
-                        if self._trail_in_progress:
-                            _flag_age = now - getattr(self, "_trail_started_at", 0.0)
-                            if _flag_age > 60.0:
-                                _live_trail_threads = any(
-                                    ("trail" in t.name.lower()) and t.is_alive()
-                                    for t in threading.enumerate()
-                                )
-                                if not _live_trail_threads:
-                                    logger.warning(
-                                        "Trail flag stuck %.0fs with no live thread — self-healing",
-                                        _flag_age,
-                                    )
-                                    self._trail_in_progress = False
-                                    self._trail_started_at = 0.0
-                        if not self._trail_in_progress:
-                            self._trail_in_progress = True
-                            self._trail_started_at = now
-                            _can_launch = True
-
-                    if _can_launch:
-                        _snap_om  = order_manager
-                        _snap_dm  = data_manager
-                        _snap_px  = price
-                        _snap_now = now
-                        if _new_extreme:
-                            try:
-                                moved = self._update_trailing_sl(_snap_om, _snap_dm, _snap_px, _snap_now)
-                                if moved:
-                                    self._last_trail_rest_time = time.time()
-                            except Exception as _te:
-                                logger.error("Trail immediate-extreme error: %s", _te, exc_info=True)
-                            finally:
-                                self._trail_in_progress = False
-                                self._trail_started_at = 0.0
-                            return
-
-                        def _bg_trail():
-                            with instrument_scope(getattr(self, "_instrument", None)):
-                              try:
-                                live_price = _snap_dm.get_last_price()
-                                live_now   = time.time()
-                                if live_price < 1.0:
-                                    live_price = _snap_px
-                                moved = self._update_trailing_sl(_snap_om, _snap_dm, live_price, live_now)
-                                if moved:
-                                    self._last_trail_rest_time = time.time()
-                              except Exception as _te:
-                                logger.error("Trail background error: %s", _te, exc_info=True)
-                              finally:
-                                self._trail_in_progress = False
-                                self._trail_started_at = 0.0
-
-                        threading.Thread(target=_bg_trail, daemon=True,
-                                         name=f"trail-sl-{int(now*1000)%100000}").start()
+        # SL migration is removed by design. The active exit model is:
+        #   fixed original SL + reduce-only internal TP ladder + final TP.
+        # Do not compute or dispatch any SL migration here.
+        return
 
     def _detect_structure_change(self, data_manager, price: float,
                                   pos: 'PositionState', now: float) -> bool:
@@ -7576,496 +7599,14 @@ class QuantStrategy:
         return True
 
     def _trail_payoff_lock_ok(self, pos, new_sl: float, atr: float,
-                              phase: str) -> Tuple[bool, str]:
-        """Require structural profit locks to improve payoff, not just win rate."""
-        phase_u = str(phase or "").upper()
-        if phase_u in {"BE_LOCK", "COUNTER_BOS"}:
-            return True, "risk-defense lock"
+                              phase: str) -> tuple:
+        return False, "SL migration disabled by fixed-SL TP-ladder policy"
 
-        side = str(getattr(pos, "side", "") or "").lower()
-        if side not in {"long", "short"}:
-            return True, "missing side context"
-
-        try:
-            entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
-            current_sl = float(getattr(pos, "sl_price", 0.0) or 0.0)
-            proposed_sl = float(new_sl or 0.0)
-            atr_f = max(float(atr or 0.0), 1e-9)
-        except Exception:
-            return True, "invalid payoff context"
-
-        if entry <= 0.0 or proposed_sl <= 0.0:
-            return True, "incomplete payoff context"
-
-        init_dist = float(getattr(pos, "initial_sl_dist", 0.0) or 0.0)
-        if init_dist <= 1e-10 and current_sl > 0.0:
-            init_dist = abs(entry - current_sl)
-        if init_dist <= 1e-10:
-            return True, "missing initial risk context"
-
-        true_be = _calc_be_price(side, entry, atr_f, pos=pos)
-        cost_buffer_pts = abs(true_be - entry)
-        if side == "long":
-            net_lock_pts = proposed_sl - true_be
-            gross_lock_pts = proposed_sl - entry
-        else:
-            net_lock_pts = true_be - proposed_sl
-            gross_lock_pts = entry - proposed_sl
-
-        min_net_r = max(0.0, float(getattr(config, "PAYOFF_TRAIL_MIN_NET_R", 0.50)))
-        min_cost_mult = max(0.0, float(getattr(config, "PAYOFF_TRAIL_MIN_COST_MULT", 0.75)))
-        tick_floor = max(QCfg.TICK_SIZE() * 2.0, 1e-9)
-        required_pts = max(min_net_r * init_dist,
-                           min_cost_mult * cost_buffer_pts,
-                           tick_floor)
-        net_r = net_lock_pts / init_dist if init_dist > 1e-10 else 0.0
-        req_r = required_pts / init_dist if init_dist > 1e-10 else 0.0
-
-        if gross_lock_pts <= 0.0:
-            return False, (
-                f"no positive gross lock: gross={gross_lock_pts:.1f}pts "
-                f"trueBE=${true_be:,.1f}")
-        if net_lock_pts + max(QCfg.TICK_SIZE(), 1e-9) < required_pts:
-            return False, (
-                f"net_lock={net_lock_pts:.1f}pts/{net_r:.2f}R < "
-                f"required={required_pts:.1f}pts/{req_r:.2f}R "
-                f"(cost_buf={cost_buffer_pts:.1f}pts trueBE=${true_be:,.1f})")
-        return True, (
-            f"net_lock={net_lock_pts:.1f}pts/{net_r:.2f}R >= "
-            f"required={required_pts:.1f}pts/{req_r:.2f}R")
 
     def _update_trailing_sl(self, order_manager, data_manager, price, now) -> bool:
-        """Institutional trail v5.0 — 5-feature upgrade (OB/Breaker priority,
-        AMD-phase adaptive buffer, 4H/1H HTF cascade, liq pool ceiling,
-        displacement+CVD gate). All SL changes are LIMIT orders only."""
-        pos = self._pos; atr = self._atr_5m.atr
-        if atr < 1e-10: return False
-        if pos.entry_price < 1.0:
-            logger.warning("Trail: entry_price invalid (%.2f) — skipping", pos.entry_price)
-            return False
-        if not pos.sl_order_id:
-            # BUG-FIX B: was logger.debug — invisible in production where INFO is the
-            # floor.  This condition means the trail is permanently blocked for the
-            # entire trade since sl_order_id is never set after entry.  Raising to
-            # WARNING makes the blockage immediately visible in logs and Telegram.
-            _warn_key = "_trail_no_sl_warned"
-            if not getattr(self, _warn_key, False):
-                setattr(self, _warn_key, True)
-                logger.warning(
-                    "Trail BLOCKED: sl_order_id not set — trailing SL disabled "
-                    "for this position.  Check SL order placement in _enter_trade.")
-            return False
-        profit = (price-pos.entry_price) if pos.side=="long" else (pos.entry_price-price)
+        """Disabled: SL price is fixed; TP ladder handles monetisation."""
+        return False
 
-        # CRIT-2 FIX: All compound read-modify-write mutations on shared PositionState
-        # must be executed under self._lock to prevent TOCTOU races with the main
-        # thread (_log_thinking, _manage_active) and the reconcile thread.
-        # Python's GIL protects individual attr stores but NOT the if/assign pattern:
-        #   T1: reads peak_profit=50, T2: reads peak_profit=50 → both pass → T2 overwrites T1.
-        with self._lock:
-            if profit > pos.peak_profit:
-                pos.peak_profit = profit
-
-            # PostTradeAgent: track Maximum Adverse Excursion (MAE)
-            _adverse = max(0.0, -profit)
-            if _adverse > pos.peak_adverse:
-                pos.peak_adverse = _adverse
-
-            # Track absolute peak price (used by liquidity-agnostic trail)
-            if pos.side == "long":
-                if price > pos.peak_price_abs:
-                    pos.peak_price_abs = price
-            else:
-                if pos.peak_price_abs < 1e-10 or price < pos.peak_price_abs:
-                    pos.peak_price_abs = price
-
-        try: candles_1m = data_manager.get_candles("1m", limit=60)
-        except Exception: candles_1m = []
-        try: candles_5m = data_manager.get_candles("5m", limit=30)
-        except Exception: candles_5m = []
-        try: orderbook = data_manager.get_orderbook()
-        except Exception: orderbook = {"bids": [], "asks": []}
-
-        hold_secs = now - pos.entry_time
-        now_ms = int(now * 1000)
-
-        # ── Issue 2 fix: Refresh ICT engine with live multi-timeframe structure ──
-        # Also captures HTF candles (4h/1h) here for the trail engine cascade.
-        _trail_candles_15m = None
-        _trail_candles_1h  = None
-        _trail_candles_4h  = None
-        if self._ict is not None:
-            try:
-                candles_15m        = data_manager.get_candles("15m", limit=200)
-                _trail_candles_15m = candles_15m
-                _trail_5m          = data_manager.get_candles("5m",  limit=300)
-                _trail_1m          = data_manager.get_candles("1m",  limit=120)
-                _trail_candles_1h  = data_manager.get_candles("1h",  limit=100)
-                _trail_candles_4h  = data_manager.get_candles("4h",  limit=50)
-                # Bug #40 fix: force an ICT refresh specifically for the trail
-                # path by temporarily backing the ICT engine's last-update
-                # timestamp.  The 5s throttle was designed to prevent redundant
-                # updates on every 250ms tick, but here we NEED fresh structure
-                # because a new 5m bar may have closed between the entry-path
-                # ICT update and this trail tick.  We only force a refresh if
-                # at least TRAIL_ICT_MIN_REFRESH_SEC (2s) have elapsed since
-                # the last actual update — this prevents a full re-scan every
-                # 250ms while still ensuring the trail sees bars that closed
-                # within the last 2 seconds.
-                _trail_ict_min_refresh = float(
-                    getattr(config, 'TRAIL_ICT_MIN_REFRESH_SEC', 2.0))
-                _ict_age = now - getattr(self._ict, '_last_update', 0.0)
-                if _ict_age >= _trail_ict_min_refresh:
-                    # Temporarily set _last_update to 0 to bypass the throttle,
-                    # then immediately restore so the entry path's next call
-                    # still benefits from the throttle.
-                    _saved_ts = self._ict._last_update
-                    self._ict._last_update = 0.0
-                    try:
-                        self._ict.update(_trail_5m, candles_15m, price, now_ms,
-                                         candles_1m=_trail_1m,
-                                         candles_1h=_trail_candles_1h,
-                                         candles_4h=_trail_candles_4h,
-                                         candles_1d=data_manager.get_candles("1d", limit=30))
-                    except Exception:
-                        self._ict._last_update = _saved_ts
-                        raise
-            except Exception as _ict_refresh_e:
-                logger.debug(f"Trail ICT refresh error (non-fatal): {_ict_refresh_e}")
-
-        # ══════════════════════════════════════════════════════════════════
-        # INSTITUTIONAL LIQUIDITY/STRUCTURE TRAIL ENGINE - SOLE TRAILING ENGINE
-        # ══════════════════════════════════════════════════════════════════
-        # Liquidity/structure trailing: bar-close-gated, close-confirmation counter,
-        # swing-invalidation, momentum gate, liquidity/PD-array buffers, HTF
-        # alignment, Counter-BOS sovereign override, OTE pullback freeze.
-        # No fallback logic: if the engine returns new_sl=None, we HOLD.
-        # ══════════════════════════════════════════════════════════════════
-        if self._liq_trail is None:
-            # Engine not wired in — no trailing possible.
-            logger.debug("Trail: LiquidityTrailEngine not initialised — HOLD")
-            return False
-
-        # Live CVD trend for the momentum gate
-        _cvd_trend_now = 0.0
-        try:
-            _cvd_trend_now = self._cvd.get_trend_signal()
-        except Exception:
-            pass
-
-        # Build a live liquidity snapshot if available
-        _trail_snap = None
-        if self._liq_map is not None:
-            try:
-                _trail_snap = self._liq_map.get_snapshot(price, atr)
-            except Exception as _liq_snap_e:
-                logger.debug("Trail liq_snapshot error (non-fatal): %s", _liq_snap_e)
-
-        # Institutional profit-defense: only after meaningful delivery + large
-        # giveback + adverse evidence. This preserves edge without aggressively
-        # trailing routine pullbacks.
-        if self._profit_defense_exit_if_needed(order_manager, price, atr, _cvd_trend_now, now):
-            return True
-
-        _liq_hold_reasons: list = []
-        try:
-            _liq_result = self._liq_trail.compute(
-                pos_side        = pos.side,
-                price           = price,
-                entry_price     = pos.entry_price,
-                current_sl      = pos.sl_price,
-                atr             = atr,
-                initial_sl_dist = pos.initial_sl_dist,
-                peak_profit     = pos.peak_profit,
-                liq_snapshot    = _trail_snap,
-                ict_engine      = self._ict,
-                now             = now,
-                hold_reason     = _liq_hold_reasons,
-                pos             = pos,
-                fee_engine      = getattr(self, '_fee_engine', None),
-                cvd_trend       = _cvd_trend_now,
-                candles_1m      = candles_1m,
-                candles_5m      = candles_5m,
-                candles_15m     = _trail_candles_15m,
-                candles_1h      = _trail_candles_1h,
-            )
-        except Exception as _lt_e:
-            logger.exception("Trail: compute error — HOLD")
-            return False
-
-        # Bug #18b fix: check trail_blocked before treating new_sl=None as a
-        # structural HOLD.  trail_blocked=True means the engine was deliberately
-        # gated (e.g. ASIA session disabled) — this is policy, not a failure to
-        # find a valid Fib level.  Log it separately so the operator can
-        # distinguish "no valid swing" from "session blocked".
-        # Also: do NOT increment consecutive_trail_holds on a policy block,
-        # because that counter is used for "trail is stuck" detection and a
-        # blocked trail is not stuck — it is intentionally paused.
-        if _liq_result.new_sl is None:
-            if getattr(_liq_result, 'trail_blocked', False):
-                _log_interval = 60.0   # less noisy for policy blocks
-                if now - self._last_trail_block_log >= _log_interval:
-                    self._last_trail_block_log = now
-                    logger.info(
-                        f"🚫 Trail POLICY_BLOCK [{_liq_result.block_reason}] "
-                        f"SL=${pos.sl_price:,.1f} — not incrementing hold counter")
-                return False
-
-            # Structural HOLD — engine searched but found no valid Fib level
-            pos.consecutive_trail_holds += 1
-            _log_interval = 30.0
-            if now - self._last_trail_block_log >= _log_interval:
-                self._last_trail_block_log = now
-                _hold_str = " | ".join(_liq_hold_reasons[:3]) if _liq_hold_reasons \
-                            else f"phase={_liq_result.phase}"
-                init_dist_r = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
-                _mfe_r = pos.peak_profit / init_dist_r if init_dist_r > 1e-10 else 0.0
-                hm = (now - pos.entry_time) / 60.0
-                logger.info(
-                    f"🔒 Trail HOLD [{_liq_result.phase}] | {_hold_str} | "
-                    f"profit={profit:.1f}pts MFE={pos.peak_profit:.1f}pts R={_mfe_r:.2f} | "
-                    f"SL=${pos.sl_price:,.1f} hold={hm:.0f}m")
-            return False
-
-        # Engine returned a new SL — dispatch to exchange
-        _new_liq_sl = _liq_result.new_sl
-        _tick_gap = max(QCfg.TICK_SIZE() * 0.5, 1e-9)
-        _invalid_stop = (
-            (pos.side == "long" and _new_liq_sl >= price - _tick_gap) or
-            (pos.side == "short" and _new_liq_sl <= price + _tick_gap)
-        )
-        if _invalid_stop:
-            if now - self._last_trail_block_log >= 30.0:
-                self._last_trail_block_log = now
-                _verb = "SELL below" if pos.side == "long" else "BUY above"
-                logger.warning(
-                    f"InstitutionalTrail dispatch blocked: {pos.side.upper()} protective "
-                    f"stop ${_new_liq_sl:,.1f} is not executable at market "
-                    f"${price:,.1f}; requires {_verb} market. No REST retry.")
-            return False
-        _payoff_ok, _payoff_reason = self._trail_payoff_lock_ok(
-            pos, _new_liq_sl, atr, _liq_result.phase)
-        if not _payoff_ok:
-            pos.consecutive_trail_holds += 1
-            if now - self._last_trail_block_log >= 30.0:
-                self._last_trail_block_log = now
-                logger.info(
-                    f"InstitutionalTrail PAYOFF_HOLD [{_liq_result.phase}] "
-                    f"SL=${_new_liq_sl:,.1f} current=${pos.sl_price:,.1f} | "
-                    f"{_payoff_reason}")
-            return False
-        logger.info(
-            f"🏦 InstitutionalTrail [{_liq_result.phase}] "
-            f"R={_liq_result.r_multiple:.2f}R → SL ${_new_liq_sl:.1f} | "
-            f"{_liq_result.reason}")
-
-        # SIG-3 FIX: Verify position identity before issuing REST call.
-        # The background trail thread can race with a close/reconcile event
-        # between the compute and the replace_stop_loss dispatch.
-        _entry_time_snap = pos.entry_time
-        _phase_snap      = pos.phase
-        with self._lock:
-            _pos_still_valid = (
-                self._pos.phase       == _phase_snap and
-                self._pos.entry_time  == _entry_time_snap and
-                self._pos.sl_order_id == pos.sl_order_id
-            )
-        if not _pos_still_valid:
-            logger.warning(
-                "InstitutionalTrail: position changed between compute and REST dispatch "
-                "— aborting trail to prevent orphaned stop order")
-            return False
-
-        _lt_side = "sell" if pos.side == "long" else "buy"
-        logger.info(
-            f"🏦 InstitutionalTrail SL dispatch [STOP-LIMIT] "
-            f"trigger=${_new_liq_sl:,.1f} side={_lt_side} qty={pos.quantity} "
-            f"phase={_liq_result.phase}")
-        _lt_result = order_manager.replace_stop_loss(
-            existing_sl_order_id = pos.sl_order_id,
-            side                 = _lt_side,
-            quantity             = pos.quantity,
-            new_trigger_price    = _new_liq_sl,
-            old_trigger_price    = pos.sl_price,
-            current_price        = price,
-        )
-        if _lt_result is None:
-            # replace_stop_loss returns None ONLY when it verified the SL
-            # order is a TRUE fill (not a self-cancellation ghost). Safe
-            # to record exchange exit.
-            logger.warning("🚨 SL already fired during trail dispatch")
-            self._record_exchange_exit(None)
-            return True
-        if isinstance(_lt_result, dict) and _lt_result.get("error"):
-            err = _lt_result.get("error", "unknown")
-
-            # ── FIX (third-trade bug): UNPROTECTED means SL is GONE ───────────
-            # The cancel succeeded but the replace failed AND the restore
-            # failed — position is live on the exchange with no stop-loss.
-            # This is the exact state that blew up the third trade. The only
-            # institutionally-correct response is to flatten at market and
-            # let the reconcile path record the exit.
-            if err == "UNPROTECTED":
-                logger.critical(
-                    "💀 TRAIL: SL replace returned UNPROTECTED — "
-                    "position has no stop-loss on exchange. Emergency-flattening.")
-                self._send_telegram(
-                    "🚨 <b>UNPROTECTED POSITION</b>\n"
-                    "SL could not be moved or restored.\n"
-                    "Emergency-flattening at market.")
-                try:
-                    if hasattr(order_manager, "emergency_flatten"):
-                        order_manager.emergency_flatten(reason="trail_unprotected")
-                    else:
-                        _es = "sell" if pos.side == "long" else "buy"
-                        order_manager.place_market_order(
-                            side=_es, quantity=pos.quantity, reduce_only=True)
-                except Exception as _ef_e:
-                    logger.error(
-                        f"emergency_flatten raised: {_ef_e}", exc_info=True)
-                # Transition to EXITING; reconcile will book the real exit.
-                with self._lock:
-                    if self._pos.phase == PositionPhase.ACTIVE:
-                        self._pos.phase = PositionPhase.EXITING
-                        self._exiting_since = time.time()
-                return False
-
-            # Partial success: old SL cancelled, new one at requested trigger
-            # failed, but we successfully restored an SL at a fallback trigger.
-            # The trail did not move as intended — update our tracking to the
-            # restored trigger so we don't re-fire the same failing replace
-            # every tick, but do NOT mark the trail as advanced.
-            if err == "PLACE_FAILED_RESTORED":
-                _restore_oid = _lt_result.get("restore_order_id")
-                _restore_trig = float(_lt_result.get("restore_trigger", 0) or 0)
-                logger.warning(
-                    f"⚠️ Trail: SL restored at ${_restore_trig:,.2f} (not the "
-                    f"requested ${_new_liq_sl:,.1f}). Updating tracking.")
-                with self._lock:
-                    if _restore_oid:
-                        self._pos.sl_order_id = _restore_oid
-                    if _restore_trig > 0:
-                        self._pos.sl_price = _restore_trig
-                        self.current_sl_price = _restore_trig
-                return False
-
-            logger.warning(f"InstitutionalTrail: SL replace failed ({err}) — keeping current SL")
-            return False
-
-        # Success — update position state under lock
-        with self._lock:
-            self._pos.sl_price = _new_liq_sl
-            _new_oid = (_lt_result or {}).get("order_id")
-            if _new_oid:
-                self._pos.sl_order_id = _new_oid
-            self.current_sl_price = _new_liq_sl
-            self._pos.consecutive_trail_holds = 0
-            if not self._pos.trail_active:
-                self._pos.trail_active = True
-                logger.info("✅ Institutional trail now active")
-            if _liq_result.phase == "BE_LOCK":
-                self._pos.be_ratchet_applied = True
-
-        # Throttled Telegram update with the full v5.0 context
-        _trail_tg_key = "_liq_trail_tg_last"
-        if now - getattr(self, _trail_tg_key, 0.0) >= 120.0:
-            setattr(self, _trail_tg_key, now)
-            try:
-                from telegram.notifier import format_liquidity_trail_update
-                _a = _liq_result.anchor
-                self._send_telegram(format_liquidity_trail_update(
-                    side          = pos.side,
-                    new_sl        = _new_liq_sl,
-                    anchor_price  = (_a.price if _a else pos.entry_price),
-                    anchor_tf     = (_a.timeframe if _a else ""),
-                    anchor_sig    = (_a.sig if _a else 0.0),
-                    phase         = _liq_result.phase,
-                    is_swept      = (_a.is_swept if _a else False),
-                    entry_price   = pos.entry_price,
-                    current_price = price,
-                    atr           = atr,
-                    session       = self._liq_trail._detect_session(self._ict),
-                    fib_ratio     = (_a.fib_ratio if _a else None),
-                    r_multiple    = _liq_result.r_multiple,
-                    swing_low     = _liq_result.swing_low,
-                    swing_high    = _liq_result.swing_high,
-                    momentum_gate = _liq_result.momentum_gate,
-                    htf_aligned   = _liq_result.htf_aligned,
-                    is_cluster    = (_a.is_cluster if _a else False),
-                    n_cluster_tfs = (_a.n_cluster_tfs if _a else 1),
-                    pool_boost    = (_a.pool_boost if _a else False),
-                    pool_between_expand = (_a.pool_between_expand if _a else False),
-                    buffer_atr    = (_a.buffer_atr if _a else 0.0),
-                ))
-            except Exception as _lt_tg_e:
-                logger.debug(f"InstitutionalTrail Telegram error: {_lt_tg_e}")
-        return True
-
-    def _exit_trade(self, order_manager, price, reason):
-        pos = self._pos
-        if pos.phase != PositionPhase.ACTIVE: return
-        logger.info(f"🚪 EXIT {pos.side.upper()} @ ${price:,.2f} | {reason}")
-        self._pos.phase = PositionPhase.EXITING
-        self._exiting_since = time.time()
-        order_manager.cancel_all_exit_orders(sl_order_id=pos.sl_order_id, tp_order_id=pos.tp_order_id)
-        es = "sell" if pos.side=="long" else "buy"
-        exit_data = order_manager.place_market_order(side=es, quantity=pos.quantity, reduce_only=True)
-        # Persist the exact reduce-only market-exit order id. This is mandatory
-        # for correct PnL accounting because identify_exit_order() only knows the
-        # exchange SL/TP child ids; profit-defense/manual exits cancel those and
-        # fire a new market order.
-        try:
-            manual_oid = str((exit_data or {}).get('order_id') or (exit_data or {}).get('id') or '')
-            with self._lock:
-                pos.manual_exit_order_id = manual_oid
-                pos.manual_exit_reason = str(reason or 'manual_exit')
-                pos.manual_exit_requested_at = time.time()
-                pos.manual_exit_reference_price = float(price or 0.0)
-            if manual_oid:
-                logger.info(f"Manual/reduce-only exit order tracked: {manual_oid[:10]}… reason={reason}")
-            else:
-                logger.error("Manual/reduce-only exit order was submitted but no order_id was returned; exact PnL will retry via exchange history/fallback")
-        except Exception as _mx_e:
-            logger.error(f"failed to store manual exit order id: {_mx_e}", exc_info=True)
-
-        # FIX Bug-D: do NOT call _record_pnl here with an estimated PnL.
-        # _record_exchange_exit() (called by the reconcile / sync path once the
-        # exchange confirms the position is flat) will record the exact PnL.
-        # Calling _record_pnl here first created a guaranteed duplicate: this
-        # estimated entry fires immediately, then the exact entry fires ~1–30 s
-        # later when _sync_position or _reconcile_apply confirms the close.
-        # The _pnl_recorded_for guard would drop the second call — but the first
-        # call was the ESTIMATED one. Now we always record the exact value first.
-        #
-        # If the exchange confirmation never arrives (network failure), the
-        # EXITING watchdog fires after 120s and calls _finalise_exit() which
-        # records PnL=0 via the "unconfirmed" path — acceptable fallback.
-        # Telegram message still uses local price estimate for immediacy.
-        fill_type = getattr(pos, 'entry_fill_type', 'taker')
-        pnl_est = self._estimate_pnl(pos, price, entry_fill_type=fill_type)
-
-        hold_min     = (time.time() - pos.entry_time) / 60.0
-        init_sl_dist = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else abs(pos.entry_price - pos.sl_price)
-        raw_pts      = (price - pos.entry_price) if pos.side == "long" else (pos.entry_price - price)
-        achieved_r   = raw_pts / init_sl_dist if init_sl_dist > 1e-10 else 0.0
-        tp_dist      = abs(pos.tp_price - pos.entry_price) if pos.tp_price > 0 else 0.0
-        planned_rr   = tp_dist / init_sl_dist if init_sl_dist > 1e-10 else 0.0
-        result_icon  = "✅" if pnl_est > 0 else "❌"
-
-        self._send_telegram(
-            f"🚪 <b>CLOSING POSITION — {reason.upper()}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Side:     {pos.side.upper()} [{pos.trade_mode.upper()}]\n"
-            f"Entry:    ${pos.entry_price:,.2f}\n"
-            f"Est exit: ~${price:,.2f}  ({'+' if raw_pts>=0 else ''}{raw_pts:.1f} pts)\n"
-            f"Est PnL:  ~${pnl_est:+.2f} USDT\n"
-            f"<i>Awaiting exchange confirmation...</i>"
-        )
-        self._last_exit_side = pos.side
-        # _finalise_exit() is NOT called here — let _sync_position / _reconcile_apply
-        # confirm the position is flat on the exchange and then call _record_exchange_exit,
-        # which records exact PnL and calls _finalise_exit().  The EXITING watchdog (120s)
-        # is the safety net if exchange confirmation never arrives.
 
     def _record_exchange_exit(self, ex_pos):
         """
@@ -8156,7 +7697,7 @@ class QuantStrategy:
                 exit_info = self._om.identify_exit_order(
                     sl_order_id  = pos.sl_order_id,
                     tp_order_id  = pos.tp_order_id,
-                    trail_active = pos.trail_active,
+                    trail_active = False,
                 )
             except Exception as e:
                 logger.error(f"identify_exit_order (attempt 1) error: {e}", exc_info=True)
@@ -8173,7 +7714,7 @@ class QuantStrategy:
                     exit_info = self._om.identify_exit_order(
                         sl_order_id  = pos.sl_order_id,
                         tp_order_id  = pos.tp_order_id,
-                        trail_active = pos.trail_active,
+                        trail_active = False,
                     )
                     if exit_info.get("confirmed"):
                         logger.info(f"✅ Exit confirmed on retry {_retry_idx + 2} (after {_delay}s)")
@@ -8474,10 +8015,8 @@ class QuantStrategy:
             result_icon = "🎯"; result_label = "TP HIT";   result_color = "WIN ✅"
         elif is_sl_hit and pnl > 0:
             result_icon = "🔒"
-            result_label = "TRAIL SL (profitable)" if pos.trail_active else "SL HIT (profitable)"
+            result_label = "SL HIT (protected)"
             result_color = "WIN ✅"
-        elif is_sl_hit and pos.trail_active:
-            result_icon = "🔒"; result_label = "TRAIL SL"; result_color = "LOSS ❌"
         else:
             result_icon = "🛑"; result_label = "SL HIT";   result_color = "LOSS ❌"
 
@@ -8486,7 +8025,6 @@ class QuantStrategy:
         planned_rr = tp_dist / init_sl_dist if init_sl_dist > 1e-10 else 0.0
         _orig_sl   = ((pos.entry_price - init_sl_dist) if pos.side == "long"
                       else (pos.entry_price + init_sl_dist))
-        _trail_imp = abs(pos.sl_price - _orig_sl) if pos.trail_active else 0.0
 
         # v6.0: Margin-based P&L %
         _exit_margin_pct = 0.0
@@ -8513,8 +8051,7 @@ class QuantStrategy:
             f"PnL:      <b>${pnl:+.2f} USDT</b>  ({_exit_margin_pct:+.1f}% on ${_exit_margin_used:.2f} margin)\n"
             f"R:        {achieved_r:+.2f}R  (planned 1:{planned_rr:.2f}R)\n"
             f"MFE:      {mfe_r:.2f}R  |  Hold: {hold_min:.1f}m\n"
-            + (f"Trail:    ✅ SL moved {_trail_imp:+.1f}pts vs orig\n"
-               if pos.trail_active else "Trail:    — not activated\n") +
+            + f"Exit:     fixed SL + TP ladder\n" +
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"<i>Session: {self._total_trades}T | WR: {self._win_rate():.0%} | "
             f"Total PnL: ${self._total_pnl:+.2f}</i>"
@@ -8640,7 +8177,7 @@ class QuantStrategy:
             "is_win":       is_win,
             "reason":       exit_reason,
             "hold_min":     (time.time() - pos.entry_time) / 60.0 if getattr(pos,'entry_time',0) > 0 else 0.0,
-            "trailed":      getattr(pos, 'trail_active', False),
+            "exit_model":    "fixed_sl_tp_ladder",
             "mfe_r":        (getattr(pos,'peak_profit',0.0) / init_sl_dist
                              if init_sl_dist > 1e-10 else 0.0),
             # ── v6.0: Margin-based P&L % ─────────────────────────────────────
@@ -8765,18 +8302,6 @@ class QuantStrategy:
         if hasattr(self, '_entry_engine') and self._entry_engine is not None:
             self._entry_engine.on_position_closed()
 
-        # Bug #23 fix: LiquidityTrailEngine holds _locked_anchor and
-        # _anchor_lock_until across the lifetime of the instance (one instance
-        # per QuantStrategy, reused for every position).  If position A closed
-        # while anchored to a 15m SSL at $66,800 and position B opens within
-        # the 90-second lock window, the engine would reuse A's stale anchor —
-        # structurally irrelevant and potentially in the wrong direction for B.
-        # reset() clears both fields atomically; it is intentionally idempotent.
-        if hasattr(self, '_liq_trail') and self._liq_trail is not None:
-            try:
-                self._liq_trail.reset()
-            except Exception as _ltr_e:
-                logger.debug(f"LiquidityTrailEngine.reset() error (non-fatal): {_ltr_e}")
 
         # FIX-B4: Invalidate the cached LiquidityMap snapshot immediately after
         # the position closes so that the FIRST post-close tick's predict_hunt()
@@ -8825,13 +8350,7 @@ class QuantStrategy:
         # thread called _record_pnl() and the guard was open → duplicate.
         self._pos = PositionState(); self._last_exit_time = time.time()
         self.current_sl_price = 0.0; self.current_tp_price = 0.0
-        # v6.0: Reset structure-event trail state for next trade
         self._last_structure_fingerprint = None
-        self._last_trail_check_price = 0.0
-        self._last_trail_rest_time = 0.0
-        # BUG-FIX C: reset per-trade trail diagnostic flags so each new position
-        # re-emits the "sl_order_id not set" warning if the problem recurs.
-        self._trail_no_sl_warned = False
 
         # ─── sweep-posterior FIX: delayed _exit_completed clear ──────────────────────────
         # Production logs (2026-04-25) showed watchdog firing `stuck_exit_completed`
@@ -9509,7 +9028,7 @@ class QuantStrategy:
         To hold 0.005 BTC exposure at $68,856, you need 0.005 × 68,856 = 344 USD contracts.
         Dividing by 0.001 gave 5 contracts = $5 notional instead of $344 notional.
         Result: gross PnL was ~68× too small; net was always dominated by fees → showed loss
-        even when trailing SL locked 98 points of profit.
+        even when SL migration locked 98 points of profit.
 
         FIX:
         For Delta BTCUSD inverse perp, convert BTC quantity to USD contracts by
@@ -9734,7 +9253,6 @@ class QuantStrategy:
                 "entry_price": p.entry_price,
                 "quantity": p.quantity,
                 "peak_profit": p.peak_profit,
-                "trail_active": p.trail_active,
             }
             pos_entry = p.entry_price
             pos_sl = p.sl_price
@@ -9991,7 +9509,7 @@ class QuantStrategy:
             # Compute initial_sl_dist for the adopted position.
             # When sl_p is known: use the actual distance from entry to SL.
             # When sl_p is zero (no SL on exchange): fall back to 1.5×ATR so the
-            # LiquidityTrailEngine has a valid R-denominator and doesn't stay
+            # DisabledSLMigrationEngine has a valid R-denominator and doesn't stay
             # permanently in PHASE_0_HANDS_OFF at 0/0 = 0R.
             _adopt_atr = self._atr_5m.atr if (hasattr(self, '_atr_5m') and self._atr_5m and self._atr_5m.atr > 0) else 0.0
             _adopt_sl_dist = (
@@ -10025,37 +9543,6 @@ class QuantStrategy:
             #     on_position_closed() → _reset() → purge _processed_sweeps is skipped,
             #     leaving stale sweep holds that block re-entry.
             #
-            # (B) LiquidityTrailEngine retains _locked_anchor from the PREVIOUS trade.
-            #     If the bot took a trade (or had state) before adopting this position,
-            #     the 90s anti-oscillation lock from that prior trade may still be active.
-            #     When the adopted position closes and trail logic next runs, it reuses
-            #     the stale anchor (wrong price, wrong direction) for up to 90s.
-            #
-            # (C) LiquidityMap snapshot is stale at adoption time.
-            #     predict_hunt() is called BEFORE liq_map.update() per direction_engine
-            #     FIX-8. The snapshot in use carries whatever pool layout existed BEFORE
-            #     the adoption. If a sweep happened just before adoption (which is common
-            #     — the bot adopted because its own trade signal was fast and the position
-            #     was already on exchange), the swept pool is still in the snapshot as the
-            #     primary target. After adoption, that stale pool biases hunt predictions
-            #     for the entire position lifetime.
-            #
-            # (D) DirectionEngine may have a stale PostSweepState if a sweep was detected
-            #     in the ticks leading up to adoption. clear_sweep() is idempotent — safe
-            #     to call even when no post-sweep state is active.
-            #
-            # Fixes applied here match the exact call sequence in _enter_trade (line ~4906):
-            if hasattr(self, '_entry_engine') and self._entry_engine is not None:
-                try:
-                    self._entry_engine.on_position_opened()
-                except Exception as _ee_e:
-                    logger.debug(f"entry_engine.on_position_opened() at adopt error: {_ee_e}")
-
-            if hasattr(self, '_liq_trail') and self._liq_trail is not None:
-                try:
-                    self._liq_trail.reset()
-                except Exception as _lt_e:
-                    logger.debug(f"liq_trail.reset() at adopt error: {_lt_e}")
 
             if hasattr(self, '_liq_map') and self._liq_map is not None:
                 try:
@@ -10093,6 +9580,7 @@ class QuantStrategy:
             logger.info("📡 Reconcile: exchange FLAT → TP/SL fired")
             self._record_exchange_exit(ex_pos); return
         if phase==PositionPhase.ACTIVE and ex_size>=QCfg.MIN_QTY():
+            self._reconcile_tp_ladder_quantity(order_manager, ex_size)
             if (not self._pos.sl_order_id or not self._pos.tp_order_id) and open_orders:
                 for o in open_orders:
                     ot=(o.get("type") or (o.get("raw") or {}).get("order_type") or "").upper().replace(" ","_").replace("-","_")
@@ -10137,6 +9625,8 @@ class QuantStrategy:
             if ex_size<QCfg.MIN_QTY():
                 logger.info("📡 Sync: exchange FLAT → TP/SL fired")
                 self._record_exchange_exit(ex_pos)
+            else:
+                self._reconcile_tp_ladder_quantity(order_manager, ex_size)
         elif self._pos.phase==PositionPhase.EXITING:
             if ex_size<QCfg.MIN_QTY():
                 # v8.0 FIX: call _record_exchange_exit, NOT _finalise_exit.

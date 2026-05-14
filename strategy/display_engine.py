@@ -299,7 +299,7 @@ def _format_heartbeat_industry(
         init_sl = _safe_float(position.get("initial_sl_dist", abs(entry - sl)), abs(entry - sl))
         move = (price - entry) if side == "LONG" else (entry - price)
         r_now = move / init_sl if init_sl > 1e-10 else 0.0
-        # Planned R:R must use the ORIGINAL risk. Once SL trails to BE/profit,
+        # Planned R:R must use the ORIGINAL risk. Even after partial TP fills,
         # using current SL distance makes R:R explode to fake values.
         rr = abs(tp - entry) / init_sl if entry and tp and init_sl > 1e-10 else 0.0
         upnl = move * qty if qty else move
@@ -475,7 +475,6 @@ def format_heartbeat(
         sl_atr    = abs(price - sl) / atr if atr > 1e-10 else 0.0
         tp_atr    = abs(price - tp) / atr if atr > 1e-10 else 0.0
         peak_r    = position.get("peak_profit", pnl) / init_sl if init_sl > 1e-10 else 0.0
-        trail     = position.get("trail_active", False)
         progress  = min(1.0, max(0, abs(price - entry) / max(abs(tp - entry), 1))) if pnl >= 0 else 0.0
         pc        = C.BGRN if side == "LONG" else C.BRED
         pi        = "▲ LONG" if side == "LONG" else "▼ SHORT"
@@ -485,7 +484,7 @@ def format_heartbeat(
         lines.append(MID)
 
         lines.append(BAR(f"  Entry  {_c(_price(entry), C.CYN)}   ATR {_c(atr_str, C.YLW)}   {_c(pd_label, C.DIM)}"))
-        lines.append(BAR(f"  SL     {_c(_price(sl), C.BRED)}   ({sl_atr:.1f} ATR){_c('  🔒 TRAIL', C.BYLW) if trail else ''}"))
+        lines.append(BAR(f"  SL     {_c(_price(sl), C.BRED)}   ({sl_atr:.1f} ATR)"))
         lines.append(BAR(f"  TP     {_c(_price(tp), C.BGRN)}   ({tp_atr:.1f} ATR)"))
         lines.append(SEP)
 
@@ -833,7 +832,7 @@ def format_thinking_telegram(
                 f"  SL ${sl:,.2f}  ·  TP ${tp:,.2f}",
             ]
             if trail_phase:
-                lines.append(f"  Trail  {_esc(trail_phase)}")
+                lines.append(f"  Exit {_esc(trail_phase)}")
 
     # Verdict
     verdicts = {
@@ -1074,7 +1073,7 @@ def format_periodic_report_display(
                 f"  SL ${current_sl:,.2f}  ·  TP ${current_tp:,.2f}",
             ]
             if trail_phase:
-                lines.append(f"  Trail {_esc(trail_phase)}")
+                lines.append(f"  Exit {_esc(trail_phase)}")
 
     # Performance
     lines += [
@@ -1262,7 +1261,7 @@ HELP_TEXT = (
     "/balance      — Wallet balance\n"
     "/pause        — Pause trading (keep monitoring)\n"
     "/resume       — Resume trading\n"
-    "/trail [on|off|auto] — Adaptive exit override\n"
+    ""
     "/config       — Show config values\n"
     "/set &lt;key&gt; &lt;val&gt; — Adjust config live\n"
     "/setexchange &lt;delta|coinswitch&gt; — Switch exchange\n"

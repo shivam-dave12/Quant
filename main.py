@@ -19,7 +19,7 @@ Current architecture:
   6. Risk/Execution validates sizing, liquidation distance, exchange lot size,
      bracket placement and exact fill/fee accounting.
   7. Adaptive Exit manages the live position using expected adverse excursion,
-     liquidity context, true net breakeven and exchange-reconciled PnL.
+     liquidity context, cost-aware TP ladder and exchange-reconciled PnL.
 
 Exchange routing:
   - Both exchange data managers start concurrently.
@@ -365,7 +365,7 @@ class QuantBot:
       2. Map live BSL/SSL features and archived sweeps.      → LiquidityMap
       3. Estimate posterior edge, EV and uncertainty.        → QuantPosterior
       4. Validate sizing, liquidation, lots and fills.       → Risk/Execution
-      5. Manage live trade via adaptive exit controller.     → LiquidityTrail
+      5. Manage live trade via fixed SL + TP ladder.       → TPLadder
 
     Public attributes accessed by the Telegram controller:
       .strategy          — QuantStrategy
@@ -604,7 +604,7 @@ class QuantBot:
                 "  2️⃣  LiquidityMap: active BSL/SSL features; swept pools archived\n"
                 "  3️⃣  QuantPosterior: P(edge), EV, uncertainty, SPRT barrier\n"
                 "  4️⃣  Risk/Execution: sizing, liquidation guard, exact fills\n"
-                "  5️⃣  Adaptive Exit: EAE, true net BE, liquidity-aware stops\n"
+                "  5️⃣  Fixed SL + TP ladder: staged liquidity monetisation\n"
                 "\n"
                 "<b>Authority model:</b>\n"
                 "  🧠 QuantPosterior is the master alpha decision\n"

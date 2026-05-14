@@ -59,7 +59,7 @@ class PortfolioManager:
             return True, 'portfolio slot available'
 
     def evaluation_interval(self, ctx: Any) -> float:
-        """Per-contract loop cadence. Positions are stepped fastest for exits/trailing."""
+        """Per-contract loop cadence. Positions are stepped fastest for exits and TP-ladder reconciliation."""
         if getattr(ctx, 'has_position', False):
             return max(0.05, float(getattr(config, 'SCANNER_POSITION_TICK_SEC', 0.25)))
         try:

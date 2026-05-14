@@ -234,7 +234,7 @@ class MultiAssetQuantBot:
             "desk": pol.desk_id, "desk_name": pol.desk_name, "strategy": pol.strategy_key,
             "price": px, "position": pos, "upnl": 0.0, "r": 0.0,
             "mfe_r": 0.0, "hold_min": 0.0, "state": ctx.phase_name,
-            "trail_active": False, "sl": 0.0, "tp": 0.0, "entry": 0.0,
+            "sl": 0.0, "tp": 0.0, "entry": 0.0,
             "qty": 0.0, "side": "", "policy": pol,
         }
         if not pos:
@@ -259,7 +259,7 @@ class MultiAssetQuantBot:
             out.update({
                 "side": side, "entry": entry, "qty": qty, "upnl": upnl, "r": r_now,
                 "mfe_r": mfe_r, "hold_min": hold_m, "sl": float(pos.sl_price or 0.0),
-                "tp": float(pos.tp_price or 0.0), "trail_active": bool(getattr(pos, "trail_active", False)),
+                "tp": float(pos.tp_price or 0.0),
                 "trade_mode": getattr(pos, "trade_mode", ""), "entry_id": getattr(pos, "entry_order_id", ""),
                 "sl_id": getattr(pos, "sl_order_id", ""), "tp_id": getattr(pos, "tp_order_id", ""),
             })
@@ -457,10 +457,9 @@ class MultiAssetQuantBot:
         if open_rows:
             lines.append("\n<b>Open positions</b>")
             for r in sorted(open_rows, key=lambda x: (str(x.get("desk")), str(x.get("asset")))):
-                trail = "TRAIL" if r.get("trail_active") else "INIT"
                 lines.append(
                     f"<code>{self._esc(r['desk']):<5} {self._esc(r['asset']):<8} {self._esc(r['side']):<5} {self._fmt_money(r['upnl']):>11} "
-                    f"R {float(r['r']):+5.2f} MFE {float(r['mfe_r']):>4.2f} {trail:<5}</code>"
+                    f"R {float(r['r']):+5.2f} MFE {float(r['mfe_r']):>4.2f} LADDER</code>"
                 )
                 lines.append(
                     f"<code>       px {self._fmt_price(r['price']):>12} entry {self._fmt_price(r['entry']):>12} SL {self._fmt_price(r['sl']):>12}</code>"
@@ -495,7 +494,7 @@ class MultiAssetQuantBot:
                 f"<code>ENTRY {self._fmt_price(r['entry']):>12}  PX {self._fmt_price(r['price']):>12}  UPNL {self._fmt_money(r['upnl']):>11}</code>"
             )
             lines.append(
-                f"<code>SL    {self._fmt_price(r['sl']):>12}  TP {self._fmt_price(r['tp']):>12}  TRAIL {'ON' if r.get('trail_active') else 'WATCH'}</code>"
+                f"<code>SL    {self._fmt_price(r['sl']):>12}  FINAL TP {self._fmt_price(r['tp']):>12}  LADDER</code>"
             )
             if r.get("sl_id") or r.get("tp_id"):
                 lines.append(f"<code>BRKT  SL {str(r.get('sl_id') or '-')[:8]}…  TP {str(r.get('tp_id') or '-')[:8]}…</code>")

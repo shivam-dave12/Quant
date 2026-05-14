@@ -1252,7 +1252,7 @@ def format_exit_alert(
     reason_label = {
         "tp_hit":       "TP HIT",
         "sl_hit":       "SL HIT",
-        "trail_sl_hit": "TRAIL EXIT",
+        "trail_sl_hit": "SL EXIT",
     }.get(reason, (reason or "exit").upper())
 
     pts_realised = (exit_price - entry) if side_u == "LONG" else (entry - exit_price)
@@ -1291,7 +1291,7 @@ def format_trail_advance(
     """
     Adaptive exit advance alert. Compact — fires often; reports the stop move and historical R fields only for analytics compatibility.
 
-        🔒 TRAIL ↑ LONG   $77,540.00   TRUE_NET_BE / EAE_PROTECTION
+        🎯 LADDER ↑ LONG   $77,540.00   TRUE_NET_BE / EAE_PROTECTION
         ─────────────────────────
         SL    $77,520.00 → $77,540.00   locked +0.20R
         FIB   0.500   anchor 15m @ $77,420.00
@@ -1300,7 +1300,7 @@ def format_trail_advance(
     arrow = "↑" if side_u == "LONG" else "↓"
     phase_disp = phase.upper() if phase else "TRAIL"
     rows = [
-        f"🔒 <b>TRAIL {_esc(arrow)} {_esc(side_u)}</b>"
+        f"🔒 <b>TP LADDER {_esc(arrow)} {_esc(side_u)}</b>"
         f"   <code>{_fmt_price(new_sl)}</code>"
         f"   <i>{_esc(phase_disp)}</i>  ({r_multiple:.2f}R)",
         "<code>──────────────────────────────</code>",
@@ -1892,7 +1892,7 @@ def format_liquidity_trail_update(
     symbol = getattr(inst, "display_symbol", "-") if inst is not None else "-"
     venue = getattr(getattr(inst, "primary_exchange", None), "value", "") if inst is not None else ""
     lines = [
-        f"🔒 <b>PORTFOLIO TRAIL UPDATE</b>  <code>{_esc(str(asset))}</code> <code>{_esc(str(venue).upper())}:{_esc(str(symbol))}</code>",
+        f"🔒 <b>PORTFOLIO TP LADDER UPDATE</b>  <code>{_esc(str(asset))}</code> <code>{_esc(str(venue).upper())}:{_esc(str(symbol))}</code>",
         _TG_RULE,
         f"<code>{_esc(side_u):<5} SL {_tg_price(new_sl):>14}   phase {_esc(phase or '-')}</code>",
         f"<code>R       live {float(r_multiple or 0):+6.2f}R   locked {locked:+8.2f} pts ({locked_atr:+.2f}A)   move {_tg_num(move, 1):>8} pts</code>",

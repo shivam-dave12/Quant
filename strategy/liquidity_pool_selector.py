@@ -146,21 +146,22 @@ _KILLZONE_HOURS = (7, 8, 9, 10, 12, 13, 14, 15, 16)
 
 # Terminal-target handling.
 #
-# The MTF probability model has a useful ``first-sweep reach`` window for
-# predicting which pool is likely to be hit NEXT. That window must NOT be a
-# hard veto for execution TP: institutional delivery can target HTF external
-# liquidity many ATR away, while the trade is protected by BE migration and
-# liquidity/structure trailing. Therefore distance beyond the TF reach model
-# is a SOFT EV penalty and an audit note, not an automatic rejection.
+# The MTF probability model estimates which pool is likely to be hit NEXT.
+# With a TP ladder, the final TP is not expected to carry the whole position
+# through one uninterrupted impulse. Internal same-side liquidity between entry
+# and final TP can monetise size on the way, so distant HTF/external pools are
+# handled as final-runner objectives instead of being rejected just because
+# they are beyond first-sweep reach.
+#
 # Hard vetoes remain: wrong side, swept/consumed, too close/cost-invalid, and
-# below required R:R.
+# below the ladder-aware payoff floor.
 _TF_RANK = {"1m": 1, "2m": 1, "3m": 1, "5m": 2, "15m": 3, "1h": 4, "4h": 5, "1d": 6}
 _TERMINAL_TP_MIN_TF_RANK = 3      # 15m+ can be used as terminal delivery objectives
 _TERMINAL_TP_MIN_SIG     = 3.0    # lower-TF distant pools need real significance
 _TERMINAL_REACH_FLOOR    = 0.05   # never zero out a valid terminal objective
 
 # Final TP payoff geometry. A high posterior can relax the static R:R prior,
-# but it cannot turn a BE-adjacent pool into a full-position institutional TP.
+# but it cannot turn a cost-adjacent pool into a full-position institutional TP.
 _TP_DURABLE_RR_FLOOR     = 1.35
 _TP_MIN_BE_MOVE_MULT     = 1.80
 _TP_TERMINAL_PROFILE_FLOOR = 0.55
@@ -239,6 +240,7 @@ class PoolCandidateDiagnostic:
     confluence:    float = 1.0
     gauntlet_n:    int   = 0
     be_move:       float = 0.0
+    ladder_path_score: float = 0.0
     buffer_atr:    float = 0.0
     quality:       float = 0.0
     notes:         List[str] = field(default_factory=list)
@@ -550,6 +552,66 @@ def _gauntlet_penalty(
     return n, 1.0 - pen
 
 
+def _tp_ladder_path_score(snap, side: str, entry: float, tp_price: float, atr: float) -> Tuple[float, Dict[str, float]]:
+    """Score internal same-side liquidity between entry and final TP.
+
+    This is the key difference between single-TP and ladder execution. A far
+    final target is institutionally valid only when the path has monetisable
+    internal liquidity where size can be reduced before the runner reaches the
+    terminal pool. Score ∈ [0, 1.25]. It is NOT a direction signal; it only
+    tells the target selector how much final-runner distance can be tolerated.
+    """
+    if snap is None or atr <= 0 or entry <= 0 or tp_price <= 0:
+        return 0.0, {"n": 0.0, "coverage": 0.0, "quality": 0.0, "max_gap": 1.0}
+    try:
+        same = list(_safe(snap, "bsl_pools", []) or []) if side == "long" else list(_safe(snap, "ssl_pools", []) or [])
+        lo, hi = min(entry, tp_price), max(entry, tp_price)
+        den = max(hi - lo, 1e-9)
+        pts: List[Tuple[float, float]] = []
+        for t in same:
+            pool = _safe(t, "pool", None)
+            status = _pool_status(pool).upper()
+            if status in ("SWEPT", "CONSUMED"):
+                continue
+            px = float(_safe(pool, "price", 0.0) or 0.0)
+            if px <= lo or px >= hi:
+                continue
+            frac = (px - lo) / den
+            # Ignore entry-noise and final-duplicate zones. They do not create
+            # useful staged monetisation legs.
+            if frac < 0.08 or frac > 0.94:
+                continue
+            dist_from_entry_atr = abs(px - entry) / max(atr, 1e-9)
+            if dist_from_entry_atr < 0.35:
+                continue
+            sig = max(0.0, float(_safe(t, "significance", 0.0) or 0.0))
+            tf_rank = _tf_rank(str(_safe(pool, "timeframe", "5m")))
+            touch = _touch_penalty(pool)
+            fresh = _freshness_bonus(pool)
+            struct = _structural_bonus(pool)
+            # Quality favours significant, fresh, structurally aligned pools
+            # and higher timeframe liquidity. Capped to prevent one pool from
+            # making a bad path look good.
+            q = min(1.0, (0.18 * math.sqrt(sig + 1.0)) * (0.75 + 0.08 * tf_rank) * touch * fresh * min(struct, 1.35))
+            pts.append((frac, q))
+        if not pts:
+            return 0.0, {"n": 0.0, "coverage": 0.0, "quality": 0.0, "max_gap": 1.0}
+        pts.sort(key=lambda x: x[0])
+        fracs = [x[0] for x in pts]
+        qs = [x[1] for x in pts]
+        gaps = [fracs[0]] + [fracs[i] - fracs[i-1] for i in range(1, len(fracs))] + [1.0 - fracs[-1]]
+        max_gap = max(gaps) if gaps else 1.0
+        coverage = _clamp(1.0 - max_gap, 0.0, 1.0)
+        density = 1.0 - math.exp(-len(pts) / 2.6)
+        qavg = _clamp(sum(qs) / max(len(qs), 1), 0.0, 1.0)
+        # reward even spacing and quality; do not reward random clusters only
+        # near entry or only near final TP.
+        score = _clamp(0.44 * density + 0.34 * coverage + 0.22 * qavg, 0.0, 1.25)
+        return score, {"n": float(len(pts)), "coverage": coverage, "quality": qavg, "max_gap": max_gap}
+    except Exception:
+        return 0.0, {"n": 0.0, "coverage": 0.0, "quality": 0.0, "max_gap": 1.0}
+
+
 def _tf_rank(tf: str) -> int:
     return _TF_RANK.get(str(tf).lower(), 2)
 
@@ -666,20 +728,34 @@ def _institutional_rr_floor(
 
 
 def _tp_reach_multiplier(distance_atr: float, tf: str, selector_profile: MarketProfile,
-                         terminal_target: bool) -> float:
+                         terminal_target: bool, ladder_path_score: float = 0.0) -> float:
     mtf_reach = _terminal_reach_multiplier(distance_atr, tf)
     profile_reach = selector_profile.target_reach_penalty(distance_atr, tf)
     if terminal_target:
-        profile_reach = max(profile_reach, _TP_TERMINAL_PROFILE_FLOOR)
-    return mtf_reach * profile_reach
+        # A clean TP ladder converts first-sweep distance from a binary problem
+        # into a staged-monetisation problem. The final target still gets a
+        # distance penalty, but the penalty floor rises when internal liquidity
+        # can reduce exposure along the path.
+        ladder = _clamp(float(ladder_path_score or 0.0), 0.0, 1.25)
+        profile_reach = max(profile_reach, _TP_TERMINAL_PROFILE_FLOOR + 0.18 * ladder)
+        mtf_reach = max(mtf_reach, _TERMINAL_REACH_FLOOR + 0.18 * ladder)
+    return _clamp(mtf_reach * profile_reach, 0.01, 1.35)
 
 
 def _tp_selection_value(ev: float, rr: float, rr_floor: float,
-                        distance_atr: float) -> float:
+                        distance_atr: float, ladder_path_score: float = 0.0,
+                        terminal_target: bool = False) -> float:
     surplus_r = max(float(rr) - float(rr_floor), 0.0)
     payoff_frontier = math.sqrt(max(float(rr), 0.0)) * (1.0 + min(surplus_r * 0.25, 1.00))
     delivery_span = 1.0 + min(max(float(distance_atr) - 1.0, 0.0) * 0.035, 0.35)
-    return float(ev) * payoff_frontier * delivery_span
+    ladder = _clamp(float(ladder_path_score or 0.0), 0.0, 1.25)
+    ladder_frontier = 1.0
+    if terminal_target and ladder > 0.0:
+        # Distant final targets are allowed to rank higher only when the path
+        # contains executable internal liquidity. This is not fixed TP1/TP2; it
+        # is dynamic path monetisation.
+        ladder_frontier += min(0.65, ladder * (0.22 + 0.035 * max(float(distance_atr) - 2.0, 0.0)))
+    return float(ev) * payoff_frontier * delivery_span * ladder_frontier
 
 
 def _cross_asset_adjustment(cross_asset_state: Any, asset_id: str, side: str) -> Any:
@@ -746,7 +822,7 @@ def _target_utility(raw_prob: float, rr: float, min_rr: float,
     Convert hit probability into trade utility.
 
     Near pools often have high sweep probability but too little room after
-    fees, slippage, and BE migration. This utility still respects probability,
+    fees, slippage, and TP-ladder path monetisation. This utility still respects probability,
     but pays for durable R and distance beyond the cost envelope.
     """
     rr_excess = max(0.0, rr - float(min_rr))
@@ -822,7 +898,7 @@ def score_tp_pools(
             pool_price = float(_safe(pool, "price", 0.0))
 
             # Reach gates. Too-close remains a hard veto because fees/slippage
-            # and BE migration consume the whole move. Too-far is NOT a hard
+            # and TP-ladder path monetisation consume the whole move. Too-far is NOT a hard
             # veto: distant HTF pools are valid terminal delivery objectives,
             # but they receive a probability/reach EV penalty below.
             if dist_atr < 0.25:
@@ -862,7 +938,10 @@ def score_tp_pools(
                 * _touch_penalty(pool)
             )
 
-            reach_mult = _tp_reach_multiplier(dist_atr, tf, selector_profile, terminal_target)
+            ladder_path_score, ladder_path_components = _tp_ladder_path_score(
+                snap, side, entry, tp_price, atr)
+            reach_mult = _tp_reach_multiplier(
+                dist_atr, tf, selector_profile, terminal_target, ladder_path_score)
 
             n_gauntlet, gauntlet_mult = _gauntlet_penalty(
                 target, sig, snap, side, entry, atr,
@@ -891,7 +970,8 @@ def score_tp_pools(
             #   - confluence and rr_quality are bounded by ~3-5×.
             #   - gauntlet_mult is a divisor in [0.45, 1.0].
             ev = utility * _W_PROBABILITY * confluence * gauntlet_mult
-            selection_ev = _tp_selection_value(ev, rr, rr_floor, dist_atr)
+            selection_ev = _tp_selection_value(
+                ev, rr, rr_floor, dist_atr, ladder_path_score, terminal_target)
             selection_ev = _apply_cross_asset_tp_overlay(selection_ev, type("_Row", (), {"distance_atr": dist_atr, "rr": rr})(), cross_adj)
 
             reasons: List[str] = []
@@ -901,13 +981,16 @@ def score_tp_pools(
                 reasons.append(f"gauntlet {n_gauntlet} pools −{(1-gauntlet_mult)*100:.0f}%")
             if terminal_target:
                 reasons.append(
-                    f"terminal target beyond first-sweep reach ({dist_atr:.1f}>{max_reach:.1f}ATR; reach×{reach_mult:.2f})")
+                    f"final-runner target beyond first-sweep reach ({dist_atr:.1f}>{max_reach:.1f}ATR; reach×{reach_mult:.2f})")
+                if ladder_path_score > 0.10:
+                    reasons.append(
+                        f"ladder path score {ladder_path_score:.2f} across {int(ladder_path_components.get('n', 0))} internal pools")
             if rr >= float(min_rr) + 1.0:
                 reasons.append(f"R:R {rr:.1f}")
             elif rr_floor < effective_min_rr - 1e-9:
                 reasons.append(f"payoff RR floor {rr_floor:.2f}")
             if utility_components["be_quality"] < 0.75:
-                reasons.append("thin post-BE room")
+                reasons.append("thin post-cost room")
             if _safe(pool, "ob_aligned", False):
                 reasons.append("OB-aligned")
             if _safe(pool, "fvg_aligned", False):
@@ -934,6 +1017,9 @@ def score_tp_pools(
                     "max_reach_atr": utility_components.get("max_reach_atr", max_reach),
                     "selection_ev": selection_ev,
                     "be_move":     utility_components["be_move"],
+                    "ladder_path_score": ladder_path_score,
+                    "ladder_path_n": ladder_path_components.get("n", 0.0),
+                    "ladder_path_coverage": ladder_path_components.get("coverage", 0.0),
                     "gauntlet":    gauntlet_mult,
                     "significance": sig,
                     "rr_floor":    rr_floor,
@@ -1184,7 +1270,11 @@ def diagnose_tp_pools(
                 * _touch_penalty(pool)
             )
             row.confluence = confluence
-            reach_mult = _tp_reach_multiplier(row.distance_atr, tf, selector_profile, terminal_target)
+            ladder_path_score, ladder_path_components = _tp_ladder_path_score(
+                snap, side, entry, row.tp_price, atr)
+            row.ladder_path_score = ladder_path_score
+            reach_mult = _tp_reach_multiplier(
+                row.distance_atr, tf, selector_profile, terminal_target, ladder_path_score)
             n_gauntlet, gauntlet_mult = _gauntlet_penalty(target, sig, snap, side, entry, atr)
             row.gauntlet_n = n_gauntlet
             rr_floor, delivery_prob, cost_r = _institutional_rr_floor(
@@ -1215,20 +1305,24 @@ def diagnose_tp_pools(
             utility, comps = _target_utility(raw_prob, row.rr, rr_floor, row.distance_atr, row.reward, be_move)
             utility *= reach_mult
             row.ev = utility * _W_PROBABILITY * confluence * gauntlet_mult
-            selection_ev = _tp_selection_value(row.ev, row.rr, rr_floor, row.distance_atr)
+            selection_ev = _tp_selection_value(
+                row.ev, row.rr, rr_floor, row.distance_atr, ladder_path_score, terminal_target)
             row.selection_ev = _apply_cross_asset_tp_overlay(selection_ev, row, cross_adj)
             row.eligible = True
             row.reason = "eligible; payoff-adjusted EV candidate"
             row.notes = []
             if terminal_target:
-                row.notes.append(f"terminal TP; reach×{reach_mult:.2f}")
+                row.notes.append(f"final-runner TP; reach×{reach_mult:.2f}")
+                if ladder_path_score > 0.10:
+                    row.notes.append(
+                        f"ladder={ladder_path_score:.2f}/{int(ladder_path_components.get('n', 0))} pools")
             if confluence > 1.30: row.notes.append(f"conf×{confluence:.2f}")
             if rr_floor < effective_min_rr - 1e-9:
                 row.notes.append(f"payoff RR floor {rr_floor:.2f}")
             if selection_ev > row.ev + 1e-12:
                 row.notes.append(f"frontierEV={selection_ev:.3f}")
             if n_gauntlet: row.notes.append(f"gauntlet={n_gauntlet}")
-            if comps.get("be_quality", 1.0) < 0.75: row.notes.append("thin post-BE room")
+            if comps.get("be_quality", 1.0) < 0.75: row.notes.append("thin post-cost room")
             if cross_adj is not None and getattr(cross_adj, "reason", ""):
                 row.notes.append("cross=" + str(getattr(cross_adj, "reason", ""))[:60])
             accepted.append((row.selection_ev, row))

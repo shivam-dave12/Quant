@@ -399,7 +399,7 @@ class HardeningTests(unittest.TestCase):
 
         self.assertTrue(ok, reason)
 
-    def test_trail_off_is_ignored_while_position_active(self):
+    def test_sl_migration_override_is_ignored_while_position_active(self):
         import threading
         from strategy.quant_strategy import QuantStrategy
 
@@ -413,7 +413,7 @@ class HardeningTests(unittest.TestCase):
         changed = strategy.set_trail_override(False)
 
         self.assertFalse(changed)
-        self.assertIsNone(strategy._pos.trail_override)
+        self.assertFalse(strategy._pos.trail_override)
 
     def test_fee_to_risk_can_return_no_allocation(self):
         from strategy.quant_strategy import QuantStrategy, SignalBreakdown
@@ -851,7 +851,7 @@ class HardeningTests(unittest.TestCase):
         self.assertGreater(mult, 0.0)
         self.assertLess(mult, 0.50)
 
-    def test_structural_trail_rejects_fee_dragged_micro_winner(self):
+    def test_sl_migration_payoff_lock_disabled_under_tp_ladder(self):
         from strategy.quant_strategy import QuantStrategy
 
         strategy = object.__new__(QuantStrategy)
@@ -868,9 +868,9 @@ class HardeningTests(unittest.TestCase):
             pos, new_sl=100.6, atr=1.0, phase="DELIVERY_LOCK")
 
         self.assertFalse(ok)
-        self.assertIn("net_lock", reason)
+        self.assertIn("TP-ladder", reason)
 
-    def test_breakeven_trail_remains_allowed_for_loss_reduction(self):
+    def test_be_style_sl_migration_disabled_under_tp_ladder(self):
         from strategy.quant_strategy import QuantStrategy
 
         strategy = object.__new__(QuantStrategy)
@@ -886,10 +886,10 @@ class HardeningTests(unittest.TestCase):
         ok, reason = strategy._trail_payoff_lock_ok(
             pos, new_sl=100.5, atr=1.0, phase="BE_LOCK")
 
-        self.assertTrue(ok)
-        self.assertIn("risk-defense", reason)
+        self.assertFalse(ok)
+        self.assertIn("TP-ladder", reason)
 
-    def test_structural_trail_accepts_meaningful_net_payoff_lock(self):
+    def test_structural_sl_migration_disabled_even_when_payoff_positive(self):
         from strategy.quant_strategy import QuantStrategy
 
         strategy = object.__new__(QuantStrategy)
@@ -905,7 +905,8 @@ class HardeningTests(unittest.TestCase):
         ok, reason = strategy._trail_payoff_lock_ok(
             pos, new_sl=101.6, atr=1.0, phase="STRUCTURAL")
 
-        self.assertTrue(ok, reason)
+        self.assertFalse(ok)
+        self.assertIn("TP-ladder", reason)
 
     def test_quant_posterior_learns_from_closed_trade_outcomes(self):
         from strategy import quantitative_models as qm

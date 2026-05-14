@@ -1999,7 +1999,7 @@ class DirectionEngine:
                 return ContinuationDecision(
                     action="hold",
                     confidence=0.0,
-                    reason="POOL_GATE reverse debounced; bracket/trail already managing",
+                    reason="POOL_GATE reverse debounced; fixed SL + TP ladder already managing",
                     next_target=None,
                 )
             return ContinuationDecision(
@@ -2020,7 +2020,7 @@ class DirectionEngine:
                 return ContinuationDecision(
                     action="hold",
                     confidence=0.0,
-                    reason="POOL_GATE continue debounced; TP immutability/trail already managing",
+                    reason="POOL_GATE continue debounced; fixed SL + TP ladder already managing",
                 )
             return ContinuationDecision(
                 action="continue",
@@ -2035,7 +2035,7 @@ class DirectionEngine:
                 action="hold",
                 confidence=0.60,
                 reason=(
-                    f"FLOW_REVERSED but no BOS — hold, trail SL "
+                    f"FLOW_REVERSED but no BOS — hold; fixed SL unchanged "
                     f"(flow={tick_flow:+.2f})"),
             )
 

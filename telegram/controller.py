@@ -14,7 +14,6 @@ All command handlers reflect the QuantPosterior authority model:
   /balance    — Wallet balance
   /pause      — Pause trading (keep monitoring)
   /resume     — Resume trading
-  /trail      — Adaptive exit override on/off/auto
   /config     — Show current config values
   /killswitch — Emergency: close all positions + cancel orders
   /setexchange — Switch execution exchange (delta|coinswitch)
@@ -310,7 +309,6 @@ class TelegramBotController:
                 {"command": "watchdog_unfreeze", "description": "Clear watchdog breaker"},
                 {"command": "pause",       "description": "Pause trading"},
                 {"command": "resume",      "description": "Resume trading"},
-                {"command": "trail",       "description": "Toggle trailing SL on/off/auto"},
                 {"command": "config",      "description": "Show config values"},
                 {"command": "set",         "description": "Set config value live"},
                 {"command": "setexchange", "description": "Switch execution exchange"},
@@ -340,7 +338,7 @@ class TelegramBotController:
         bare_cmds = {
             "start", "stop", "status", "assets", "thinking", "pools", "flow",
             "structures", "position", "trades", "stats", "config",
-            "pause", "resume", "balance", "trail", "killswitch",
+            "pause", "resume", "balance", "killswitch",
             "set", "help", "huntstatus", "setexchange", "resetrisk",
             "pnl", "market", "risk", "equity", "sl", "tp",
             "learn", "watchdog", "watchdog_status", "watchdog_heal",
@@ -376,7 +374,6 @@ class TelegramBotController:
             elif cmd == "/balance":             return self._cmd_balance()
             elif cmd == "/pause":               return self._cmd_pause()
             elif cmd == "/resume":              return self._cmd_resume()
-            elif cmd == "/trail":               return self._cmd_trail(args)
             elif cmd == "/config":              return self._cmd_config()
             elif cmd == "/killswitch":          return self._cmd_killswitch()
             elif cmd == "/resetrisk":           return self._cmd_resetrisk(args)
@@ -420,7 +417,7 @@ class TelegramBotController:
             "📊 <b>QUICK VIEW</b>\n"
             "  /pnl — Snapshot: uPnL, realised, last trades\n"
             "  /market — Price, ATR, AMD, MTF, flow, pools\n"
-            "  /sl — SL/TP, true net BE, adaptive exit state\n"
+            "  /sl — fixed SL, TP ladder, final TP state\n"
             "  /equity — Balance + unrealised + session return\n"
             "  /risk — Gate status, daily limits, cooldown\n\n"
             "🧠 <b>DECISION ANALYSIS</b>\n"
@@ -430,7 +427,7 @@ class TelegramBotController:
             "  /structures — structure/AMD/PD features used by posterior\n"
             "  /huntstatus — liquidity-draw telemetry, not execution authority\n\n"
             "📈 <b>POSITION &amp; HISTORY</b>\n"
-            "  /position — Position + adaptive exit state\n"
+            "  /position — Position + TP ladder state\n"
             "  /trades — Last 10 trades with R, MFE, fees\n"
             "  /stats — Win rate attribution by tier/reason\n"
             "  /learn — Post-trade Bayesian adaptive params\n"
@@ -438,7 +435,7 @@ class TelegramBotController:
             "⚙️ <b>CONTROL</b>\n"
             "  /start · /stop — Start/stop bot\n"
             "  /pause · /resume — Pause trading (keep monitoring)\n"
-            "  /trail [on|off|auto] — Adaptive exit override\n"
+
             "  /config — Show active config values\n"
             "  /set &lt;key&gt; &lt;val&gt; — Live-adjust config\n"
             "  /setexchange &lt;delta|coinswitch&gt; — Switch execution\n\n"
@@ -693,7 +690,7 @@ class TelegramBotController:
                 except Exception:
                     pass
 
-            lines += ["", "<b>ADAPTIVE EXIT STATE</b>"]
+            lines += ["", "<b>TP LADDER EXIT STATE</b>"]
             phase = getattr(pos, 'phase', None)
             phase_val = str(getattr(phase, 'value', phase))
             if 'ACTIVE' in phase_val.upper():
@@ -706,19 +703,13 @@ class TelegramBotController:
                 live_pts = (price - entry_px) if side == 'LONG' else (entry_px - price)
                 lines.append(f"  Active {side} entry=${entry_px:,.1f} live={live_pts:+.1f}pts MFE={mfe:.1f} MAE={mae:.1f}")
                 lines.append(f"  Protective SL=${sl_px:,.1f} | exchange TP=${tp_px:,.1f}")
-                try:
-                    tr = getattr(strat, '_last_trail_reason', '') or getattr(strat, '_last_trail_action', '')
-                    if tr:
-                        lines.append(f"  Last exit decision: {_esc(tr)}")
-                except Exception:
-                    pass
             else:
-                lines.append("  No active position. Exit controller idle.")
+                lines.append("  No active position. TP ladder controller idle.")
 
             lines += ["", "<b>DECISION READOUT</b>"]
             state_u = engine_state.upper()
             if 'ACTIVE' in phase_val.upper():
-                lines.append("  Managing open risk through adaptive exit controller.")
+                lines.append("  Managing open risk with fixed SL + TP ladder.")
             elif surf is not None and getattr(surf, 'has_positive_edge', False) and can_ok and cd_rem <= 0:
                 lines.append("  Positive target surface exists; execution waits only for live posterior/safety alignment.")
             elif sa and _sf(sa.get('quant_posterior', 0.0)) > 0:
@@ -1100,7 +1091,7 @@ class TelegramBotController:
             except Exception:
                 pass
 
-        # ── ICT trail engine state ────────────────────────────────────────────────
+        # ── TP ladder exit state ────────────────────────────────────────────────
         from strategy.quant_strategy import _DynamicStructureTrail
         bos_cnt   = 0
         choch_tf  = None
@@ -1114,47 +1105,39 @@ class TelegramBotController:
                 pass
         choch_active = choch_tf is not None and choch_lvl > 0.0
 
-        # Break-even threshold — use same _calc_be_price() as the trail engine.
-        # Importing from quant_strategy ensures display always matches execution.
+        # TP ladder state. No SL migration or breakeven display here.
+        ladder = getattr(p, 'tp_ladder', []) or []
+        ladder_active = bool(getattr(p, 'tp_ladder_active', False))
+        internal_legs = []
         try:
-            from strategy.quant_strategy import _calc_be_price as _cbp
-        except ImportError:
-            from quant_strategy import _calc_be_price as _cbp
-        # pos object not available here (controller only has flat scalars);
-        # exact fee falls back to commission-rate estimate (acceptable for display).
-        _be_price = _cbp(side.lower(), entry, atr, pos=None)
-        be_locked = ((side == "LONG"  and sl >= _be_price) or
-                     (side == "SHORT" and sl <= _be_price and sl > 0))
+            internal_legs = [x for x in ladder if str(x.get('role', '')).upper() != 'FINAL']
+        except Exception:
+            internal_legs = []
+        ladder_lbl = (
+            f"TP ladder active: {len(internal_legs)} internal legs"
+            if ladder_active or internal_legs else
+            "Final TP only: no internal liquidity legs placed"
+        )
 
-        # Adaptive exit phase — EAE/liquidity-aware labels; R is analytics only.
-        # These MUST match the phase strings emitted by LiquidityTrailEngine:
-        #   PHASE_0_MAX_R=1.0  PHASE_1_MAX_R=2.0  PHASE_2_MAX_R=3.5  P3=3.5+
-        if mfe_r >= 3.5:
-            trail_phase_lbl = (
-                "🟢 AGGRESSIVE  (Phase 3, 3.5R+) — all-TF Fib, HTF-gated, tight buffers"
-            )
-        elif mfe_r >= 2.0:
-            trail_phase_lbl = (
-                "🟠 STRUCTURAL  (Phase 2, 2.0–3.5R) — 1H/15m Fib, wider buffers"
-            )
-        elif mfe_r >= 1.0:
-            trail_phase_lbl = (
-                "🟡 BE_LOCK  (Phase 1, 1.0–2.0R) — SL at BE + exact fees"
-            )
-        else:
-            trail_phase_lbl = (
-                "⬜ HANDS OFF  (Phase 0, <1.0R) — initial structural SL trusted"
-            )
+        # Next monetisation milestone
+        next_leg = None
+        try:
+            for leg in internal_legs:
+                px = float(leg.get('price', 0.0) or 0.0)
+                if side == 'LONG' and px > price:
+                    next_leg = leg; break
+                if side == 'SHORT' and px < price:
+                    next_leg = leg; break
+        except Exception:
+            next_leg = None
+        _next_ratchet_str = (
+            f"next {next_leg.get('role','TP')} @ ${float(next_leg.get('price',0.0)):,.2f} "
+            f"qty {float(next_leg.get('qty_fraction',0.0))*100:.0f}%"
+            if next_leg else "final/remaining target management"
+        )
 
-        # Ratchet next milestone
-        _ratchet_milestones = [0.50, 1.00, 1.50, 2.00, 2.50]
-        last_ratchet_r      = getattr(p, 'last_ratchet_r', 0.0)
-        _next_ratchet       = next((m for m in _ratchet_milestones if mfe_r < m), None)
-        _next_ratchet_str   = (f"next @ {_next_ratchet:.2f}R" if _next_ratchet
-                               else "✅ all ratchets hit")
-
-        # Progress bar (4 blocks per R, max 16 blocks = 4R)
-        _bar_filled = min(int(mfe_r * 4), 16)
+        # Progress bar to final TP
+        _bar_filled = min(int(max(mfe_r, 0.0) * 4), 16)
         _prog_bar   = "█" * _bar_filled + "░" * (16 - _bar_filled)
 
         # Pool TP source from stored entry signal
@@ -1222,15 +1205,11 @@ class TelegramBotController:
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"<b>📈 R-PROGRESS</b>\n"
             f"[{_prog_bar}] MFE={mfe_r:.2f}R  cur={current_r:+.2f}R\n"
-            f"{_next_ratchet_str}  |  last ratchet: {last_ratchet_r:.2f}R\n"
+            f"{_next_ratchet_str}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>🏛️ TRAIL ENGINE</b>\n"
-            f"{trail_phase_lbl}\n"
-            f"BOS confirmed: {bos_cnt}  │  CHoCH: "
-            + (f"{choch_tf} @ ${choch_lvl:,.0f}" if choch_active else "none") +
-            f"\nBE lock: "
-            + ("✅ risk-free (SL ≥ entry)" if be_locked
-               else f"❌ not yet  (SL needs ${_be_price:,.2f})")
+            f"<b>🏛️ TP LADDER</b>\n"
+            f"{ladder_lbl}\n"
+            f"{_next_ratchet_str}"
             + _amd_line + _dr_line
         )
 
@@ -1267,7 +1246,6 @@ class TelegramBotController:
                 reason    = t.get('reason', '?')
                 hold      = t.get('hold_min', 0.0)
                 mfe_r     = t.get('mfe_r', 0.0)
-                trailed   = t.get('trailed', False)
                 is_win    = t.get('is_win', False)
                 init_sl   = t.get('init_sl_dist', 0.0)
                 ict_tier  = t.get('ict_tier', '')
@@ -1280,12 +1258,12 @@ class TelegramBotController:
                 margin_pct = t.get('margin_pnl_pct', 0.0)
 
                 if   reason == "tp_hit":       label = "🎯 TP (pool sweep)"
-                elif reason == "trail_sl_hit": label = "🔒 ADAPTIVE TRAIL"
+                elif reason == "trail_sl_hit": label = "🛑 SL EXIT"
                 elif reason == "sl_hit":       label = "🛑 PROTECTIVE SL"
                 else:                          label = f"🚪 {reason[:8]}"
 
                 result    = "✅" if is_win else "❌"
-                trail_tag = " [T]" if trailed else ""
+                ladder_tag = " [LADDER]" if t.get("tp_ladder", False) else ""
                 tier_badge = f" [T{ict_tier}]" if ict_tier else ""
                 pool_tp_tag = f"  pool_tp=${pool_tp:,.0f}" if pool_tp else ""
 
@@ -1301,7 +1279,7 @@ class TelegramBotController:
                     f"{result} {side} [{mode}]{tier_badge}  "
                     f"${entry:,.0f}→${exit_p:,.0f}  "
                     f"PnL: <b>${pnl:+.2f}</b>{margin_tag}  R: {ach_r:+.2f}  MFE: {mfe_r:.1f}R\n"
-                    f"    {label}{trail_tag}  hold: {hold:.0f}m{pool_tp_tag}"
+                    f"    {label}{ladder_tag}  hold: {hold:.0f}m{pool_tp_tag}"
                     + fee_line
                 )
         else:
@@ -1429,8 +1407,8 @@ class TelegramBotController:
           • Per AMD Phase WR + SL efficiency + entry efficiency + avg R
           • Per Session WR + avg PnL (London / NY / Asia / Kill-zone)
           • SL Causation breakdown (WICK_SWEEP / BOS_BREAK / AMD_FLIP / …)
-          • TP Causation breakdown (POOL_REACHED / STRUCTURAL / TRAIL_LOCK / …)
-          • Adaptive parameter adjustments (mult × drift%) with evidence trail
+          • TP Causation breakdown (POOL_REACHED / STRUCTURAL / TP_LADDER / …)
+          • Adaptive parameter adjustments (mult × drift%) with evidence log
           • Recent insights (INFO / WARN / ACTION) from the adaptive engine
         """
         global bot_instance, bot_running
@@ -1642,7 +1620,7 @@ class TelegramBotController:
             return f"Balance error: {_esc(e)}"
 
     # ================================================================
-    # /pause / /resume / /trail
+    # /pause / /resume / 
     # ================================================================
 
     def _cmd_pause(self) -> str:
@@ -1654,7 +1632,7 @@ class TelegramBotController:
             "⏸️ <b>Trading PAUSED</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "• No new entries will be taken\n"
-            "• Existing position (if any) is still managed (trail + SL/TP)\n"
+            "• Existing position (if any) is managed by fixed SL + TP ladder\n"
             "• Pool monitoring continues\n"
             "• Send <code>/resume</code> to re-enable entries"
         )
@@ -1667,79 +1645,6 @@ class TelegramBotController:
         return (
             "▶️ <b>Trading RESUMED</b>\n"
             "Entries re-enabled. Bot will evaluate signals on next tick."
-        )
-
-    def _cmd_trail(self, args: str) -> str:
-        global bot_instance
-        if not bot_instance:
-            return "Bot not running."
-
-        pairs = []
-        for ctx in list(getattr(bot_instance, "contexts", []) or []):
-            strat = getattr(ctx, "strategy", None)
-            inst = getattr(ctx, "instrument", None)
-            label = getattr(inst, "asset_id", "") or getattr(inst, "display_symbol", "") or "asset"
-            if strat is not None:
-                pairs.append((str(label).upper(), strat))
-        if not pairs:
-            strat = getattr(bot_instance, "strategy", None)
-            if strat is not None:
-                pairs.append(("BTC", strat))
-        if not pairs:
-            return "Strategy not ready."
-
-        def apply_all(value):
-            changed = 0
-            blocked = 0
-            for _, strat in pairs:
-                try:
-                    ok = strat.set_trail_override(value)
-                    if ok is False:
-                        blocked += 1
-                    else:
-                        changed += 1
-                except Exception:
-                    blocked += 1
-            return changed, blocked
-
-        arg = (args or "").strip().lower()
-        if arg in ("on", "enable", "1", "true", "yes"):
-            changed, blocked = apply_all(True)
-            return (
-                "<b>Trailing SL: FORCED ON</b>\n"
-                f"Applied to {changed}/{len(pairs)} strategy contexts.\n"
-                f"Errors/blocked: {blocked}\n"
-                "Engine: Adaptive Exit (EAE + liquidity + true net BE)."
-            )
-        if arg in ("off", "disable", "0", "false", "no"):
-            changed, blocked = apply_all(False)
-            if changed == 0 and blocked:
-                return (
-                    "<b>Trailing SL: still protected</b>\n"
-                    f"{blocked} active strategy contexts refused OFF because a position is live.\n"
-                    "Use /pause to stop new entries; protective management stays intact."
-                )
-            return (
-                "<b>Trailing SL: FORCED OFF</b>\n"
-                f"Applied to {changed}/{len(pairs)} strategy contexts.\n"
-                f"Active protected contexts kept ON: {blocked}\n"
-                "No trailing will start unless you send /trail on."
-            )
-
-        changed, blocked = apply_all(None)
-        enabled = 0
-        for _, strat in pairs:
-            try:
-                if strat.get_trail_enabled():
-                    enabled += 1
-            except Exception:
-                pass
-        return (
-            "<b>Trailing SL: AUTO</b>\n"
-            f"Cleared runtime override on {changed}/{len(pairs)} strategy contexts.\n"
-            f"Desk config default currently ON for {enabled}/{len(pairs)} contexts.\n"
-            f"Errors/blocked: {blocked}\n"
-            "Send /trail on to start trailing, or /trail off to force it off while flat."
         )
 
     # ================================================================
@@ -1760,7 +1665,7 @@ class TelegramBotController:
             "  Entry:     QuantPosterior P(edge), EV, uncertainty, SPRT barrier",
             "  SL:        Thesis invalidation + liquidation guard + stop survival",
             "  TP:        EV-ranked active liquidity target after costs",
-            "  Exit:      Adaptive EAE trail + true net BE + exchange PnL reconciliation",
+            "  Exit:      Fixed original SL + dynamic TP ladder + exchange PnL reconciliation",
             "",
             "<b>Position Sizing  (risk-based)</b>",
             # CRIT-1/CRIT-7 FIX: display RISK_PER_TRADE (now the actual sizing lever).
@@ -1783,15 +1688,12 @@ class TelegramBotController:
             f"  Max consec loss:  {getattr(cfg,'MAX_CONSECUTIVE_LOSSES',2)}",
             f"  Max drawdown:     {getattr(cfg,'MAX_DRAWDOWN_PCT',15.0):.1f}%",
             "",
-            "<b>Exit Controller  (adaptive EAE / liquidity / true net BE)</b>",
-            f"  Enabled:      {getattr(cfg,'QUANT_TRAIL_ENABLED',True)}",
-            f"  Hands off: delivery inside expected adverse excursion — structural SL trusted",
-            f"  BE lock: true net BE only after structure/delivery proof",
-            f"  Structural: accepted swings/liquidity anchors",
-            f"  Phase 3 (3.5R+):    FIB AGGRESSIVE — all TFs, HTF-gated",
-            f"  Close confirm:  P2=2 closes, P3=1 close + displacement",
-            f"  Counter-BOS:    sovereign override → BE at any R",
-            f"  Commission RT:  {getattr(cfg,'COMMISSION_RATE',0.00055)*100:.3f}% taker (×2)",
+            "<b>Exit Controller  (fixed SL + dynamic TP ladder)</b>",
+            f"  Model:        original SL remains fixed",
+            f"  TP ladder:    internal liquidity TP1..TPn reduces size",
+            f"  Final TP:     selected terminal liquidity remains live",
+            f"  SL handling:   price is not migrated; qty reconciles after partial exits",
+            f"  Commission RT: {getattr(cfg,'COMMISSION_RATE',0.00055)*100:.3f}% taker (×2)",
         ]
         return "\n".join(lines)
 
@@ -1983,7 +1885,7 @@ class TelegramBotController:
                 "  max_daily_loss    float %\n"
                 "  max_consec_loss   int\n"
                 "  min_rr            float\n"
-                "  trail_enabled     bool  (true/false)\n"
+
                 "  max_hold          int   seconds\n"
             )
 
@@ -2001,7 +1903,6 @@ class TelegramBotController:
             "max_daily_loss":   ("MAX_DAILY_LOSS_PCT",   float),
             "max_consec_loss":  ("MAX_CONSECUTIVE_LOSSES", int),
             "min_rr":           ("MIN_RISK_REWARD_RATIO", float),
-            "trail_enabled":    ("QUANT_TRAIL_ENABLED",  bool),
             "max_hold":         ("QUANT_MAX_HOLD_SEC",   int),
         }
 
