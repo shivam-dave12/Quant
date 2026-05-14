@@ -32,6 +32,7 @@ from risk.risk_manager import RiskManager
 from orchestration.portfolio_manager import PortfolioManager, PortfolioRiskManager
 from core.market_policy import active_policy
 from strategy.quant_strategy import QuantStrategy
+from strategy.cross_asset_regime import CrossAssetRegimeEngine
 from telegram.notifier import send_telegram_message
 
 logger = logging.getLogger(__name__)
@@ -74,6 +75,7 @@ class MultiAssetQuantBot:
         self.running = False
         self.contexts: List[AssetContext] = []
         self.guard = PortfolioManager()
+        self.cross_asset = CrossAssetRegimeEngine()
         self.discovery_report: Optional[DiscoveryReport] = None
         self.registry: Optional[InstrumentRegistry] = None
         self.trading_enabled = True
@@ -700,13 +702,33 @@ class MultiAssetQuantBot:
         lines.append(f"• Balance allocation: {self.guard.budget_mode}; cash is slot-scoped, risk base is {self.guard.risk_budget_mode}; sizing uses per-instrument policy, not BTC defaults")
         lines.append("• Live exchange products only; no synthetic symbols. Delta SPXUSD is SPX6900 crypto, not S&P 500, so it is not used for SPX_INDEX.")
         lines.append("• Alpha remains posterior/EV based; PortfolioManager only controls exposure mechanics")
+        lines.append("• Cross-asset overlay active for BTC/GOLD/SILVER: correlation, relative value, TP reach, SL buffer, and cluster risk are advisory/sizing inputs — never hard entry vetoes")
         return "\n".join(lines)
+
+    def _update_cross_asset_overlay(self) -> None:
+        """Refresh portfolio-level BTC/GOLD/SILVER context and push it into desks."""
+        try:
+            state = self.cross_asset.update_from_contexts([c for c in self.contexts if c.ready])
+            for c in self.contexts:
+                try:
+                    if hasattr(c.strategy, "set_cross_asset_state"):
+                        c.strategy.set_cross_asset_state(state)
+                except Exception:
+                    pass
+            now = time.time()
+            last = getattr(self, "_last_cross_asset_log", 0.0)
+            if state.enabled and now - last >= float(getattr(config, "CROSS_ASSET_LOG_SEC", 60.0)):
+                self._last_cross_asset_log = now
+                logger.info("🌐 CROSS-ASSET | %s", state.summary())
+        except Exception as e:
+            logger.debug("cross-asset overlay update failed: %s", e)
 
     def run(self) -> None:
         logger.info("📊 Multi-asset loop active")
         while self.running:
             try:
                 now_ms = int(time.time() * 1000)
+                self._update_cross_asset_overlay()
                 for ctx in list(self.contexts):
                     if not ctx.ready:
                         continue
@@ -771,6 +793,12 @@ class MultiAssetQuantBot:
                     state, price, dt_ms, self.guard.count_open(self.contexts), self.guard.max_open_positions,
                     self.guard.report_line(ctx),
                 )
+                try:
+                    ca = getattr(ctx.strategy, "_cross_asset_state", None)
+                    if ca is not None and getattr(ca, "enabled", False):
+                        logger.info("ANALYSIS_CROSS_ASSET asset=%s | %s", inst.asset_id, ca.summary())
+                except Exception:
+                    pass
         except Exception as e:
             logger.debug("analysis audit failed for %s: %s", ctx.instrument.asset_id, e)
 

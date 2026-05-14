@@ -37,6 +37,11 @@ from core.market_policy import policy_value, active_policy
 from telegram.notifier import send_telegram_message
 from execution.order_manager import CancelResult
 try:
+    from strategy.cross_asset_regime import logit_adjust_probability
+except Exception:  # pragma: no cover
+    def logit_adjust_probability(p, logit_delta):
+        return p
+try:
     from strategy.ict_engine import ICTEngine, ICTConfluence
     _ICT_AVAILABLE = True
 except ImportError:
@@ -2789,6 +2794,11 @@ class QuantStrategy:
         self._active_post_exit_size_mult = 1.0
         self._active_spread_cost_mult = 1.0
         self._last_spread_gate_context = {}
+        self._cross_asset_state = None
+        self._last_cross_asset_adjustment = None
+        self._active_cross_asset_size_mult = 1.0
+        self._active_cross_asset_tp_aggression = 0.0
+        self._active_cross_asset_sl_buffer_mult = 1.0
 
         # ── Post-Trade Analysis Agent (v2.0) ──────────────────────────────────
         # Five-dimension institutional analysis: exit geometry (MAE/MFE/G-ratio/
@@ -3036,6 +3046,82 @@ class QuantStrategy:
         if predicted == "SSL":
             return "short"
         return ""
+
+    def set_cross_asset_state(self, state) -> None:
+        """Receive portfolio-level BTC/GOLD/SILVER regime state.
+
+        This state is advisory only: it can alter posterior, TP/SL preference,
+        and sizing, but it cannot create or veto an entry.
+        """
+        self._cross_asset_state = state
+        try:
+            if self._entry_engine is not None and hasattr(self._entry_engine, "set_cross_asset_state"):
+                self._entry_engine.set_cross_asset_state(state)
+                setattr(self._entry_engine, "_instrument", self._instrument)
+        except Exception:
+            pass
+
+    def _apply_cross_asset_overlay(self, signal, price: float, atr: float) -> None:
+        state = getattr(self, "_cross_asset_state", None)
+        self._last_cross_asset_adjustment = None
+        self._active_cross_asset_size_mult = 1.0
+        self._active_cross_asset_tp_aggression = 0.0
+        self._active_cross_asset_sl_buffer_mult = 1.0
+        try:
+            if state is None or not bool(getattr(state, "enabled", False)):
+                return
+            asset = str(getattr(self, "_asset_id", "") or "")
+            side = str(getattr(signal, "side", "") or "").lower()
+            adj = state.adjustment_for(asset, side)
+            if adj is None or not bool(getattr(adj, "enabled", False)):
+                return
+            self._last_cross_asset_adjustment = adj
+            self._active_cross_asset_size_mult = self._bounded(
+                float(getattr(adj, "risk_multiplier", 1.0) or 1.0),
+                float(_cfg("CROSS_ASSET_MIN_RISK_MULT", 0.25)),
+                float(_cfg("CROSS_ASSET_MAX_RISK_MULT", 1.18)),
+            )
+            self._active_cross_asset_tp_aggression = self._bounded(
+                float(getattr(adj, "tp_aggression", 0.0) or 0.0), -0.35, 0.35)
+            self._active_cross_asset_sl_buffer_mult = self._bounded(
+                float(getattr(adj, "sl_buffer_multiplier", 1.0) or 1.0), 0.75, 1.35)
+
+            # Attach an adjusted posterior for expected-utility/TP surface.
+            base_p = 0.0
+            try:
+                base_p = float(
+                    getattr(signal, "posterior_prob", 0.0)
+                    or getattr(signal, "posterior", 0.0)
+                    or (getattr(self._entry_engine, "_last_sweep_analysis", {}) or {}).get("quant_posterior", 0.0)
+                    or 0.0
+                )
+            except Exception:
+                base_p = 0.0
+            if base_p > 0.0:
+                new_p = adj.adjusted_probability(base_p) if hasattr(adj, "adjusted_probability") else logit_adjust_probability(base_p, float(getattr(adj, "posterior_logit_adjust", 0.0) or 0.0))
+                setattr(signal, "posterior_prob", new_p)
+                try:
+                    _sa = getattr(self._entry_engine, "_last_sweep_analysis", None)
+                    if isinstance(_sa, dict):
+                        _sa["quant_posterior_raw"] = base_p
+                        _sa["quant_posterior_cross_asset"] = new_p
+                        _sa["quant_posterior"] = new_p
+                except Exception:
+                    pass
+            setattr(signal, "cross_asset_adjustment", adj)
+            setattr(signal, "cross_asset_state", state.as_dict() if hasattr(state, "as_dict") else {})
+            logger.info(
+                "🌐 CrossAsset overlay [%s %s] pΔ=%+.3f risk×%.2f tpΔ=%+.2f sl×%.2f cluster=%.2f | %s",
+                asset, side.upper(),
+                float(getattr(adj, "posterior_logit_adjust", 0.0) or 0.0),
+                self._active_cross_asset_size_mult,
+                self._active_cross_asset_tp_aggression,
+                self._active_cross_asset_sl_buffer_mult,
+                float(getattr(adj, "cluster_risk_penalty", 0.0) or 0.0),
+                str(getattr(adj, "reason", ""))[:140],
+            )
+        except Exception as e:
+            logger.debug("cross-asset overlay application failed: %s", e)
 
     def _institutional_signal_veto(self, signal, price: float, atr: float, ict_ctx) -> str:
         """Cheap safety sanity only; no style/threshold vetoes.
@@ -5466,6 +5552,7 @@ class QuantStrategy:
         self._last_flow_state = flow_state
         signal = self._entry_engine.get_signal()
         if signal is not None:
+            self._apply_cross_asset_overlay(signal, price, atr)
             self._apply_expected_utility_target_surface(signal, liq_snapshot, flow_state, ict_ctx, price, atr)
             _surf_after = getattr(signal, 'target_surface', getattr(self, '_last_target_surface', None))
             _selected_target_u = getattr(signal, "selected_target_utility", None)
@@ -5546,7 +5633,8 @@ class QuantStrategy:
                 f"score={_inst_decision.score:.2f} RR={_inst_decision.rr:.2f} "
                 f"SL={_inst_decision.sl_atr:.2f}ATR TP={_inst_decision.tp_atr:.2f}ATR "
                 f"target={_inst_decision.target_realism:.2f} "
-                f"size_mult={_inst_decision.size_mult:.2f}")
+                f"size_mult={_inst_decision.size_mult:.2f} "
+                f"cross×={float(getattr(self, '_active_cross_asset_size_mult', 1.0) or 1.0):.2f}")
 
             _ug_ok, _ug_reason = self._unified_entry_gate(
                 signal, ict_ctx, flow_state, liq_snapshot, price, atr, now)
@@ -6125,7 +6213,7 @@ class QuantStrategy:
                 sl_price = _fsl
                 tp_price = _ftp
                 _using_force_levels = True
-                logger.info(f"Protective exchange SL/TP armed: SL=${sl_price:,.1f} TP=${tp_price:,.1f}")
+                logger.info(f"Protective exchange SL/TP armed: SL=${sl_price:,.1f} TP=${tp_price:,.1f} | cross_tpΔ={float(getattr(self, '_active_cross_asset_tp_aggression', 0.0) or 0.0):+.2f}")
             self._force_sl = None
             self._force_tp = None
 
@@ -9161,13 +9249,14 @@ class QuantStrategy:
         ic_mult = float(getattr(self, "_active_ic_size_mult", 1.0) or 1.0)
         post_exit_mult = float(getattr(self, "_active_post_exit_size_mult", 1.0) or 1.0)
         spread_cost_mult = float(getattr(self, "_active_spread_cost_mult", 1.0) or 1.0)
+        cross_asset_mult = float(getattr(self, "_active_cross_asset_size_mult", 1.0) or 1.0)
         try:
             policy_risk_mult = float(policy_value("risk_multiplier", 1.0))
         except Exception:
             policy_risk_mult = 1.0
         total_mult = max(
             0.05,
-            min(1.15, (tier_mult + comp_mod + amd_mod) * inst_mult * ic_mult * post_exit_mult * spread_cost_mult * policy_risk_mult),
+            min(1.15, (tier_mult + comp_mod + amd_mod) * inst_mult * ic_mult * post_exit_mult * spread_cost_mult * cross_asset_mult * policy_risk_mult),
         )
 
         # ── Available balance (reuse prefetched — SIG-8 fix) ─────────────────

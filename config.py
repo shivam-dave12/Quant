@@ -56,7 +56,7 @@ REMAINDER_MIN_QTY        = 0.001
 #   The inconsistency caused 100× over-sizing (entire balance at risk per trade),
 #   triggering the "required margin > available — scaling down" warnings in logs.
 #   Fix: one convention (fraction), both consumers agree. See risk_manager.py line 266.
-RISK_PER_TRADE           = 0.005   # 0.5% of available balance per trade; 10 losses fits 5% daily cap
+RISK_PER_TRADE           = 0.005  # 0.5% of available balance per trade; 10 losses fits 5% daily cap
 MAX_DAILY_LOSS           = 10000
 MAX_DAILY_LOSS_PCT       = 5.0       # day circuit breaker
 MAX_DRAWDOWN_PCT         = 15.0      # realistic drawdown limit
@@ -762,3 +762,21 @@ def _float_env(name: str, default: float) -> float:
 
 TELEGRAM_GETUPDATES_BACKOFF_BASE_SEC = _float_env("TELEGRAM_GETUPDATES_BACKOFF_BASE_SEC", 2.0)
 TELEGRAM_GETUPDATES_BACKOFF_MAX_SEC = _float_env("TELEGRAM_GETUPDATES_BACKOFF_MAX_SEC", 30.0)
+
+
+# Cross-asset institutional overlay (BTC/GOLD/SILVER)
+# Context engine only: no hard entry vetoes.  It adjusts posterior, TP reach,
+# SL buffer, and risk sizing based on correlation, relative-value residuals,
+# BTC macro role, and cluster crowding.
+CROSS_ASSET_OVERLAY_ENABLED = True
+CROSS_ASSET_TIMEFRAME = "5m"
+CROSS_ASSET_WINDOW = 48
+CROSS_ASSET_HORIZON_BARS = 6
+CROSS_ASSET_EWMA_HALFLIFE = 16.0
+CROSS_ASSET_MIN_RETURNS = 24
+CROSS_ASSET_UPDATE_INTERVAL_SEC = 2.0
+CROSS_ASSET_MAX_STATE_AGE_SEC = 20.0
+CROSS_ASSET_METALS_CORR_STRONG = 0.55
+CROSS_ASSET_TP_AGGRESSION_WEIGHT = 0.25
+CROSS_ASSET_MAX_RISK_MULT = 1.18
+CROSS_ASSET_MIN_RISK_MULT = 0.25

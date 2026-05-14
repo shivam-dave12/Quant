@@ -682,6 +682,39 @@ def _tp_selection_value(ev: float, rr: float, rr_floor: float,
     return float(ev) * payoff_frontier * delivery_span
 
 
+def _cross_asset_adjustment(cross_asset_state: Any, asset_id: str, side: str) -> Any:
+    try:
+        if cross_asset_state is None:
+            return None
+        fn = getattr(cross_asset_state, "adjustment_for", None)
+        if callable(fn):
+            return fn(str(asset_id or ""), str(side or ""))
+    except Exception:
+        return None
+    return None
+
+
+def _apply_cross_asset_tp_overlay(selection_ev: float, row: Any, adjustment: Any) -> float:
+    if adjustment is None or not bool(getattr(adjustment, "enabled", False)):
+        return float(selection_ev)
+    try:
+        tp_aggr = float(getattr(adjustment, "tp_aggression", 0.0) or 0.0)
+        logit = float(getattr(adjustment, "posterior_logit_adjust", 0.0) or 0.0)
+        penalty = float(getattr(adjustment, "cluster_risk_penalty", 0.0) or 0.0)
+        dist = float(getattr(row, "distance_atr", 0.0) or 0.0)
+        rr = float(getattr(row, "rr", 0.0) or 0.0)
+        # Positive sponsorship rewards farther, payable liquidity. Negative sponsorship
+        # compresses distance preference and makes the selector favour cleaner/nearer pools.
+        distance_frontier = 1.0 + max(0.0, dist - 1.0) * 0.10
+        rr_frontier = 1.0 + max(0.0, rr - 1.0) * 0.07
+        sponsorship = 1.0 + tp_aggr * min(distance_frontier * rr_frontier, 1.65)
+        posterior = 1.0 + 0.35 * logit
+        crowd = 1.0 - min(max(penalty, 0.0), 0.45) * 0.35
+        return float(selection_ev) * max(0.40, min(1.75, sponsorship * posterior * crowd))
+    except Exception:
+        return float(selection_ev)
+
+
 def _tp_payoff_rejection_reason(
     rr: float,
     rr_floor: float,
@@ -748,6 +781,8 @@ def score_tp_pools(
     now:     Optional[float] = None,
     session: str = "",
     posterior_prob: float = 0.0,
+    cross_asset_state: Any = None,
+    asset_id: str = "",
 ) -> List[PoolScore]:
     """
     Score every candidate TP pool. Returns PoolScore[], sorted by EV desc.
@@ -759,6 +794,7 @@ def score_tp_pools(
         return []
 
     risk = abs(float(entry) - float(sl))
+    cross_adj = _cross_asset_adjustment(cross_asset_state, asset_id, side)
     if risk < 1e-10:
         return []
 
@@ -856,6 +892,7 @@ def score_tp_pools(
             #   - gauntlet_mult is a divisor in [0.45, 1.0].
             ev = utility * _W_PROBABILITY * confluence * gauntlet_mult
             selection_ev = _tp_selection_value(ev, rr, rr_floor, dist_atr)
+            selection_ev = _apply_cross_asset_tp_overlay(selection_ev, type("_Row", (), {"distance_atr": dist_atr, "rr": rr})(), cross_adj)
 
             reasons: List[str] = []
             if confluence > 1.30:
@@ -904,8 +941,10 @@ def score_tp_pools(
                     "required_delivery_prob": required_delivery_prob,
                     "posterior_prob": _clamp(posterior_prob, 0.0, 0.95),
                     "cost_r":      cost_r,
+                    "cross_asset_tp_aggression": float(getattr(cross_adj, "tp_aggression", 0.0) or 0.0) if cross_adj is not None else 0.0,
+                    "cross_asset_risk_penalty": float(getattr(cross_adj, "cluster_risk_penalty", 0.0) or 0.0) if cross_adj is not None else 0.0,
                 },
-                reasons      = reasons,
+                reasons      = (reasons + (["cross-asset: " + str(getattr(cross_adj, "reason", ""))[:80]] if cross_adj is not None and getattr(cross_adj, "reason", "") else [])),
             ))
         except Exception as e:
             logger.debug("score_tp_pools: skipping target due to %s", e)
@@ -1050,6 +1089,8 @@ def diagnose_tp_pools(
     session: str = "",
     limit:   int = 8,
     posterior_prob: float = 0.0,
+    cross_asset_state: Any = None,
+    asset_id: str = "",
 ) -> PoolSelectionReport:
     """Return a TP candidate audit table without weakening any gate.
 
@@ -1067,6 +1108,7 @@ def diagnose_tp_pools(
         return report
 
     risk = abs(float(entry) - float(sl))
+    cross_adj = _cross_asset_adjustment(cross_asset_state, asset_id, side)
     be_move = _breakeven_move(entry, atr)
     if risk < 1e-10:
         report.summary = "invalid risk: entry and SL overlap"
@@ -1174,7 +1216,7 @@ def diagnose_tp_pools(
             utility *= reach_mult
             row.ev = utility * _W_PROBABILITY * confluence * gauntlet_mult
             selection_ev = _tp_selection_value(row.ev, row.rr, rr_floor, row.distance_atr)
-            row.selection_ev = selection_ev
+            row.selection_ev = _apply_cross_asset_tp_overlay(selection_ev, row, cross_adj)
             row.eligible = True
             row.reason = "eligible; payoff-adjusted EV candidate"
             row.notes = []
@@ -1187,7 +1229,9 @@ def diagnose_tp_pools(
                 row.notes.append(f"frontierEV={selection_ev:.3f}")
             if n_gauntlet: row.notes.append(f"gauntlet={n_gauntlet}")
             if comps.get("be_quality", 1.0) < 0.75: row.notes.append("thin post-BE room")
-            accepted.append((selection_ev, row))
+            if cross_adj is not None and getattr(cross_adj, "reason", ""):
+                row.notes.append("cross=" + str(getattr(cross_adj, "reason", ""))[:60])
+            accepted.append((row.selection_ev, row))
             rows.append(row)
         except Exception as e:
             row.reason = f"diagnostic error: {e}"
@@ -1325,15 +1369,18 @@ def select_tp_with_report(
     snap, side: str, entry: float, sl: float, atr: float,
     ict: Any = None, htf: Any = None, min_rr: float = 2.0,
     now: Optional[float] = None, session: str = "", posterior_prob: float = 0.0,
+    cross_asset_state: Any = None, asset_id: str = "",
 ) -> Tuple[Optional[float], Optional[Any], Optional[PoolScore], PoolSelectionReport]:
     """select_tp() plus a full rejection/selection report."""
     report = diagnose_tp_pools(
         snap, side, entry, sl, atr, ict, htf, min_rr, now, session,
         posterior_prob=posterior_prob,
+        cross_asset_state=cross_asset_state, asset_id=asset_id,
     )
     scores = score_tp_pools(
         snap, side, entry, sl, atr, ict, htf, min_rr, now, session,
         posterior_prob=posterior_prob,
+        cross_asset_state=cross_asset_state, asset_id=asset_id,
     )
     if not scores:
         return None, None, None, report
@@ -1369,6 +1416,7 @@ def select_tp(
     snap, side: str, entry: float, sl: float, atr: float,
     ict: Any = None, htf: Any = None, min_rr: float = 2.0,
     now: Optional[float] = None, session: str = "", posterior_prob: float = 0.0,
+    cross_asset_state: Any = None, asset_id: str = "",
 ) -> Tuple[Optional[float], Optional[Any], Optional[PoolScore]]:
     """
     One-call TP selection. Returns (tp_price, target, score) or (None, None, None).
@@ -1376,6 +1424,7 @@ def select_tp(
     scores = score_tp_pools(
         snap, side, entry, sl, atr, ict, htf, min_rr, now, session,
         posterior_prob=posterior_prob,
+        cross_asset_state=cross_asset_state, asset_id=asset_id,
     )
     if not scores:
         return None, None, None

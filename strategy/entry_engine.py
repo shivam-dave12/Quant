@@ -455,6 +455,7 @@ class EntryEngine:
         self._last_sweep_analysis: Dict = {}
         self._last_liq_snapshot = None
         self._last_market_profile = None
+        self._cross_asset_state = None
 
         # Flow EWMA
         self._flow_ewma             = 0.0
@@ -549,6 +550,14 @@ class EntryEngine:
         self._atr_pctile: float = 0.5
 
     # ── Public API ────────────────────────────────────────────────────
+
+    def set_cross_asset_state(self, state) -> None:
+        """Receive portfolio-level BTC/GOLD/SILVER regime state.
+
+        This is advisory only.  The entry engine still requires its own
+        liquidity sweep, structural SL, and executable TP.
+        """
+        self._cross_asset_state = state
 
     def set_atr_pctile(self, pctile: float) -> None:
         """Update current ATR percentile rank [0, 1] from quant_strategy.
@@ -2500,6 +2509,8 @@ class EntryEngine:
             min_rr=required_rr,
             posterior_prob=posterior_prob,
             now=time.time(),
+            cross_asset_state=getattr(self, "_cross_asset_state", None),
+            asset_id=getattr(getattr(self, "_instrument", None), "asset_id", ""),
         )
         report = report_obj.as_dict() if hasattr(report_obj, "as_dict") else dict(report_obj or {})
 
