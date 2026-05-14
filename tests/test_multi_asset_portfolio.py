@@ -9,7 +9,7 @@ socketio_stub = types.SimpleNamespace(Client=lambda *a, **kw: SimpleNamespace())
 sys.modules.setdefault("socketio", socketio_stub)
 
 from core.instruments import AssetClass
-from orchestration.multi_asset_bot import PortfolioGuard
+from orchestration.portfolio_manager import PortfolioManager
 
 
 class _Ctx:
@@ -25,7 +25,7 @@ class _Ctx:
 
 class MultiAssetPortfolioTests(unittest.TestCase):
     def test_one_position_per_contract_but_multiple_contracts_allowed(self):
-        guard = PortfolioGuard()
+        guard = PortfolioManager()
         guard.max_open_positions = 4
         guard.max_same_class = 4
         guard.max_per_contract = 1
@@ -43,7 +43,7 @@ class MultiAssetPortfolioTests(unittest.TestCase):
         self.assertIn("contract slot occupied", reason_btc2)
 
     def test_equal_slot_balance_allocation_preserves_portfolio_budget(self):
-        guard = PortfolioGuard()
+        guard = PortfolioManager()
         guard.max_open_positions = 4
         guard.budget_mode = "equal_slots"
         ctx = _Ctx("BTC", AssetClass.CRYPTO)

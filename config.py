@@ -56,7 +56,7 @@ REMAINDER_MIN_QTY        = 0.001
 #   The inconsistency caused 100× over-sizing (entire balance at risk per trade),
 #   triggering the "required margin > available — scaling down" warnings in logs.
 #   Fix: one convention (fraction), both consumers agree. See risk_manager.py line 266.
-RISK_PER_TRADE           = 0.05    # 5% of available balance per trade
+RISK_PER_TRADE           = 0.005   # 0.5% of available balance per trade; 10 losses fits 5% daily cap
 MAX_DAILY_LOSS           = 10000
 MAX_DAILY_LOSS_PCT       = 5.0       # day circuit breaker
 MAX_DRAWDOWN_PCT         = 15.0      # realistic drawdown limit
@@ -65,7 +65,6 @@ ALLOW_TIME_BASED_CONSEC_LOSS_RESET = False
 CONSEC_LOSS_AUTO_RESET_HOURS = 1.0
 MAX_DAILY_TRADES         = 20        # institutional selectivity over frequency
 ONE_POSITION_AT_A_TIME   = True
-MIN_TIME_BETWEEN_TRADES  = 5.0       # minutes; compatibility alias for 300 seconds
 MIN_TIME_BETWEEN_TRADES_SEC = 300.0
 TRADE_COOLDOWN_SECONDS   = 300       # 5m cooldown after loss
 MIN_RISK_REWARD_RATIO    = 2.0       # expected-utility reference; thin R:R reduces size/EV
@@ -76,14 +75,10 @@ MAX_RR_RATIO             = 20.0
 # Style/quality signals are never hidden alpha vetoes. They are continuous
 # references used for score, size multiplier, expected utility, and attribution.
 # Only mechanical account/exchange safety can stop routing.
-INSTITUTIONAL_STRICT_QUALITY_GATES = False      # backward-compatible flag; ignored in dynamic mode
 INSTITUTIONAL_DYNAMIC_SCORE_REFERENCE = 0.66
 INSTITUTIONAL_TARGET_REALISM_REFERENCE = 0.52
 INSTITUTIONAL_MIN_DECISION_SCORE   = INSTITUTIONAL_DYNAMIC_SCORE_REFERENCE
 INSTITUTIONAL_MIN_TARGET_REALISM   = INSTITUTIONAL_TARGET_REALISM_REFERENCE
-ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR = 0.75
-ENTRY_HARD_MIN_DISPLACEMENT_ATR    = ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR  # compatibility alias
-ENTRY_STRONG_DISPLACEMENT_ATR      = 1.25
 ENTRY_MIN_POOL_SIGNIFICANCE        = 1.25
 ENTRY_MIN_SWEEP_QUALITY            = 0.20
 ENTRY_ENGINE_SIGNAL_COOLDOWN_SEC   = 10.0
@@ -202,8 +197,6 @@ def validate_config() -> None:
         errors.append("MIN_RISK_REWARD_RATIO must be >= 1.5")
     if abs(CONVICTION_MIN_RR - MIN_RISK_REWARD_RATIO) > 1e-9:
         errors.append("CONVICTION_MIN_RR must match MIN_RISK_REWARD_RATIO")
-    if abs(QUANT_REVERSION_MIN_RR - MIN_RISK_REWARD_RATIO) > 1e-9:
-        errors.append("QUANT_REVERSION_MIN_RR must match MIN_RISK_REWARD_RATIO")
     if get_tick_size() <= 0:
         errors.append("tick size must be positive")
     if MAX_DAILY_LOSS_PCT <= 0 or MAX_DAILY_LOSS_PCT > 10:
@@ -229,7 +222,6 @@ SL_ATR_PERIOD            = 14
 SL_ATR_BUFFER_MULT       = 0.75      # trail manager buffer (separate from entry SL)
 SL_MIN_CLEARANCE_ATR_MULT    = 1.5
 SL_MIN_IMPROVEMENT_ATR_MULT  = 0.20   # prevents micro SL updates
-TRAILING_SL_CHECK_INTERVAL   = 10
 TRAIL_SWING_MAX_AGE_MS       = 14_400_000
 
 # ── Aggregator ────────────────────────────────────────────────────────────────
@@ -256,7 +248,7 @@ QUANT_OB_WALL_DEPTH            = 20
 QUANT_OB_WALL_MULT             = 2.5
 QUANT_TRAIL_SWING_BARS         = 5
 QUANT_TRAIL_VOL_DECAY_MULT     = 0.6
-QUANT_TRAIL_ENABLED            = True
+QUANT_TRAIL_ENABLED            = False
 QUANT_TRAIL_BE_R               = 1.00     # BE lock at 1.0R
 QUANT_TRAIL_LOCK_R             = 1.00     # Fib trail begins after BE checkpoint
 QUANT_TRAIL_AGGRESSIVE_R       = 3.50     # aggressive trail at 3.5R
@@ -326,9 +318,6 @@ QUANT_OB_HIST_LEN              = 60
 QUANT_TICK_AGG_WINDOW_SEC      = 30.0
 QUANT_TP_MAX_RR                = 3.5
 QUANT_SL_SWING_DENSITY_WINDOW  = 0.30
-# Deprecated compatibility only: the live trail is liquidity/structure based.
-QUANT_TRAIL_CHANDELIER_N_START = 3.00
-QUANT_TRAIL_CHANDELIER_N_END   = 1.50
 QUANT_TRAIL_HVN_SNAP_THRESH    = 0.55
 QUANT_ADX_PERIOD               = 14
 QUANT_ADX_TREND_THRESH         = 25.0
@@ -340,7 +329,6 @@ QUANT_TREND_CVD_MIN            = -0.20
 QUANT_TREND_TP_ATR_MULT        = 2.5
 QUANT_TREND_COMPOSITE_MIN      = 0.35
 QUANT_TREND_CONFIRM_TICKS      = 3
-QUANT_TREND_CHANDELIER_N       = 1.5
 QUANT_MAX_SPREAD_ATR_RATIO     = 0.50     # crypto/BTC hard spread/ATR cap
 # Asset-aware spread gate (v8): xStock/RWA products have coarse tick geometry;
 # a normal 1-4 tick spread can exceed the current 5m ATR in quiet windows.
@@ -359,9 +347,7 @@ QUANT_MAX_SPREAD_BPS_COMMODITY        = 45.0
 QUANT_MAX_SPREAD_TICKS_COMMODITY      = 10.0
 QUANT_SPREAD_MIN_SIZE_MULT            = 0.35
 QUANT_SPREAD_SIZE_HAIRCUT_MAX         = 0.55
-QUANT_REVERSION_MIN_RR         = 2.0      # single authoritative R:R floor
 QUANT_REVERSION_MAX_RR         = 5.0
-QUANT_TREND_MIN_RR             = 2.0
 QUANT_TREND_MAX_RR             = 5.0
 QUANT_TREND_SL_ATR_MULT        = 2.0
 QUANT_TP_MIN_ATR_MULT          = 0.5
@@ -425,7 +411,6 @@ KZ_NY_NY_START              = 7
 KZ_NY_NY_END                = 10
 
 # ── ICT Gate ──────────────────────────────────────────────────────────────────
-ICT_MIN_SCORE_FOR_ENTRY     = 0.25     # lowered ICT score gate
 ICT_OB_MIN_SCORE_FOR_ENTRY  = 0.20     # lowered OB score gate
 ICT_REQUIRE_OB_OR_FVG       = False
 ICT_OB_PROXIMITY_ATR        = 1.5
@@ -453,7 +438,6 @@ CONVICTION_MAX_ENTRIES_PER_SESSION = 3
 # These are adaptive scoring references, not alpha vetoes. Weak structure lowers
 # signal quality and size; posterior/EV still owns trade expression.
 ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR       = 0.75
-ENTRY_HARD_MIN_DISPLACEMENT_ATR          = ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR  # compatibility alias
 ENTRY_STRONG_DISPLACEMENT_ATR            = 1.25
 ENTRY_REQUIRE_CISD_OR_OTE                = True
 ENTRY_MAX_CHASE_ATR_WITHOUT_OTE          = 1.15
@@ -461,8 +445,8 @@ ENTRY_REVERSAL_PD_LONG_MAX               = 0.62
 ENTRY_REVERSAL_PD_SHORT_MIN              = 0.38
 ENTRY_CONTINUATION_MIN_ACCEPTANCE_ATR    = 0.55
 ENTRY_CONTINUATION_REQUIRE_CISD_OR_BOS   = True
-ENTRY_FLOW_HARD_OPPOSE_THRESHOLD         = 0.40  # compatibility name; dynamic penalty reference
-ENTRY_CVD_HARD_OPPOSE_THRESHOLD          = 0.30  # compatibility name; dynamic penalty reference
+ENTRY_FLOW_OPPOSE_THRESHOLD              = 0.40
+ENTRY_CVD_OPPOSE_THRESHOLD               = 0.30
 ENTRY_HTF_CONTRA_MAX_WITHOUT_STRONG_DISP = True
 ENTRY_GATE_LOG_INTERVAL_SEC              = 12.0
 # ── Trail (liquidity-first) ───────────────────────────────────────────────────
@@ -663,6 +647,102 @@ POLICY_EQUITY_MAX_RR = 5.0
 POLICY_EQUITY_MAX_HOLD_SEC = 5400
 POLICY_EQUITY_COOLDOWN_SEC = 180
 POLICY_EQUITY_SL_BUFFER_ATR = 0.55
+
+# Desk model: the alpha stack remains the same everywhere
+# (ICT FVG + Quant). Desks only change thresholds, sizing and exit parameters.
+STRATEGY_CORE_NAME = "ICT_FVG_QUANT"
+TELEGRAM_RECENT_TRADES_LIMIT = 30
+
+TRADING_DESKS = {
+    "BTC": {
+        "display_name": "BTC Desk",
+        "strategy": STRATEGY_CORE_NAME,
+        "asset_ids": ("BTC",),
+        "asset_classes": ("crypto",),
+        "risk_multiplier": POLICY_CRYPTO_RISK_MULT,
+        "margin_pct": QUANT_MARGIN_PCT,
+        "tick_eval_sec": ENTRY_EVALUATION_INTERVAL_SECONDS,
+        "loop_interval_sec": POLICY_CRYPTO_LOOP_INTERVAL_SEC,
+        "min_1m_bars": MIN_CANDLES_1M,
+        "min_5m_bars": MIN_CANDLES_5M,
+        "min_rr": MIN_RISK_REWARD_RATIO,
+        "max_rr": QUANT_TP_MAX_RR,
+        "max_hold_sec": QUANT_MAX_HOLD_SEC,
+        "cooldown_sec": QUANT_COOLDOWN_SEC,
+        "sl_buffer_atr": QUANT_SL_BUFFER_ATR_MULT,
+        "entry": {
+            "confirm_ticks": QUANT_CONFIRM_TICKS,
+            "fvg_proximity_atr": ICT_FVG_PROXIMITY_ATR,
+            "require_ob_or_fvg": ICT_REQUIRE_OB_OR_FVG,
+            "min_pool_significance": ENTRY_MIN_POOL_SIGNIFICANCE,
+            "min_sweep_quality": ENTRY_MIN_SWEEP_QUALITY,
+            "reversal_sl_buffer_atr": 0.35,
+            "continuation_sl_buffer_atr": 0.40,
+        },
+        "exit": {
+            "tp_min_rr_reversion": 1.80,
+            "tp_min_rr_trend": 2.50,
+        },
+    },
+    "COMMODITIES": {
+        "display_name": "Commodities Desk",
+        "strategy": STRATEGY_CORE_NAME,
+        "asset_classes": ("commodity",),
+        "risk_multiplier": 0.50,
+        "margin_pct": 0.10,
+        "tick_eval_sec": 0.65,
+        "loop_interval_sec": 0.65,
+        "min_1m_bars": 100,
+        "min_5m_bars": 80,
+        "min_rr": 2.20,
+        "max_rr": 5.50,
+        "max_hold_sec": 3600,
+        "cooldown_sec": 300,
+        "sl_buffer_atr": 0.65,
+        "entry": {
+            "confirm_ticks": 3,
+            "fvg_proximity_atr": 0.60,
+            "require_ob_or_fvg": True,
+            "min_pool_significance": 1.45,
+            "min_sweep_quality": 0.28,
+            "reversal_sl_buffer_atr": 0.48,
+            "continuation_sl_buffer_atr": 0.55,
+        },
+        "exit": {
+            "tp_min_rr_reversion": 2.20,
+            "tp_min_rr_trend": 2.80,
+        },
+    },
+    "STOCKS": {
+        "display_name": "Stocks Desk",
+        "strategy": STRATEGY_CORE_NAME,
+        "asset_classes": ("equity", "index"),
+        "risk_multiplier": 0.40,
+        "margin_pct": 0.08,
+        "tick_eval_sec": 0.90,
+        "loop_interval_sec": 0.90,
+        "min_1m_bars": 110,
+        "min_5m_bars": 85,
+        "min_rr": 2.40,
+        "max_rr": 6.00,
+        "max_hold_sec": 3000,
+        "cooldown_sec": 360,
+        "sl_buffer_atr": 0.75,
+        "entry": {
+            "confirm_ticks": 4,
+            "fvg_proximity_atr": 0.50,
+            "require_ob_or_fvg": True,
+            "min_pool_significance": 1.60,
+            "min_sweep_quality": 0.32,
+            "reversal_sl_buffer_atr": 0.55,
+            "continuation_sl_buffer_atr": 0.65,
+        },
+        "exit": {
+            "tp_min_rr_reversion": 2.40,
+            "tp_min_rr_trend": 3.20,
+        },
+    },
+}
 
 # v13 multi-asset protection invariants
 # A Delta bracket fill is not considered safe until the bot verifies the SL and

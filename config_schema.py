@@ -318,16 +318,6 @@ class TrailConfig(BaseModel):
         le=20.0,
         description="R-multiple at which aggressive (tight) trail engages.",
     )
-    QUANT_TRAIL_CHANDELIER_N_START: float = Field(
-        default_factory=lambda: _c("QUANT_TRAIL_CHANDELIER_N_START", 3.0),
-        ge=0.5,
-        le=10.0,
-    )
-    QUANT_TRAIL_CHANDELIER_N_END: float = Field(
-        default_factory=lambda: _c("QUANT_TRAIL_CHANDELIER_N_END", 1.5),
-        ge=0.5,
-        le=10.0,
-    )
     PAYOFF_TRAIL_MIN_NET_R: float = Field(
         default_factory=lambda: _c("PAYOFF_TRAIL_MIN_NET_R", 0.50),
         ge=0.0,
@@ -351,18 +341,6 @@ class TrailConfig(BaseModel):
                 f"{self.QUANT_TRAIL_AGGRESSIVE_R}."
             )
         return self
-
-    @model_validator(mode="after")
-    def chandelier_ordering(self) -> "TrailConfig":
-        """Chandelier multiplier must decay from start to end (start > end)."""
-        if self.QUANT_TRAIL_CHANDELIER_N_START <= self.QUANT_TRAIL_CHANDELIER_N_END:
-            raise ValueError(
-                f"QUANT_TRAIL_CHANDELIER_N_START ({self.QUANT_TRAIL_CHANDELIER_N_START}) "
-                f"must be > QUANT_TRAIL_CHANDELIER_N_END ({self.QUANT_TRAIL_CHANDELIER_N_END}). "
-                f"The chandelier tightens as profit grows."
-            )
-        return self
-
 
 # ---------------------------------------------------------------------------
 # Sub-model: Exchange / Execution
@@ -428,11 +406,11 @@ class ExecutionConfig(BaseModel):
 
 class RRConsistencyConfig(BaseModel):
     """
-    Cross-module R:R invariant: all three R:R gates must be identical.
+    Cross-module R:R invariant: global R:R gates must be identical.
 
-    The three gates — MIN_RISK_REWARD_RATIO (risk_manager),
-    CONVICTION_MIN_RR (advisory_safety_model), and QUANT_REVERSION_MIN_RR
-    (quant_strategy) — must agree.  If they diverge, you get asymmetric
+    MIN_RISK_REWARD_RATIO (risk_manager) and CONVICTION_MIN_RR
+    (advisory_safety_model) must agree. Desk strategy R:R is configured in
+    TRADING_DESKS. If the global gates diverge, you get asymmetric
     rejection: e.g. a setup passes conviction at 1.3R but fails risk at 1.5R,
     burning entry-engine cooldown budget for a trade that can never fire.
     """
@@ -444,21 +422,16 @@ class RRConsistencyConfig(BaseModel):
     CONVICTION_MIN_RR: float = Field(
         default_factory=lambda: _c("CONVICTION_MIN_RR", 2.0), ge=1.0
     )
-    QUANT_REVERSION_MIN_RR: float = Field(
-        default_factory=lambda: _c("QUANT_REVERSION_MIN_RR", 2.0), ge=1.0
-    )
-
     @model_validator(mode="after")
     def all_rr_gates_identical(self) -> "RRConsistencyConfig":
         vals = {
             "MIN_RISK_REWARD_RATIO": self.MIN_RISK_REWARD_RATIO,
             "CONVICTION_MIN_RR":     self.CONVICTION_MIN_RR,
-            "QUANT_REVERSION_MIN_RR": self.QUANT_REVERSION_MIN_RR,
         }
         if len(set(round(v, 9) for v in vals.values())) > 1:
             detail = ", ".join(f"{k}={v}" for k, v in vals.items())
             raise ValueError(
-                f"All three R:R gates must be identical. Got: {detail}. "
+                f"Global R:R gates must be identical. Got: {detail}. "
                 f"Set them all to the same value in config.py."
             )
         return self
@@ -495,7 +468,6 @@ class TradingConfig(BaseModel):
         for name, val in [
             ("risk.MIN_RISK_REWARD_RATIO",    self.risk.MIN_RISK_REWARD_RATIO),
             ("conviction.CONVICTION_MIN_RR",  self.conviction.CONVICTION_MIN_RR),
-            ("rr.QUANT_REVERSION_MIN_RR",     self.rr.QUANT_REVERSION_MIN_RR),
         ]:
             if val < floor - 1e-9:
                 raise ValueError(

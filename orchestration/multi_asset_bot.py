@@ -4,7 +4,7 @@ orchestration/multi_asset_bot.py — portfolio scanner for confirmed instruments
 
 One strategy instance per tradable instrument.  Every instrument has its own data
 manager, execution router, risk ledger, strategy state, liquidity map and trail
-state.  PortfolioGuard enforces account-level exposure so the scanner can watch
+state.  PortfolioManager enforces account-level exposure so the scanner can watch
 multiple contracts without stacking correlated risk blindly.
 """
 from __future__ import annotations
@@ -15,11 +15,12 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import config
 from aggregator.market_aggregator import MarketAggregator
 from core.instruments import ExchangeName, TradableInstrument, instrument_scope
+from core.pnl import gross_pnl_usd
 from execution.instrument_registry import InstrumentRegistry, DiscoveryReport
 from execution.order_manager import OrderManager
 from execution.router import ExecutionRouter
@@ -66,137 +67,6 @@ class AssetContext:
         except Exception:
             return False
 
-
-class _LegacyPortfolioGuard:
-    """
-    Account-level exposure coordinator.
-
-    It does not judge alpha.  It only enforces portfolio mechanics:
-      • many contracts may trade simultaneously, up to the configured slot cap;
-      • one reserved slot per contract (ENTERING/ACTIVE/EXITING all count);
-      • each contract sees a portfolio-adjusted balance slice before the existing
-        BTC-style risk/margin sizing runs inside QuantStrategy.
-    """
-    def __init__(self) -> None:
-        self.max_open_positions = max(1, int(getattr(config, "PORTFOLIO_MAX_OPEN_POSITIONS", 4)))
-        self.max_same_class = max(1, int(getattr(config, "PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS", self.max_open_positions)))
-        self.max_per_contract = max(1, int(getattr(config, "PORTFOLIO_MAX_OPEN_PER_CONTRACT", 1)))
-        self.budget_mode = str(getattr(config, "PORTFOLIO_BUDGET_MODE", "equal_slots")).lower()
-        self._lock = threading.RLock()
-
-    def reserved_contexts(self, contexts: List[AssetContext]) -> List[AssetContext]:
-        return [c for c in contexts if c.has_position]
-
-    def count_open(self, contexts: List[AssetContext]) -> int:
-        return len(self.reserved_contexts(contexts))
-
-    def can_evaluate_entry(self, ctx: AssetContext, contexts: List[AssetContext]) -> tuple[bool, str]:
-        with self._lock:
-            reserved_ctx = self.reserved_contexts(contexts)
-
-            # One position slot per contract.  Existing slot is allowed only for
-            # management/exits/trailing; a second entry cannot be opened by this
-            # context because QuantStrategy remains non-FLAT.
-            if ctx.has_position:
-                return True, f"{ctx.phase_name.lower()} position management"
-
-            same_contract = [c for c in reserved_ctx if c.instrument.asset_id == ctx.instrument.asset_id]
-            if len(same_contract) >= self.max_per_contract:
-                return False, f"contract slot occupied {ctx.instrument.asset_id} {len(same_contract)}/{self.max_per_contract}"
-
-            if len(reserved_ctx) >= self.max_open_positions:
-                return False, f"portfolio exposure cap {len(reserved_ctx)}/{self.max_open_positions}"
-
-            same_class = [c for c in reserved_ctx if c.instrument.asset_class == ctx.instrument.asset_class]
-            if len(same_class) >= self.max_same_class:
-                return False, f"asset-class exposure cap {ctx.instrument.asset_class.value} {len(same_class)}/{self.max_same_class}"
-
-            return True, "portfolio slot available"
-
-    def allocate_balance(self, ctx: Optional[AssetContext], contexts: List[AssetContext], raw_balance: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        """Return a balance view scoped to one contract's portfolio slot.
-
-        QuantStrategy already applies RISK_PER_TRADE and BALANCE_USAGE_PERCENTAGE
-        to whatever `available` it receives.  Therefore the institutional way to
-        preserve the current BTC sizing semantics across multiple simultaneous
-        contracts is to give each contract an account-equity slice, not the full
-        account equity.  With 4 slots and 60% balance usage, each contract may use
-        about 15% of total equity as margin; all 4 together remain around the old
-        60% portfolio envelope.
-        """
-        if raw_balance is None:
-            return None
-        if not isinstance(raw_balance, dict):
-            return raw_balance
-
-        try:
-            raw_available = max(0.0, float(raw_balance.get("available", 0.0) or 0.0))
-            raw_total = max(0.0, float(raw_balance.get("total", raw_available) or raw_available))
-        except Exception:
-            return raw_balance
-
-        # Slot count is the configured maximum, not current open count.  That
-        # prevents the first signal of the day from consuming the whole account
-        # just because other contracts have not fired yet.
-        configured_slots = max(1, self.max_open_positions)
-        active_universe = max(1, len(contexts or []))
-        slot_count = min(configured_slots, active_universe) if self.budget_mode in {"active_equal_slots", "active_slots"} else configured_slots
-
-        slot_equity = raw_total / float(slot_count) if slot_count > 0 else raw_total
-        slot_available = min(slot_equity, raw_available)
-
-        # If the account has less free cash than one nominal slot, use the real
-        # exchange-available cash.  Never fabricate availability.
-        adjusted = dict(raw_balance)
-        adjusted["available_raw"] = raw_available
-        adjusted["total_raw"] = raw_total
-        adjusted["available"] = max(0.0, slot_available)
-        adjusted["total"] = max(0.0, slot_equity)
-        adjusted["portfolio_scoped"] = True
-        adjusted["portfolio_budget_mode"] = self.budget_mode
-        adjusted["portfolio_slot_count"] = slot_count
-        adjusted["portfolio_slot_available"] = slot_available
-        adjusted["portfolio_slot_equity"] = slot_equity
-        adjusted["portfolio_reserved_slots"] = self.count_open(contexts or [])
-        adjusted["portfolio_max_slots"] = self.max_open_positions
-
-        # Sizing v5.1 separation:
-        #   • available/total above are the slot-scoped cash view used for
-        #     margin and fee-cap checks;
-        #   • risk_available/risk_total keep the portfolio equity base used for
-        #     dollar-risk sizing.  Without this separation, BTC min lot gets
-        #     rejected on small accounts because the risk target is divided by
-        #     the number of portfolio slots before the exchange lot floor is
-        #     considered.  PortfolioGuard still limits total concurrent slots;
-        #     QuantStrategy still limits actual cash/margin by the slot view.
-        # Keep risk dollars anchored to portfolio equity; do not shrink the
-        # second signal only because the first signal has reserved margin.
-        # Actual spendable cash remains slot-scoped through `available`.
-        adjusted["risk_available"] = raw_total
-        adjusted["risk_total"] = raw_total
-        adjusted["portfolio_free_cash_after_reserves"] = raw_available
-        if ctx is not None:
-            adjusted["portfolio_asset_id"] = ctx.instrument.asset_id
-        return adjusted
-
-
-class _LegacyPortfolioRiskManager(RiskManager):
-    """RiskManager wrapper that exposes a per-contract balance slice."""
-    def __init__(self, shared_api=None, *, allocator: Callable[[Optional[AssetContext], List[AssetContext], Optional[Dict[str, Any]]], Optional[Dict[str, Any]]], context_getter: Callable[[], Optional[AssetContext]], contexts_getter: Callable[[], List[AssetContext]]):
-        super().__init__(shared_api=shared_api)
-        self._portfolio_allocator = allocator
-        self._portfolio_context_getter = context_getter
-        self._portfolio_contexts_getter = contexts_getter
-
-    def get_available_balance(self) -> Optional[Dict]:
-        raw = super().get_available_balance()
-        try:
-            ctx = self._portfolio_context_getter()
-            contexts = self._portfolio_contexts_getter()
-            return self._portfolio_allocator(ctx, contexts, raw)
-        except Exception:
-            logger.exception("Portfolio balance allocation failed; using raw exchange balance")
-            return raw
 
 
 class MultiAssetQuantBot:
@@ -323,7 +193,7 @@ class MultiAssetQuantBot:
 
     # ---------------------------------------------------------------------
     # Institutional command-center reports used by Telegram commands.
-    # These replace the old BTC-era single-strategy /pnl /position /equity
+    # Portfolio command-center reports used by Telegram commands.
     # views.  They aggregate all asset desks under the central portfolio
     # manager while preserving per-contract detail.
     # ---------------------------------------------------------------------
@@ -359,6 +229,7 @@ class MultiAssetQuantBot:
         out: Dict[str, Any] = {
             "asset": inst.asset_id, "symbol": inst.display_symbol,
             "venue": inst.primary_exchange.value.upper(), "class": pol.asset_class,
+            "desk": pol.desk_id, "desk_name": pol.desk_name, "strategy": pol.strategy_key,
             "price": px, "position": pos, "upnl": 0.0, "r": 0.0,
             "mfe_r": 0.0, "hold_min": 0.0, "state": ctx.phase_name,
             "trail_active": False, "sl": 0.0, "tp": 0.0, "entry": 0.0,
@@ -371,7 +242,14 @@ class MultiAssetQuantBot:
             entry = float(pos.entry_price or 0.0)
             qty = float(pos.quantity or 0.0)
             move_pts = (px - entry) if side == "LONG" else (entry - px)
-            upnl = move_pts * qty
+            try:
+                inv = (
+                    inst.primary_exchange == ExchangeName.DELTA
+                    and str(inst.execution_symbol).upper() == "BTCUSD"
+                )
+                upnl = gross_pnl_usd(side, entry, px, qty, inverse=bool(inv))
+            except Exception:
+                upnl = move_pts * qty
             init_dist = float(pos.initial_sl_dist or 0.0) or abs(entry - float(pos.sl_price or 0.0))
             r_now = move_pts / init_dist if init_dist > 1e-10 else 0.0
             mfe_r = float(pos.peak_profit or 0.0) / init_dist if init_dist > 1e-10 else 0.0
@@ -387,15 +265,104 @@ class MultiAssetQuantBot:
             pass
         return out
 
+    @staticmethod
+    def _float_val(v: Any, default: float = 0.0) -> float:
+        try:
+            f = float(v)
+            return f if f == f else float(default)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _clip(value: Any, width: int) -> str:
+        text = str(value or "")
+        if len(text) <= width:
+            return text
+        return text[: max(0, width - 1)] + "~"
+
+    @classmethod
+    def _trade_ts(cls, t: Dict[str, Any]) -> float:
+        return cls._float_val(t.get("timestamp"), 0.0)
+
+    @classmethod
+    def _trade_net(cls, t: Dict[str, Any]) -> float:
+        return cls._float_val(t.get("pnl"), 0.0)
+
+    @classmethod
+    def _trade_fees(cls, t: Dict[str, Any]) -> float:
+        if "total_fees" in t:
+            return abs(cls._float_val(t.get("total_fees"), 0.0))
+        return abs(cls._float_val(t.get("entry_fee"), 0.0) + cls._float_val(t.get("exit_fee"), 0.0))
+
+    @classmethod
+    def _trade_gross(cls, t: Dict[str, Any]) -> float:
+        if "gross_pnl" in t:
+            return cls._float_val(t.get("gross_pnl"), cls._trade_net(t))
+        return cls._trade_net(t) + cls._trade_fees(t)
+
+    @classmethod
+    def _trade_r(cls, t: Dict[str, Any]) -> float:
+        return cls._float_val(t.get("r", t.get("achieved_r", 0.0)), 0.0)
+
+    @staticmethod
+    def _blank_pnl_bucket() -> Dict[str, Any]:
+        return {
+            "trades": 0, "wins": 0, "losses": 0, "net": 0.0, "gross": 0.0,
+            "fees": 0.0, "upnl": 0.0, "open": 0, "win_sum": 0.0,
+            "loss_sum": 0.0, "r_sum": 0.0,
+        }
+
+    def _add_trade_to_bucket(self, bucket: Dict[str, Any], trade: Dict[str, Any]) -> None:
+        net = self._trade_net(trade)
+        bucket["trades"] += 1
+        bucket["net"] += net
+        bucket["gross"] += self._trade_gross(trade)
+        bucket["fees"] += self._trade_fees(trade)
+        bucket["r_sum"] += self._trade_r(trade)
+        if net > 0:
+            bucket["wins"] += 1
+            bucket["win_sum"] += net
+        elif net < 0:
+            bucket["losses"] += 1
+            bucket["loss_sum"] += net
+
+    @staticmethod
+    def _bucket_wr(bucket: Dict[str, Any]) -> float:
+        trades = int(bucket.get("trades", 0) or 0)
+        return (float(bucket.get("wins", 0) or 0) / trades * 100.0) if trades else 0.0
+
+    @staticmethod
+    def _bucket_avg_win(bucket: Dict[str, Any]) -> float:
+        wins = int(bucket.get("wins", 0) or 0)
+        return (float(bucket.get("win_sum", 0.0) or 0.0) / wins) if wins else 0.0
+
+    @staticmethod
+    def _bucket_avg_loss(bucket: Dict[str, Any]) -> float:
+        losses = int(bucket.get("losses", 0) or 0)
+        return (float(bucket.get("loss_sum", 0.0) or 0.0) / losses) if losses else 0.0
+
+    @staticmethod
+    def _fmt_trade_time(timestamp: float) -> str:
+        try:
+            return time.strftime("%m-%d %H:%M", time.localtime(float(timestamp)))
+        except Exception:
+            return "--"
+
     def _all_trade_records(self) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         for ctx in self.contexts:
             try:
+                pol = active_policy(ctx.instrument)
                 for t in list(getattr(ctx.strategy, "_trade_history", [])):
                     r = dict(t)
                     r.setdefault("asset", ctx.instrument.asset_id)
                     r.setdefault("symbol", ctx.instrument.display_symbol)
                     r.setdefault("venue", ctx.instrument.primary_exchange.value.upper())
+                    r.setdefault("desk", pol.desk_id)
+                    r.setdefault("desk_name", pol.desk_name)
+                    r.setdefault("asset_class", pol.asset_class)
+                    r["total_fees"] = self._trade_fees(r)
+                    r["gross_pnl"] = self._trade_gross(r)
                     rows.append(r)
             except Exception:
                 continue
@@ -405,24 +372,92 @@ class MultiAssetQuantBot:
         rows = [self._ctx_position_metrics(c) for c in self.contexts]
         open_rows = [r for r in rows if r.get("position")]
         trades = self._all_trade_records()
-        total_realised = sum(float(t.get("pnl", 0.0) or 0.0) for t in trades)
-        total_upnl = sum(float(r.get("upnl", 0.0) or 0.0) for r in open_rows)
-        wins = sum(1 for t in trades if t.get("is_win"))
-        total = len(trades)
-        wr = (wins / total * 100.0) if total else 0.0
-        icon = "🟢" if total_realised + total_upnl >= 0 else "🔴"
+        desk_cfg = getattr(config, "TRADING_DESKS", {}) or {}
+        desk_order = [str(k).upper() for k in desk_cfg.keys()] or ["BTC", "COMMODITIES", "STOCKS"]
+        desk_names = {
+            str(k).upper(): str(v.get("display_name", k)) if isinstance(v, dict) else str(k)
+            for k, v in desk_cfg.items()
+        }
+        desks: Dict[str, Dict[str, Any]] = {d: self._blank_pnl_bucket() for d in desk_order}
+        assets: Dict[str, Dict[str, Any]] = {}
+        total_bucket = self._blank_pnl_bucket()
+
+        for r in rows:
+            desk_id = str(r.get("desk") or "BTC").upper()
+            if desk_id not in desks:
+                desks[desk_id] = self._blank_pnl_bucket()
+                desk_order.append(desk_id)
+            asset = str(r.get("asset") or "?").upper()
+            if asset not in assets:
+                assets[asset] = self._blank_pnl_bucket()
+                assets[asset]["desk"] = desk_id
+                assets[asset]["symbol"] = r.get("symbol", asset)
+            if r.get("position"):
+                upnl = self._float_val(r.get("upnl"), 0.0)
+                desks[desk_id]["upnl"] += upnl
+                desks[desk_id]["open"] += 1
+                assets[asset]["upnl"] += upnl
+                assets[asset]["open"] += 1
+                total_bucket["upnl"] += upnl
+                total_bucket["open"] += 1
+
+        for t in trades:
+            desk_id = str(t.get("desk") or "BTC").upper()
+            if desk_id not in desks:
+                desks[desk_id] = self._blank_pnl_bucket()
+                desk_order.append(desk_id)
+            asset = str(t.get("asset") or "?").upper()
+            if asset not in assets:
+                assets[asset] = self._blank_pnl_bucket()
+                assets[asset]["desk"] = desk_id
+                assets[asset]["symbol"] = t.get("symbol", asset)
+            self._add_trade_to_bucket(desks[desk_id], t)
+            self._add_trade_to_bucket(assets[asset], t)
+            self._add_trade_to_bucket(total_bucket, t)
+
+        total_realised = float(total_bucket["net"])
+        total_gross = float(total_bucket["gross"])
+        total_fees = float(total_bucket["fees"])
+        total_upnl = float(total_bucket["upnl"])
+        total = int(total_bucket["trades"])
+        wr = self._bucket_wr(total_bucket)
+        icon = "GREEN" if total_realised + total_upnl >= 0 else "RED"
         lines = [
-            f"{icon} <b>PORTFOLIO PnL COMMAND CENTER</b>",
-            "━━━━━━━━━━━━━━━━━━━━━━━━",
-            f"<code>OPEN   {len(open_rows):>2}/{self.guard.max_open_positions:<2}   UPNL {self._fmt_money(total_upnl):>12}   REAL {self._fmt_money(total_realised):>12}</code>",
-            f"<code>TRADES {total:>4}   WR {wr:>5.1f}%   BUDGET {self._esc(self.guard.budget_mode)}</code>",
+            f"{icon} <b>PORTFOLIO PNL COMMAND CENTER</b>",
+            "--------------------------------",
+            f"<code>NET {self._fmt_money(total_realised):>12}  UPNL {self._fmt_money(total_upnl):>12}  TOTAL {self._fmt_money(total_realised + total_upnl):>12}</code>",
+            f"<code>GROSS {self._fmt_money(total_gross):>10}  FEES ${total_fees:>9,.2f}  TRADES {total:>4}  WR {wr:>5.1f}%</code>",
+            f"<code>AVG WIN {self._fmt_money(self._bucket_avg_win(total_bucket)):>10}  AVG LOSS {self._fmt_money(self._bucket_avg_loss(total_bucket)):>10}  OPEN {len(open_rows):>2}/{self.guard.max_open_positions:<2}</code>",
+            f"<code>BUDGET {self._esc(self.guard.budget_mode)}</code>",
+            "\n<b>Desk PnL</b>",
         ]
+        for desk_id in desk_order:
+            st = desks.get(desk_id) or self._blank_pnl_bucket()
+            name = self._clip(desk_names.get(desk_id, desk_id), 13)
+            total_desk = self._float_val(st.get("net"), 0.0) + self._float_val(st.get("upnl"), 0.0)
+            lines.append(
+                f"<code>{self._esc(name):<13} net {self._fmt_money(st['net']):>10} "
+                f"upnl {self._fmt_money(st['upnl']):>10} total {self._fmt_money(total_desk):>10} "
+                f"T {int(st['trades']):>3} WR {self._bucket_wr(st):>5.1f}%</code>"
+            )
+
+        lines.append("\n<b>Asset PnL</b>")
+        for asset, st in sorted(assets.items(), key=lambda kv: (str(kv[1].get("desk", "")), kv[0])):
+            desk_id = self._clip(st.get("desk", ""), 5)
+            asset_label = self._clip(asset, 8)
+            total_asset = self._float_val(st.get("net"), 0.0) + self._float_val(st.get("upnl"), 0.0)
+            lines.append(
+                f"<code>{self._esc(asset_label):<8} {self._esc(desk_id):<5} net {self._fmt_money(st['net']):>10} "
+                f"upnl {self._fmt_money(st['upnl']):>10} total {self._fmt_money(total_asset):>10} "
+                f"T {int(st['trades']):>3} WR {self._bucket_wr(st):>5.1f}%</code>"
+            )
+
         if open_rows:
-            lines.append("\n<b>Live exposure by desk</b>")
-            for r in sorted(open_rows, key=lambda x: str(x.get("asset"))):
+            lines.append("\n<b>Open positions</b>")
+            for r in sorted(open_rows, key=lambda x: (str(x.get("desk")), str(x.get("asset")))):
                 trail = "TRAIL" if r.get("trail_active") else "INIT"
                 lines.append(
-                    f"<code>{self._esc(r['asset']):<6} {self._esc(r['side']):<5} {self._fmt_money(r['upnl']):>11} "
+                    f"<code>{self._esc(r['desk']):<5} {self._esc(r['asset']):<8} {self._esc(r['side']):<5} {self._fmt_money(r['upnl']):>11} "
                     f"R {float(r['r']):+5.2f} MFE {float(r['mfe_r']):>4.2f} {trail:<5}</code>"
                 )
                 lines.append(
@@ -430,12 +465,13 @@ class MultiAssetQuantBot:
                 )
         if trades:
             lines.append("\n<b>Recent realised trades</b>")
-            for t in sorted(trades, key=lambda x: float(x.get("timestamp", 0.0) or 0.0))[-6:][::-1]:
-                pnl = float(t.get("pnl", 0.0) or 0.0)
-                ok = "✅" if pnl >= 0 else "❌"
+            for t in sorted(trades, key=self._trade_ts, reverse=True)[:6]:
+                pnl = self._trade_net(t)
+                ok = "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "FLAT")
                 lines.append(
-                    f"{ok} <code>{self._esc(t.get('asset','?')):<6} {self._esc(str(t.get('side','?')).upper()):<5} {self._fmt_money(pnl):>11} "
-                    f"{self._esc(str(t.get('reason',''))[:12]):<12}</code>"
+                    f"{ok:<4} <code>{self._esc(t.get('desk','?')):<5} {self._esc(t.get('asset','?')):<8} "
+                    f"{self._esc(str(t.get('side','?')).upper()):<5} net {self._fmt_money(pnl):>10} "
+                    f"R {self._trade_r(t):+5.2f} {self._esc(str(t.get('reason',''))[:18]):<18}</code>"
                 )
         return "\n".join(lines)
 
@@ -497,18 +533,31 @@ class MultiAssetQuantBot:
 
     def format_portfolio_trades_report(self) -> str:
         trades = self._all_trade_records()
-        lines = ["📋 <b>PORTFOLIO TRADE TAPE</b>", "━━━━━━━━━━━━━━━━━━━━━━━━"]
+        lines = ["<b>PORTFOLIO TRADE TAPE</b>", "--------------------------------"]
         if not trades:
             return "\n".join(lines + ["No closed trades recorded yet."])
-        for t in sorted(trades, key=lambda x: float(x.get("timestamp", 0.0) or 0.0))[-12:][::-1]:
-            pnl = float(t.get("pnl", 0.0) or 0.0)
-            ok = "✅" if pnl >= 0 else "❌"
+        limit = max(1, int(getattr(config, "TELEGRAM_RECENT_TRADES_LIMIT", 30)))
+        ordered = sorted(trades, key=self._trade_ts, reverse=True)
+        lines.append(f"<code>Showing {min(limit, len(ordered))}/{len(ordered)} closed trades, newest first</code>")
+        for t in ordered[:limit]:
+            pnl = self._trade_net(t)
+            gross = self._trade_gross(t)
+            fees = self._trade_fees(t)
+            ok = "WIN " if pnl > 0 else ("LOSS" if pnl < 0 else "FLAT")
+            side = str(t.get("side", "?")).upper()
+            desk = self._clip(t.get("desk", "?"), 5)
+            asset = self._clip(t.get("asset", "?"), 8)
             lines.append(
-                f"{ok} <code>{self._esc(t.get('asset','?')):<6} {self._esc(str(t.get('side','?')).upper()):<5} "
-                f"{self._fmt_price(float(t.get('entry',0) or 0)):>10}→{self._fmt_price(float(t.get('exit',0) or 0)):>10} "
-                f"PnL {self._fmt_money(pnl):>10} R {float(t.get('r', t.get('achieved_r',0)) or 0):+5.2f}</code>"
+                f"{ok} <code>{self._fmt_trade_time(self._trade_ts(t)):<11} {self._esc(desk):<5} "
+                f"{self._esc(asset):<8} {self._esc(side):<5} "
+                f"{self._fmt_price(float(t.get('entry',0) or 0)):>10}->{self._fmt_price(float(t.get('exit',0) or 0)):>10} "
+                f"net {self._fmt_money(pnl):>10} R {self._trade_r(t):+5.2f}</code>"
             )
-            lines.append(f"    <i>{self._esc(str(t.get('reason',''))[:80])}</i>")
+            lines.append(
+                f"    <code>gross {self._fmt_money(gross):>10} fees ${fees:>8,.2f} "
+                f"hold {self._float_val(t.get('hold_min'), 0.0):>5.1f}m</code>"
+            )
+            lines.append(f"    <i>{self._esc(str(t.get('reason',''))[:96])}</i>")
         return "\n".join(lines)
 
     def initialize(self) -> bool:
@@ -650,7 +699,7 @@ class MultiAssetQuantBot:
         lines.append(f"• One live/entering/exit slot per contract: max {self.guard.max_per_contract}")
         lines.append(f"• Balance allocation: {self.guard.budget_mode}; cash is slot-scoped, risk base is {self.guard.risk_budget_mode}; sizing uses per-instrument policy, not BTC defaults")
         lines.append("• Live exchange products only; no synthetic symbols. Delta SPXUSD is SPX6900 crypto, not S&P 500, so it is not used for SPX_INDEX.")
-        lines.append("• Alpha remains posterior/EV based; PortfolioGuard only controls exposure mechanics")
+        lines.append("• Alpha remains posterior/EV based; PortfolioManager only controls exposure mechanics")
         return "\n".join(lines)
 
     def run(self) -> None:
@@ -774,5 +823,3 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-# Backward-compatible test/import alias. Runtime uses PortfolioManager.
-PortfolioGuard = PortfolioManager

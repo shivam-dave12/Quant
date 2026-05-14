@@ -213,11 +213,7 @@ class RiskManager:
 
             # ── Min time between trades ───────────────────────────────────────
             time_since_last = now - self.last_trade_time
-            min_trade_gap_sec = float(getattr(
-                config,
-                "MIN_TIME_BETWEEN_TRADES_SEC",
-                float(config.MIN_TIME_BETWEEN_TRADES) * 60.0,
-            ))
+            min_trade_gap_sec = float(getattr(config, "MIN_TIME_BETWEEN_TRADES_SEC", 300.0))
             if (self.last_trade_time > 0 and
                     time_since_last < min_trade_gap_sec):
                 remaining = int(min_trade_gap_sec - time_since_last)
@@ -225,8 +221,8 @@ class RiskManager:
 
             # ── Loss cooldown — Bug #3 fix ────────────────────────────────────
             # The original code compared TRADE_COOLDOWN_SECONDS against
-            # time_since_last (the same timer as MIN_TIME_BETWEEN_TRADES).
-            # MIN_TIME_BETWEEN_TRADES * 60 is always >= TRADE_COOLDOWN_SECONDS
+            # time_since_last (the same timer as MIN_TIME_BETWEEN_TRADES_SEC).
+            # If the pacing interval is shorter than TRADE_COOLDOWN_SECONDS,
             # (0.5 min × 60 = 30s vs TRADE_COOLDOWN_SECONDS default 300s),
             # so the min-interval gate fired first and the loss cooldown
             # check was reached only after the pacing interval had already
@@ -324,7 +320,7 @@ class RiskManager:
         P&L (futures, no leverage multiplier bug):
           gross_pnl  = price_delta × quantity
           commission = quantity × avg_price × fee_rate × 2
-          net_pnl    = gross_pnl − commission
+          pnl        = gross_pnl − commission
 
         pnl_override: use caller-supplied net PnL when strategy has already
                       computed the correct figure (avoids double-accounting).

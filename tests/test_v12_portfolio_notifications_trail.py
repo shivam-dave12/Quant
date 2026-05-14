@@ -28,7 +28,7 @@ class V12PortfolioNotificationTrailTests(unittest.TestCase):
 
     def test_multi_asset_has_command_center_reports(self):
         from pathlib import Path
-        src = Path("orchestration/multi_asset_bot.py").read_text()
+        src = Path("orchestration/multi_asset_bot.py").read_text(encoding="utf-8")
         self.assertIn("def format_portfolio_pnl_report", src)
         self.assertIn("def format_portfolio_position_report", src)
         self.assertIn("def format_portfolio_equity_report", src)

@@ -116,6 +116,31 @@ _CONT_SL_BUFFER_ATR = 0.40
 _TP_RR_SAFETY_BUFFER = float(getattr(_cfg, "ENTRY_TP_RR_SAFETY_BUFFER", 0.20)) if '_cfg' in globals() else 0.20
 _TP_MIN_NET_ATR      = float(getattr(_cfg, "ENTRY_TP_MIN_NET_ATR", 0.20)) if '_cfg' in globals() else 0.20
 
+def _policy_float(name: str, default: float) -> float:
+    try:
+        from core.market_policy import policy_value
+        return float(policy_value(name, default))
+    except Exception:
+        return float(default)
+
+def _min_pool_significance() -> float:
+    return _policy_float("entry_min_pool_significance", _MIN_POOL_SIGNIFICANCE)
+
+def _min_sweep_quality() -> float:
+    return _policy_float("entry_min_sweep_quality", _MIN_SWEEP_QUALITY)
+
+def _min_rr_ratio() -> float:
+    return _policy_float("min_rr", _MIN_RR_RATIO)
+
+def _rev_sl_buffer_atr() -> float:
+    return _policy_float("entry_reversal_sl_buffer_atr", _REV_SL_BUFFER_ATR)
+
+def _cont_sl_buffer_atr() -> float:
+    return _policy_float("entry_continuation_sl_buffer_atr", _CONT_SL_BUFFER_ATR)
+
+def _sl_buffer_atr() -> float:
+    return _policy_float("sl_buffer_atr_mult", _SL_BUFFER_ATR)
+
 try:
     import config as _sl_cfg
     # Institutional SL geometry: structure first, ATR noise floor second,
@@ -190,7 +215,7 @@ _PS_NEUTRAL_TICK_DECAY = 0.98
 # for scoring/penalty, not hard alpha vetoes.
 try:
     import config as _entry_gate_cfg
-    _ENTRY_HARD_MIN_DISP_ATR = float(getattr(_entry_gate_cfg, "ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR", getattr(_entry_gate_cfg, "ENTRY_HARD_MIN_DISPLACEMENT_ATR", 0.75)))
+    _ENTRY_HARD_MIN_DISP_ATR = float(getattr(_entry_gate_cfg, "ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR", 0.75))
     _ENTRY_STRONG_DISP_ATR   = float(getattr(_entry_gate_cfg, "ENTRY_STRONG_DISPLACEMENT_ATR", 1.25))
     _ENTRY_REQUIRE_CISD_OR_OTE = bool(getattr(_entry_gate_cfg, "ENTRY_REQUIRE_CISD_OR_OTE", True))
     _ENTRY_MAX_CHASE_ATR_WITHOUT_OTE = float(getattr(_entry_gate_cfg, "ENTRY_MAX_CHASE_ATR_WITHOUT_OTE", 1.15))
@@ -198,8 +223,8 @@ try:
     _ENTRY_REVERSAL_PD_SHORT_MIN = float(getattr(_entry_gate_cfg, "ENTRY_REVERSAL_PD_SHORT_MIN", 0.38))
     _ENTRY_CONT_MIN_ACCEPT_ATR = float(getattr(_entry_gate_cfg, "ENTRY_CONTINUATION_MIN_ACCEPTANCE_ATR", 0.55))
     _ENTRY_CONT_REQUIRE_CISD_OR_BOS = bool(getattr(_entry_gate_cfg, "ENTRY_CONTINUATION_REQUIRE_CISD_OR_BOS", True))
-    _ENTRY_FLOW_HARD_OPPOSE = float(getattr(_entry_gate_cfg, "ENTRY_FLOW_HARD_OPPOSE_THRESHOLD", 0.40))
-    _ENTRY_CVD_HARD_OPPOSE  = float(getattr(_entry_gate_cfg, "ENTRY_CVD_HARD_OPPOSE_THRESHOLD", 0.30))
+    _ENTRY_FLOW_HARD_OPPOSE = float(getattr(_entry_gate_cfg, "ENTRY_FLOW_OPPOSE_THRESHOLD", 0.40))
+    _ENTRY_CVD_HARD_OPPOSE  = float(getattr(_entry_gate_cfg, "ENTRY_CVD_OPPOSE_THRESHOLD", 0.30))
     _ENTRY_HTF_CONTRA_VETO = bool(getattr(_entry_gate_cfg, "ENTRY_HTF_CONTRA_MAX_WITHOUT_STRONG_DISP", True))
     _ENTRY_GATE_LOG_SEC = float(getattr(_entry_gate_cfg, "ENTRY_GATE_LOG_INTERVAL_SEC", 12.0))
 except Exception:
@@ -638,7 +663,7 @@ class EntryEngine:
                     and sig is not None
                     and sweep is not None
                     and getattr(sig, 'entry_type', None) == EntryType.SWEEP_REVERSAL
-                    and float(getattr(sig, 'rr_ratio', 0.0) or 0.0) >= max(_MIN_RR_RATIO, 2.0)):
+                    and float(getattr(sig, 'rr_ratio', 0.0) or 0.0) >= max(_min_rr_ratio(), 2.0)):
                 ctx = execution_context if isinstance(execution_context, dict) else {}
                 min_viable = float(ctx.get("min_viable_sl_dist", 0.0) or 0.0)
                 gap = float(ctx.get("geometry_gap_pts", 0.0) or 0.0)
@@ -956,7 +981,7 @@ class EntryEngine:
             if s.detected_at <= now - 60.0:
                 _skipped_stale += 1
                 continue
-            if s.quality < _MIN_SWEEP_QUALITY:
+            if s.quality < _min_sweep_quality():
                 _skipped_low_quality += 1
                 continue
             if self._is_processed(s, now):
@@ -1008,7 +1033,7 @@ class EntryEngine:
                 wick = ev.candle_high if ev.pool_type == "BSL" else ev.candle_low
                 quality = min(1.0, 0.35 + 0.35 * ev.disp_score
                               + (0.15 if ev.wick_reject else 0.0))
-                if quality < _MIN_SWEEP_QUALITY:
+                if quality < _min_sweep_quality():
                     _bridge_low_q += 1
                     continue
 
@@ -1393,7 +1418,7 @@ class EntryEngine:
 
             # Target quality
             opp = self._find_opposing_target(rev_dir, snap, price, atr)
-            if opp and opp.significance >= _MIN_POOL_SIGNIFICANCE:
+            if opp and opp.significance >= _min_pool_significance():
                 s_rev += min(5.0, opp.significance * 0.5)
 
             # Session
@@ -2090,9 +2115,9 @@ class EntryEngine:
         # envelope as the original entry path.
         regime_mult = self._regime_sl_mult()
         if side == "long":
-            sl = sweep.wick_extreme - atr * _REV_SL_BUFFER_ATR * regime_mult
+            sl = sweep.wick_extreme - atr * _rev_sl_buffer_atr() * regime_mult
         else:
-            sl = sweep.wick_extreme + atr * _REV_SL_BUFFER_ATR * regime_mult
+            sl = sweep.wick_extreme + atr * _rev_sl_buffer_atr() * regime_mult
         sl = self._push_sl_behind_pools(sl, side, price, atr)
         if not self._sl_is_protective(side, sl, price):
             p.last_reason = "refined SL non-protective at current price"
@@ -2134,12 +2159,12 @@ class EntryEngine:
                 f"{_REFINE_RISK_IMPROVE:.0%} of initial {p.initial_risk:.1f}pts")
             return
 
-        tp, target = self._find_tp(snap, side, price, atr, sl, _MIN_RR_RATIO)
+        tp, target = self._find_tp(snap, side, price, atr, sl, _min_rr_ratio())
         if tp is None or target is None:
             p.last_reason = f"refined TP unavailable: {self._last_pool_plan_summary()}"
             return
         rr = abs(tp - price) / max(risk, 1e-10)
-        rr_floor = self._last_selected_tp_rr_floor(_MIN_RR_RATIO)
+        rr_floor = self._last_selected_tp_rr_floor(_min_rr_ratio())
         if rr < rr_floor:
             p.last_reason = f"refined R:R {rr:.2f} < institutional floor {rr_floor:.2f}"
             return
@@ -2180,9 +2205,9 @@ class EntryEngine:
         # vol → wider buffer (regime_mult: 0.60 low-vol → 1.40 high-vol).
         regime_mult = self._regime_sl_mult()
         if side == "long":
-            sl = sweep.wick_extreme - atr * _REV_SL_BUFFER_ATR * regime_mult
+            sl = sweep.wick_extreme - atr * _rev_sl_buffer_atr() * regime_mult
         else:
-            sl = sweep.wick_extreme + atr * _REV_SL_BUFFER_ATR * regime_mult
+            sl = sweep.wick_extreme + atr * _rev_sl_buffer_atr() * regime_mult
 
         sl = self._push_sl_behind_pools(sl, side, price, atr)
         if self._reject_bad_sl(side, sl, price, sweep.pool.price, now, "reversal initial stop wrong-side"):
@@ -2262,7 +2287,7 @@ class EntryEngine:
         self._last_sweep_reversal_time = now
 
         # TP: pool → HTF → 2R (only if CISD)
-        tp, target = self._find_tp(snap, side, price, atr, sl, _MIN_RR_RATIO)
+        tp, target = self._find_tp(snap, side, price, atr, sl, _min_rr_ratio())
         if tp is None:
             logger.info(
                 f"CANDIDATE DEFERRED [no_liquidity_tp]: side={side} "
@@ -2273,7 +2298,7 @@ class EntryEngine:
             return
 
         rr = abs(tp - price) / risk
-        rr_floor = self._last_selected_tp_rr_floor(_MIN_RR_RATIO)
+        rr_floor = self._last_selected_tp_rr_floor(_min_rr_ratio())
         if rr < rr_floor:
             logger.info(
                 f"⚠️ ENTRY CANDIDATE DEFERRED [payoff_geometry]: rr={rr:.2f} < institutional_floor={rr_floor:.2f} "
@@ -2321,9 +2346,9 @@ class EntryEngine:
         # invalidated. SL goes behind pool price with a regime-adaptive buffer.
         regime_mult = self._regime_sl_mult()
         if side == "long":
-            sl = sweep.pool.price - atr * _CONT_SL_BUFFER_ATR * regime_mult
+            sl = sweep.pool.price - atr * _cont_sl_buffer_atr() * regime_mult
         else:
-            sl = sweep.pool.price + atr * _CONT_SL_BUFFER_ATR * regime_mult
+            sl = sweep.pool.price + atr * _cont_sl_buffer_atr() * regime_mult
 
         sl = self._push_sl_behind_pools(sl, side, price, atr)
 
@@ -2393,7 +2418,7 @@ class EntryEngine:
         # hint, not an execution TP.  This prevents "visible pool = TP" shortcut
         # shortcuts and forces every continuation target through R:R, probability,
         # gauntlet, freshness, and execution-cost gates.
-        tp2, target2 = self._find_tp(snap, side, price, atr, sl, _MIN_RR_RATIO)
+        tp2, target2 = self._find_tp(snap, side, price, atr, sl, _min_rr_ratio())
         if tp2 is not None:
             tp, target = tp2, target2
             rr = abs(tp - price) / risk
@@ -2407,7 +2432,7 @@ class EntryEngine:
             self._reset(now)
             return
 
-        rr_floor = self._last_selected_tp_rr_floor(_MIN_RR_RATIO)
+        rr_floor = self._last_selected_tp_rr_floor(_min_rr_ratio())
         if rr < rr_floor:
             logger.info(
                 f"⚠️ ENTRY CANDIDATE DEFERRED [payoff_geometry]: rr={rr:.2f} < institutional_floor={rr_floor:.2f} "
@@ -2648,7 +2673,7 @@ class EntryEngine:
         pools = snap.bsl_pools if direction == "long" else snap.ssl_pools
         reachable = [t for t in pools
                      if t.distance_atr <= _HTF_TP_MAX_ATR
-                     and t.significance >= _MIN_POOL_SIGNIFICANCE * 0.5]
+                     and t.significance >= _min_pool_significance() * 0.5]
         if not reachable:
             return None
         return max(reachable, key=lambda t: self._pool_draw_score(t, 1.0, 1.0))
@@ -2839,7 +2864,7 @@ class ICTTrailManager:
             _CHOCH_SL_BUFFER = float(getattr(_ee_cfg, 'ENTRY_CHOCH_SL_BUFFER_ATR', 0.20))
         except Exception:
             _CHOCH_SL_BUFFER = 0.20
-        buf_mult = _CHOCH_SL_BUFFER if self._choch else (0.10 if self._bos_count >= 2 else _SL_BUFFER_ATR)
+        buf_mult = _CHOCH_SL_BUFFER if self._choch else (0.10 if self._bos_count >= 2 else _sl_buffer_atr())
         buf = atr * buf_mult
 
         if c15m and len(c15m) >= 12:

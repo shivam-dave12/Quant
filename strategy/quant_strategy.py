@@ -6,7 +6,7 @@ Architecture:
 
 Core principle:
   Only the quantitative posterior/EV model can approve an executable entry.
-  Legacy heuristic engines are telemetry/features only. They must not override a
+  Heuristic engines are telemetry/features only. They must not override a
   positive posterior, and they must not create trades by themselves.
 
 Decision ownership:
@@ -101,7 +101,7 @@ except ImportError:
         _ENTRY_ENGINE_AVAILABLE = False
 
 # ── DirectionEngine — hunt prediction, post-sweep evaluation, pool-hit gate ─
-# Replaces ICTEngine.predict_next_hunt() with a dedicated 10-factor engine.
+# DirectionEngine owns the 10-factor hunt prediction path.
 # ICTEngine retains structural context; DirectionEngine owns the decisions.
 _DIRECTION_ENGINE_AVAILABLE = False
 try:
@@ -239,7 +239,9 @@ class QCfg:
     @staticmethod
     def CONFIRM_TICKS() -> int:
         return max(1, int(round(_adaptive_param_value(
-            "entry_confirm_ticks", _cfg("QUANT_CONFIRM_TICKS", 2), 1.0, 10.0))))
+            "entry_confirm_ticks",
+            policy_value("entry_confirm_ticks", _cfg("QUANT_CONFIRM_TICKS", 2)),
+            1.0, 10.0))))
     @staticmethod
     def SL_SWING_LOOKBACK() -> int: return int(_cfg("QUANT_SL_SWING_LOOKBACK", 12))
     @staticmethod
@@ -265,17 +267,12 @@ class QCfg:
     @staticmethod
     def ATR_PERIOD() -> int: return int(_cfg("SL_ATR_PERIOD", 14))
     @staticmethod
-    def TRAIL_ENABLED() -> bool: return bool(_cfg("QUANT_TRAIL_ENABLED", True))
+    def TRAIL_ENABLED() -> bool:
+        return bool(_cfg("QUANT_TRAIL_ENABLED", False))
     @staticmethod
     def TRAIL_BE_R() -> float: return float(_cfg("QUANT_TRAIL_BE_R", 0.3))
     @staticmethod
     def TRAIL_LOCK_R() -> float: return float(_cfg("QUANT_TRAIL_LOCK_R", 0.8))
-    @staticmethod
-    def TRAIL_INTERVAL_S() -> int:
-        """DEPRECATED v6.0: Time-based trail interval eliminated.
-        Trail is now structure-event-driven. This accessor is kept for
-        backward compat only — it is NOT used in any trail logic."""
-        return int(_cfg("TRAILING_SL_CHECK_INTERVAL", 10))
     @staticmethod
     def TRAIL_MIN_MOVE_ATR() -> float: return float(policy_value("trail_min_move_atr", _cfg("SL_MIN_IMPROVEMENT_ATR_MULT", 0.08)))
     @staticmethod
@@ -340,14 +337,6 @@ class QCfg:
     @staticmethod
     def SL_SWING_DENSITY_WINDOW() -> float: return float(_cfg("QUANT_SL_SWING_DENSITY_WINDOW", 0.30))
     @staticmethod
-    def TRAIL_CHANDELIER_N_START() -> float:
-        """Deprecated compatibility alias. LiquidityTrailEngine owns trailing."""
-        return float(_cfg("QUANT_TRAIL_CHANDELIER_N_START", 2.5))
-    @staticmethod
-    def TRAIL_CHANDELIER_N_END() -> float:
-        """Deprecated compatibility alias. LiquidityTrailEngine owns trailing."""
-        return float(_cfg("QUANT_TRAIL_CHANDELIER_N_END", 1.2))
-    @staticmethod
     def TRAIL_HVN_SNAP_THRESH() -> float: return float(_cfg("QUANT_TRAIL_HVN_SNAP_THRESH", 0.55))
     # ── v4.2: Trend-following mode ──────────────────────────────
     @staticmethod
@@ -371,16 +360,13 @@ class QCfg:
     @staticmethod
     def TREND_CONFIRM_TICKS() -> int: return int(_cfg("QUANT_TREND_CONFIRM_TICKS", 3))
     @staticmethod
-    def TREND_CHANDELIER_N() -> float:
-        # Deprecated compatibility accessor only; trend exits are structure/flow based.
-        return float(_cfg("QUANT_TREND_CHANDELIER_N", 1.5))
-    # ── v4.4: Mode-aware R:R ────────────────────────────────────
-    @staticmethod
-    def REVERSION_MIN_RR() -> float: return float(_cfg("QUANT_REVERSION_MIN_RR", 1.5))
+    def REVERSION_MIN_RR() -> float:
+        return float(policy_value("exit_tp_min_rr_reversion", _cfg("MIN_RISK_REWARD_RATIO", 2.0)))
     @staticmethod
     def REVERSION_MAX_RR() -> float: return float(_cfg("QUANT_REVERSION_MAX_RR", 3.0))
     @staticmethod
-    def TREND_MIN_RR() -> float: return float(_cfg("QUANT_TREND_MIN_RR", 3.0))
+    def TREND_MIN_RR() -> float:
+        return float(policy_value("exit_tp_min_rr_trend", _cfg("MIN_RISK_REWARD_RATIO", 2.0)))
     @staticmethod
     def TREND_MAX_RR() -> float: return float(_cfg("QUANT_TREND_MAX_RR", 5.0))
     # ── v4.5: Institutional trail params ────────────────────────
@@ -455,9 +441,11 @@ class QCfg:
     @staticmethod
     def ICT_TRAIL_MANIP_FREEZE_R() -> float: return float(_cfg("QUANT_ICT_TRAIL_MANIP_FREEZE_R", 1.5))
     @staticmethod
-    def ICT_TP_MIN_RR_REVERSION() -> float: return float(_cfg("QUANT_ICT_TP_MIN_RR_REVERSION", 1.8))
+    def ICT_TP_MIN_RR_REVERSION() -> float:
+        return float(policy_value("exit_tp_min_rr_reversion", _cfg("MIN_RISK_REWARD_RATIO", 2.0)))
     @staticmethod
-    def ICT_TP_MIN_RR_TREND() -> float: return float(_cfg("QUANT_ICT_TP_MIN_RR_TREND", 2.5))
+    def ICT_TP_MIN_RR_TREND() -> float:
+        return float(policy_value("exit_tp_min_rr_trend", _cfg("MIN_RISK_REWARD_RATIO", 2.0)))
     # ── v5.1: CHoCH staleness expiry ─────────────────────────────────────────
     @staticmethod
     def CHOCH_EXPIRY_BARS() -> int: return int(_cfg("QUANT_CHOCH_EXPIRY_BARS", 10))
@@ -2645,7 +2633,8 @@ class QuantStrategy:
         self._adx = ADXEngine()
         self._regime = RegimeClassifier()
         # v4.8: ICT/SMC structural confluence engine
-        self._ict = ICTEngine() if _ICT_AVAILABLE else None
+        with instrument_scope(instrument):
+            self._ict = ICTEngine() if _ICT_AVAILABLE else None
         # DirectionEngine — owns hunt prediction, post-sweep eval, pool-hit gate.
         # Reads structural context from self._ict; writes results back via
         # inject_hunt_prediction() so the rest of the stack is unaware of the split.
@@ -2700,6 +2689,7 @@ class QuantStrategy:
         self._exit_sync_in_progress = False   # EXITING sync thread running
         self._trail_in_progress     = False   # trail REST call running in background
         self._trail_started_at      = 0.0     # sweep-posterior: timestamp for self-heal of stuck flag
+        self._trail_runtime_override: Optional[bool] = None
         self._last_exit_side = ""; self._last_think_log = 0.0; self._think_interval = 120.0
         self._last_fed_trade_ts = 0.0
 
@@ -3523,7 +3513,7 @@ class QuantStrategy:
             _disp_atr = float(_sa.get("displacement_atr", 0.0) or 0.0)
             _cisd_ok = bool(_sa.get("cisd", False))
             _ote_ok = bool(_sa.get("ote", False))
-            _min_disp = float(getattr(config, "ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR", getattr(config, "ENTRY_HARD_MIN_DISPLACEMENT_ATR", 0.75)))
+            _min_disp = float(getattr(config, "ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR", 0.75))
             _strong_disp = float(getattr(config, "ENTRY_STRONG_DISPLACEMENT_ATR", 1.25))
             if is_sweep and _disp_atr < _min_disp:
                 rejects.append(f"institutional displacement {_disp_atr:.2f}ATR < {_min_disp:.2f}ATR")
@@ -3753,6 +3743,7 @@ class QuantStrategy:
                     "Trail override OFF ignored while position is active; "
                     "protective management remains on")
                 return False
+            self._trail_runtime_override = enabled
             self._pos.trail_override = enabled
             if enabled is None:
                 logger.info("Trail override cleared → using config default")
@@ -3766,6 +3757,9 @@ class QuantStrategy:
         override = self._pos.trail_override
         if override is not None:
             return override
+        runtime_override = getattr(self, "_trail_runtime_override", None)
+        if runtime_override is not None:
+            return bool(runtime_override)
         return QCfg.TRAIL_ENABLED()
 
     def _spread_atr_gate(self, data_manager) -> tuple:
@@ -4663,7 +4657,7 @@ class QuantStrategy:
             _disp = float(_sa.get('displacement_atr', 0.0) or 0.0)
             _cisd = bool(_sa.get('cisd', False))
             _ote  = bool(_sa.get('ote', False))
-            _min_disp = float(getattr(config, 'ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR', getattr(config, 'ENTRY_HARD_MIN_DISPLACEMENT_ATR', 0.75)))
+            _min_disp = float(getattr(config, 'ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR', 0.75))
             _strong_disp = float(getattr(config, 'ENTRY_STRONG_DISPLACEMENT_ATR', 1.25))
             if _disp < _min_disp:
                 rejects.append(f"displacement {_disp:.2f}ATR < {_min_disp:.2f}ATR")
@@ -4678,8 +4672,8 @@ class QuantStrategy:
 
             _tick = float(getattr(flow_state, 'tick_flow', 0.0) or 0.0)
             _cvd  = float(getattr(flow_state, 'cvd_trend', 0.0) or 0.0)
-            _ft = float(getattr(config, 'ENTRY_FLOW_HARD_OPPOSE_THRESHOLD', 0.40))
-            _ct = float(getattr(config, 'ENTRY_CVD_HARD_OPPOSE_THRESHOLD', 0.30))
+            _ft = float(getattr(config, 'ENTRY_FLOW_OPPOSE_THRESHOLD', 0.40))
+            _ct = float(getattr(config, 'ENTRY_CVD_OPPOSE_THRESHOLD', 0.30))
             if signal.side == 'long' and _tick < -_ft and _cvd < -_ct and _disp < _strong_disp:
                 rejects.append(f"tick/CVD oppose long {_tick:+.2f}/{_cvd:+.2f}")
             if signal.side == 'short' and _tick > _ft and _cvd > _ct and _disp < _strong_disp:
@@ -6024,7 +6018,7 @@ class QuantStrategy:
         # live orderbook offset.  This prevents stale signals from placing
         # orders far off-market.
         # Bug #34 fix: use_maker was always True, making MakerTakerDecision.decide()
-        # dead code.  Now query the fee engine for a proper maker/taker decision.
+        # could not influence routing. Query the fee engine for the decision.
         # OTE-routed entries (signal.entry_price valid) are always limit orders and
         # default to maker.  Non-OTE (book-offset) entries consult the fee engine
         # based on signal urgency to decide whether to post limit or take market.
@@ -6833,7 +6827,7 @@ class QuantStrategy:
         # CVD, ADX, OB, tick) on every active tick, but in the dominant trade mode
         # "reversion" (all liquidity-first entries) the result is used only for
         # _log_thinking() — pure overhead.  The WeightScheduler and its dynamic
-        # regime weights are also dead code in the v10 liquidity-first path
+        # regime weights are also bypassed in the v10 liquidity-first path
         # (_evaluate_entry routes through pool-based logic, never calls
         # _compute_signals).
         #
@@ -7140,7 +7134,7 @@ class QuantStrategy:
                 logger.debug(f"DirectionEngine.pool_hit_gate error: {_pg}")
 
                 # ── Trailing SL — v6.0 STRUCTURE-EVENT-DRIVEN ──────────────────────
-        # ARCHITECTURE CHANGE: Time-based TRAIL_INTERVAL_S (10s timer) REMOVED.
+        # Trail checks are structure-event driven.
         #
         # Old problem: The 10s timer missed critical structure events. A BOS could
         # form at t=1s, but trail wouldn't check until t=10s — by which time price
@@ -7263,7 +7257,7 @@ class QuantStrategy:
         Structure-Event Detector for Trail Triggering v6.0
         ===================================================
         Detects whether ICT market structure has CHANGED since the last trail
-        computation. This replaces the old time-based TRAIL_INTERVAL_S gate.
+        computation. Structure changes, rather than a timer, trigger review.
 
         TRACKED STRUCTURE EVENTS (any one = True):
           1. BOS direction change on 1m, 5m, or 15m
@@ -8327,7 +8321,6 @@ class QuantStrategy:
             "entry_fee":  round(entry_fee, 4),
             "exit_fee":   round(exit_fee, 4),
             "total_fees": round(entry_fee + exit_fee, 4),
-            "net_pnl":    round(pnl, 4),
             "exact_fees": entry_fee_is_exact and exit_fee_is_exact,
         }
 
@@ -8528,9 +8521,25 @@ class QuantStrategy:
         # Full trade record for /trades command
         init_sl_dist = getattr(pos, 'initial_sl_dist', 0.0)
         _fb = fee_breakdown or {}
+        _trade_ts = time.time()
+        _inst = getattr(self, "_instrument", None)
+        try:
+            _pol = active_policy(_inst)
+            _desk_id = getattr(_pol, "desk_id", "")
+            _desk_name = getattr(_pol, "desk_name", "")
+            _asset_class = getattr(_pol, "asset_class", "")
+        except Exception:
+            _desk_id = ""
+            _desk_name = ""
+            _asset_class = ""
         self._trade_history.append({
             # ── Core trade data ────────────────────────────────────────────
-            "ts":           time.time(),
+            "timestamp":    _trade_ts,
+            "asset":        getattr(_inst, "asset_id", getattr(self, "_asset_id", "")),
+            "symbol":       getattr(_inst, "display_symbol", QCfg.SYMBOL()),
+            "desk":         _desk_id,
+            "desk_name":    _desk_name,
+            "asset_class":  _asset_class,
             "side":         getattr(pos, 'side', '?'),
             "mode":         getattr(pos, 'trade_mode', '?'),
             "entry":        getattr(pos, 'entry_price', 0.0),
@@ -9463,12 +9472,12 @@ class QuantStrategy:
         entry_fee = pos.entry_price * pos.quantity * entry_rate
         exit_fee  = exit_price      * pos.quantity * exit_rate
 
-        net_pnl = gross - entry_fee - exit_fee
+        realized_pnl = gross - entry_fee - exit_fee
         logger.debug(
             f"PnL calc: {pos.side} qty={pos.quantity} entry=${pos.entry_price:,.2f} "
             f"exit=${exit_price:,.2f} gross=${gross:.4f} fees=${entry_fee+exit_fee:.4f} "
-            f"net=${net_pnl:.4f} [{'delta_inv' if _is_delta else 'linear'}]")
-        return net_pnl
+            f"net=${realized_pnl:.4f} [{'delta_inv' if _is_delta else 'linear'}]")
+        return realized_pnl
 
     def _win_rate(self): return self._winning_trades/self._total_trades if self._total_trades else 0.0
 

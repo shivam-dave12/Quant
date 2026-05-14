@@ -1006,14 +1006,16 @@ class TelegramBotController:
             lines.append("\n<b>Posterior feature confluence</b>")
             lines.append(
                 f"  LONG  Σ={long_c.total:.2f}  "
-                f"OB={long_c.ob_score:.2f}  FVG={long_c.fvg_score:.2f}  "
-                f"Sweep={long_c.sweep_score:.2f}  KZ={long_c.session_score:.2f}")
+                f"STR={long_c.structure_score:.2f}  AMD={long_c.amd_score:.2f}  "
+                f"PD={long_c.pd_array_score:.2f}  LIQ={long_c.liquidity_score:.2f}  "
+                f"KZ={long_c.session_score:.2f}")
             if long_c.details:
                 lines.append(f"    → {_esc(long_c.details)}")
             lines.append(
                 f"  SHORT Σ={short_c.total:.2f}  "
-                f"OB={short_c.ob_score:.2f}  FVG={short_c.fvg_score:.2f}  "
-                f"Sweep={short_c.sweep_score:.2f}  KZ={short_c.session_score:.2f}")
+                f"STR={short_c.structure_score:.2f}  AMD={short_c.amd_score:.2f}  "
+                f"PD={short_c.pd_array_score:.2f}  LIQ={short_c.liquidity_score:.2f}  "
+                f"KZ={short_c.session_score:.2f}")
             if short_c.details:
                 lines.append(f"    → {_esc(short_c.details)}")
 
@@ -1669,40 +1671,76 @@ class TelegramBotController:
 
     def _cmd_trail(self, args: str) -> str:
         global bot_instance
-        if not bot_instance: return "Bot not running."
-        strat = bot_instance.strategy
-        if not strat: return "Strategy not ready."
+        if not bot_instance:
+            return "Bot not running."
+
+        pairs = []
+        for ctx in list(getattr(bot_instance, "contexts", []) or []):
+            strat = getattr(ctx, "strategy", None)
+            inst = getattr(ctx, "instrument", None)
+            label = getattr(inst, "asset_id", "") or getattr(inst, "display_symbol", "") or "asset"
+            if strat is not None:
+                pairs.append((str(label).upper(), strat))
+        if not pairs:
+            strat = getattr(bot_instance, "strategy", None)
+            if strat is not None:
+                pairs.append(("BTC", strat))
+        if not pairs:
+            return "Strategy not ready."
+
+        def apply_all(value):
+            changed = 0
+            blocked = 0
+            for _, strat in pairs:
+                try:
+                    ok = strat.set_trail_override(value)
+                    if ok is False:
+                        blocked += 1
+                    else:
+                        changed += 1
+                except Exception:
+                    blocked += 1
+            return changed, blocked
+
         arg = (args or "").strip().lower()
         if arg in ("on", "enable", "1", "true", "yes"):
-            strat.set_trail_override(True)
+            changed, blocked = apply_all(True)
             return (
-                "🔒 <b>Trailing SL: FORCED ON</b>\n"
-                "Engine: Adaptive Exit (EAE + liquidity + true net BE)\n"
-                "Will advance SL per phase logic regardless of config flag."
+                "<b>Trailing SL: FORCED ON</b>\n"
+                f"Applied to {changed}/{len(pairs)} strategy contexts.\n"
+                f"Errors/blocked: {blocked}\n"
+                "Engine: Adaptive Exit (EAE + liquidity + true net BE)."
             )
-        elif arg in ("off", "disable", "0", "false", "no"):
-            changed = strat.set_trail_override(False)
-            if changed is False:
+        if arg in ("off", "disable", "0", "false", "no"):
+            changed, blocked = apply_all(False)
+            if changed == 0 and blocked:
                 return (
-                    "Trailing SL remains ON for the active position.\n"
-                    "Protective management cannot be disabled mid-trade; "
-                    "use /pause to stop new entries."
+                    "<b>Trailing SL: still protected</b>\n"
+                    f"{blocked} active strategy contexts refused OFF because a position is live.\n"
+                    "Use /pause to stop new entries; protective management stays intact."
                 )
             return (
-                "🔓 <b>Trailing SL: FORCED OFF</b>\n"
-                "SL will remain at initial structural level.\n"
-                "Exit will be via TP fill, SL hit, or max-hold timeout."
+                "<b>Trailing SL: FORCED OFF</b>\n"
+                f"Applied to {changed}/{len(pairs)} strategy contexts.\n"
+                f"Active protected contexts kept ON: {blocked}\n"
+                "No trailing will start unless you send /trail on."
             )
-        else:
-            strat.set_trail_override(None)
-            enabled = strat.get_trail_enabled()
-            default_txt = "ON" if enabled else "OFF"
-            return (
-                f"🔄 <b>Trailing SL: AUTO</b>\n"
-                f"Using config default: <b>{default_txt}</b>\n"
-                f"Engine: Adaptive Exit (EAE + liquidity + true net BE)\n"
-                f"Send <code>/trail on</code> or <code>/trail off</code> to override."
-            )
+
+        changed, blocked = apply_all(None)
+        enabled = 0
+        for _, strat in pairs:
+            try:
+                if strat.get_trail_enabled():
+                    enabled += 1
+            except Exception:
+                pass
+        return (
+            "<b>Trailing SL: AUTO</b>\n"
+            f"Cleared runtime override on {changed}/{len(pairs)} strategy contexts.\n"
+            f"Desk config default currently ON for {enabled}/{len(pairs)} contexts.\n"
+            f"Errors/blocked: {blocked}\n"
+            "Send /trail on to start trailing, or /trail off to force it off while flat."
+        )
 
     # ================================================================
     # /config
