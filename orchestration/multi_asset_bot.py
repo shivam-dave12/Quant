@@ -3,7 +3,7 @@ orchestration/multi_asset_bot.py — portfolio scanner for confirmed instruments
 ================================================================================
 
 One strategy instance per tradable instrument.  Every instrument has its own data
-manager, execution router, risk ledger, strategy state, liquidity map and trail
+manager, execution router, risk ledger, strategy state, liquidity map and fixed-SL TP ladder
 state.  PortfolioManager enforces account-level exposure so the scanner can watch
 multiple contracts without stacking correlated risk blindly.
 """
@@ -561,18 +561,47 @@ class MultiAssetQuantBot:
             lines.append(f"    <i>{self._esc(str(t.get('reason',''))[:96])}</i>")
         return "\n".join(lines)
 
+    def _filter_suspended_requests(self, requested):
+        """Remove suspended desk instruments before catalog discovery.
+
+        This is a hard desk suspension at orchestration level. Suspended assets
+        never get a data manager, strategy context, risk manager, or router, so
+        they cannot trade by accident.
+        """
+        req = list(requested or [])
+        disabled_classes = {str(x).lower() for x in getattr(config, "SUSPENDED_ASSET_CLASSES", ())}
+        if bool(getattr(config, "STOCK_DESK_TRADING_ENABLED", True)):
+            disabled_classes.discard("equity")
+            disabled_classes.discard("index")
+        out = []
+        skipped = []
+        for r in req:
+            ac = str((r or {}).get("asset_class", "") or "").lower()
+            aid = str((r or {}).get("asset_id", "") or "")
+            if ac in disabled_classes:
+                skipped.append(aid or ac)
+                continue
+            out.append(r)
+        if skipped:
+            logger.warning(
+                "⏸ STOCK DESK SUSPENDED — excluded from trading universe before discovery: %s",
+                ", ".join(skipped),
+            )
+        return out
+
     def initialize(self) -> bool:
         try:
             logger.info("=" * 92)
             logger.info("⚡ MULTI-ASSET INSTITUTIONAL LIQUIDITY SCANNER")
-            logger.info("   Live exchange catalogs only — no synthetic commodity/index/equity feeds")
+            logger.info("   Live exchange catalogs only — stock desk suspended; no synthetic feeds")
             logger.info("=" * 92)
             delta_api, cs_api = self._build_api_clients()
             self.registry = InstrumentRegistry(execution_preference=getattr(config, "EXECUTION_EXCHANGE", "delta"))
+            requested = self._filter_suspended_requests(getattr(config, "MULTI_ASSET_REQUESTS", None))
             self.discovery_report = self.registry.discover(
                 delta_api=delta_api,
                 coinswitch_api=cs_api,
-                requested=getattr(config, "MULTI_ASSET_REQUESTS", None),
+                requested=requested,
                 max_active=int(getattr(config, "SCANNER_MAX_ACTIVE_INSTRUMENTS", 8)),
                 require_primary=False,
             )
@@ -695,11 +724,14 @@ class MultiAssetQuantBot:
             cadence = getattr(pol, "loop_interval_sec", getattr(pol, "tick_eval_sec", 0.0))
             lines.append(f"• <b>{inst.asset_id}</b> — {inst.primary_exchange.value.upper()}:{inst.display_symbol} | venues {venues} | lev {lev}x | {pol.asset_class} | risk×{pol.risk_multiplier:.2f} | margin {pol.margin_pct:.0%} | cadence {float(cadence):.2f}s")
         lines.append("")
+        if not bool(getattr(config, "STOCK_DESK_TRADING_ENABLED", True)):
+            lines.append("⏸ <b>STOCK DESK SUSPENDED</b> — equity/index contexts are not created and cannot route orders.")
+            lines.append("")
         lines.append("<b>Portfolio rules:</b>")
         lines.append(f"• Multiple simultaneous contracts allowed: {self.guard.max_open_positions} portfolio slots")
         lines.append(f"• One live/entering/exit slot per contract: max {self.guard.max_per_contract}")
         lines.append(f"• Balance allocation: {self.guard.budget_mode}; cash is slot-scoped, risk base is {self.guard.risk_budget_mode}; sizing uses per-instrument policy, not BTC defaults")
-        lines.append("• Live exchange products only; no synthetic symbols. Delta SPXUSD is SPX6900 crypto, not S&P 500, so it is not used for SPX_INDEX.")
+        lines.append("• Live exchange products only; no synthetic symbols. Stock/equity/index desk is suspended and excluded before discovery.")
         lines.append("• Alpha remains posterior/EV based; PortfolioManager only controls exposure mechanics")
         lines.append("• Cross-asset overlay active for BTC/GOLD/SILVER: correlation, relative value, TP reach, SL buffer, and cluster risk are advisory/sizing inputs — never hard entry vetoes")
         return "\n".join(lines)

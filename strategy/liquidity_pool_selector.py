@@ -57,6 +57,14 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 try:
+    from strategy.liquidity_fibonacci import score_liquidity_fib_confluence
+except Exception:  # pragma: no cover - standalone tests
+    try:
+        from liquidity_fibonacci import score_liquidity_fib_confluence  # type: ignore
+    except Exception:
+        score_liquidity_fib_confluence = None  # type: ignore
+
+try:
     from strategy.market_intelligence import build_market_profile, MarketProfile
 except Exception:  # pragma: no cover - standalone tests
     from market_intelligence import build_market_profile, MarketProfile  # type: ignore
@@ -241,6 +249,12 @@ class PoolCandidateDiagnostic:
     gauntlet_n:    int   = 0
     be_move:       float = 0.0
     ladder_path_score: float = 0.0
+    fib_confluence: float = 1.0
+    fib_score:      float = 0.0
+    fib_ratio:      float = 0.0
+    fib_distance_atr: float = 0.0
+    fib_role:       str = ""
+    fib_anchor:     float = 0.0
     buffer_atr:    float = 0.0
     quality:       float = 0.0
     notes:         List[str] = field(default_factory=list)
@@ -616,6 +630,21 @@ def _tf_rank(tf: str) -> int:
     return _TF_RANK.get(str(tf).lower(), 2)
 
 
+
+
+def _fib_geometry(snap, side: str, entry: float, sl: float, tp_price: float, atr: float, target: Any):
+    """Soft Fib-auction confluence for an existing liquidity TP."""
+    if score_liquidity_fib_confluence is None:
+        return None
+    try:
+        return score_liquidity_fib_confluence(
+            snap=snap, side=side, entry=entry, sl=sl,
+            target_price=tp_price, atr=atr, target=target,
+        )
+    except Exception as e:
+        logger.debug("Fib geometry scoring failed: %s", e)
+        return None
+
 def _max_reach_for_tf(tf: str) -> float:
     return float(_MAX_REACH_ATR.get(str(tf), _MAX_REACH_ATR.get(str(tf).lower(), 12.0)))
 
@@ -937,6 +966,9 @@ def score_tp_pools(
                 * _freshness_bonus(pool)
                 * _touch_penalty(pool)
             )
+            fib_geo = _fib_geometry(snap, side, entry, sl, tp_price, atr, target)
+            fib_mult = float(getattr(fib_geo, "multiplier", 1.0) or 1.0) if fib_geo is not None else 1.0
+            confluence *= fib_mult
 
             ladder_path_score, ladder_path_components = _tp_ladder_path_score(
                 snap, side, entry, tp_price, atr)
@@ -964,6 +996,8 @@ def score_tp_pools(
             utility *= reach_mult
             utility_components["reach_mult"] = reach_mult
             utility_components["max_reach_atr"] = max_reach
+            utility_components["fib_multiplier"] = fib_mult
+            utility_components["fib_score"] = float(getattr(fib_geo, "score", 0.0) or 0.0) if fib_geo is not None else 0.0
 
             # EV. The scaling here is intentional:
             #   - probability dominates (multiplicative base).
@@ -977,6 +1011,10 @@ def score_tp_pools(
             reasons: List[str] = []
             if confluence > 1.30:
                 reasons.append(f"high confluence ×{confluence:.2f}")
+            if fib_geo is not None and float(getattr(fib_geo, "score", 0.0) or 0.0) >= 0.35:
+                reasons.append(
+                    f"liq+Fib {float(getattr(fib_geo, 'nearest_ratio', 0.0) or 0.0):.3g} "
+                    f"{str(getattr(fib_geo, 'role', ''))} ×{fib_mult:.2f}")
             if n_gauntlet > 0:
                 reasons.append(f"gauntlet {n_gauntlet} pools −{(1-gauntlet_mult)*100:.0f}%")
             if terminal_target:
@@ -1020,6 +1058,11 @@ def score_tp_pools(
                     "ladder_path_score": ladder_path_score,
                     "ladder_path_n": ladder_path_components.get("n", 0.0),
                     "ladder_path_coverage": ladder_path_components.get("coverage", 0.0),
+                    "fib_multiplier": fib_mult,
+                    "fib_score": float(getattr(fib_geo, "score", 0.0) or 0.0) if fib_geo is not None else 0.0,
+                    "fib_ratio": float(getattr(fib_geo, "nearest_ratio", 0.0) or 0.0) if fib_geo is not None else 0.0,
+                    "fib_distance_atr": float(getattr(fib_geo, "distance_atr", 0.0) or 0.0) if fib_geo is not None else 0.0,
+                    "fib_anchor": float(getattr(fib_geo, "anchor_price", 0.0) or 0.0) if fib_geo is not None else 0.0,
                     "gauntlet":    gauntlet_mult,
                     "significance": sig,
                     "rr_floor":    rr_floor,
@@ -1269,7 +1312,16 @@ def diagnose_tp_pools(
                 * _freshness_bonus(pool)
                 * _touch_penalty(pool)
             )
+            fib_geo = _fib_geometry(snap, side, entry, sl, row.tp_price, atr, target)
+            fib_mult = float(getattr(fib_geo, "multiplier", 1.0) or 1.0) if fib_geo is not None else 1.0
+            confluence *= fib_mult
             row.confluence = confluence
+            row.fib_confluence = fib_mult
+            row.fib_score = float(getattr(fib_geo, "score", 0.0) or 0.0) if fib_geo is not None else 0.0
+            row.fib_ratio = float(getattr(fib_geo, "nearest_ratio", 0.0) or 0.0) if fib_geo is not None else 0.0
+            row.fib_distance_atr = float(getattr(fib_geo, "distance_atr", 0.0) or 0.0) if fib_geo is not None else 0.0
+            row.fib_anchor = float(getattr(fib_geo, "anchor_price", 0.0) or 0.0) if fib_geo is not None else 0.0
+            row.fib_role = str(getattr(fib_geo, "role", "") or "") if fib_geo is not None else ""
             ladder_path_score, ladder_path_components = _tp_ladder_path_score(
                 snap, side, entry, row.tp_price, atr)
             row.ladder_path_score = ladder_path_score
@@ -1317,6 +1369,8 @@ def diagnose_tp_pools(
                     row.notes.append(
                         f"ladder={ladder_path_score:.2f}/{int(ladder_path_components.get('n', 0))} pools")
             if confluence > 1.30: row.notes.append(f"conf×{confluence:.2f}")
+            if row.fib_score >= 0.35:
+                row.notes.append(f"liq+Fib {row.fib_ratio:.3g} {row.fib_role} ×{row.fib_confluence:.2f}")
             if rr_floor < effective_min_rr - 1e-9:
                 row.notes.append(f"payoff RR floor {rr_floor:.2f}")
             if selection_ev > row.ev + 1e-12:
@@ -1337,8 +1391,9 @@ def diagnose_tp_pools(
         selected.selected = True
         selected.reason = "selected by payoff-adjusted EV after all institutional gates"
         report.selected = selected
+        _fib_s = f"; Fib={selected.fib_ratio:.3g}×{selected.fib_confluence:.2f}" if selected.fib_score >= 0.20 else ""
         report.summary = (f"selected ${selected.tp_price:,.1f}; RR={selected.rr:.2f}; "
-                          f"EV={selected.ev:.3f}; P={selected.sweep_prob:.2f}")
+                          f"EV={selected.ev:.3f}; P={selected.sweep_prob:.2f}{_fib_s}")
     else:
         if rows:
             # Surface the most relevant rejection, not just "no TP".

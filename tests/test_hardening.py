@@ -388,16 +388,12 @@ class HardeningTests(unittest.TestCase):
 
         self.assertEqual(expected_utility_size_multiplier(surface, posterior=0.95), 0.0)
 
-    def test_structural_be_gate_uses_peak_delivery_not_retraced_mark(self):
-        from strategy.liquidity_trail import LiquidityTrailEngine
+    def test_legacy_liquidity_trail_module_removed_from_strategy_build(self):
+        import os
 
-        ok, reason = LiquidityTrailEngine._structural_be_gate(
-            "short", price=100.40, entry_price=101.00, atr=1.0,
-            r_multiple=0.0, momentum_gate="CVD", ict_engine=None,
-            liq_snapshot=None, now=time.time(), peak_profit=1.00,
-        )
-
-        self.assertTrue(ok, reason)
+        # Fixed-SL TP ladder is the active exit model. The legacy SL-migration
+        # strategy module must not be shipped as an executable strategy path.
+        self.assertFalse(os.path.exists(os.path.join("strategy", "liquidity_trail.py")))
 
     def test_sl_migration_override_is_ignored_while_position_active(self):
         import threading

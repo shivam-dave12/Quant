@@ -1855,24 +1855,11 @@ def _ict_atr_inline(candles: list, period: int) -> float:
 
 
 class _DynamicStructureTrail:
-    """
-    Slim ICT structure-query helper — v5.0 refactor.
+    """Pure ICT-state query helper for display/awareness only.
 
-    The v7.0 trail logic that used to live here (retired ATR fallback,
-    dynamic-buffer computation, liquidity-first anchor selection,
-    ATR-percentile-scaled multipliers, etc.) was REMOVED as part of the
-    move to pure-Fibonacci trailing via DisabledSLMigrationEngine v5.0.
-
-    Retained here (as classmethods / static methods) are ONLY the pure
-    ICT-state query helpers used by the display layer:
-      _bos_count     — how many aligned BOS events across TFs
-      _counter_bos   — is there a fresh BOS AGAINST the position?
-      _choch         — most relevant CHoCH against the position
-      _phase         — simple phase label (R-multiple driven)
-      _session_mult  — DST-aware session buffer multiplier
-
-    All SL migration decisions are made by DisabledSLMigrationEngine in
-    strategy/liquidity_trail.py.  This class NO LONGER drives SL moves.
+    The bot uses fixed original SL + dynamic TP ladder.  This class does not
+    calculate, propose, log, or dispatch any SL migration.  Its methods only
+    read BOS/CHoCH/session context for operator visibility.
     """
 
     # ── Structure event detection ────────────────────────────────────
@@ -4512,15 +4499,11 @@ class QuantStrategy:
                 except Exception: pass
             choch_active = choch_tf is not None and choch_lvl > 0.0
 
-            _be_price = _calc_be_price(pos.side, pos.entry_price, atr, pos=pos)
-            be_locked = ((pos.side == "long" and pos.sl_price >= _be_price) or
-                         (pos.side == "short" and pos.sl_price <= _be_price))
-
-            if mfe_r >= 2.0: trail_phase = 3; phase_lbl = f"🟢 PHASE 3 — AGGRESSIVE ({mfe_r:.2f}R)"
-            elif mfe_r >= 1.0: trail_phase = 2; phase_lbl = f"🟠 PHASE 2 — STRUCTURE ({mfe_r:.2f}R)"
-            elif mfe_r >= 0.40: trail_phase = 1; phase_lbl = f"🟡 PHASE 1 — BE FLOOR ({mfe_r:.2f}R)"
-            elif mfe_r >= 0.10: trail_phase = 0; phase_lbl = f"⬜ PHASE 0 — OBSERVE/EAE ({mfe_r:.2f}R)"
-            else: trail_phase = -1; phase_lbl = f"⬜ HANDS OFF ({mfe_r:.2f}R < 0.10R)"
+            if mfe_r >= 2.0: ladder_phase_lbl = f"🟢 LADDER RUNNER — final target in play ({mfe_r:.2f}R)"
+            elif mfe_r >= 1.0: ladder_phase_lbl = f"🟠 LADDER DELIVERY — internal targets should be monetising ({mfe_r:.2f}R)"
+            elif mfe_r >= 0.40: ladder_phase_lbl = f"🟡 LADDER EARLY — first internal liquidity zone active ({mfe_r:.2f}R)"
+            elif mfe_r >= 0.10: ladder_phase_lbl = f"⬜ LADDER OBSERVE — fixed SL unchanged ({mfe_r:.2f}R)"
+            else: ladder_phase_lbl = f"⬜ FIXED SL — waiting for delivery ({mfe_r:.2f}R < 0.10R)"
 
             _margin_pnl_pct = 0.0
             try:
@@ -4552,10 +4535,10 @@ class QuantStrategy:
                 f"  R-PROGRESS: current={cur_r:+.2f}R  peak={mfe_r:.2f}R",
                 f"  [{_prog_bar}] {mfe_r:.2f}R │ Margin PnL: {_margin_pnl_pct:+.1f}%",
                 f"  ─" * 30,
-                f"  TRAIL: {phase_lbl}",
+                f"  EXIT MODEL: {ladder_phase_lbl}",
                 f"  BOS: {bos_cnt} │ CHoCH: "
                 + (f"{choch_tf} @ ${choch_lvl:,.0f}" if choch_active else "none"),
-                f"  BE: " + ("✅ LOCKED" if be_locked else f"❌ needs ${_be_price:,.2f}"),
+                f"  SL: fixed at original invalidation; risk reduced only by TP ladder fills",
             ]
             if _amd_brief:
                 lines_out.append(f"  AMD: {_amd_brief}")
@@ -6035,17 +6018,23 @@ class QuantStrategy:
                     pool_report = self._entry_engine.pool_plan_info
                 except Exception:
                     pool_report = None
+            _qty = max(float(quantity or 0.0), 0.0)
+            _min_qty = max(float(QCfg.MIN_QTY() or 0.0), 0.0)
+            _min_leg_fraction = (_min_qty / _qty) if (_qty > 0 and _min_qty > 0) else 0.0
+            _max_internal_legs = max(0, int(_qty // _min_qty) - 1) if (_qty > 0 and _min_qty > 0) else 0
             plan = build_tp_ladder(
                 side=side,
                 entry=float(entry_price),
                 sl=float(sl_price),
                 final_tp=float(final_tp),
                 atr=float(atr or 0.0),
-                total_quantity=float(quantity or 0.0),
+                total_quantity=_qty,
                 pool_report=pool_report,
                 target_surface=getattr(getattr(self, "_last_entry_signal", None), "target_surface", None),
                 cross_asset_state=getattr(self, "_cross_asset_state", None),
                 asset_id=str(getattr(getattr(self, "_instrument", None), "asset_id", "") or ""),
+                min_leg_fraction=_min_leg_fraction,
+                max_internal_legs=_max_internal_legs,
             )
             if plan is not None and getattr(plan, "legs", None):
                 logger.info(
@@ -6952,12 +6941,7 @@ class QuantStrategy:
         # Side icon
         _side_icon = "🟢" if side == "long" else "🔴"
 
-        # Trail plan for "what's next"
-        _trail_plan = (
-            "BOS confirmed -> P1 swing trail"
-            " -> CHoCH tighten (P2)"
-            " -> 15m structure (P3 at 1.5R+)")
-        _ratchet_plan = "BE @0.5R -> +0.15R@1R -> +0.5R@1.5R -> +1R@2R -> trailing@2.5R+"
+        # TP ladder/final target advisory for "what's next".
         _sep = "-" * 30
 
         _ts = getattr(_es, 'target_surface', None) if _es is not None else getattr(self, '_last_target_surface', None)
@@ -7082,7 +7066,7 @@ class QuantStrategy:
                         logger.info(f"🔄 Regime flip → exit {pos.side.upper()} [{pos.trade_mode}]")
                         self._exit_trade(order_manager, price, "regime_flip"); return
 
-            # Liquidity-hunt trades exit via SL, TP, or SL migration only.
+            # Liquidity-hunt trades exit via fixed SL, TP ladder, or final TP only.
             # No premature composite-based exit while the liquidity-delivery thesis is active.
 
             # v5.1: Flow trades exit when order flow structurally reverses.
@@ -7117,7 +7101,7 @@ class QuantStrategy:
                         return
 
         # v5.0: max-hold time exit REMOVED.
-        # Trades exit via SL, TP, SL migration, regime flip, or breakout expiry only.
+        # Trades exit via fixed SL, TP ladder/final TP, regime flip, or breakout expiry only.
         # A timer cannot know if the trade is working.
 
         # ── DirectionEngine: pool-hit gate ────────────────────────────────────
@@ -7125,7 +7109,7 @@ class QuantStrategy:
         # determines whether to exit (TP hit), reverse, continue to next pool, or hold.
         # action="exit"     → close position now (pool TP reached)
         # action="reverse"  → close and open opposite
-        # action="continue" → update TP to next pool, tighten SL
+        # action="continue" → log next pool; fixed SL and TP ladder remain unchanged
         # action="hold"     → nothing, let existing SL/TP manage
         if self._dir_engine is not None and not pos.is_flat():
             try:
@@ -7153,13 +7137,10 @@ class QuantStrategy:
                     liq_snapshot = _gate_liq_snap,
                 )
                 if _gate is not None and _gate.action == "reverse":
-                    # BUG-3 FIX: pool_hit_gate "reverse" must NEVER close the
-                    # position.  The gate fires every tick once AMD flips contra
-                    # — exiting on each tick would fire multiple exits and leave
-                    # the bot flat at a suboptimal price.  Instead: migrate SL
-                    # to breakeven (capital protection) and send a Telegram
-                    # awareness alert.  The existing SL/TP bracket remains live
-                    # and manages the exit when the market decides.
+                    # pool_hit_gate "reverse" is awareness-only under the fixed-SL
+                    # TP-ladder model.  It never exits, never moves SL, and never
+                    # mutates the bracket; monetisation is handled by TP1..TPn and
+                    # the final target.
                     # BUG-SPAM FIX: reason embeds FLOW_REVERSED(flow=-0.83)
                     # which changes every tick → key never matched → fired
                     # every tick.  Use only stable trade-identity fields;
@@ -7188,126 +7169,18 @@ class QuantStrategy:
                             f"POOL-GATE reverse held: conf={_gate.confidence:.2f} | "
                             f"{_gate.reason[:100]}")
 
-                    _be_tick  = _round_to_tick(
-                        _calc_be_price(pos.side, pos.entry_price,
-                                       self._atr_5m.atr if self._atr_5m else 1.0,
-                                       pos=pos))
-                    _safe_be_tick = _safe_be_migration_price(
-                        pos.side, _be_tick, price,
-                        self._atr_5m.atr if self._atr_5m else 0.0)
-                    _be_needed = (
-                        _safe_be_tick is not None and
-                        ((pos.side == "long"  and pos.sl_price < _safe_be_tick) or
-                         (pos.side == "short" and pos.sl_price > _safe_be_tick))
-                    )
-                    if _safe_be_tick is None:
-                        _atr_now = self._atr_5m.atr if self._atr_5m else 0.0
-                        _gap_atr = abs(price - _be_tick) / max(_atr_now, 1e-10)
-                        # BUG-SPAM FIX: reason contains dynamic flow float → key
-                        # changed every tick → 120 s guard never triggered.
-                        _key = f"{pos.side}:{round(pos.entry_price, 1)}"
-                        if (_key != pos.pool_gate_reverse_regime_key or
-                                now - pos.pool_gate_reverse_signaled_at >= 120.0):
-                            with self._lock:
-                                pos.pool_gate_reverse_regime_key = _key
-                                pos.pool_gate_reverse_signaled_at = now
-                                pos.pool_gate_reverse_attempts += 1
-                            # Downgraded WARNING→INFO: diagnostic only; the
-                            # existing bracket is still live and protected.
-                            # WARNING level would double-send via TelegramLogHandler.
-                            logger.info(
-                                f"POOL-GATE BE blocked: desired=${_be_tick:,.2f} "
-                                f"price=${price:,.2f} gap={_gap_atr:.2f}ATR; "
-                                "too close to market, existing SL/TP remains protected")
-                        else:
-                            logger.debug(
-                                f"POOL-GATE BE still blocked: desired=${_be_tick:,.2f} "
-                                f"price=${price:,.2f} gap={_gap_atr:.2f}ATR")
-                    # SL breakeven migration removed: fixed SL only.
-                    _be_upgrade_allowed = (
-                        False and _be_needed and pos.sl_order_id and (
-                            (not pos.be_ratchet_applied) or
-                            (pos.side == "long" and
-                             _safe_be_tick > pos.sl_price + max(QCfg.TICK_SIZE(), 0.1)) or
-                            (pos.side == "short" and
-                             _safe_be_tick < pos.sl_price - max(QCfg.TICK_SIZE(), 0.1))
-                        )
-                    )
-                    if _be_upgrade_allowed:
-                        try:
-                            _es = "sell" if pos.side == "long" else "buy"
-                            _be_result = order_manager.replace_stop_loss(
-                                existing_sl_order_id = pos.sl_order_id,
-                                side                 = _es,
-                                quantity             = pos.quantity,
-                                new_trigger_price    = _safe_be_tick,
-                                old_trigger_price    = pos.sl_price,
-                                current_price        = price,
-                            )
-                            if _be_result is None:
-                                # replace_stop_loss returning None means SL already
-                                # fired — treat as a fill event and bail out.
-                                self._record_exchange_exit(None)
-                                return
-                            if isinstance(_be_result, dict) and _be_result.get("error") == "UNPROTECTED":
-                                logger.critical(
-                                    "💀 POOL-GATE BE: SL replace UNPROTECTED — "
-                                    "emergency-flattening.")
-                                try:
-                                    if hasattr(order_manager, "emergency_flatten"):
-                                        order_manager.emergency_flatten(reason="pool_gate_be_unprotected")
-                                    else:
-                                        order_manager.place_market_order(
-                                            side=_es, quantity=pos.quantity, reduce_only=True)
-                                except Exception as _ef_e:
-                                    logger.error(f"emergency_flatten raised: {_ef_e}", exc_info=True)
-                                with self._lock:
-                                    if self._pos.phase == PositionPhase.ACTIVE:
-                                        self._pos.phase = PositionPhase.EXITING
-                                        self._exiting_since = time.time()
-                                return
-                            if isinstance(_be_result, dict) and _be_result.get("error") == "PLACE_FAILED_RESTORED":
-                                _r_oid = _be_result.get("restore_order_id")
-                                _r_trig = float(_be_result.get("restore_trigger", 0) or 0)
-                                with self._lock:
-                                    if _r_oid: pos.sl_order_id = _r_oid
-                                    if _r_trig > 0:
-                                        pos.sl_price = _r_trig
-                                        self.current_sl_price = _r_trig
-                                logger.warning(
-                                    f"⚠️ POOL-GATE BE: SL restored at ${_r_trig:,.2f} "
-                                    f"(requested ${_be_tick:,.2f}).")
-                            elif isinstance(_be_result, dict) and "error" not in _be_result:
-                                with self._lock:
-                                    pos.sl_price           = _safe_be_tick
-                                    pos.sl_order_id        = (_be_result.get("order_id")
-                                                              or pos.sl_order_id)
-                                    pos.be_ratchet_applied = True
-                                    self.current_sl_price  = _safe_be_tick
-                                logger.info(
-                                    f"🔒 POOL-GATE REVERSE → SL migrated to BE "
-                                    f"${_safe_be_tick:,.2f} (no exit; bracket manages)")
-                                self._send_telegram(
-                                    f"⚠️ <b>POOL-GATE: STRUCTURAL REVERSAL SIGNAL</b>\n"
-                                    f"Pool hit with contra AMD flow — <b>no exit taken</b>\n"
-                                    f"SL unchanged by fixed-SL policy; TP ladder/final TP manages monetisation.\n"
-                                    f"Conf: {_gate.confidence:.0%} | {_gate.reason[:150]}")
-                            else:
-                                logger.debug(
-                                    f"Pool-gate BE migration rejected by exchange: "
-                                    f"{_be_result}")
-                        except Exception as _be_e:
-                            logger.debug(
-                                f"Pool-gate BE migration error (non-fatal): {_be_e}")
-                    elif _gate_notice_due:
-                        # SL is already at or beyond BE, or no sl_order_id yet.
-                        # Send awareness-only alert so operator can see the signal.
+                    # Fixed-SL TP-ladder policy: a reverse/contra-flow signal is
+                    # awareness only.  It must NOT migrate SL to entry/BE, must
+                    # NOT trail, and must NOT alter the native bracket.  Risk is
+                    # compressed only through TP-ladder partials and final-target
+                    # quantity allocation.
+                    if _gate_notice_due:
                         try:
                             from telegram.notifier import format_pool_gate_alert
                             self._send_telegram(format_pool_gate_alert(
                                 action        = "hold",
                                 confidence    = _gate.confidence,
-                                reason        = f"[REVERSE signal — no exit] {_gate.reason}",
+                                reason        = f"[REVERSE signal — fixed SL unchanged] {_gate.reason}",
                                 pos_side      = pos.side,
                                 pos_entry     = pos.entry_price,
                                 current_price = price,
@@ -7318,9 +7191,9 @@ class QuantStrategy:
                         except Exception:
                             self._send_telegram(
                                 f"⚠️ <b>POOL-GATE: REVERSE SIGNAL (no exit)</b>\n"
-                                f"SL unchanged — fixed SL + TP ladder manage exits\n"
+                                f"Fixed SL unchanged; TP ladder/final TP manage monetisation.\n"
                                 f"Conf: {_gate.confidence:.0%} | {_gate.reason[:150]}")
-                    # NOTE: no early return — trail engine must still run this tick.
+                    # Fixed-SL policy: no SL-migration branch follows.
                 elif _gate is not None and _gate.action == "continue" and _gate.next_target:
                     # ════════════════════════════════════════════════════════════
                     # TP IMMUTABILITY POLICY
@@ -7330,20 +7203,18 @@ class QuantStrategy:
                     # WHY:
                     #   In production, 23/24 trades exited via SL.  Only 1 hit TP.
                     #   Extending TP further when the first target isn't reached
-                    #   guarantees the trade dies to a SL migration instead.
+                    #   guarantees the trade gives back ladder monetisation if residual sizing is wrong.
                     #
                     #   The original TP was set at the opposing liquidity pool —
                     #   the structural delivery target.  If the market doesn't
-                    #   reach it, the SL trail manages the exit with whatever
-                    #   profit was captured.
+                    #   reach it, the fixed SL and TP ladder manage monetisation without SL migration.
                     #
                     #   If you believe TP should be further, that's a NEW THESIS.
                     #   Open a new position after the current one closes.
                     #
                     # WHAT WE DO INSTEAD:
                     #   Log the suggestion for post-trade analysis.
-                    #   The trail engine may tighten SL on the next tick,
-                    #   which naturally locks available profit.
+                    #   The TP ladder, not SL movement, manages monetisation.
                     #
                     _next = _gate.next_target
                     logger.info(
@@ -7352,7 +7223,7 @@ class QuantStrategy:
                         f"conf={_gate.confidence:.2f} | {_gate.reason[:80]}")
                     # DO NOT call replace_take_profit.
                     # DO NOT modify pos.tp_price.
-                    # The existing SL/TP bracket manages the exit.
+                    # The fixed SL + TP ladder/final TP manages the exit.
                 # action="hold" → do nothing, let existing SL/TP manage
             except Exception as _pg:
                 logger.debug(f"DirectionEngine.pool_hit_gate error: {_pg}")
@@ -9261,9 +9132,9 @@ class QuantStrategy:
             if init_sl > 1e-10:
                 raw_pts = (price - p.entry_price) if p.side == "long" else (p.entry_price - price)
                 locked_r = max(0, raw_pts / init_sl) if raw_pts > 0 else 0.0
-            _be_price = _calc_be_price(p.side, p.entry_price, atr, pos=p)
-            be_moved = ((p.side == "long" and p.sl_price >= _be_price) or
-                        (p.side == "short" and p.sl_price <= _be_price))
+            # Fixed-SL TP-ladder build: do not compute or display break-even
+            # migration state.  SL price remains the original invalidation.
+            be_moved = False
 
         # ── Build extra lines (execution costs + expectancy) ─────────────
         extra = []

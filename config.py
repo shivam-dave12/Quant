@@ -56,7 +56,7 @@ REMAINDER_MIN_QTY        = 0.001
 #   The inconsistency caused 100× over-sizing (entire balance at risk per trade),
 #   triggering the "required margin > available — scaling down" warnings in logs.
 #   Fix: one convention (fraction), both consumers agree. See risk_manager.py line 266.
-RISK_PER_TRADE           = 0.05  # 5% of available balance per trade; 10 losses fits 5% daily cap
+RISK_PER_TRADE           = 0.005  # 0.5% of available balance per trade; 10 losses fits 5% daily cap
 MAX_DAILY_LOSS           = 10000
 MAX_DAILY_LOSS_PCT       = 5.0       # day circuit breaker
 MAX_DRAWDOWN_PCT         = 15.0      # realistic drawdown limit
@@ -569,6 +569,14 @@ SCANNER_MAX_ACTIVE_INSTRUMENTS = 14
 SCANNER_TICK_SLEEP_SEC = 0.25
 SCANNER_ASSET_HEARTBEAT_SEC = 60.0
 SCANNER_ASSET_ANALYSIS_LOG_SEC = 15.0  # per-contract proof-of-analysis log cadence
+
+# Desk suspension policy.  Suspended desks are excluded before live catalog
+# discovery, so they cannot subscribe, analyse, size, or route orders.
+# This is a desk-level trading suspension, not a removal of instrument metadata.
+STOCK_DESK_TRADING_ENABLED = False
+SUSPENDED_TRADING_DESKS = ("STOCKS",)
+SUSPENDED_ASSET_CLASSES = ("equity", "index")
+
 # Portfolio slots: the bot may hold multiple contracts at once, but each
 # contract gets only one ENTERING/ACTIVE/EXITING slot.  The existing BTC-style
 # risk model is preserved by giving each contract a slot-scoped balance view
@@ -714,6 +722,7 @@ TRADING_DESKS = {
         },
     },
     "STOCKS": {
+        "enabled": STOCK_DESK_TRADING_ENABLED,
         "display_name": "Stocks Desk",
         "strategy": STRATEGY_CORE_NAME,
         "asset_classes": ("equity", "index"),

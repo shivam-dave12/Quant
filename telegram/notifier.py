@@ -1675,8 +1675,7 @@ def format_periodic_report(
             f"<code>ENTRY   {_tg_price(entry):>14}   UPNL {_tg_pnl(upnl):>14}</code>",
             f"<code>SL      {_tg_price(sl):>14}   TP {_tg_price(tp):>14}   RR 1:{rr:.2f}</code>",
         ]
-        if breakeven_moved:
-            lines.append(f"<code>LOCK    BE protected   secured {float(profit_locked_pct or 0):+.2f}R</code>")
+        # Fixed-SL TP-ladder policy: no break-even lock line is rendered.
 
     lines += [
         _tg_section("\U0001f4c8", "Risk & Performance"),
@@ -1919,7 +1918,7 @@ def _telegram_arch_layer(logger_name: str, message: str = "") -> tuple[str, str]
         ("EXECUTION", "⚙", ("execution", "order_manager", "router")),
         ("RISK", "⚖", ("risk", "risk_manager")),
         ("MARKET-DATA", "📡", ("data_manager", "websocket", "market_aggregator", "exchanges")),
-        ("LIQUIDITY", "💧", ("liquidity_map", "liquidity_pool", "liquidity_trail")),
+        ("LIQUIDITY", "💧", ("liquidity_map", "liquidity_pool", "tp_ladder")),
         ("POSTERIOR", "🧠", ("quant_strategy", "quantitative_models", "expected_utility")),
         ("STRUCTURE", "🏛", ("ict_engine", "direction_engine", "conviction_filter", "market_intelligence")),
     )

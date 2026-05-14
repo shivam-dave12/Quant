@@ -128,7 +128,7 @@ _LOG_LAYER_RULES = (
     ("EXECUTION", "⚙", ("execution", "order_manager", "router")),
     ("RISK", "⚖", ("risk", "risk_manager")),
     ("MARKET-DATA", "📡", ("data_manager", "websocket", "market_aggregator", "exchanges")),
-    ("LIQUIDITY", "💧", ("liquidity_map", "liquidity_pool", "liquidity_trail")),
+    ("LIQUIDITY", "💧", ("liquidity_map", "liquidity_pool", "tp_ladder")),
     ("POSTERIOR", "🧠", ("quant_strategy", "quantitative_models", "expected_utility")),
     ("STRUCTURE", "🏛", ("ict_engine", "direction_engine", "conviction_filter", "market_intelligence")),
     ("RUNTIME", "▶", ("main", "__main__")),
