@@ -6,6 +6,10 @@ Builds TP1..TPn from internal liquidity between entry and final TP.
 Design constraints:
 - Final TP remains the strategy-selected final liquidity objective.
 - Internal BSL/SSL pools become partial reduce-only targets.
+- If no internal liquidity exists, a Fibonacci auction-geometry fallback may
+  create intermediate TP legs between entry and the already-selected final TP.
+  This does not create a new trade target; it only monetises the path to a
+  validated final objective.
 - SL price is never moved by this module.
 - Quantity allocation is dynamic: path distance, delivery probability,
   liquidity quality, gauntlet, execution cost, liquidity+Fibonacci auction
@@ -194,6 +198,100 @@ def _candidate_weight(row: Dict[str, Any], path_frac: float) -> float:
         * gauntlet_pen * (1.0 + 0.10 * min(ev, 3.0)) * (1.0 + 0.18 * ladder_score),
     )
 
+
+
+# Fibonacci fallback ratios are used only when no internal liquidity exists
+# between entry and the selected final TP.  They are path monetisation points,
+# not a standalone target generator.
+_FIB_FALLBACK_PATH_RATIOS = (0.382, 0.500, 0.618, 0.786)
+
+
+def _fib_path_price(side: str, entry: float, final_tp: float, frac: float) -> float:
+    if side == "long":
+        return entry + abs(final_tp - entry) * float(frac)
+    return entry - abs(final_tp - entry) * float(frac)
+
+
+def _fib_fallback_internals(*, side: str, entry: float, sl: float, final_tp: float,
+                            atr: float, max_internal_legs: int,
+                            min_spacing: float, sponsorship: float,
+                            final_fib_score: float, final_fib_mult: float,
+                            final_dist_atr: float) -> List[Dict[str, Any]]:
+    """Create Fibonacci path-monetisation legs when internal liquidity is absent.
+
+    This is deliberately conservative: the final TP must already be validated by
+    the strategy/selector, distance must be large enough to need staging, and
+    quantity capacity must permit at least one independent reduce-only leg.
+    """
+    if max_internal_legs <= 0:
+        return []
+    if final_dist_atr < 1.65:
+        return []
+    risk = abs(entry - sl)
+    if risk <= 1e-12:
+        return []
+    atr = max(float(atr or 0.0), 1e-9)
+    path = abs(final_tp - entry)
+    if path <= max(0.75 * atr, 1e-9):
+        return []
+    out: List[Dict[str, Any]] = []
+    seen: List[float] = []
+    max_legs = max(0, int(max_internal_legs or 0))
+    fib_quality = _clamp(0.55 * _clamp(final_fib_score, 0.0, 1.0) + 0.45 * ((final_fib_mult - 0.90) / 0.42), 0.0, 1.0)
+    sponsor = _clamp(sponsorship, -1.0, 1.0)
+    for ratio in _FIB_FALLBACK_PATH_RATIOS:
+        if len(out) >= max_legs:
+            break
+        px = _fib_path_price(side, entry, final_tp, ratio)
+        if not _in_path(side, entry, final_tp, px):
+            continue
+        # Avoid false precision around entry/final.  A fallback TP must be far
+        # enough to pay spread/fees/noise and far enough from final to remain a
+        # true intermediate monetisation leg.
+        if abs(px - entry) < max(0.55 * atr, 0.16 * risk):
+            continue
+        if abs(final_tp - px) < max(0.45 * atr, 0.08 * path):
+            continue
+        if any(abs(px - p) < min_spacing for p in seen):
+            continue
+        rr = abs(px - entry) / max(risk, 1e-9)
+        if rr < 0.35:
+            continue
+        path_frac = _path_fraction(side, entry, final_tp, px)
+        # Delivery estimate is path-based: nearer fallback legs have higher
+        # probability; strong final Fib geometry and cross-asset sponsorship
+        # can lift it, but cannot overpower adverse sponsorship.
+        delivery = _clamp(
+            0.76 * math.exp(-0.82 * path_frac)
+            + 0.10 * fib_quality
+            + 0.06 * max(0.0, sponsor)
+            - 0.10 * max(0.0, -sponsor),
+            0.10,
+            0.84,
+        )
+        row = {
+            "pool_side": "BSL" if side == "long" else "SSL",
+            "tp_price": px,
+            "pool_price": px,
+            "quality": _clamp(0.46 + 0.22 * fib_quality + 0.08 * max(0.0, sponsor), 0.30, 0.82),
+            "significance": _clamp(2.2 + 2.4 * fib_quality + 1.0 * (1.0 - path_frac), 1.5, 6.0),
+            "delivery_prob": delivery,
+            "selection_ev": max(0.0, rr * delivery - (1.0 - delivery)),
+            "fib_confluence": _clamp(1.02 + 0.18 * fib_quality, 0.98, 1.20),
+            "fib_score": _clamp(0.55 + 0.35 * fib_quality, 0.35, 0.90),
+            "fib_ratio": ratio,
+            "fib_role": "fib_fallback_monetisation",
+            "timeframe": "fib_path",
+            "cost_r": 0.0,
+            "reason": f"fib fallback path monetisation {ratio:.3g}; no internal liquidity before selected final TP",
+            "_ladder_price": px,
+            "_ladder_path_frac": path_frac,
+            "_ladder_source": "fib_fallback_geometry",
+        }
+        row["_ladder_weight"] = _candidate_weight(row, path_frac) * (0.90 + 0.15 * fib_quality)
+        out.append(row)
+        seen.append(px)
+    return out
 
 
 def _sigmoid(x: float) -> float:
@@ -453,20 +551,49 @@ def build_tp_ladder(
     final_fib_mult = max([_clamp(_num(r.get("fib_confluence", r.get("fib_multiplier", 1.0)), 1.0), 0.90, 1.32) for r in final_rows] or [1.0])
     final_fib_ratio = max([_num(r.get("fib_ratio", 0.0), 0.0) for r in final_rows] or [0.0])
 
-    # If no valid internal targets exist, return final-only ladder.  The caller
-    # will price this as single-exit lifecycle risk; no fake ladder protection.
+    # If no valid internal liquidity exists, build Fibonacci path-monetisation
+    # legs only when the final TP is already validated and exchange lot capacity
+    # allows partial reduce-only exits.  Otherwise return final-only and explain.
     if not internals:
-        plan.final_fraction = 1.0
-        plan.internal_budget = 0.0
-        plan.final_runner_model = {"path_strength": 0.0, "reason": "no_internal_liquidity", "fib_score": final_fib_score, "fib_multiplier": final_fib_mult, "fib_ratio": final_fib_ratio}
-        plan.legs = [TPLadderLeg(
-            index=1, role="FINAL", price=final_tp, qty_fraction=1.0,
-            quantity=total_quantity, source="selected_final_tp",
-            distance_atr=final_dist_atr,
-            rr=final_rr,
-            reason="no valid internal liquidity between entry and final TP",
-        )]
-        return plan
+        fib_internals = _fib_fallback_internals(
+            side=side,
+            entry=entry,
+            sl=sl,
+            final_tp=final_tp,
+            atr=atr,
+            max_internal_legs=max_internal_legs,
+            min_spacing=min_spacing,
+            sponsorship=sponsorship,
+            final_fib_score=final_fib_score,
+            final_fib_mult=final_fib_mult,
+            final_dist_atr=final_dist_atr,
+        )
+        if fib_internals:
+            internals = fib_internals
+            plan.regime_notes.append(
+                f"no internal liquidity: using Fibonacci path-monetisation fallback ({len(internals)} legs)"
+            )
+        else:
+            plan.final_fraction = 1.0
+            plan.internal_budget = 0.0
+            reason = "no valid internal liquidity between entry and final TP"
+            if max_internal_legs <= 0:
+                reason += "; position size not splittable under exchange lot/min-qty constraints"
+                plan.regime_notes.append("no internal/fib ladder: quantity cannot be split under exchange lot size")
+            elif final_dist_atr < 1.65:
+                reason += "; final TP too close for non-noisy Fibonacci staging"
+                plan.regime_notes.append("no internal/fib ladder: final TP too close for non-noisy staging")
+            else:
+                plan.regime_notes.append("no internal/fib ladder: no robust Fibonacci staging level survived cost/noise filters")
+            plan.final_runner_model = {"path_strength": 0.0, "reason": "no_internal_liquidity_or_fib_capacity", "fib_score": final_fib_score, "fib_multiplier": final_fib_mult, "fib_ratio": final_fib_ratio, "max_internal_legs": float(max_internal_legs)}
+            plan.legs = [TPLadderLeg(
+                index=1, role="FINAL", price=final_tp, qty_fraction=1.0,
+                quantity=total_quantity, source="selected_final_tp",
+                distance_atr=final_dist_atr,
+                rr=final_rr,
+                reason=reason,
+            )]
+            return plan
 
     runner_model = _runner_fraction_model(
         final_dist_atr=final_dist_atr,
@@ -527,7 +654,7 @@ def build_tp_ladder(
             price=px,
             qty_fraction=frac,
             quantity=qty,
-            source="internal_liquidity",
+            source=str(c.get("_ladder_source", "internal_liquidity") or "internal_liquidity"),
             pool_timeframe=str(c.get("timeframe", "") or ""),
             pool_price=_num(c.get("pool_price"), px),
             distance_atr=abs(px - entry) / atr,

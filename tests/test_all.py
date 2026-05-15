@@ -1571,6 +1571,47 @@ def test_tp_ladder_uses_fib_confluence_as_runner_geometry_not_fixed_percent():
     # Solvency still dominates: Fib support cannot leave a destructive residual.
     assert plan.solvency_checkpoint_index >= 1
     assert plan.worst_case_after_checkpoint_r >= plan.solvency_floor_r
+
+
+def test_tp_ladder_uses_fibonacci_fallback_when_no_internal_liquidity_exists():
+    pool_report = {
+        "candidates": [
+            # Only the final liquidity target exists.  No internal BSL rows are present.
+            {"pool_side": "BSL", "tp_price": 104.0, "pool_price": 104.0, "quality": 0.75,
+             "significance": 6.0, "delivery_prob": 0.42, "selection_ev": 0.40,
+             "fib_confluence": 1.24, "fib_score": 0.78, "fib_ratio": 1.618,
+             "fib_role": "runner_projection", "timeframe": "1h", "selected": True, "cost_r": 0.05},
+        ]
+    }
+    plan = build_tp_ladder(
+        side="long", entry=100.0, sl=99.0, final_tp=104.0, atr=1.0,
+        total_quantity=10.0, pool_report=pool_report,
+        min_leg_fraction=0.10, max_internal_legs=4,
+    )
+    internal = [l for l in plan.legs if l.role != "FINAL"]
+    assert internal, plan.as_dict()
+    assert all(l.source == "fib_fallback_geometry" for l in internal)
+    assert all(100.0 < l.price < 104.0 for l in internal)
+    assert any("Fibonacci path-monetisation fallback" in n for n in plan.regime_notes)
+    assert plan.final_fraction < 1.0
+
+
+def test_tp_ladder_final_only_when_quantity_cannot_be_split():
+    pool_report = {
+        "candidates": [
+            {"pool_side": "BSL", "tp_price": 104.0, "pool_price": 104.0, "selected": True,
+             "fib_confluence": 1.24, "fib_score": 0.78, "fib_ratio": 1.618}
+        ]
+    }
+    plan = build_tp_ladder(
+        side="long", entry=100.0, sl=99.0, final_tp=104.0, atr=1.0,
+        total_quantity=1.0, pool_report=pool_report,
+        min_leg_fraction=1.0, max_internal_legs=0,
+    )
+    assert len(plan.legs) == 1
+    assert plan.legs[0].role == "FINAL"
+    assert "position size not splittable" in plan.legs[0].reason
+
 # ===== END test_liquidity_fibonacci_target_surface.py =====
 
 

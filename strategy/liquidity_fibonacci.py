@@ -3,8 +3,11 @@ liquidity_fibonacci.py — Liquidity-first Fibonacci auction geometry
 ===================================================================
 
 Institutional rule:
-    Fibonacci never creates a target.
-    Fibonacci can only upgrade/downgrade an existing liquidity target.
+    Liquidity remains the primary final target source.
+    Fibonacci normally upgrades/downgrades existing liquidity targets.
+    If no internal liquidity exists between entry and the selected final TP,
+    TP ladder code may use Fibonacci as path-monetisation geometry for TP1..TPn.
+    Fibonacci must not invent a new final target by itself.
 
 This module scores whether a BSL/SSL liquidity pool sits at a structurally
 reasonable expansion/rotation distance from the entry auction.  The output is

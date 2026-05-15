@@ -9405,6 +9405,47 @@ class QuantStrategy:
             logger.warning(f"⚡ RECONCILE: adopted {iside.upper()} @ ${ex_entry:,.2f}")
             self._send_telegram(f"⚡ <b>POSITION ADOPTED</b>\nSide: {iside.upper()} | Size: {ex_size}\nEntry: ${ex_entry:,.2f} | uPnL: ${ex_upnl:+.2f}")
 
+            # ── TP-LADDER ADOPTION REPAIR ─────────────────────────────────────
+            # If a native bracket fill/child-verification timed out but the
+            # exchange later shows an active protected position, the normal
+            # post-fill TP ladder hook never ran.  Build/attach the ladder here
+            # from the recovered SL/TP.  SL price remains fixed; internal legs
+            # are reduce-only monetisation orders only.
+            try:
+                if sl_oid and tp_oid and sl_p > 0.0 and tp_p > 0.0 and _adopt_atr > 0.0:
+                    _adopt_ladder = self._build_tp_ladder_plan(
+                        side=iside,
+                        entry_price=ex_entry,
+                        sl_price=sl_p,
+                        final_tp=tp_p,
+                        quantity=ex_size,
+                        atr=_adopt_atr,
+                    )
+                    _ladder_dicts, _ladder_ids = self._place_internal_tp_ladder(
+                        order_manager=order_manager,
+                        side=iside,
+                        quantity=ex_size,
+                        final_tp=tp_p,
+                        native_final_tp_order_id=str(tp_oid or ""),
+                        ladder_plan=_adopt_ladder,
+                    )
+                    if _ladder_dicts:
+                        self._pos.tp_ladder = _ladder_dicts
+                        self._pos.tp_ladder_order_ids = list(_ladder_ids or [])
+                        self._pos.tp_ladder_active = bool(_ladder_ids)
+                        self._pos.tp_ladder_last_sync_qty = ex_size
+                        if _ladder_ids:
+                            logger.info(
+                                "✅ TP_LADDER adoption repair placed %d internal reduce-only legs; fixed SL remains $%.2f",
+                                len(_ladder_ids), sl_p)
+                        else:
+                            logger.info(
+                                "TP_LADDER adoption repair produced final-only plan; fixed SL remains $%.2f. notes=%s",
+                                sl_p,
+                                "; ".join(getattr(_adopt_ladder, "regime_notes", []) or []) if _adopt_ladder is not None else "none")
+            except Exception as _adopt_ladder_e:
+                logger.warning("TP_LADDER adoption repair failed; native bracket remains live: %s", _adopt_ladder_e, exc_info=True)
+
             # ── FIX-ADOPT-ENGINE: Wire all per-position stateful engines at adoption.
             # ─────────────────────────────────────────────────────────────────────────
             # The original _reconcile_apply set pos.phase = ACTIVE and returned.
