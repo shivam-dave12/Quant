@@ -6020,6 +6020,22 @@ class QuantStrategy:
 
             logger.info(f"[THINK] {' | '.join(parts)}")
 
+    @staticmethod
+    def _clamp_ladder_value(value: float, lo: float, hi: float) -> float:
+        """Local numeric clamp for TP-ladder path math.
+
+        Kept local to QuantStrategy so the ladder-build path never depends on
+        private helpers from selector modules. A failure here must never degrade
+        the strategy to final-TP-only again.
+        """
+        try:
+            v = float(value)
+        except Exception:
+            v = float(lo)
+        if not math.isfinite(v):
+            v = float(lo)
+        return max(float(lo), min(float(hi), v))
+
     def _build_tp_ladder_plan(self, side: str, entry_price: float, sl_price: float,
                               final_tp: float, quantity: float, atr: float):
         """Build TP1..TPn from internal liquidity; final TP remains unchanged."""
@@ -6048,7 +6064,7 @@ class QuantStrategy:
             _info_capacity = max(1, int(math.ceil(math.sqrt(max(_path_information, 1.0))))) if _final_dist_atr >= 1.25 else 0
             _max_internal_legs = min(_lot_capacity, _info_capacity) if _lot_capacity > 0 else _info_capacity
             _target_spacing_atr = (_final_dist_atr / max(_max_internal_legs + 1, 1)) if _max_internal_legs > 0 else _final_dist_atr
-            _min_spacing_atr = _clamp(max(0.35, 0.58 * _target_spacing_atr, 0.55 * _risk_atr), 0.35, 1.35)
+            _min_spacing_atr = self._clamp_ladder_value(max(0.35, 0.58 * _target_spacing_atr, 0.55 * _risk_atr), 0.35, 1.35)
             plan = build_tp_ladder(
                 side=side,
                 entry=float(entry_price),
