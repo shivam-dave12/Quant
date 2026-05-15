@@ -19,7 +19,7 @@ Current architecture:
   6. Risk/Execution validates sizing, liquidation distance, exchange lot size,
      bracket placement and exact fill/fee accounting.
   7. Adaptive Exit manages the live position using expected adverse excursion,
-     liquidity context, true net breakeven and exchange-reconciled PnL.
+     liquidity context, cost-aware TP ladder and exchange-reconciled PnL.
 
 Exchange routing:
   - Both exchange data managers start concurrently.
@@ -128,7 +128,7 @@ _LOG_LAYER_RULES = (
     ("EXECUTION", "⚙", ("execution", "order_manager", "router")),
     ("RISK", "⚖", ("risk", "risk_manager")),
     ("MARKET-DATA", "📡", ("data_manager", "websocket", "market_aggregator", "exchanges")),
-    ("LIQUIDITY", "💧", ("liquidity_map", "liquidity_pool", "liquidity_trail")),
+    ("LIQUIDITY", "💧", ("liquidity_map", "liquidity_pool", "tp_ladder")),
     ("POSTERIOR", "🧠", ("quant_strategy", "quantitative_models", "expected_utility")),
     ("STRUCTURE", "🏛", ("ict_engine", "direction_engine", "conviction_filter", "market_intelligence")),
     ("RUNTIME", "▶", ("main", "__main__")),
@@ -365,7 +365,7 @@ class QuantBot:
       2. Map live BSL/SSL features and archived sweeps.      → LiquidityMap
       3. Estimate posterior edge, EV and uncertainty.        → QuantPosterior
       4. Validate sizing, liquidation, lots and fills.       → Risk/Execution
-      5. Manage live trade via adaptive exit controller.     → LiquidityTrail
+      5. Manage live trade via fixed SL + TP ladder.       → TPLadder
 
     Public attributes accessed by the Telegram controller:
       .strategy          — QuantStrategy
@@ -604,7 +604,7 @@ class QuantBot:
                 "  2️⃣  LiquidityMap: active BSL/SSL features; swept pools archived\n"
                 "  3️⃣  QuantPosterior: P(edge), EV, uncertainty, SPRT barrier\n"
                 "  4️⃣  Risk/Execution: sizing, liquidation guard, exact fills\n"
-                "  5️⃣  Adaptive Exit: EAE, true net BE, liquidity-aware stops\n"
+                "  5️⃣  Fixed SL + TP ladder: staged liquidity monetisation\n"
                 "\n"
                 "<b>Authority model:</b>\n"
                 "  🧠 QuantPosterior is the master alpha decision\n"
@@ -962,8 +962,11 @@ class QuantBot:
                     self._publish_tick_time()
 
             except KeyboardInterrupt:
-                logger.info("Keyboard interrupt — shutting down")
-                break
+                logger.warning(
+                    "KeyboardInterrupt ignored by Telegram-only shutdown guard; "
+                    "use /stop from Telegram to stop the bot."
+                )
+                continue
             except Exception:
                 logger.exception("❌ Main loop error")
                 time.sleep(1.0)
@@ -1022,12 +1025,9 @@ def main() -> None:
         bot = QuantBot()
 
     if threading.current_thread() is threading.main_thread():
-        def _signal_handler(signum, frame):
-            logger.info(f"Shutdown signal {signum} received")
-            bot.stop()
-            sys.exit(0)
-        signal.signal(signal.SIGINT,  _signal_handler)
-        signal.signal(signal.SIGTERM, _signal_handler)
+        from runtime_shutdown_guard import install_telegram_only_shutdown_guard
+
+        install_telegram_only_shutdown_guard(logger, "single/multi-asset-main")
 
     if not bot.initialize():
         sys.exit(1)
