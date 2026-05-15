@@ -2127,3 +2127,50 @@ def test_active_strategy_exit_management_returns_before_legacy_sl_migration():
     assert "return" in src.split("Do not compute or dispatch any SL migration here.", 1)[1].split("def _detect_structure_change", 1)[0]
 
 # ===== END institutional_final_audit_tests =====
+
+
+def test_tp_ladder_clusters_near_same_pool_and_uses_mtf_effective_liquidity():
+    from strategy.tp_ladder import build_tp_ladder
+
+    report = {
+        "candidates": [
+            {"pool_side": "SSL", "tp_price": 70.40, "pool_price": 70.40, "quality": 0.65, "significance": 2.0, "delivery_prob": 0.72, "selection_ev": 0.40, "timeframe": "1m"},
+            {"pool_side": "SSL", "tp_price": 70.42, "pool_price": 70.42, "quality": 0.82, "significance": 4.5, "delivery_prob": 0.76, "selection_ev": 0.48, "timeframe": "15m"},
+            {"pool_side": "SSL", "tp_price": 69.70, "pool_price": 69.70, "quality": 0.70, "significance": 3.5, "delivery_prob": 0.58, "selection_ev": 0.55, "timeframe": "1h"},
+        ],
+        "selected": {"pool_side": "SSL", "tp_price": 67.42, "pool_price": 67.42, "quality": 0.80, "significance": 5.0, "delivery_prob": 0.12, "selection_ev": 0.77, "timeframe": "4h", "selected": True},
+    }
+    plan = build_tp_ladder(
+        side="short", entry=70.66, sl=71.26, final_tp=67.42, atr=0.34,
+        total_quantity=1.0, pool_report=report, min_leg_fraction=0.01,
+        max_internal_legs=8,
+    )
+    internals = [l for l in plan.legs if l.role != "FINAL"]
+    assert internals, plan.compact()
+    assert any(l.source == "mtf_liquidity_cluster" for l in internals)
+    prices = [l.price for l in internals]
+    assert len(prices) == len(set(round(p, 2) for p in prices))
+    for a, b in zip(prices, prices[1:]):
+        assert abs(a - b) >= 0.30 * 0.34
+    assert internals[0].qty_fraction < 0.90
+    assert plan.final_fraction > 0.0
+
+
+def test_tp_ladder_sparse_path_adds_fib_gap_filler_not_all_nearest():
+    from strategy.tp_ladder import build_tp_ladder
+
+    report = {
+        "candidates": [
+            {"pool_side": "SSL", "tp_price": 70.40, "pool_price": 70.40, "quality": 0.70, "significance": 3.0, "delivery_prob": 0.72, "selection_ev": 0.40, "timeframe": "1m"},
+        ],
+        "selected": {"pool_side": "SSL", "tp_price": 67.42, "pool_price": 67.42, "quality": 0.82, "significance": 5.0, "delivery_prob": 0.12, "selection_ev": 0.77, "timeframe": "4h", "selected": True, "fib_score": 0.75, "fib_confluence": 1.20, "fib_ratio": 1.618},
+    }
+    plan = build_tp_ladder(
+        side="short", entry=70.66, sl=71.26, final_tp=67.42, atr=0.34,
+        total_quantity=1.0, pool_report=report, min_leg_fraction=0.01,
+        max_internal_legs=8,
+    )
+    internals = [l for l in plan.legs if l.role != "FINAL"]
+    assert len(internals) >= 2, plan.compact()
+    assert any(l.source == "fib_fallback_geometry" for l in internals)
+    assert internals[0].qty_fraction < 0.90

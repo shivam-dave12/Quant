@@ -184,20 +184,151 @@ def _candidate_weight(row: Dict[str, Any], path_frac: float) -> float:
     fib_mult = _clamp(_num(row.get("fib_confluence", row.get("fib_multiplier", 1.0)), 1.0), 0.90, 1.32)
     fib_score = _clamp(_num(row.get("fib_score", 0.0), 0.0), 0.0, 1.0)
     gauntlet = max(0, int(_num(row.get("gauntlet_n", 0), 0)))
-    # Closer internal liquidity is monetisation, but not blindly: very tiny
-    # path_frac targets get less size because costs can dominate.
-    proximity = math.exp(-1.35 * max(0.0, path_frac - 0.12))
-    too_near_pen = _clamp(path_frac / 0.10, 0.35, 1.0)
+    # Effective liquidity score: do not blindly overweight the nearest pool.
+    # Institutional monetisation should prefer pools where liquidity quality,
+    # delivery and multi-timeframe confluence are strong enough to pay costs,
+    # while very-near pools are penalised for spread/noise crowding.
+    path_shape = _clamp(0.62 + 0.78 * math.sqrt(max(path_frac, 0.0)) - 0.36 * max(0.0, path_frac - 0.72), 0.35, 1.25)
+    too_near_pen = _clamp((path_frac / 0.14) ** 0.70, 0.22, 1.0)
     gauntlet_pen = 1.0 / (1.0 + 0.22 * gauntlet)
     return max(
         1e-6,
         dp * (0.65 + 0.18 * math.sqrt(sig + 1.0)) * (0.75 + qual)
         * (0.75 + 0.25 * confluence)
         * (0.88 + 0.12 * fib_mult + 0.10 * fib_score)
-        * proximity * too_near_pen
+        * path_shape * too_near_pen
         * gauntlet_pen * (1.0 + 0.10 * min(ev, 3.0)) * (1.0 + 0.18 * ladder_score),
+
     )
 
+
+def _tf_rank(tf: str) -> float:
+    tf = str(tf or "").lower()
+    return {
+        "1m": 1.0, "2m": 1.05, "3m": 1.08, "5m": 1.15,
+        "15m": 1.32, "30m": 1.42, "1h": 1.62,
+        "4h": 1.90, "1d": 2.15,
+        "fib_path": 1.0,
+    }.get(tf, 1.0)
+
+
+def _cluster_effective_liquidity(rows: List[Dict[str, Any]], *, side: str, entry: float,
+                                 final_tp: float, min_spacing: float) -> List[Dict[str, Any]]:
+    """Merge same-zone pools across timeframes into one effective TP level.
+
+    The input rows are already valid same-side pools inside the entry→final path.
+    Clustering prevents TP1/TP2 from being two prices inside the same liquidity
+    pocket, while preserving multi-timeframe information as aggregate weight.
+    """
+    if not rows:
+        return []
+    rows = sorted(rows, key=lambda r: abs(_num(r.get("_ladder_price"), 0.0) - entry))
+    clusters: List[List[Dict[str, Any]]] = []
+    radius = max(float(min_spacing or 0.0), 1e-9)
+    for r in rows:
+        px = _num(r.get("_ladder_price"), 0.0)
+        if px <= 0:
+            continue
+        placed = False
+        for c in clusters:
+            cpx = sum(_num(x.get("_ladder_price"), 0.0) for x in c) / max(len(c), 1)
+            if abs(px - cpx) <= radius:
+                c.append(r); placed = True; break
+        if not placed:
+            clusters.append([r])
+
+    out: List[Dict[str, Any]] = []
+    for cluster in clusters:
+        weights = []
+        for r in cluster:
+            tf = str(r.get("timeframe", "") or "")
+            pf = _clamp(_num(r.get("_ladder_path_frac"), 0.0), 0.0, 1.0)
+            w = max(1e-6, _num(r.get("_ladder_weight"), 1e-6))
+            w *= _tf_rank(tf)
+            # A pool confirmed by a higher timeframe should influence the
+            # effective level, but not turn the first internal TP into an
+            # all-in exit. Path fraction stays part of allocation later.
+            w *= 0.80 + 0.35 * math.sqrt(max(pf, 0.0))
+            weights.append(w)
+        wsum = sum(weights) or 1.0
+        price = sum(_num(r.get("_ladder_price"), 0.0) * w for r, w in zip(cluster, weights)) / wsum
+        path_frac = _path_fraction(side, entry, final_tp, price)
+        base = max(cluster, key=lambda r: _num(r.get("_ladder_weight"), 0.0))
+        c = dict(base)
+        tfs = sorted({str(r.get("timeframe", "") or "?") for r in cluster}, key=_tf_rank)
+        c["_ladder_price"] = price
+        c["tp_price"] = price
+        c["pool_price"] = price
+        c["_ladder_path_frac"] = path_frac
+        c["_ladder_source"] = "mtf_liquidity_cluster"
+        c["timeframe"] = "+".join(tfs)
+        c["cluster_size"] = len(cluster)
+        c["cluster_timeframes"] = "+".join(tfs)
+        c["quality"] = _clamp(sum(_num(r.get("quality"), 0.0) * w for r, w in zip(cluster, weights)) / wsum, 0.0, 1.0)
+        c["significance"] = max(_num(r.get("significance", 0.0), 0.0) for r in cluster) + math.log1p(len(cluster))
+        c["delivery_prob"] = _clamp(sum(_num(r.get("delivery_prob", r.get("sweep_prob", 0.0)), 0.0) * w for r, w in zip(cluster, weights)) / wsum, 0.01, 0.97)
+        c["selection_ev"] = max(_num(r.get("selection_ev", r.get("ev", 0.0)), 0.0) for r in cluster)
+        c["fib_confluence"] = max(_num(r.get("fib_confluence", r.get("fib_multiplier", 1.0)), 1.0) for r in cluster)
+        c["fib_score"] = max(_num(r.get("fib_score", 0.0), 0.0) for r in cluster)
+        c["reason"] = f"MTF effective liquidity cluster: {len(cluster)} pools across {c['cluster_timeframes']}"
+        c["_ladder_weight"] = _candidate_weight(c, path_frac) * (1.0 + 0.10 * math.log1p(len(cluster)))
+        out.append(c)
+    out.sort(key=lambda x: abs(_num(x.get("_ladder_price"), 0.0) - entry))
+    return out
+
+
+def _add_fib_gap_fillers(*, side: str, entry: float, sl: float, final_tp: float,
+                         atr: float, existing: List[Dict[str, Any]], max_internal_legs: int,
+                         min_spacing: float, sponsorship: float,
+                         final_fib_score: float, final_fib_mult: float,
+                         final_dist_atr: float) -> List[Dict[str, Any]]:
+    """Add Fibonacci monetisation only where the liquidity path is sparse.
+
+    This is not a target generator. It fills delivery gaps between MTF liquidity
+    clusters so a single nearest cluster cannot consume most of the position.
+    """
+    capacity = max(0, int(max_internal_legs or 0) - len(existing))
+    if capacity <= 0 or final_dist_atr < 2.10:
+        return existing
+    current = list(existing)
+    points = [0.0] + [_clamp(_num(c.get("_ladder_path_frac"), 0.0), 0.0, 1.0) for c in current] + [1.0]
+    points = sorted(points)
+    # Add ratios that sit in the largest uncovered path gaps first.
+    candidate_ratios = list(_FIB_FALLBACK_PATH_RATIOS)
+    candidate_ratios += [0.236, 0.707, 0.886]
+    ranked = []
+    for ratio in candidate_ratios:
+        if ratio <= 0.0 or ratio >= 1.0:
+            continue
+        if any(abs(ratio - p) < 0.08 for p in points):
+            continue
+        left = max([p for p in points if p < ratio] or [0.0])
+        right = min([p for p in points if p > ratio] or [1.0])
+        gap = right - left
+        if gap <= 0.18:
+            continue
+        ranked.append((gap, ratio))
+    ranked.sort(reverse=True)
+    for _, ratio in ranked:
+        if capacity <= 0:
+            break
+        fibs = _fib_fallback_internals(
+            side=side, entry=entry, sl=sl, final_tp=final_tp, atr=atr,
+            max_internal_legs=1, min_spacing=min_spacing, sponsorship=sponsorship,
+            final_fib_score=final_fib_score, final_fib_mult=final_fib_mult,
+            final_dist_atr=final_dist_atr,
+            ratios=(ratio,),
+        )
+        if not fibs:
+            continue
+        f = fibs[0]
+        px = _num(f.get("_ladder_price"), 0.0)
+        if any(abs(px - _num(c.get("_ladder_price"), 0.0)) < min_spacing for c in current):
+            continue
+        current.append(f); capacity -= 1
+        points.append(ratio); points.sort()
+    current.sort(key=lambda x: abs(_num(x.get("_ladder_price"), 0.0) - entry))
+    return current
 
 
 # Fibonacci fallback ratios are used only when no internal liquidity exists
@@ -216,7 +347,8 @@ def _fib_fallback_internals(*, side: str, entry: float, sl: float, final_tp: flo
                             atr: float, max_internal_legs: int,
                             min_spacing: float, sponsorship: float,
                             final_fib_score: float, final_fib_mult: float,
-                            final_dist_atr: float) -> List[Dict[str, Any]]:
+                            final_dist_atr: float,
+                            ratios: Iterable[float] = _FIB_FALLBACK_PATH_RATIOS) -> List[Dict[str, Any]]:
     """Create Fibonacci path-monetisation legs when internal liquidity is absent.
 
     This is deliberately conservative: the final TP must already be validated by
@@ -239,7 +371,7 @@ def _fib_fallback_internals(*, side: str, entry: float, sl: float, final_tp: flo
     max_legs = max(0, int(max_internal_legs or 0))
     fib_quality = _clamp(0.55 * _clamp(final_fib_score, 0.0, 1.0) + 0.45 * ((final_fib_mult - 0.90) / 0.42), 0.0, 1.0)
     sponsor = _clamp(sponsorship, -1.0, 1.0)
-    for ratio in _FIB_FALLBACK_PATH_RATIOS:
+    for ratio in ratios:
         if len(out) >= max_legs:
             break
         px = _fib_path_price(side, entry, final_tp, ratio)
@@ -430,6 +562,37 @@ def _enforce_lifecycle_solvency(*, internals: List[Dict[str, Any]], fracs: List[
                 fracs[i] = max(0.0, fracs[i] - take)
         for i in range(checkpoint):
             fracs[i] += move * prefix_weights[i] / psum
+    # Prevent one nearest zone from swallowing the ladder when multiple
+    # effective path zones exist. The cap is not a fixed TP percentage: it is
+    # derived from the number of zones, path proof, RR and sponsorship. Excess
+    # is redistributed to later liquidity/fib zones before it becomes runner.
+    if len(fracs) > 1 and sum(fracs) > 0:
+        sponsor = _clamp(_num(internals[0].get("_ladder_sponsorship", 0.0), 0.0), -1.0, 1.0)
+        for i in range(len(fracs) - 1):
+            path_i = _clamp(_num(internals[i].get("_ladder_path_frac"), 0.0), 0.0, 1.0)
+            avg_remaining_depth = max(1, len(fracs) - i)
+            rr_i = max(0.0, rewards_r[i] if i < len(rewards_r) else 0.0)
+            earned_cap = _clamp(
+                (1.0 / math.sqrt(avg_remaining_depth + 0.65))
+                * (0.78 + 0.22 * math.sqrt(max(path_i, 0.02)))
+                * (0.86 + 0.12 * min(rr_i, 2.5))
+                * (1.0 + 0.10 * max(0.0, -sponsor)),
+                min_leg_fraction,
+                0.72,
+            )
+            if fracs[i] > earned_cap:
+                excess = fracs[i] - earned_cap
+                fracs[i] = earned_cap
+                tail_weights = []
+                for j in range(i + 1, len(fracs)):
+                    tail_weights.append(max(1e-6, _num(internals[j].get("_ladder_weight", 1e-6), 1e-6)) * (1.0 + _num(internals[j].get("_ladder_path_frac", 0.0), 0.0)))
+                tsum = sum(tail_weights)
+                if tsum > 0:
+                    for off, j in enumerate(range(i + 1, len(fracs))):
+                        fracs[j] += excess * tail_weights[off] / tsum
+                else:
+                    final_fraction += excess
+
     for i, f in enumerate(list(fracs)):
         if 0 < f < min_leg_fraction and i >= checkpoint:
             final_fraction += f
@@ -501,8 +664,7 @@ def build_tp_ladder(
         if isinstance(sel, dict):
             rows.append(sel)
 
-    internals: List[Dict[str, Any]] = []
-    seen_prices: List[float] = []
+    raw_internals: List[Dict[str, Any]] = []
     min_spacing = max(min_spacing_atr * atr, 1e-9)
     for r in rows:
         if not _correct_pool_side(side, str(r.get("pool_side", ""))):
@@ -510,46 +672,57 @@ def build_tp_ladder(
         px = _num(r.get("tp_price") or r.get("pool_price"), 0.0)
         if px <= 0 or not _in_path(side, entry, final_tp, px):
             continue
-        # Do not duplicate the final TP as internal.
         if abs(px - final_tp) <= max(0.25 * atr, 1e-9):
             continue
-        # Skip micro-targets inside cost/noise zone.
         if abs(px - entry) < max(0.45 * atr, 1e-9):
-            continue
-        if any(abs(px - p) < min_spacing for p in seen_prices):
             continue
         rr = abs(px - entry) / max(abs(entry - sl), 1e-9)
         if rr < 0.35:
             continue
-        rr_req = _num(r.get("required_rr", 0.0), 0.0)
-        # Eligible rows are preferable, but rejected rows can still become small
-        # monetisation targets if they are closer than the final and not invalid
-        # because of side/status. This is intentional: internal TP != full TP.
         reason = str(r.get("reason", "") or "")
         if "wrong side" in reason.lower() or "swept" in reason.lower():
             continue
-        rr *= (1.0 - 0.08 * max(0.0, rr_req - rr))
-        rr = max(rr, 0.0)
         rr_path = _path_fraction(side, entry, final_tp, px)
-        rr_weight = _candidate_weight(r, rr_path)
         c = dict(r)
         c["_ladder_price"] = px
         c["_ladder_path_frac"] = rr_path
-        c["_ladder_weight"] = rr_weight
-        internals.append(c)
-        seen_prices.append(px)
-
-    reverse = side == "short"  # short targets descend; sort by distance from entry ascending
-    internals.sort(key=lambda x: abs(_num(x.get("_ladder_price"), 0.0) - entry))
-    if max_internal_legs > 0 and len(internals) > max_internal_legs:
-        internals = internals[:max_internal_legs]
-        plan.regime_notes.append(f"internal targets capped by executable lot capacity at {max_internal_legs}")
+        c["_ladder_weight"] = _candidate_weight(c, rr_path)
+        raw_internals.append(c)
 
     selected_rows = [r for r in rows if r.get("selected") is True]
     final_rows = selected_rows or [r for r in rows if abs(_num(r.get("tp_price") or r.get("pool_price"), 0.0) - final_tp) <= max(0.35 * atr, 1e-9)]
     final_fib_score = max([_clamp(_num(r.get("fib_score", 0.0), 0.0), 0.0, 1.0) for r in final_rows] or [0.0])
     final_fib_mult = max([_clamp(_num(r.get("fib_confluence", r.get("fib_multiplier", 1.0)), 1.0), 0.90, 1.32) for r in final_rows] or [1.0])
     final_fib_ratio = max([_num(r.get("fib_ratio", 0.0), 0.0) for r in final_rows] or [0.0])
+
+    internals = _cluster_effective_liquidity(
+        raw_internals,
+        side=side,
+        entry=entry,
+        final_tp=final_tp,
+        min_spacing=min_spacing,
+    )
+    if internals:
+        plan.regime_notes.append(f"MTF liquidity clustering: {len(raw_internals)} raw pools → {len(internals)} effective zones")
+        internals = _add_fib_gap_fillers(
+            side=side,
+            entry=entry,
+            sl=sl,
+            final_tp=final_tp,
+            atr=atr,
+            existing=internals,
+            max_internal_legs=max_internal_legs,
+            min_spacing=min_spacing,
+            sponsorship=sponsorship,
+            final_fib_score=final_fib_score,
+            final_fib_mult=final_fib_mult,
+            final_dist_atr=final_dist_atr,
+        )
+        if len(internals) > len(_cluster_effective_liquidity(raw_internals, side=side, entry=entry, final_tp=final_tp, min_spacing=min_spacing)):
+            plan.regime_notes.append("sparse path: Fibonacci gap-fillers added between liquidity zones")
+        if max_internal_legs > 0 and len(internals) > max_internal_legs:
+            internals = internals[:max_internal_legs]
+            plan.regime_notes.append(f"internal targets capped by executable lot capacity at {max_internal_legs}")
 
     # If no valid internal liquidity exists, build Fibonacci path-monetisation
     # legs only when the final TP is already validated and exchange lot capacity
@@ -594,6 +767,9 @@ def build_tp_ladder(
                 reason=reason,
             )]
             return plan
+
+    for _c in internals:
+        _c["_ladder_sponsorship"] = sponsorship
 
     runner_model = _runner_fraction_model(
         final_dist_atr=final_dist_atr,
@@ -697,6 +873,8 @@ def build_tp_ladder(
         _rr = [float(getattr(l, "rr", 0.0) or 0.0) for l in legs if str(getattr(l, "role", "")).upper() != "FINAL"]
         if plan.solvency_checkpoint_index > 0:
             plan.worst_case_after_checkpoint_r = _prefix_solvency_r(_fr, _rr, min(plan.solvency_checkpoint_index, len(_fr)))
+            if abs(plan.worst_case_after_checkpoint_r - plan.solvency_floor_r) <= 1e-8:
+                plan.worst_case_after_checkpoint_r = plan.solvency_floor_r
         plan.expected_internal_profit_r = sum(
             float(getattr(l, "qty_fraction", 0.0) or 0.0)
             * float(getattr(l, "rr", 0.0) or 0.0)

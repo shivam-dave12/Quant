@@ -2459,12 +2459,18 @@ class PositionState:
     tp_ladder_order_ids: List[str] = field(default_factory=list)
     tp_ladder_active: bool = False
     tp_ladder_last_sync_qty: float = 0.0
+    tp_ladder_initial_qty: float = 0.0
+    tp_ladder_realized_pnl: float = 0.0
+    tp_ladder_realized_gross: float = 0.0
+    tp_ladder_realized_fees: float = 0.0
+    tp_ladder_recorded_order_ids: List[str] = field(default_factory=list)
     entry_order_id: Optional[str] = None; entry_time: float = 0.0
     initial_risk: float = 0.0; initial_sl_dist: float = 0.0
     trail_active: bool = False; last_trail_time: float = 0.0
     entry_signal: Optional[SignalBreakdown] = None
     peak_profit: float = 0.0; entry_atr: float = 0.0; entry_vol: float = 0.0
     peak_price_abs: float = 0.0  # actual peak price hit (highest for long, lowest for short)
+    last_seen_price: float = 0.0
     trade_mode: str = "reversion"  # "reversion" | "trend" | "momentum"
     entry_fill_type: str = "taker"  # v4.3: "maker" | "taker" — for correct PnL fee calc
     entry_fee_paid: float = 0.0    # v8.1: exact paid_commission from Delta entry order (0 = use estimate)
@@ -2509,7 +2515,8 @@ class PositionState:
                 "entry_price": self.entry_price,
                 "sl_price": self.sl_price, "tp_price": self.tp_price,
                 "tp_ladder": list(self.tp_ladder or []),
-                "tp_ladder_active": bool(self.tp_ladder_active)}
+                "tp_ladder_active": bool(self.tp_ladder_active),
+                "tp_ladder_realized_pnl": float(self.tp_ladder_realized_pnl or 0.0)}
 
 # ═══════════════════════════════════════════════════════════════
 # DAILY RISK GATE with consecutive loss lockout
@@ -6124,6 +6131,100 @@ class QuantStrategy:
             except Exception as _e:
                 logger.warning("TP_LADDER cancel error %s: %s", str(oid)[:10], _e)
 
+    def _compute_leg_net_pnl(self, pos, exit_price: float, qty: float,
+                             exit_fee: float = 0.0) -> tuple:
+        """Return (net, gross, entry_fee_alloc, exit_fee) for a partial exit."""
+        try:
+            import config as _cfg_x
+            _is_delta_btc = (
+                getattr(_cfg_x, "EXECUTION_EXCHANGE", "").lower() == "delta"
+                and str(getattr(_cfg_x, "DELTA_SYMBOL", "BTCUSD")).upper() == "BTCUSD"
+            )
+            gross = gross_pnl_usd(
+                pos.side,
+                float(pos.entry_price or 0.0),
+                float(exit_price or 0.0),
+                float(qty or 0.0),
+                inverse=bool(_is_delta_btc and exit_price > 0),
+            )
+            initial_qty = float(getattr(pos, "tp_ladder_initial_qty", 0.0) or getattr(pos, "quantity", 0.0) or 0.0)
+            entry_fee_total = float(getattr(pos, "entry_fee_paid", 0.0) or 0.0)
+            entry_fee_alloc = entry_fee_total * (float(qty or 0.0) / max(initial_qty, 1e-9)) if entry_fee_total else 0.0
+            net = gross - entry_fee_alloc - float(exit_fee or 0.0)
+            return net, gross, entry_fee_alloc, float(exit_fee or 0.0)
+        except Exception:
+            gross = ((float(exit_price or 0.0) - pos.entry_price) if pos.side == "long" else (pos.entry_price - float(exit_price or 0.0))) * float(qty or 0.0)
+            return gross - float(exit_fee or 0.0), gross, 0.0, float(exit_fee or 0.0)
+
+    def _book_tp_ladder_partials(self, order_manager, closed_qty: float) -> None:
+        """Book realised PnL for internal TP ladder fills.
+
+        Delta reduce-only TP legs are separate orders from the native bracket.
+        If we only shrink local position size, lifecycle PnL later ignores TP1..TPn.
+        This method records each filled internal leg exactly where possible;
+        if order state propagation is late, it uses the planned reduce-only TP
+        price rather than poisoning the trade ledger with a zero-PnL fallback.
+        """
+        pos = self._pos
+        if closed_qty <= 0 or not getattr(pos, "tp_ladder", None):
+            return
+        recorded = set(str(x) for x in (getattr(pos, "tp_ladder_recorded_order_ids", []) or []))
+        remaining_to_match = float(closed_qty or 0.0)
+        booked_any = False
+        for leg in list(getattr(pos, "tp_ladder", []) or []):
+            try:
+                role = str(leg.get("role", "") or "").upper()
+                if role == "FINAL":
+                    continue
+                oid = str(leg.get("order_id", "") or "").strip()
+                if oid and oid in recorded:
+                    continue
+                planned_qty = float(leg.get("quantity", 0.0) or 0.0)
+                planned_px = float(leg.get("price", 0.0) or 0.0)
+                if planned_qty <= 0 or planned_px <= 0:
+                    continue
+                fill_px = 0.0; fill_qty = 0.0; fee_paid = 0.0; confirmed = False
+                if oid and order_manager is not None and hasattr(order_manager, "get_fill_details"):
+                    try:
+                        details = order_manager.get_fill_details(oid) or {}
+                        status = str(details.get("status", "") or "").upper()
+                        fill_px = float(details.get("fill_price", 0.0) or 0.0)
+                        fill_qty = float(details.get("filled_qty", 0.0) or 0.0)
+                        fee_paid = float(details.get("paid_commission", 0.0) or 0.0)
+                        confirmed = status in ("FILLED", "CLOSED", "PARTIAL_FILL") and fill_px > 0 and fill_qty > 0
+                    except Exception as _fd_e:
+                        logger.debug("TP_LADDER fill detail lookup failed for %s: %s", oid[:10], _fd_e)
+                if not confirmed:
+                    # We observed exchange position size fall. If exact leg fill
+                    # is not yet visible, allocate the observed closed quantity
+                    # to the next unrecorded planned TP leg at its planned price.
+                    fill_px = planned_px
+                    fill_qty = min(planned_qty, remaining_to_match if remaining_to_match > 0 else planned_qty)
+                    fee_paid = 0.0
+                if fill_qty <= 0:
+                    continue
+                net, gross, entry_fee_alloc, exit_fee = self._compute_leg_net_pnl(pos, fill_px, fill_qty, fee_paid)
+                with self._lock:
+                    pos.tp_ladder_realized_pnl += net
+                    pos.tp_ladder_realized_gross += gross
+                    pos.tp_ladder_realized_fees += (entry_fee_alloc + exit_fee)
+                    if oid:
+                        pos.tp_ladder_recorded_order_ids.append(oid)
+                        recorded.add(oid)
+                booked_any = True
+                remaining_to_match = max(0.0, remaining_to_match - fill_qty)
+                logger.info(
+                    "🎯 TP_LADDER realised %s qty=%.8g fill=$%.2f gross=%+.4f fees=%.4f net=%+.4f cumulative_net=%+.4f%s",
+                    role or "TP", fill_qty, fill_px, gross, entry_fee_alloc + exit_fee, net,
+                    float(getattr(pos, "tp_ladder_realized_pnl", 0.0) or 0.0),
+                    " exact" if confirmed else " estimated-from-planned-leg")
+                if remaining_to_match <= max(QCfg.MIN_QTY() * 0.25, 1e-12):
+                    break
+            except Exception as _e:
+                logger.debug("TP_LADDER partial booking leg error: %s", _e)
+        if not booked_any:
+            logger.warning("TP_LADDER partial quantity changed but no internal TP leg could be booked; closed_qty=%.8g", closed_qty)
+
     def _reconcile_tp_ladder_quantity(self, order_manager, ex_size: float) -> None:
         """
         After TP1/TP2 fills, exchange position size drops while SL price must stay
@@ -6140,6 +6241,7 @@ class QuantStrategy:
             min_delta = max(QCfg.MIN_QTY(), old_qty * 0.005)
             if new_qty < old_qty - min_delta:
                 closed = old_qty - new_qty
+                self._book_tp_ladder_partials(order_manager, closed)
                 with self._lock:
                     self._pos.quantity = new_qty
                     self._pos.tp_ladder_last_sync_qty = new_qty
@@ -6794,6 +6896,8 @@ class QuantStrategy:
             tp_ladder_order_ids = tp_ladder_order_ids,
             tp_ladder_active = bool(tp_ladder_order_ids),
             tp_ladder_last_sync_qty = qty,
+            tp_ladder_initial_qty = qty,
+            last_seen_price = fill_price,
         )
         # ── Reconcile safety: discard any in-flight reconcile data ────────────────
         self._reconcile_data        = None
@@ -7013,6 +7117,8 @@ class QuantStrategy:
         profit = (price - pos.entry_price) if pos.side == "long" else (pos.entry_price - price)
         new_extreme = False
         with self._lock:
+            if price > 0:
+                pos.last_seen_price = price
             if profit > pos.peak_profit + 1e-9:
                 pos.peak_profit = profit
                 new_extreme = True
@@ -7820,22 +7926,28 @@ class QuantStrategy:
         exit_fee  = fee_paid
         _exit_tag = "exact" if exit_fee_is_exact else "rate-est"
 
-        pnl = gross - entry_fee - exit_fee
+        residual_pnl = gross - entry_fee - exit_fee
+        ladder_pnl = float(getattr(pos, 'tp_ladder_realized_pnl', 0.0) or 0.0)
+        ladder_gross = float(getattr(pos, 'tp_ladder_realized_gross', 0.0) or 0.0)
+        ladder_fees = float(getattr(pos, 'tp_ladder_realized_fees', 0.0) or 0.0)
+        pnl = residual_pnl + ladder_pnl
 
         _entry_tag = "exact" if entry_fee_is_exact else "rate-est"
         fee_breakdown: Dict = {
-            "gross_pnl":  round(gross, 4),
+            "gross_pnl":  round(gross + ladder_gross, 4),
             "entry_fee":  round(entry_fee, 4),
             "exit_fee":   round(exit_fee, 4),
-            "total_fees": round(entry_fee + exit_fee, 4),
+            "total_fees": round(entry_fee + exit_fee + ladder_fees, 4),
             "exact_fees": entry_fee_is_exact and exit_fee_is_exact,
+            "residual_pnl": round(residual_pnl, 4),
+            "tp_ladder_realized_pnl": round(ladder_pnl, 4),
         }
 
         logger.info(
             f"📊 Exit price=${fill_price:,.2f} reason={exit_reason} "
-            f"entry=${pos.entry_price:,.2f} gross=${gross:+.4f} "
+            f"entry=${pos.entry_price:,.2f} residual_gross=${gross:+.4f} "
             f"entry_fee=${entry_fee:.4f}({_entry_tag}) exit_fee=${exit_fee:.4f}({_exit_tag}) "
-            f"net=${pnl:+.4f}"
+            f"ladder_net=${ladder_pnl:+.4f} lifecycle_net=${pnl:+.4f}"
         )
 
         # ─── Step 3: Record PnL and trade history ─────────────────────────────
@@ -9397,7 +9509,9 @@ class QuantStrategy:
             self._pos = PositionState(phase=PositionPhase.ACTIVE, side=iside, quantity=ex_size,
                 entry_price=ex_entry, sl_price=sl_p, tp_price=tp_p, sl_order_id=sl_oid,
                 tp_order_id=tp_oid, entry_time=time.time(), initial_sl_dist=_adopt_sl_dist,
-                entry_atr=_adopt_atr, entry_session=self._current_entry_session())
+                entry_atr=_adopt_atr, entry_session=self._current_entry_session(),
+                tp_ladder_initial_qty=ex_size, tp_ladder_last_sync_qty=ex_size,
+                last_seen_price=ex_entry)
             self.current_sl_price=sl_p; self.current_tp_price=tp_p
             self._confirm_long=self._confirm_short=0
             # Reset duplicate guards for the newly adopted position
@@ -9434,6 +9548,7 @@ class QuantStrategy:
                         self._pos.tp_ladder_order_ids = list(_ladder_ids or [])
                         self._pos.tp_ladder_active = bool(_ladder_ids)
                         self._pos.tp_ladder_last_sync_qty = ex_size
+                        self._pos.tp_ladder_initial_qty = ex_size
                         if _ladder_ids:
                             logger.info(
                                 "✅ TP_LADDER adoption repair placed %d internal reduce-only legs; fixed SL remains $%.2f",
