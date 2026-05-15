@@ -471,11 +471,27 @@ def _runner_fraction_model(*, final_dist_atr: float, final_rr: float, sponsorshi
     path_strength = _clamp(0.30 * coverage + 0.24 * density + 0.22 * quality + 0.14 * early_quality + 0.10 * fib_quality, 0.0, 1.0)
     sponsor = _clamp(float(sponsorship or 0.0), -1.0, 1.0)
     raw = 0.08 + 0.40 * path_strength + 0.10 * rr_saturation - 0.25 * distance_penalty + 0.14 * max(0.0, sponsor) - 0.12 * max(0.0, -sponsor) + 0.10 * fib_quality
-    min_runner = _clamp(0.025 + 0.035 * max(0.0, sponsor) + 0.035 * fib_quality, 0.02, 0.18)
-    max_runner = _clamp(0.26 + 0.30 * path_strength + 0.10 * max(0.0, sponsor) + 0.10 * fib_quality, 0.22, 0.78)
+    # The final TP is a real thesis leg, not a dust remainder.  The reserve is
+    # earned from terminal-path information: path strength, Fib/geometry support,
+    # R:R saturation, and sponsorship.  Negative sponsorship lowers the raw
+    # runner, but it must not collapse the final leg to dust if the strategy has
+    # selected a far terminal liquidity objective; otherwise the ladder becomes
+    # a scalp disguised as a runner.
+    terminal_information = _clamp(
+        0.36 * path_strength
+        + 0.24 * fib_quality
+        + 0.18 * rr_saturation
+        + 0.14 * (1.0 - distance_penalty)
+        + 0.12 * max(0.0, sponsor)
+        - 0.08 * max(0.0, -sponsor),
+        0.0, 1.0,
+    )
+    min_runner = _clamp(0.06 + 0.28 * terminal_information, 0.055, 0.38)
+    max_runner = _clamp(0.30 + 0.28 * path_strength + 0.10 * max(0.0, sponsor) + 0.10 * fib_quality, 0.24, 0.80)
     final_fraction = _clamp(raw, min_runner, max_runner)
     return {
         "final_fraction": final_fraction,
+        "terminal_information": terminal_information,
         "path_strength": path_strength,
         "coverage": coverage,
         "density": density,
@@ -524,11 +540,12 @@ def _select_solvency_checkpoint(internals: List[Dict[str, Any]], rewards_r: List
     return len(internals)
 
 
-def _enforce_lifecycle_solvency(*, internals: List[Dict[str, Any]], fracs: List[float], final_fraction: float, rewards_r: List[float], min_leg_fraction: float, floor_r: float) -> tuple[List[float], float, int, float, float]:
+def _enforce_lifecycle_solvency(*, internals: List[Dict[str, Any]], fracs: List[float], final_fraction: float, rewards_r: List[float], min_leg_fraction: float, floor_r: float, min_final_fraction: float = 0.0) -> tuple[List[float], float, int, float, float]:
     """Front-load enough internal liquidity so TP checkpoint + original SL remains solvent."""
     if not internals:
         return fracs, final_fraction, 0, 0.0, 0.0
-    final_fraction = _clamp(final_fraction, 0.0, 1.0)
+    min_final_fraction = _clamp(float(min_final_fraction or 0.0), 0.0, 0.95)
+    final_fraction = _clamp(final_fraction, min_final_fraction, 1.0)
     internal_budget = _clamp(1.0 - final_fraction, 0.0, 1.0)
     checkpoint = _select_solvency_checkpoint(
         internals,
@@ -548,7 +565,7 @@ def _enforce_lifecycle_solvency(*, internals: List[Dict[str, Any]], fracs: List[
         psum = sum(prefix_weights) or 1.0
         avg_eff = sum((prefix_weights[i] / psum) * (1.0 + rewards_r[i]) for i in range(checkpoint))
         need = max(0.0, (floor_r - solv) / max(avg_eff, 1e-9))
-        move = min(need, max(0.0, final_fraction - 0.02))
+        move = min(need, max(0.0, final_fraction - min_final_fraction))
         if move > 1e-9:
             final_fraction -= move
         else:
@@ -578,7 +595,7 @@ def _enforce_lifecycle_solvency(*, internals: List[Dict[str, Any]], fracs: List[
                 * (0.86 + 0.12 * min(rr_i, 2.5))
                 * (1.0 + 0.10 * max(0.0, -sponsor)),
                 min_leg_fraction,
-                0.72,
+                0.58,
             )
             if fracs[i] > earned_cap:
                 excess = fracs[i] - earned_cap
@@ -609,7 +626,15 @@ def _enforce_lifecycle_solvency(*, internals: List[Dict[str, Any]], fracs: List[
         for i in range(len(fracs))
     )
     residual_domination = _clamp(final_fraction, 0.0, 1.0) / max(expected_internal, 1e-9)
-    return fracs, _clamp(final_fraction, 0.0, 1.0), checkpoint, worst, residual_domination
+    if final_fraction < min_final_fraction:
+        deficit = min_final_fraction - final_fraction
+        available = sum(max(0.0, f) for f in fracs)
+        if available > 1e-12:
+            for i in range(len(fracs)):
+                take = deficit * max(0.0, fracs[i]) / available
+                fracs[i] = max(0.0, fracs[i] - take)
+            final_fraction = min_final_fraction
+    return fracs, _clamp(final_fraction, min_final_fraction, 1.0), checkpoint, worst, residual_domination
 
 
 def build_tp_ladder(
@@ -779,7 +804,21 @@ def build_tp_ladder(
         final_fib_score=final_fib_score,
         final_fib_mult=final_fib_mult,
     )
-    final_fraction = _clamp(_num(runner_model.get("final_fraction"), 1.0), 0.0, 1.0)
+    terminal_information = _clamp(_num(runner_model.get("terminal_information", 0.0), 0.0), 0.0, 1.0)
+    # Final runner must be executable and meaningful.  The floor is derived
+    # from lot capacity plus terminal information; it is not a fixed TP split.
+    _reserve_frac = _clamp(0.06 + 0.22 * terminal_information, 0.055, 0.42)
+    if min_leg_fraction > 0:
+        _lot_qty = max(min_leg_fraction * total_quantity, 1e-9)
+        _target_final_qty = max(_lot_qty, total_quantity * _reserve_frac)
+        min_final_fraction = _clamp(
+            math.ceil(_target_final_qty / _lot_qty) * _lot_qty / max(total_quantity, 1e-9),
+            min_leg_fraction,
+            0.42,
+        )
+    else:
+        min_final_fraction = _reserve_frac
+    final_fraction = _clamp(_num(runner_model.get("final_fraction"), 1.0), min_final_fraction, 1.0)
     internal_budget = _clamp(1.0 - final_fraction, 0.0, 0.96)
     raw_fracs = _weighted_allocate(internals, internal_budget)
     rewards_r = [abs(_num(c.get("_ladder_price"), entry) - entry) / max(abs(entry - sl), 1e-9) for c in internals]
@@ -791,6 +830,7 @@ def build_tp_ladder(
         rewards_r=rewards_r,
         min_leg_fraction=min_leg_fraction,
         floor_r=solvency_floor_r,
+        min_final_fraction=min_final_fraction,
     )
 
     merged_internal: List[tuple[Dict[str, Any], float]] = []
@@ -847,6 +887,14 @@ def build_tp_ladder(
         idx += 1
 
     final_fraction = _clamp(1.0 - sum(l.qty_fraction for l in legs), 0.0, 1.0)
+    if final_fraction < min_final_fraction and legs:
+        deficit = min_final_fraction - final_fraction
+        internal_sum = sum(max(0.0, l.qty_fraction) for l in legs)
+        if internal_sum > 1e-12:
+            for l in legs:
+                l.qty_fraction = max(0.0, l.qty_fraction - deficit * max(0.0, l.qty_fraction) / internal_sum)
+                l.quantity = total_quantity * l.qty_fraction
+            final_fraction = min_final_fraction
     legs.append(TPLadderLeg(
         index=idx,
         role="FINAL",
@@ -886,6 +934,8 @@ def build_tp_ladder(
         plan.worst_case_after_checkpoint_r = float(worst_r or 0.0)
         plan.residual_domination = float(residual_dom or 0.0)
     plan.final_runner_model = dict(runner_model)
+    if min_final_fraction > 0:
+        plan.regime_notes.append(f"terminal-runner reserve {min_final_fraction:.0%}: final TP kept executable after path monetisation")
     if sponsorship > 0.15:
         plan.regime_notes.append(f"cross-asset sponsorship +{sponsorship:.2f}: runner earned by sponsorship")
     elif sponsorship < -0.05:

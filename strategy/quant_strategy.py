@@ -6035,7 +6035,20 @@ class QuantStrategy:
             _qty = max(float(quantity or 0.0), 0.0)
             _min_qty = max(float(QCfg.MIN_QTY() or 0.0), 0.0)
             _min_leg_fraction = (_min_qty / _qty) if (_qty > 0 and _min_qty > 0) else 0.0
-            _max_internal_legs = max(0, int(_qty // _min_qty) - 1) if (_qty > 0 and _min_qty > 0) else 0
+
+            # Internal TP count is not a fixed setting.  It is constrained by
+            # (a) executable lot capacity and (b) information capacity of the
+            # entry→final path.  A 7–8ATR objective does not justify ten tiny
+            # orders if the path contains only a few independent auction zones.
+            _lot_capacity = max(0, int(_qty // _min_qty) - 1) if (_qty > 0 and _min_qty > 0) else 0
+            _final_dist_atr = abs(float(final_tp) - float(entry_price)) / max(float(atr or 0.0), 1e-9)
+            _risk_atr = abs(float(entry_price) - float(sl_price)) / max(float(atr or 0.0), 1e-9)
+            _rr = abs(float(final_tp) - float(entry_price)) / max(abs(float(entry_price) - float(sl_price)), 1e-9)
+            _path_information = max(0.0, _final_dist_atr) * (0.70 + 0.30 * min(1.0, _rr / 4.0))
+            _info_capacity = max(1, int(math.ceil(math.sqrt(max(_path_information, 1.0))))) if _final_dist_atr >= 1.25 else 0
+            _max_internal_legs = min(_lot_capacity, _info_capacity) if _lot_capacity > 0 else _info_capacity
+            _target_spacing_atr = (_final_dist_atr / max(_max_internal_legs + 1, 1)) if _max_internal_legs > 0 else _final_dist_atr
+            _min_spacing_atr = _clamp(max(0.35, 0.58 * _target_spacing_atr, 0.55 * _risk_atr), 0.35, 1.35)
             plan = build_tp_ladder(
                 side=side,
                 entry=float(entry_price),
@@ -6048,6 +6061,7 @@ class QuantStrategy:
                 cross_asset_state=getattr(self, "_cross_asset_state", None),
                 asset_id=str(getattr(getattr(self, "_instrument", None), "asset_id", "") or ""),
                 min_leg_fraction=_min_leg_fraction,
+                min_spacing_atr=_min_spacing_atr,
                 max_internal_legs=_max_internal_legs,
             )
             if plan is not None and getattr(plan, "legs", None):
@@ -6059,6 +6073,102 @@ class QuantStrategy:
         except Exception as _e:
             logger.error("TP ladder build failed — falling back to final TP only: %s", _e, exc_info=True)
             return None
+
+    def _floor_to_step(self, qty: float, step: float) -> float:
+        try:
+            qty = float(qty or 0.0)
+            step = float(step or 0.0)
+            if qty <= 0:
+                return 0.0
+            if step <= 0:
+                return qty
+            return math.floor((qty + 1e-12) / step) * step
+        except Exception:
+            return 0.0
+
+    def _prepare_executable_tp_ladder_legs(self, internal_legs, total_qty: float, ladder_plan=None):
+        """Quantise internal TP quantities before placing exchange orders.
+
+        This prevents the exchange/UI from rounding each tiny fractional leg up
+        until all lots are offloaded before the selected final TP.  The final
+        runner reserve is respected first; only the remaining executable lot
+        budget is distributed across internal legs by their planned weights.
+        """
+        total_qty = max(float(total_qty or 0.0), 0.0)
+        if total_qty <= 0 or not internal_legs:
+            return []
+        step = max(float(QCfg.LOT_STEP() or 0.0), 0.0)
+        min_qty = max(float(QCfg.MIN_QTY() or 0.0), step, 0.0)
+        if step <= 0:
+            step = min_qty if min_qty > 0 else 0.0
+        # Use the actual final leg in the plan as the final-runner reserve.  If
+        # it is below executable size, reserve at least one executable lot.
+        final_qty_planned = 0.0
+        try:
+            for l in getattr(ladder_plan, "legs", []) or []:
+                if str(getattr(l, "role", "")).upper() == "FINAL":
+                    final_qty_planned = max(final_qty_planned, float(getattr(l, "quantity", 0.0) or 0.0))
+        except Exception:
+            final_qty_planned = 0.0
+        reserve = max(final_qty_planned, min_qty if total_qty >= 2.0 * min_qty else 0.0)
+        if step > 0:
+            reserve = math.ceil(reserve / step - 1e-12) * step
+        reserve = min(max(reserve, 0.0), total_qty)
+        max_internal_qty = max(0.0, total_qty - reserve)
+        if max_internal_qty < min_qty:
+            logger.info(
+                "TP_LADDER final reserve %.8g leaves no executable internal TP budget; native final TP remains live",
+                reserve,
+            )
+            return []
+        raw = [max(0.0, float(getattr(l, "quantity", 0.0) or 0.0)) for l in internal_legs]
+        raw_sum = sum(raw)
+        if raw_sum <= 0:
+            return []
+        scale = min(1.0, max_internal_qty / raw_sum)
+        targets = [q * scale for q in raw]
+        floored = [self._floor_to_step(q, step) if step > 0 else q for q in targets]
+        # Drop non-executable dust and redistribute the remaining capacity to
+        # legs with the largest useful remainder.  Never round up beyond the
+        # total internal budget reserved by the final-runner model.
+        floored = [q if q >= min_qty else 0.0 for q in floored]
+        used = sum(floored)
+        capacity = self._floor_to_step(max_internal_qty - used, step) if step > 0 else max_internal_qty - used
+        remainders = []
+        for i, (leg, target, base) in enumerate(zip(internal_legs, targets, floored)):
+            if target < min_qty:
+                continue
+            remainders.append((target - base, -float(getattr(leg, "distance_atr", 0.0) or 0.0), i))
+        remainders.sort(reverse=True)
+        for _, __, i in remainders:
+            if capacity + 1e-12 < min_qty:
+                break
+            add = min(step if step > 0 else capacity, capacity)
+            if floored[i] + add <= targets[i] + (step if step > 0 else add) + 1e-12:
+                floored[i] += add
+                capacity -= add
+        out = []
+        for leg, q in zip(internal_legs, floored):
+            if q >= min_qty:
+                out.append((leg, q))
+            else:
+                logger.info(
+                    "TP_LADDER skip %s non-executable qty %.8f after final-runner reserve; qty remains for final TP",
+                    getattr(leg, "role", "TP"), q,
+                )
+        planned_internal = sum(raw)
+        executable_internal = sum(q for _, q in out)
+        if executable_internal + reserve > total_qty + max(step, 1e-12):
+            logger.warning(
+                "TP_LADDER quantisation guard: internal %.8g + final reserve %.8g exceeds total %.8g; trimming internals",
+                executable_internal, reserve, total_qty,
+            )
+        if abs(executable_internal - planned_internal) > max(min_qty, total_qty * 0.01):
+            logger.info(
+                "TP_LADDER executable allocation: planned_internal=%.8g executable_internal=%.8g final_reserved=%.8g total=%.8g step=%.8g min=%.8g",
+                planned_internal, executable_internal, reserve, total_qty, step, min_qty,
+            )
+        return out
 
     def _place_internal_tp_ladder(self, order_manager, side: str, quantity: float,
                                   final_tp: float, native_final_tp_order_id: str,
@@ -6081,18 +6191,14 @@ class QuantStrategy:
         if not internal_legs:
             leg_dicts = [l.as_dict() for l in ladder_plan.legs]
             return leg_dicts, placed_ids
-        for leg in internal_legs:
+        executable_legs = self._prepare_executable_tp_ladder_legs(internal_legs, float(quantity or 0.0), ladder_plan)
+        if not executable_legs:
+            leg_dicts = [l.as_dict() for l in ladder_plan.legs]
+            return leg_dicts, placed_ids
+        for leg, leg_qty in executable_legs:
             try:
-                leg_qty = float(getattr(leg, "quantity", 0.0) or 0.0)
                 leg_px = float(getattr(leg, "price", 0.0) or 0.0)
                 if leg_qty <= 0 or leg_px <= 0:
-                    continue
-                # Avoid dust orders. If one leg is below min qty, do not send it;
-                # its size remains covered by the native final TP.
-                if leg_qty < QCfg.MIN_QTY():
-                    logger.info(
-                        "TP_LADDER skip %s dust qty %.8f < min %.8f; qty remains for final TP",
-                        getattr(leg, "role", "TP"), leg_qty, QCfg.MIN_QTY())
                     continue
                 res = order_manager.place_take_profit(
                     side=exit_side,
@@ -6103,6 +6209,11 @@ class QuantStrategy:
                     oid = str(res.get("order_id") or res.get("id") or "")
                     if oid:
                         leg.order_id = oid
+                        leg.quantity = leg_qty
+                        try:
+                            leg.qty_fraction = leg_qty / max(float(quantity or 0.0), 1e-12)
+                        except Exception:
+                            pass
                         leg.placed = True
                         placed_ids.append(oid)
                         logger.info(
@@ -6123,6 +6234,9 @@ class QuantStrategy:
         ids = list(getattr(p, "tp_ladder_order_ids", []) or [])
         if not ids:
             return
+        if order_manager is None:
+            logger.warning("TP_LADDER cleanup requested but order_manager unavailable; ids=%s", ids)
+            return
         for oid in ids:
             try:
                 if oid and oid != getattr(p, "tp_order_id", ""):
@@ -6130,6 +6244,39 @@ class QuantStrategy:
                     logger.info("TP_LADDER cancel %s: %s", str(oid)[:10], getattr(result, "value", result))
             except Exception as _e:
                 logger.warning("TP_LADDER cancel error %s: %s", str(oid)[:10], _e)
+
+    def _cleanup_tp_ladder_after_position_flat(self, order_manager=None, pos=None, reason: str = "exit") -> None:
+        """Cancel all standalone internal TP ladder orders once the position is flat.
+
+        Delta native bracket normally handles the original final TP/SL pair, but
+        TP1..TPn are independent reduce-only orders.  When the original SL fires
+        or any other full-position exit makes the exchange flat, those standalone
+        internal TP orders must be cancelled immediately.  Otherwise stale
+        reduce-only conditionals remain on Delta, clutter the book/UI, and can
+        confuse later adoption/reconciliation logic.
+        """
+        p = pos or self._pos
+        ids = [str(x) for x in (getattr(p, "tp_ladder_order_ids", []) or []) if str(x)]
+        if not ids:
+            return
+        om = order_manager or getattr(self, "_om", None)
+        logger.info(
+            "TP_LADDER flat-cleanup [%s]: cancelling %d standalone internal TP orders; "
+            "native final TP/SL bracket is exchange-managed",
+            reason, len(ids))
+        self._cancel_tp_ladder_orders(om, p)
+        try:
+            for leg in list(getattr(p, "tp_ladder", []) or []):
+                if isinstance(leg, dict) and str(leg.get("role", "")).upper() != "FINAL":
+                    leg["cancelled_after_flat"] = True
+                    leg["cancel_reason"] = reason
+        except Exception:
+            pass
+        try:
+            p.tp_ladder_active = False
+            p.tp_ladder_order_ids = []
+        except Exception:
+            pass
 
     def _compute_leg_net_pnl(self, pos, exit_price: float, qty: float,
                              exit_fee: float = 0.0) -> tuple:
@@ -7781,6 +7928,7 @@ class QuantStrategy:
                     f"Individual order state unavailable but position is FLAT.\n"
                     f"Approx PnL: ${_approx_pnl:.2f}\n"
                     f"Entry: ${pos.entry_price:,.2f}")
+                self._cleanup_tp_ladder_after_position_flat(self._om, pos, reason="position_fallback_flat")
                 self._record_pnl(_approx_pnl, exit_reason="confirmed_via_position",
                                  exit_price=_last_price, fee_breakdown=None)
                 self._last_exit_side = pos.side
@@ -7839,6 +7987,7 @@ class QuantStrategy:
                 f"Entry: ${pos.entry_price:,.2f} | "
                 f"SL: {_sl_disp} | TP: {_tp_disp}"
             )
+            self._cleanup_tp_ladder_after_position_flat(self._om, pos, reason="unconfirmed_flat")
             self._record_pnl(0.0, exit_reason="unconfirmed", exit_price=0.0,
                              fee_breakdown=None)
             self._last_exit_side = pos.side
@@ -7869,6 +8018,12 @@ class QuantStrategy:
             is_tp_hit = False; is_sl_hit = False
         else:
             exit_reason = "sl_hit";       is_tp_hit = False; is_sl_hit = True
+
+        # Once the exchange has confirmed a full-position exit, cancel all
+        # standalone internal TP ladder orders.  Delta auto-cancels the native
+        # bracket peer, but not our independent reduce-only TP1..TPn orders.
+        if exit_type in ("sl", "trail_sl", "tp", "manual_exit"):
+            self._cleanup_tp_ladder_after_position_flat(self._om, pos, reason=exit_reason)
 
         _disp = (fired_id[:10] + "…") if len(fired_id) > 10 else fired_id
         logger.info(

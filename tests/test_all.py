@@ -2174,3 +2174,111 @@ def test_tp_ladder_sparse_path_adds_fib_gap_filler_not_all_nearest():
     assert len(internals) >= 2, plan.compact()
     assert any(l.source == "fib_fallback_geometry" for l in internals)
     assert internals[0].qty_fraction < 0.90
+
+# ===== BEGIN test_institutional_tp_ladder_reserve_and_quantisation =====
+
+def test_sparse_silver_path_keeps_meaningful_final_runner_and_limits_tp_count():
+    from strategy.tp_ladder import build_tp_ladder
+
+    report = {
+        "candidates": [
+            {"pool_side": "SSL", "tp_price": 70.40, "pool_price": 70.40,
+             "quality": 0.70, "significance": 3.0, "delivery_prob": 0.72,
+             "selection_ev": 0.40, "timeframe": "1m"},
+        ],
+        "selected": {"pool_side": "SSL", "tp_price": 67.42, "pool_price": 67.42,
+                     "quality": 0.82, "significance": 5.0, "delivery_prob": 0.12,
+                     "selection_ev": 0.77, "timeframe": "4h", "selected": True,
+                     "fib_score": 0.75, "fib_confluence": 1.20, "fib_ratio": 1.618},
+    }
+    plan = build_tp_ladder(
+        side="short", entry=70.66, sl=71.26, final_tp=67.42, atr=0.367,
+        total_quantity=10.0, pool_report=report, min_leg_fraction=0.10,
+        min_spacing_atr=0.85, max_internal_legs=3,
+    )
+    internals = [l for l in plan.legs if l.role != "FINAL"]
+    assert 1 <= len(internals) <= 3, plan.compact()
+    assert plan.final_fraction >= 0.18, plan.as_dict()
+    assert sum(l.qty_fraction for l in internals) <= 1.0 - plan.final_fraction + 1e-9
+    assert internals[0].qty_fraction < 0.60
+    assert any("terminal-runner reserve" in n for n in plan.regime_notes)
+
+
+def test_tp_ladder_exchange_quantisation_cannot_sell_full_size_before_final(monkeypatch):
+    from types import SimpleNamespace
+    from strategy.quant_strategy import QuantStrategy, QCfg
+
+    monkeypatch.setattr(QCfg, "LOT_STEP", staticmethod(lambda: 1.0))
+    monkeypatch.setattr(QCfg, "MIN_QTY", staticmethod(lambda: 1.0))
+
+    plan = SimpleNamespace(legs=[])
+    legs = [
+        SimpleNamespace(role="TP1", quantity=3.9, distance_atr=1.0),
+        SimpleNamespace(role="TP2", quantity=1.1, distance_atr=2.0),
+        SimpleNamespace(role="TP3", quantity=1.1, distance_atr=3.0),
+        SimpleNamespace(role="TP4", quantity=1.1, distance_atr=4.0),
+        SimpleNamespace(role="TP5", quantity=1.0, distance_atr=5.0),
+        SimpleNamespace(role="TP6", quantity=0.9, distance_atr=6.0),
+    ]
+    final = SimpleNamespace(role="FINAL", quantity=2.0)
+    plan.legs = legs + [final]
+
+    qs = QuantStrategy.__new__(QuantStrategy)
+    executable = qs._prepare_executable_tp_ladder_legs(legs, 10.0, plan)
+    internal_qty = sum(q for _, q in executable)
+    assert internal_qty <= 8.0
+    assert 10.0 - internal_qty >= 2.0
+    assert all(q >= 1.0 and abs(q - round(q)) < 1e-12 for _, q in executable)
+
+# ===== END test_institutional_tp_ladder_reserve_and_quantisation =====
+
+
+# ===== BEGIN test_tp_ladder_exit_cleanup.py =====
+from types import SimpleNamespace as _SNS_TP_CLEANUP
+
+
+def test_internal_tp_ladder_orders_are_cancelled_when_position_is_flat():
+    from strategy.quant_strategy import QuantStrategy
+
+    class DummyOM:
+        def __init__(self):
+            self.cancelled = []
+        def cancel_order(self, oid):
+            self.cancelled.append(oid)
+            return _SNS_TP_CLEANUP(value="SUCCESS")
+
+    qs = object.__new__(QuantStrategy)
+    qs._om = DummyOM()
+    qs._lock = __import__('threading').RLock()
+    pos = _SNS_TP_CLEANUP(
+        tp_order_id="native-final",
+        tp_ladder_order_ids=["tp1", "tp2", "native-final", "tp3"],
+        tp_ladder=[
+            {"role": "TP1", "order_id": "tp1"},
+            {"role": "TP2", "order_id": "tp2"},
+            {"role": "FINAL", "order_id": "native-final"},
+            {"role": "TP3", "order_id": "tp3"},
+        ],
+        tp_ladder_active=True,
+    )
+
+    qs._cleanup_tp_ladder_after_position_flat(qs._om, pos, reason="sl_hit")
+
+    assert qs._om.cancelled == ["tp1", "tp2", "tp3"]
+    assert pos.tp_ladder_active is False
+    assert pos.tp_ladder_order_ids == []
+    assert all(
+        leg.get("cancelled_after_flat") is True
+        for leg in pos.tp_ladder
+        if leg.get("role") != "FINAL"
+    )
+
+
+def test_exchange_exit_path_calls_ladder_cleanup_after_exit_reason_resolution():
+    import inspect
+    from strategy.quant_strategy import QuantStrategy
+
+    src = inspect.getsource(QuantStrategy._record_exchange_exit)
+    assert '_cleanup_tp_ladder_after_position_flat(self._om, pos, reason=exit_reason)' in src
+    assert 'exit_type in ("sl", "trail_sl", "tp", "manual_exit")' in src
+# ===== END test_tp_ladder_exit_cleanup.py =====
