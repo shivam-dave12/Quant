@@ -9143,7 +9143,43 @@ class QuantStrategy:
         else:
             risk_pct = raw_risk_pct
 
-        cash_budget = available * _bal_usage_frac
+        # ── Config-governed margin envelope ──────────────────────────────────
+        # One sizing authority only:
+        #   • policy margin_pct / QUANT_MARGIN_PCT defines the dynamic target
+        #     margin for the active desk/instrument.
+        #   • MAX_ENTRY_MARGIN_USAGE_PCT and MAX_MARGIN_PER_TRADE define hard
+        #     margin caps.
+        #   • MIN_MARGIN_PER_TRADE / policy min_margin_usd define the minimum
+        #     executable allocation; sub-floor trades are rejected instead of
+        #     falling back to dust/min-lot orders.
+        try:
+            policy_margin_frac = float(QCfg.MARGIN_PCT())
+        except Exception:
+            policy_margin_frac = float(_cfg("QUANT_MARGIN_PCT", 0.20))
+        if policy_margin_frac > 1.0 and policy_margin_frac <= 100.0:
+            policy_margin_frac = policy_margin_frac / 100.0
+        policy_margin_frac = max(0.0, min(1.0, policy_margin_frac))
+
+        min_trade_margin = max(0.0, float(QCfg.MIN_MARGIN_USDT()))
+        try:
+            max_trade_margin_cfg = float(_cfg("MAX_MARGIN_PER_TRADE", 0.0) or 0.0)
+        except Exception:
+            max_trade_margin_cfg = 0.0
+        max_trade_margin = max_trade_margin_cfg if max_trade_margin_cfg > 0.0 else float("inf")
+
+        entry_margin_cap = available * _bal_usage_frac
+        hard_margin_cap = min(available, entry_margin_cap, max_trade_margin)
+        policy_target_margin = available * policy_margin_frac
+        target_margin_budget = min(hard_margin_cap, max(min_trade_margin, policy_target_margin))
+
+        if hard_margin_cap < min_trade_margin - 1e-9:
+            logger.warning(
+                f"Sizing rejected: margin envelope below configured minimum | "
+                f"hard_cap=${hard_margin_cap:.2f} min_margin=${min_trade_margin:.2f} "
+                f"slot_available=${available:.2f} policy_margin={policy_margin_frac:.1%} "
+                f"entry_cap={_bal_usage_pct:.0f}% max_margin=${max_trade_margin_cfg:.2f}")
+            return None
+
         taker_rate = abs(float(_cfg("COMMISSION_RATE", 0.00055)))
         reserve_fee_per_btc = max(
             float(viability.round_trip_cost_pts),
@@ -9151,26 +9187,27 @@ class QuantStrategy:
         )
         margin_per_btc = price / leverage
         cash_per_btc = margin_per_btc + reserve_fee_per_btc
-        max_qty_cash = math.floor((cash_budget / max(cash_per_btc, 1e-12)) / step) * step
-        max_qty_margin = math.floor(((cash_budget * leverage / price) / step)) * step
+
+        # Cash feasibility uses the full slot cash; margin feasibility uses the
+        # config-governed hard margin cap.  This prevents fees from eating the
+        # margin budget while still proving the account can fund margin+fees.
+        max_qty_cash = math.floor((available / max(cash_per_btc, 1e-12)) / step) * step
+        max_qty_margin = math.floor(((hard_margin_cap * leverage / price) / step)) * step
         executable_qty_cap = round(max(0.0, min(max_qty, max_qty_cash, max_qty_margin)), 8)
         if executable_qty_cap < min_qty:
             logger.warning(
-                f"Sizing rejected: cash/lot envelope below minimum | "
+                f"Sizing rejected: cash/margin/lot envelope below minimum | "
                 f"cap_qty={executable_qty_cap:.8f} min_qty={min_qty:.8f} "
-                f"cash_budget=${cash_budget:.2f} step={step:.8f}")
+                f"target_margin=${target_margin_budget:.2f} hard_margin_cap=${hard_margin_cap:.2f} "
+                f"slot_available=${available:.2f} step={step:.8f}")
             return None
 
         target_risk_base = risk_available if portfolio_scoped else available
         risk_capital = target_risk_base * risk_pct * total_mult
-        qty_raw = risk_capital / sl_dist
-        max_allowed_margin = cash_budget
-        # Non-portfolio behaviour is unchanged: the confidence-adjusted target
-        # risk is also the hard cap (plus small tolerance).  Portfolio-scoped
-        # sizing gets one additional institutional rule: an exchange minimum lot
-        # may be accepted when it is above the confidence-haircut target but
-        # still inside the raw per-position portfolio risk cap.  This fixes the
-        # BTC 0.001 minimum-lot rejection without allowing runaway size.
+        qty_by_risk = risk_capital / sl_dist
+        qty_by_target_margin = target_margin_budget * leverage / price
+        qty_raw = min(qty_by_risk, qty_by_target_margin, executable_qty_cap)
+        max_allowed_margin = hard_margin_cap
         min_lot_risk_mult = float(_cfg("PORTFOLIO_MIN_LOT_MAX_RISK_MULT", 1.15))
         if portfolio_scoped:
             max_risk_cap = max(
@@ -9184,38 +9221,55 @@ class QuantStrategy:
         def _floor_step(q: float) -> float:
             return round(math.floor(max(q, 0.0) / step + 1e-12) * step, 8)
 
-        candidates = {
-            _floor_step(qty_raw),
-            _floor_step(executable_qty_cap),
-            round(min_qty, 8),
-        }
-        primary_qty = []
-        min_lot_exception = []
-        for cand in candidates:
-            if cand < min_qty - 1e-12 or cand > executable_qty_cap + 1e-12:
-                continue
+        qty = _floor_step(qty_raw)
+        if qty < min_qty - 1e-12:
+            # Minimum-lot rescue is allowed only if that lot also satisfies the
+            # configured minimum margin and the hard raw-risk cap.  This removes
+            # the old dust fallback that allowed $0.x positions through.
+            rescue_qty = round(min_qty, 8)
+            rescue_margin = rescue_qty * price / leverage
+            rescue_cash = rescue_margin + rescue_qty * reserve_fee_per_btc
+            rescue_risk = rescue_qty * sl_dist
+            if (rescue_qty <= executable_qty_cap + 1e-12 and
+                    rescue_margin >= min_trade_margin - 1e-9 and
+                    rescue_margin <= max_allowed_margin + 1e-9 and
+                    rescue_cash <= available + 1e-9 and
+                    rescue_risk <= max_risk_cap + 1e-9):
+                qty = rescue_qty
+            else:
+                logger.warning(
+                    f"Sizing rejected: dynamic allocation below exchange lot/min margin | "
+                    f"raw_qty={qty_raw:.6f} risk_qty={qty_by_risk:.6f} "
+                    f"margin_qty={qty_by_target_margin:.6f} min_qty={min_qty:.8f} "
+                    f"target_risk=${risk_capital:.2f} hard_risk_cap=${max_risk_cap:.2f} "
+                    f"target_margin=${target_margin_budget:.2f} min_margin=${min_trade_margin:.2f}")
+                return None
+
+        # If floor-to-step put the allocation below the configured trade-margin
+        # floor, try the smallest lot that reaches the floor, but never violate
+        # risk, cash, margin cap, or exchange max.
+        margin_used_pre = qty * price / leverage
+        if margin_used_pre < min_trade_margin - 1e-9:
+            qty_for_min_margin = _floor_step(math.ceil((min_trade_margin * leverage / price) / step - 1e-12) * step)
+            if qty_for_min_margin < (min_trade_margin * leverage / price) - 1e-12:
+                qty_for_min_margin = round(qty_for_min_margin + step, 8)
+            cand = qty_for_min_margin
             cand_margin = cand * price / leverage
-            cand_fee_reserve = cand * reserve_fee_per_btc
+            cand_cash = cand_margin + cand * reserve_fee_per_btc
             cand_risk = cand * sl_dist
-            cash_need = cand_margin + cand_fee_reserve
-            if cand_margin > max_allowed_margin + 1e-9 or cash_need > cash_budget + 1e-9:
-                continue
-            if cand_risk <= risk_capital + 1e-9:
-                primary_qty.append(cand)
-            elif abs(cand - min_qty) <= 1e-12 and cand_risk <= max_risk_cap:
-                min_lot_exception.append(cand)
-        if primary_qty:
-            qty = max(primary_qty)
-        elif min_lot_exception:
-            qty = min_lot_exception[0]
-        else:
-            logger.warning(
-                f"Sizing rejected: no exchange lot fits risk/margin envelope | "
-                f"raw_qty={qty_raw:.6f} target_risk=${risk_capital:.2f} "
-                f"hard_cap=${max_risk_cap:.2f} cash_budget=${cash_budget:.2f} "
-                f"risk_base=${target_risk_base:.2f} slot_available=${available:.2f} "
-                f"step={step:.8f}")
-            return None
+            if (cand >= min_qty - 1e-12 and cand <= executable_qty_cap + 1e-12 and
+                    cand_margin <= max_allowed_margin + 1e-9 and
+                    cand_cash <= available + 1e-9 and
+                    cand_risk <= max_risk_cap + 1e-9):
+                qty = cand
+            else:
+                logger.warning(
+                    f"Sizing rejected: allocation below configured minimum margin | "
+                    f"qty={qty:.8f} margin=${margin_used_pre:.2f} min_margin=${min_trade_margin:.2f} "
+                    f"needed_qty={cand:.8f} needed_risk=${cand_risk:.2f} "
+                    f"hard_risk_cap=${max_risk_cap:.2f} hard_margin_cap=${max_allowed_margin:.2f} "
+                    f"target_margin=${target_margin_budget:.2f}")
+                return None
 
         # ── Margin guard: notional must not exceed BALANCE_USAGE_PERCENTAGE ─
         # Bug #1 fix: the old guard compared required_margin against
@@ -9229,16 +9283,22 @@ class QuantStrategy:
         if required_margin > max_allowed_margin:
             logger.warning(
                 f"Sizing guard: required margin ${required_margin:.2f} > "
-                f"BALANCE_USAGE cap ${max_allowed_margin:.2f} "
-                f"({_bal_usage_pct:.0f}% of ${available:.2f}) "
-                f"— scaling down"
+                f"hard margin cap ${max_allowed_margin:.2f} "
+                f"(policy_target=${target_margin_budget:.2f}, entry_cap={_bal_usage_pct:.0f}% "
+                f"of ${available:.2f}, max_margin=${max_trade_margin_cfg:.2f})"
             )
             return None
 
-        if required_cash > cash_budget + 1e-9:
+        if required_margin < min_trade_margin - 1e-9:
+            logger.warning(
+                f"Sizing guard: required margin ${required_margin:.2f} < "
+                f"configured minimum ${min_trade_margin:.2f} — rejecting dust allocation")
+            return None
+
+        if required_cash > available + 1e-9:
             logger.warning(
                 f"Sizing guard: margin+fees ${required_cash:.2f} > "
-                f"cash budget ${cash_budget:.2f}")
+                f"slot available ${available:.2f}")
             return None
 
         if qty < min_qty:
@@ -9263,12 +9323,14 @@ class QuantStrategy:
             f"tier={ict_tier or 'none'} "
             f"mult={total_mult:.2f} (t={tier_mult:.2f} c={comp_mod:+.2f} "
             f"a={amd_mod:+.2f} i={inst_mult:.2f} fee={fee_drag_mult:.2f}) | "
-            f"target_risk=${risk_capital:.2f} raw_qty={qty_raw:.4f} | "
+            f"target_risk=${risk_capital:.2f} risk_qty={qty_by_risk:.4f} "
+            f"margin_qty={qty_by_target_margin:.4f} raw_qty={qty_raw:.4f} | "
             f"SL-dist={sl_dist:.1f}pts | $risk=${dollar_risk:.2f} "
             f"({risk_pct_act:.2f}% risk-base; {slot_risk_pct:.2f}% slot) | "
-            f"margin=${margin_used:.2f} | fees≈${actual_fees:.3f} "
-            f"({fee_to_risk:.2f}R) | "
-            f"cash=${required_cash:.2f}/${cash_budget:.2f} | "
+            f"margin=${margin_used:.2f} target=${target_margin_budget:.2f} "
+            f"min=${min_trade_margin:.2f} cap=${max_allowed_margin:.2f} | "
+            f"fees≈${actual_fees:.3f} ({fee_to_risk:.2f}R) | "
+            f"cash=${required_cash:.2f}/${available:.2f} | "
             f"risk_base=${target_risk_base:.2f} slot_available=${available:.2f} | "
             f"headroom=${available - required_cash:.2f} | qty={qty}"
         )

@@ -720,7 +720,7 @@ class HardeningTests(unittest.TestCase):
         self.assertGreater(ctx["min_viable_sl_dist"], ctx["current_sl_dist"])
         self.assertFalse(bool(ctx["allocation_allowed"]))
 
-    def test_position_sizing_floors_lot_without_overrisking_budget(self):
+    def test_position_sizing_rejects_dust_margin_even_if_lot_fits_risk(self):
         from strategy.quant_strategy import QuantStrategy
 
         strategy = object.__new__(QuantStrategy)
@@ -736,22 +736,22 @@ class HardeningTests(unittest.TestCase):
 
         price = 10000.0
         sl_dist = 5.0 / 0.00175
-        qty = strategy._compute_quantity(
-            FakeRisk(),
-            price=price,
-            sig=None,
-            ict_tier="S",
-            sl_price=price - sl_dist,
-            tp_price=price + 6000.0,
-            side="long",
-            use_maker_entry=True,
-            posterior_prob=0.75,
-            prefetched_bal_info={"available": 1000.0, "total": 1000.0},
-        )
+        with self.assertLogs("strategy.quant_strategy", level="WARNING") as logs:
+            qty = strategy._compute_quantity(
+                FakeRisk(),
+                price=price,
+                sig=None,
+                ict_tier="S",
+                sl_price=price - sl_dist,
+                tp_price=price + 6000.0,
+                side="long",
+                use_maker_entry=True,
+                posterior_prob=0.75,
+                prefetched_bal_info={"available": 1000.0, "total": 1000.0},
+            )
 
-        self.assertIsNotNone(qty)
-        self.assertGreaterEqual(qty, 0.001)
-        self.assertLessEqual(qty * sl_dist, 1000.0 * config.RISK_PER_TRADE + 1e-9)
+        self.assertIsNone(qty)
+        self.assertIn("below configured minimum margin", "\n".join(logs.output))
 
     def test_position_sizing_interprets_legacy_percent_style_risk(self):
         import config
@@ -785,9 +785,9 @@ class HardeningTests(unittest.TestCase):
                     prefetched_bal_info={"available": 1000.0, "total": 1000.0},
                 )
 
-            self.assertEqual(qty, 0.005)
-            self.assertLessEqual(qty * 1000.0, 5.0 + 1e-9)
+            self.assertIsNone(qty)
             self.assertIn("looks percent-style", "\n".join(logs.output))
+            self.assertIn("below configured minimum margin", "\n".join(logs.output))
         finally:
             config.RISK_PER_TRADE = old_risk
 
@@ -867,7 +867,7 @@ class HardeningTests(unittest.TestCase):
             )
 
         self.assertIsNone(qty)
-        self.assertIn("no exchange lot fits risk/margin envelope", "\n".join(logs.output))
+        self.assertIn("dynamic allocation below exchange lot/min margin", "\n".join(logs.output))
 
     def test_execution_geometry_repair_uses_structural_sl(self):
         from strategy.quant_strategy import QuantStrategy
@@ -2083,15 +2083,18 @@ if __name__ == "__main__":
 
 # ===== BEGIN institutional_final_audit_tests =====
 
-def test_config_uses_requested_five_percent_risk_with_coherent_daily_budget():
+def test_config_uses_margin_target_with_coherent_daily_budget():
     import config as _config
     from config_schema import cfg
 
-    assert abs(_config.RISK_PER_TRADE - 0.05) < 1e-12
-    assert _config.MAX_CONSECUTIVE_LOSSES == 1
-    assert abs(cfg.risk.RISK_PER_TRADE - 0.05) < 1e-12
-    assert cfg.risk.MAX_CONSECUTIVE_LOSSES == 1
+    assert abs(_config.RISK_PER_TRADE - 0.015) < 1e-12
+    assert _config.MAX_CONSECUTIVE_LOSSES == 3
+    assert abs(cfg.risk.RISK_PER_TRADE - 0.015) < 1e-12
+    assert cfg.risk.MAX_CONSECUTIVE_LOSSES == 3
     assert cfg.risk.RISK_PER_TRADE * cfg.risk.MAX_CONSECUTIVE_LOSSES <= cfg.risk.MAX_DAILY_LOSS_PCT / 100.0 + 1e-12
+    assert _config.MIN_MARGIN_PER_TRADE == 5
+    assert _config.MAX_MARGIN_PER_TRADE == 15
+    assert abs(_config.QUANT_MARGIN_PCT - 0.36) < 1e-12
 
 
 def test_stock_desk_suspension_filters_equity_and_index_before_context_creation():

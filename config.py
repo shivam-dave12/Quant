@@ -44,7 +44,7 @@ MAX_ENTRY_MARGIN_USAGE_PCT = BALANCE_USAGE_PERCENTAGE  # single-trade margin cei
 MIN_MARGIN_PER_TRADE     = 5
 MAX_MARGIN_PER_TRADE     = 15
 MIN_POSITION_SIZE        = 0.001
-MAX_POSITION_SIZE        = 1.0
+MAX_POSITION_SIZE        = 100.0
 LOT_STEP_SIZE            = 0.001
 REMAINDER_MIN_QTY        = 0.001
 
@@ -69,7 +69,7 @@ MIN_TIME_BETWEEN_TRADES_SEC = 300.0
 TRADE_COOLDOWN_SECONDS   = 300       # 5m cooldown after loss
 MIN_RISK_REWARD_RATIO    = 2.0       # expected-utility reference; thin R:R reduces size/EV
 TARGET_RISK_REWARD_RATIO = 3.0
-MAX_RR_RATIO             = 20.0
+MAX_RR_RATIO             = 12.0
 
 # ── Institutional dynamic execution audit ────────────────────────────────────
 # Style/quality signals are never hidden alpha vetoes. They are continuous
@@ -630,9 +630,9 @@ PORTFOLIO_BALANCE_CACHE_TTL_SEC = 2.0
 POLICY_CRYPTO_RISK_MULT = 1.00
 POLICY_CRYPTO_LOOP_INTERVAL_SEC = 0.25
 
-POLICY_COMMODITY_RISK_MULT = 0.70
-POLICY_COMMODITY_MARGIN_PCT = 0.30
-POLICY_COMMODITY_MIN_MARGIN_USD = 0.50
+POLICY_COMMODITY_RISK_MULT = 1.00
+POLICY_COMMODITY_MARGIN_PCT = 0.36
+POLICY_COMMODITY_MIN_MARGIN_USD = 5.00
 POLICY_COMMODITY_TICK_EVAL_SEC = 0.50
 POLICY_COMMODITY_LOOP_INTERVAL_SEC = 0.50
 POLICY_COMMODITY_MIN_1M_BARS = 85
@@ -644,8 +644,8 @@ POLICY_COMMODITY_COOLDOWN_SEC = 210
 POLICY_COMMODITY_SL_BUFFER_ATR = 0.50
 
 POLICY_EQUITY_RISK_MULT = 0.55
-POLICY_EQUITY_MARGIN_PCT = 0.24
-POLICY_EQUITY_MIN_MARGIN_USD = 0.50
+POLICY_EQUITY_MARGIN_PCT = 0.18
+POLICY_EQUITY_MIN_MARGIN_USD = 5.00
 POLICY_EQUITY_TICK_EVAL_SEC = 0.75
 POLICY_EQUITY_LOOP_INTERVAL_SEC = 0.75
 POLICY_EQUITY_MIN_1M_BARS = 90
@@ -696,8 +696,8 @@ TRADING_DESKS = {
         "display_name": "Commodities Desk",
         "strategy": STRATEGY_CORE_NAME,
         "asset_classes": ("commodity",),
-        "risk_multiplier": 0.70,
-        "margin_pct": 0.30,
+        "risk_multiplier": POLICY_COMMODITY_RISK_MULT,
+        "margin_pct": POLICY_COMMODITY_MARGIN_PCT,
         "tick_eval_sec": 0.65,
         "loop_interval_sec": 0.65,
         "min_1m_bars": 100,
@@ -726,8 +726,8 @@ TRADING_DESKS = {
         "display_name": "Stocks Desk",
         "strategy": STRATEGY_CORE_NAME,
         "asset_classes": ("equity", "index"),
-        "risk_multiplier": 0.40,
-        "margin_pct": 0.24,
+        "risk_multiplier": POLICY_EQUITY_RISK_MULT,
+        "margin_pct": POLICY_EQUITY_MARGIN_PCT,
         "tick_eval_sec": 0.90,
         "loop_interval_sec": 0.90,
         "min_1m_bars": 110,

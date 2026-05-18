@@ -177,6 +177,20 @@ def _cap_leverage(inst: Optional[TradableInstrument], default: int) -> int:
     return base
 
 
+def _min_margin_floor(asset_specific: float) -> float:
+    """Single authority for minimum executable margin.
+
+    Asset policies may ask for a higher floor, but they cannot silently undercut
+    the global MIN_MARGIN_PER_TRADE.  This prevents commodity/equity policies
+    from allowing dust positions while config.py says the minimum trade margin
+    is higher.
+    """
+    try:
+        return max(_f('MIN_MARGIN_PER_TRADE', 1.0), float(asset_specific or 0.0))
+    except Exception:
+        return _f('MIN_MARGIN_PER_TRADE', 1.0)
+
+
 def build_instrument_policy(inst: Optional[TradableInstrument]) -> InstrumentPolicy:
     """Build the active policy for one contract.
 
@@ -222,7 +236,7 @@ def build_instrument_policy(inst: Optional[TradableInstrument]) -> InstrumentPol
             asset_id=asset_id, asset_class=ac.value, leverage=lev,
             margin_pct=min(base_margin, _desk_float(desk, "margin_pct", _f('POLICY_EQUITY_MARGIN_PCT', 0.12))),
             risk_multiplier=_desk_float(desk, "risk_multiplier", _f('POLICY_EQUITY_RISK_MULT', 0.55)),
-            min_margin_usd=_f('POLICY_EQUITY_MIN_MARGIN_USD', 0.5),
+            min_margin_usd=_min_margin_floor(_f('POLICY_EQUITY_MIN_MARGIN_USD', 0.5)),
             tick_eval_sec=_desk_float(desk, "tick_eval_sec", _f('POLICY_EQUITY_TICK_EVAL_SEC', 0.75)),
             loop_interval_sec=_desk_float(desk, "loop_interval_sec", _f('POLICY_EQUITY_LOOP_INTERVAL_SEC', 0.75)),
             min_1m_bars=_desk_int(desk, "min_1m_bars", _i('POLICY_EQUITY_MIN_1M_BARS', 90)),
@@ -256,7 +270,7 @@ def build_instrument_policy(inst: Optional[TradableInstrument]) -> InstrumentPol
             asset_id=asset_id, asset_class=ac.value, leverage=lev,
             margin_pct=min(base_margin, _desk_float(desk, "margin_pct", _f('POLICY_COMMODITY_MARGIN_PCT', 0.14))),
             risk_multiplier=_desk_float(desk, "risk_multiplier", _f('POLICY_COMMODITY_RISK_MULT', 0.70)),
-            min_margin_usd=_f('POLICY_COMMODITY_MIN_MARGIN_USD', 0.5),
+            min_margin_usd=_min_margin_floor(_f('POLICY_COMMODITY_MIN_MARGIN_USD', 0.5)),
             tick_eval_sec=_desk_float(desk, "tick_eval_sec", _f('POLICY_COMMODITY_TICK_EVAL_SEC', 0.50)),
             loop_interval_sec=_desk_float(desk, "loop_interval_sec", _f('POLICY_COMMODITY_LOOP_INTERVAL_SEC', 0.50)),
             min_1m_bars=_desk_int(desk, "min_1m_bars", _i('POLICY_COMMODITY_MIN_1M_BARS', 85)),
@@ -290,7 +304,7 @@ def build_instrument_policy(inst: Optional[TradableInstrument]) -> InstrumentPol
         asset_id=asset_id, asset_class=getattr(ac, 'value', str(ac)), leverage=lev,
         margin_pct=_desk_float(desk, "margin_pct", base_margin),
         risk_multiplier=_desk_float(desk, "risk_multiplier", _f('POLICY_CRYPTO_RISK_MULT', 1.0)),
-        min_margin_usd=_f('MIN_MARGIN_PER_TRADE', 1.0),
+        min_margin_usd=_min_margin_floor(_f('MIN_MARGIN_PER_TRADE', 1.0)),
         tick_eval_sec=_desk_float(desk, "tick_eval_sec", _f('ENTRY_EVALUATION_INTERVAL_SECONDS', 1.0)),
         loop_interval_sec=_desk_float(desk, "loop_interval_sec", _f('POLICY_CRYPTO_LOOP_INTERVAL_SEC', float(_cfg('SCANNER_TICK_SLEEP_SEC', 0.25)))),
         min_1m_bars=_desk_int(desk, "min_1m_bars", _i('MIN_CANDLES_1M', 80)),
