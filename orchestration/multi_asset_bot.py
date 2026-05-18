@@ -423,15 +423,15 @@ class MultiAssetQuantBot:
         total_upnl = float(total_bucket["upnl"])
         total = int(total_bucket["trades"])
         wr = self._bucket_wr(total_bucket)
-        icon = "GREEN" if total_realised + total_upnl >= 0 else "RED"
+        icon = "🟢" if total_realised + total_upnl >= 0 else "🔴"
         lines = [
-            f"{icon} <b>PORTFOLIO PNL COMMAND CENTER</b>",
-            "--------------------------------",
+            f"{icon} <b>INSTITUTIONAL PORTFOLIO P&L</b>",
+            "<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>",
             f"<code>NET {self._fmt_money(total_realised):>12}  UPNL {self._fmt_money(total_upnl):>12}  TOTAL {self._fmt_money(total_realised + total_upnl):>12}</code>",
             f"<code>GROSS {self._fmt_money(total_gross):>10}  FEES ${total_fees:>9,.2f}  TRADES {total:>4}  WR {wr:>5.1f}%</code>",
             f"<code>AVG WIN {self._fmt_money(self._bucket_avg_win(total_bucket)):>10}  AVG LOSS {self._fmt_money(self._bucket_avg_loss(total_bucket)):>10}  OPEN {len(open_rows):>2}/{self.guard.max_open_positions:<2}</code>",
             f"<code>BUDGET {self._esc(self.guard.budget_mode)}</code>",
-            "\n<b>Desk PnL</b>",
+            "\n<b>🏛 Desk PnL / P&L</b>",
         ]
         for desk_id in desk_order:
             st = desks.get(desk_id) or self._blank_pnl_bucket()
@@ -443,7 +443,7 @@ class MultiAssetQuantBot:
                 f"T {int(st['trades']):>3} WR {self._bucket_wr(st):>5.1f}%</code>"
             )
 
-        lines.append("\n<b>Asset PnL</b>")
+        lines.append("\n<b>📦 Asset PnL / P&L</b>")
         for asset, st in sorted(assets.items(), key=lambda kv: (str(kv[1].get("desk", "")), kv[0])):
             desk_id = self._clip(st.get("desk", ""), 5)
             asset_label = self._clip(asset, 8)
@@ -455,7 +455,7 @@ class MultiAssetQuantBot:
             )
 
         if open_rows:
-            lines.append("\n<b>Open positions</b>")
+            lines.append("\n<b>📡 Open Positions</b>")
             for r in sorted(open_rows, key=lambda x: (str(x.get("desk")), str(x.get("asset")))):
                 lines.append(
                     f"<code>{self._esc(r['desk']):<5} {self._esc(r['asset']):<8} {self._esc(r['side']):<5} {self._fmt_money(r['upnl']):>11} "
@@ -465,10 +465,10 @@ class MultiAssetQuantBot:
                     f"<code>       px {self._fmt_price(r['price']):>12} entry {self._fmt_price(r['entry']):>12} SL {self._fmt_price(r['sl']):>12}</code>"
                 )
         if trades:
-            lines.append("\n<b>Recent realised trades</b>")
+            lines.append("\n<b>🧾 Recent Realised Trades</b>")
             for t in sorted(trades, key=self._trade_ts, reverse=True)[:6]:
                 pnl = self._trade_net(t)
-                ok = "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "FLAT")
+                ok = "✅ WIN" if pnl > 0 else ("❌ LOSS" if pnl < 0 else "➖ FLAT")
                 lines.append(
                     f"{ok:<4} <code>{self._esc(t.get('desk','?')):<5} {self._esc(t.get('asset','?')):<8} "
                     f"{self._esc(str(t.get('side','?')).upper()):<5} net {self._fmt_money(pnl):>10} "
@@ -478,10 +478,10 @@ class MultiAssetQuantBot:
 
     def format_portfolio_position_report(self) -> str:
         rows = [self._ctx_position_metrics(c) for c in self.contexts]
-        lines = ["🏛 <b>PORTFOLIO POSITIONS</b>", "━━━━━━━━━━━━━━━━━━━━━━━━"]
+        lines = ["🏛 <b>INSTITUTIONAL POSITIONS</b>", "<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>"]
         open_rows = [r for r in rows if r.get("position")]
         if not open_rows:
-            lines.append("No live positions. Scanner desks remain active.")
+            lines.append("No live positions. 🛰 Scanner Desks remain active.")
         for r in open_rows:
             pol = r["policy"]
             lines.append(
@@ -498,7 +498,7 @@ class MultiAssetQuantBot:
             )
             if r.get("sl_id") or r.get("tp_id"):
                 lines.append(f"<code>BRKT  SL {str(r.get('sl_id') or '-')[:8]}…  TP {str(r.get('tp_id') or '-')[:8]}…</code>")
-        lines.append("\n<b>Scanner desks</b>")
+        lines.append("\n<b>🛰 Scanner Desks</b>")
         for r in rows:
             if r.get("position"):
                 continue
@@ -506,7 +506,7 @@ class MultiAssetQuantBot:
         return "\n".join(lines)
 
     def format_portfolio_equity_report(self) -> str:
-        lines = ["💼 <b>PORTFOLIO EQUITY / BUDGET</b>", "━━━━━━━━━━━━━━━━━━━━━━━━"]
+        lines = ["💼 <b>INSTITUTIONAL EQUITY / BUDGET</b>", "<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>"]
         raw_total = raw_avail = 0.0
         got = False
         for ctx in self.contexts[:1]:
@@ -534,7 +534,7 @@ class MultiAssetQuantBot:
 
     def format_portfolio_trades_report(self) -> str:
         trades = self._all_trade_records()
-        lines = ["<b>PORTFOLIO TRADE TAPE</b>", "--------------------------------"]
+        lines = ["🧾 <b>INSTITUTIONAL TRADE TAPE</b>", "<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>"]
         if not trades:
             return "\n".join(lines + ["No closed trades recorded yet."])
         limit = max(1, int(getattr(config, "TELEGRAM_RECENT_TRADES_LIMIT", 30)))
@@ -544,7 +544,7 @@ class MultiAssetQuantBot:
             pnl = self._trade_net(t)
             gross = self._trade_gross(t)
             fees = self._trade_fees(t)
-            ok = "WIN " if pnl > 0 else ("LOSS" if pnl < 0 else "FLAT")
+            ok = "✅ WIN " if pnl > 0 else ("❌ LOSS" if pnl < 0 else "➖ FLAT")
             side = str(t.get("side", "?")).upper()
             desk = self._clip(t.get("desk", "?"), 5)
             asset = self._clip(t.get("asset", "?"), 8)

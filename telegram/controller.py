@@ -1190,26 +1190,29 @@ class TelegramBotController:
 
         _side_icon = "🟢" if side == "LONG" else "🔴"
         _upnl_icon = "🟢" if upnl >= 0 else "🔴"
+        _life_qty = float(getattr(p, 'tp_ladder_initial_qty', 0.0) or qty or 0.0)
+        _partial_qty = max(0.0, _life_qty - float(qty or 0.0))
+        _ladder_net = float(getattr(p, 'tp_ladder_realized_pnl', 0.0) or 0.0)
+        _ladder_fees = float(getattr(p, 'tp_ladder_realized_fees', 0.0) or 0.0)
 
         return (
-            f"{_side_icon} <b>Position: {side}{_es_type}</b>"
-            f"  Mode: {mode.upper()}  Tier: {getattr(p,'ict_entry_tier','?') or '—'}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>💰 LEVELS</b>\n"
-            f"Entry:   ${entry:,.2f}\n"
-            f"Current: ${price:,.2f}  ({current_r:+.2f}R)\n"
-            f"{_upnl_icon} uPnL:  ${upnl:+,.2f}  |  Qty: {qty:.4f} BTC\n"
-            f"SL:      ${sl:,.2f}  (dist: ${current_sl_dist:.0f} / {current_sl_dist/max(atr,1):.2f}ATR)\n"
-            f"TP:      ${tp:,.2f}{_pool_tp_src}{pool_tp_note}\n"
-            f"R:R planned: 1:{planned_rr:.2f}  |  Hold: {hold_min:.1f}m\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>📈 R-PROGRESS</b>\n"
-            f"[{_prog_bar}] MFE={mfe_r:.2f}R  cur={current_r:+.2f}R\n"
-            f"{_next_ratchet_str}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>🏛️ TP LADDER</b>\n"
-            f"{ladder_lbl}\n"
-            f"{_next_ratchet_str}"
+            f"{_side_icon} <b>INSTITUTIONAL POSITION · {side}{_es_type}</b>\n"
+            f"<code>MODE {mode.upper():<10} TIER {(getattr(p,'ict_entry_tier','?') or '—'):<4} PHASE {phase}</code>\n"
+            f"<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>\n"
+            f"💰 <b>Levels</b>\n"
+            f"<code>ENTRY ${entry:>12,.2f}   MARK ${price:>12,.2f}   R {current_r:+6.2f}</code>\n"
+            f"<code>SL    ${sl:>12,.2f}   dist ${current_sl_dist:>9,.0f}   {current_sl_dist/max(atr,1):>5.2f}ATR</code>\n"
+            f"<code>TP    ${tp:>12,.2f}   R:R 1:{planned_rr:.2f}</code>{_pool_tp_src}{pool_tp_note}\n"
+            f"{_upnl_icon} <code>UPNL ${upnl:+11,.2f}   life {_life_qty:.6f}   left {float(qty or 0.0):.6f}</code>\n"
+            f"<code>HOLD {hold_min:>7.1f}m   partial {_partial_qty:.6f}</code>\n"
+            f"<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>\n"
+            f"📈 <b>R Progress</b>\n"
+            f"<code>[{_prog_bar}]   MFE {mfe_r:>5.2f}R   NOW {current_r:+6.2f}R</code>\n"
+            f"<code>{_esc(_next_ratchet_str)}</code>\n"
+            f"<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>\n"
+            f"🎯 <b>TP Ladder Ledger</b>\n"
+            f"<code>{_esc(ladder_lbl)}</code>\n"
+            f"<code>REAL ${_ladder_net:+9,.2f}   FEES ${_ladder_fees:>8,.4f}   PART {_partial_qty:.6f}</code>"
             + _amd_line + _dr_line
         )
 
@@ -1220,7 +1223,7 @@ class TelegramBotController:
     def _cmd_trades(self) -> str:
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
-            return "Bot not running."
+            return "⚫ <b>BOT OFFLINE</b>\n<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>\n<i>No active runtime is attached.</i>"
         fn = getattr(bot_instance, "format_portfolio_trades_report", None)
         if callable(fn):
             return fn()
@@ -1228,96 +1231,82 @@ class TelegramBotController:
         strat = bot_instance.strategy
         rm    = bot_instance.risk_manager
         if not strat or not rm:
-            return "Components not ready."
+            return "⚠️ <b>REPORT UNAVAILABLE</b>\n<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>\n<i>Strategy / risk components are not ready.</i>"
 
-        # BUG 1 FIX: _trade_history is a deque(maxlen=200), which does not
-        # support slice indexing.  Convert to list before slicing so that
-        # `history[-10:]` works the same as on a list.
         history = list(getattr(strat, '_trade_history', []))
-        lines   = ["<b>📋 Trade History</b>\n"]
+        lines   = ["📋 <b>INSTITUTIONAL TRADE LEDGER</b>", "<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>"]
 
         if history:
             for t in reversed(history[-10:]):
-                side      = t.get('side', '?').upper()
-                mode      = t.get('mode', '?').upper()
-                entry     = t.get('entry', 0.0)
-                exit_p    = t.get('exit',  0.0)
-                pnl       = t.get('pnl',   0.0)
-                reason    = t.get('reason', '?')
-                hold      = t.get('hold_min', 0.0)
-                mfe_r     = t.get('mfe_r', 0.0)
-                is_win    = t.get('is_win', False)
-                init_sl   = t.get('init_sl_dist', 0.0)
-                ict_tier  = t.get('ict_tier', '')
-                pool_tp   = t.get('pool_tp_price', 0.0)
+                side      = str(t.get('side', '?')).upper()
+                mode      = str(t.get('mode', '?')).upper()
+                entry     = float(t.get('entry', 0.0) or 0.0)
+                exit_p    = float(t.get('exit',  0.0) or 0.0)
+                pnl       = float(t.get('pnl',   0.0) or 0.0)
+                reason    = str(t.get('reason', '?'))
+                hold      = float(t.get('hold_min', 0.0) or 0.0)
+                mfe_r     = float(t.get('mfe_r', 0.0) or 0.0)
+                is_win    = bool(t.get('is_win', False))
+                init_sl   = float(t.get('init_sl_dist', 0.0) or 0.0)
+                ict_tier  = str(t.get('ict_tier', '') or '')
                 raw_pts   = ((exit_p - entry) if side == "LONG" else (entry - exit_p))
                 ach_r     = raw_pts / init_sl if init_sl > 1e-10 else 0.0
+                total_fees = float(t.get('total_fees', 0.0) or 0.0)
+                exact_fees = bool(t.get('exact_fees', False))
+                margin_pct = float(t.get('margin_pnl_pct', 0.0) or 0.0)
+                ladder_net = float(t.get('tp_ladder_realized_pnl', 0.0) or 0.0)
+                ladder_fees = float(t.get('tp_ladder_fees', 0.0) or 0.0)
+                partial_qty = float(t.get('partial_qty', 0.0) or 0.0)
+                residual_pnl = float(t.get('residual_pnl', pnl) or 0.0)
 
-                total_fees = t.get('total_fees', 0.0)
-                exact_fees = t.get('exact_fees', False)
-                margin_pct = t.get('margin_pnl_pct', 0.0)
+                label = {
+                    "tp_hit": "🎯 TP HIT",
+                    "trail_sl_hit": "🔒 SL EXIT",
+                    "sl_hit": "🛑 PROTECTIVE SL",
+                }.get(reason, f"🚪 {_esc(reason[:16]).upper()}")
+                result = "✅" if is_win else "❌"
+                fee_tag  = "EXACT" if exact_fees else "MISSING/DEFERRED"
+                tier_badge = f" · TIER {ict_tier}" if ict_tier else ""
+                margin_tag = f" · ROI {margin_pct:+.1f}%" if abs(margin_pct) > 0.01 else ""
 
-                if   reason == "tp_hit":       label = "🎯 TP (pool sweep)"
-                elif reason == "trail_sl_hit": label = "🛑 SL EXIT"
-                elif reason == "sl_hit":       label = "🛑 PROTECTIVE SL"
-                else:                          label = f"🚪 {reason[:8]}"
-
-                result    = "✅" if is_win else "❌"
-                ladder_tag = " [LADDER]" if t.get("tp_ladder", False) else ""
-                tier_badge = f" [T{ict_tier}]" if ict_tier else ""
-                pool_tp_tag = f"  pool_tp=${pool_tp:,.0f}" if pool_tp else ""
-
-                fee_line = ""
-                if total_fees > 0:
-                    fee_tag  = "exact" if exact_fees else "est."
-                    fee_line = f"\n    Fees({fee_tag}): ${total_fees:.4f}"
-
-                # v6.0: margin % P&L display
-                margin_tag = f"  ({margin_pct:+.1f}% margin)" if abs(margin_pct) > 0.01 else ""
-
-                lines.append(
-                    f"{result} {side} [{mode}]{tier_badge}  "
-                    f"${entry:,.0f}→${exit_p:,.0f}  "
-                    f"PnL: <b>${pnl:+.2f}</b>{margin_tag}  R: {ach_r:+.2f}  MFE: {mfe_r:.1f}R\n"
-                    f"    {label}{ladder_tag}  hold: {hold:.0f}m{pool_tp_tag}"
-                    + fee_line
-                )
+                lines.extend([
+                    f"{result} <b>{_esc(side)}</b> <code>{_esc(mode)}{_esc(tier_badge)}</code>  {label}",
+                    f"<code>{entry:>12,.2f} → {exit_p:>12,.2f}   R {ach_r:+6.2f}   MFE {mfe_r:5.2f}</code>",
+                    f"<code>NET ${pnl:+11,.2f}   FEES ${total_fees:>9,.4f}   {fee_tag}</code>",
+                    f"<code>HOLD {hold:>7.1f}m   residual ${residual_pnl:+9,.2f}{_esc(margin_tag)}</code>",
+                ])
+                if partial_qty > 0 or abs(ladder_net) > 1e-12 or abs(ladder_fees) > 1e-12:
+                    lines.append(f"🎯 <code>LADDER qty {partial_qty:>9.6f}   net ${ladder_net:+9,.2f}   fees ${ladder_fees:>8,.4f}</code>")
+                lines.append("<code>──────────────────────────────</code>")
         else:
-            lines.append("  No trades recorded yet this session.")
+            lines.append("📭 <i>No closed trades recorded in this runtime session.</i>")
 
-        total_t   = getattr(strat, '_total_trades', 0)
-        wins      = getattr(strat, '_winning_trades', 0)
+        total_t   = int(getattr(strat, '_total_trades', 0) or 0)
+        wins      = int(getattr(strat, '_winning_trades', 0) or 0)
         losses    = total_t - wins
         wr        = wins / total_t * 100.0 if total_t > 0 else 0.0
-        total_pnl = getattr(strat, '_total_pnl', 0.0)
+        total_pnl = float(getattr(strat, '_total_pnl', 0.0) or 0.0)
 
         daily_cnt = strat._risk_gate.daily_trades if hasattr(strat, '_risk_gate') else 0
         consec    = strat._risk_gate.consec_losses if hasattr(strat, '_risk_gate') else 0
         max_d     = getattr(__import__('config'), 'MAX_DAILY_TRADES', 8)
 
-        win_pnls  = [t['pnl'] for t in history if t.get('is_win')]
-        loss_pnls = [t['pnl'] for t in history if not t.get('is_win')]
+        win_pnls  = [float(t.get('pnl', 0) or 0.0) for t in history if t.get('is_win')]
+        loss_pnls = [float(t.get('pnl', 0) or 0.0) for t in history if not t.get('is_win')]
         avg_win   = sum(win_pnls)  / len(win_pnls)  if win_pnls  else 0.0
         avg_loss  = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0.0
         expectancy = (wr/100 * avg_win) + ((1 - wr/100) * avg_loss)
-
-        total_fees_s = sum(t.get('total_fees', 0) for t in history)
-
-        # v6.0: Aggregate margin % P&L
-        margin_pcts = [t.get('margin_pnl_pct', 0.0) for t in history if abs(t.get('margin_pnl_pct', 0.0)) > 0.001]
+        total_fees_s = sum(float(t.get('total_fees', 0) or 0.0) for t in history)
+        margin_pcts = [float(t.get('margin_pnl_pct', 0.0) or 0.0) for t in history if abs(float(t.get('margin_pnl_pct', 0.0) or 0.0)) > 0.001]
         avg_margin_pct = sum(margin_pcts) / len(margin_pcts) if margin_pcts else 0.0
         total_margin_pct = sum(margin_pcts)
-
+        pnl_icon = "🟢" if total_pnl >= 0 else "🔴"
         lines += [
-            "",
-            "━━━━━━━━━━━━━━━━━━━━━━━━",
-            f"Session:   {total_t} trades  W:{wins} L:{losses}  WR: <b>{wr:.0f}%</b>",
-            f"Total PnL: <b>${total_pnl:+.2f}</b> USDT",
-            f"Margin %:  <b>{total_margin_pct:+.1f}%</b> total  (avg {avg_margin_pct:+.1f}%/trade)",
-            f"Avg Win:   ${avg_win:+.2f}  Avg Loss: ${avg_loss:+.2f}",
-            f"Expectancy: ${expectancy:+.2f}/trade",
-            f"Total Fees: ${total_fees_s:.4f}" if total_fees_s > 0 else "Total Fees: —",
-            f"Today:     {daily_cnt}/{max_d} trades  consec_loss={consec}",
+            "📊 <b>Session Ledger</b>",
+            f"{pnl_icon} <code>NET ${total_pnl:+11,.2f}   WR {wr:>5.1f}%   W/L {wins}/{losses}</code>",
+            f"<code>AVG_W ${avg_win:+9,.2f}   AVG_L ${avg_loss:+9,.2f}   EXP ${expectancy:+9,.2f}</code>",
+            f"<code>MARGIN {total_margin_pct:+8.1f}%   avg {avg_margin_pct:+7.1f}%   fees ${total_fees_s:,.4f}</code>",
+            f"<code>TODAY {int(daily_cnt):>3}/{int(max_d):<3}   loss_streak {int(consec):>2}</code>",
         ]
         return "\n".join(lines)
 
@@ -1998,7 +1987,7 @@ class TelegramBotController:
     def _cmd_pnl(self) -> str:
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
-            return "Bot not running."
+            return "⚫ <b>BOT OFFLINE</b>\n<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>\n<i>No active runtime is attached.</i>"
         fn = getattr(bot_instance, "format_portfolio_pnl_report", None)
         if callable(fn):
             return fn()
@@ -2006,106 +1995,88 @@ class TelegramBotController:
         dm    = bot_instance.data_manager
         rm    = bot_instance.risk_manager
         if not strat or not dm:
-            return "Components not ready."
+            return "⚠️ <b>PNL REPORT UNAVAILABLE</b>\n<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>\n<i>Strategy / data components are not ready.</i>"
 
-        price   = dm.get_last_price()
+        price   = float(dm.get_last_price() or 0.0)
         pos     = strat.get_position()
-        # BUG 1 FIX: _trade_history is a deque — convert to list for slicing
         history = list(getattr(strat, '_trade_history', []))
-        total_t = getattr(strat, '_total_trades', 0)
-        wins    = getattr(strat, '_winning_trades', 0)
+        total_t = int(getattr(strat, '_total_trades', 0) or 0)
+        wins    = int(getattr(strat, '_winning_trades', 0) or 0)
         losses  = total_t - wins
         wr      = wins / total_t * 100.0 if total_t > 0 else 0.0
-        total_pnl = getattr(strat, '_total_pnl', 0.0)
-
+        total_pnl = float(getattr(strat, '_total_pnl', 0.0) or 0.0)
         pnl_icon = "🟢" if total_pnl >= 0 else "🔴"
         lines = [
-            f"{pnl_icon} <b>PnL @ {_esc(f'${price:,.2f}')}</b>",
-            "━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"{pnl_icon} <b>INSTITUTIONAL P&amp;L SNAPSHOT</b>  <code>${price:,.2f}</code>",
+            "<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>",
         ]
 
-        # ── Unrealised ──────────────────────────────────────────────
         if pos:
             p = strat._pos
-            side   = p.side.upper()
-            entry  = p.entry_price
+            side   = str(p.side or "?").upper()
+            entry  = float(p.entry_price or 0.0)
+            qty    = float(getattr(p, 'quantity', 0.0) or 0.0)
+            life_qty = float(getattr(p, 'tp_ladder_initial_qty', 0.0) or qty)
+            partial_qty = max(0.0, life_qty - qty)
             upnl_pts = (price - entry) if side == "LONG" else (entry - price)
-            init_dist = p.initial_sl_dist if p.initial_sl_dist > 1e-10 \
-                        else abs(entry - p.sl_price)
+            init_dist = p.initial_sl_dist if p.initial_sl_dist > 1e-10 else abs(entry - p.sl_price)
             cur_r  = upnl_pts / init_dist if init_dist > 1e-10 else 0.0
-            mfe_r  = p.peak_profit / init_dist if init_dist > 1e-10 else 0.0
-            hold_m = (time.time() - p.entry_time) / 60.0
+            mfe_r  = float(getattr(p, 'peak_profit', 0.0) or 0.0) / init_dist if init_dist > 1e-10 else 0.0
+            hold_m = (time.time() - p.entry_time) / 60.0 if p.entry_time > 0 else 0.0
+            realised_ladder = float(getattr(p, 'tp_ladder_realized_pnl', 0.0) or 0.0)
+            ladder_fees = float(getattr(p, 'tp_ladder_realized_fees', 0.0) or 0.0)
 
             _u_margin_pct = 0.0
             _u_margin_used = 0.0
             try:
-                if entry > 0 and p.quantity > 0:
-                    _u_notional = entry * p.quantity
+                if entry > 0 and life_qty > 0:
+                    _u_notional = entry * life_qty
                     _u_lev = int(getattr(__import__('config'), 'LEVERAGE', 30))
                     _u_margin_used = _u_notional / _u_lev if _u_lev > 0 else _u_notional
                     if _u_margin_used > 1e-10:
-                        _u_upnl_usd = upnl_pts * p.quantity
+                        _u_upnl_usd = upnl_pts * qty + realised_ladder
                         _u_margin_pct = (_u_upnl_usd / _u_margin_used) * 100.0
             except Exception:
                 pass
 
             u_icon = "🟢" if upnl_pts >= 0 else "🔴"
-            lines.append(f"{u_icon} <b>OPEN {_esc(side)}</b> @ {_esc(f'${entry:,.2f}')}")
-            lines.append(
-                f"  uPnL: {upnl_pts:+.1f}pts ({cur_r:+.2f}R)  "
-                f"MFE: {mfe_r:.2f}R"
-            )
-            lines.append(
-                f"  Margin: <b>{_u_margin_pct:+.1f}%</b> on "
-                f"{_esc(f'${_u_margin_used:.2f}')}"
-            )
-            lines.append(
-                f"  SL: {_esc(f'${p.sl_price:,.2f}')}  "
-                f"TP: {_esc(f'${p.tp_price:,.2f}')}  "
-                f"Hold: {hold_m:.0f}m"
-            )
-            lines.append("")
+            lines.extend([
+                f"{u_icon} <b>OPEN {_esc(side)}</b>  <code>life {life_qty:.6f} · left {qty:.6f}</code>",
+                f"<code>ENTRY ${entry:>12,.2f}   MARK ${price:>12,.2f}   R {cur_r:+6.2f}</code>",
+                f"<code>UPNL  {upnl_pts:+9.1f} pts   MFE {mfe_r:>5.2f}R   HOLD {hold_m:>6.1f}m</code>",
+                f"<code>SL    ${float(p.sl_price or 0.0):>12,.2f}   TP ${float(p.tp_price or 0.0):>12,.2f}</code>",
+                f"🎯 <code>LADDER realised ${realised_ladder:+9,.2f}   partial {partial_qty:.6f}   fees ${ladder_fees:.4f}</code>",
+                f"💼 <code>MARGIN ${_u_margin_used:>10,.2f}   lifecycle ROI {_u_margin_pct:+8.2f}%</code>",
+                "<code>──────────────────────────────</code>",
+            ])
 
-        # ── Realised ────────────────────────────────────────────────
-        _margin_pcts = [t.get('margin_pnl_pct', 0.0) for t in history
-                        if abs(t.get('margin_pnl_pct', 0.0)) > 0.001]
+        _margin_pcts = [float(t.get('margin_pnl_pct', 0.0) or 0.0) for t in history if abs(float(t.get('margin_pnl_pct', 0.0) or 0.0)) > 0.001]
         _total_margin_pct = sum(_margin_pcts)
-        _margin_disp = f"  ({_total_margin_pct:+.1f}% margin)" if _margin_pcts else ""
+        lines.extend([
+            "📘 <b>Closed-Trade Ledger</b>",
+            f"<code>NET ${total_pnl:+11,.4f}   ROI {_total_margin_pct:+8.1f}%</code>",
+            f"<code>TRADES {total_t:>4}   W {wins:>3}   L {losses:>3}   WR {wr:>5.1f}%</code>",
+        ])
 
-        lines.append(f"<b>Realised</b>:  {_esc(f'${total_pnl:+.4f}')}{_margin_disp}")
-        lines.append(
-            f"Trades: {total_t} | W:{wins} L:{losses} | WR: <b>{wr:.0f}%</b>"
-        )
-
-        # ── Expectancy ──────────────────────────────────────────────
         if total_t >= 3:
-            win_pnls  = [t['pnl'] for t in history if t.get('is_win')]
-            loss_pnls = [t['pnl'] for t in history if not t.get('is_win')]
+            win_pnls  = [float(t.get('pnl', 0) or 0.0) for t in history if t.get('is_win')]
+            loss_pnls = [float(t.get('pnl', 0) or 0.0) for t in history if not t.get('is_win')]
             avg_win   = sum(win_pnls)  / len(win_pnls)  if win_pnls  else 0.0
             avg_loss  = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0.0
             expectancy = (wr/100 * avg_win) + ((1 - wr/100) * avg_loss)
             exp_icon = "🟢" if expectancy > 0 else "🔴"
-            lines.append(
-                f"{exp_icon} Expectancy: <b>{_esc(f'${expectancy:+.2f}')}</b>/trade  "
-                f"(avgW {_esc(f'${avg_win:+.2f}')} avgL {_esc(f'${avg_loss:+.2f}')})"
-            )
+            lines.append(f"{exp_icon} <code>EXPECT ${expectancy:+9,.2f}   avgW ${avg_win:+9,.2f}   avgL ${avg_loss:+9,.2f}</code>")
 
-        # ── Recent 3 trades ─────────────────────────────────────────
         if history:
-            lines.append("")
-            lines.append("<b>Recent</b>:")
+            lines.append("🧾 <b>Recent Prints</b>")
             for t in reversed(history[-3:]):
-                pnl    = t.get('pnl', 0.0)
-                side   = (t.get('side') or '?').upper()
-                reason = t.get('reason', '?')
-                m_pct  = t.get('margin_pnl_pct', 0.0)
+                pnl    = float(t.get('pnl', 0.0) or 0.0)
+                side   = str(t.get('side') or '?').upper()
+                reason = str(t.get('reason', '?'))
+                m_pct  = float(t.get('margin_pnl_pct', 0.0) or 0.0)
+                ladder = float(t.get('tp_ladder_realized_pnl', 0.0) or 0.0)
                 icon   = "✅" if t.get('is_win') else "❌"
-                m_tag  = f" ({m_pct:+.1f}%)" if abs(m_pct) > 0.01 else ""
-                lines.append(
-                    f"  {icon} {_esc(side)} "
-                    f"{_esc(f'${pnl:+.4f}')}{m_tag} "
-                    f"[{_esc(reason[:12])}]"
-                )
+                lines.append(f"{icon} <code>{_esc(side):<5} ${pnl:+10,.4f}   ROI {m_pct:+7.1f}%   ladder ${ladder:+8,.2f}   {_esc(reason[:12])}</code>")
         return "\n".join(lines)
 
     # ================================================================

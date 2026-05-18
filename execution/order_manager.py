@@ -319,6 +319,92 @@ class _DeltaAdapter:
             cv = float(getattr(config, 'DELTA_CONTRACT_VALUE_BTC', 0.001) or 0.001)
         return abs(float(contracts)) * cv
 
+    @staticmethod
+    def _num(value, default: float = 0.0) -> float:
+        try:
+            if value is None or value == "":
+                return float(default)
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    @classmethod
+    def _extract_paid_commission(cls, payload: Optional[Dict]) -> tuple[float, bool]:
+        """Return (exact_commission_usd, present).
+
+        Delta exposes the exact fee on orders as paid_commission / commission.
+        The value may legitimately be zero for a zero-fee promotion or negative
+        for a rebate, so presence of the field is the exactness signal — not
+        value > 0.
+        """
+        if not isinstance(payload, dict):
+            return 0.0, False
+        sources = [payload]
+        raw = payload.get("_raw")
+        if isinstance(raw, dict):
+            sources.insert(0, raw)
+        for src in sources:
+            for key in ("paid_commission", "commission", "fee", "fees"):
+                if key in src and src.get(key) is not None and src.get(key) != "":
+                    return cls._num(src.get(key), 0.0), True
+        return 0.0, False
+
+    def resolve_order_execution(self, order_id: str, page_size: int = 20) -> Optional[Dict]:
+        """Resolve exact execution details for a Delta order.
+
+        Uses GET /v2/orders/{id} as the authority for state and paid_commission,
+        then GET /v2/fills as an exact fill-level supplement. No fee estimates
+        are produced here.
+        """
+        oid = str(order_id or "").strip()
+        if not oid:
+            return None
+        raw = self.query_order_exact(oid)
+        if not isinstance(raw, dict):
+            return None
+
+        fee_paid, fee_exact = self._extract_paid_commission(raw)
+        fill_price = self.extract_fill_price(raw) or 0.0
+        filled_qty = self.extract_filled_qty(raw)
+
+        try:
+            fills = self.get_fills_recent(page_size=page_size) or []
+            num = den = 0.0
+            fill_contracts = 0.0
+            fill_commission = 0.0
+            fill_commission_seen = False
+            for fill in fills:
+                if str(fill.get("order_id", "") or "").strip() != oid:
+                    continue
+                fp = self._num(fill.get("price"), 0.0)
+                fsz = abs(self._num(fill.get("size"), 0.0))
+                if fp > 0 and fsz > 0:
+                    num += fp * fsz
+                    den += fsz
+                    fill_contracts += fsz
+                ffee, fexact = self._extract_paid_commission(fill)
+                if fexact:
+                    fill_commission += ffee
+                    fill_commission_seen = True
+            if den > 0:
+                fill_price = num / den
+            if fill_contracts > 0:
+                filled_qty = self._contracts_to_qty(fill_contracts)
+            if fill_commission_seen:
+                fee_paid = fill_commission
+                fee_exact = True
+        except Exception as e:
+            logger.debug(f"resolve_order_execution({oid}) fills lookup error: {e}")
+
+        return {
+            "status": self.extract_status(raw),
+            "fill_price": float(fill_price or 0.0),
+            "filled_qty": float(filled_qty or 0.0),
+            "paid_commission": float(fee_paid or 0.0),
+            "paid_commission_exact": bool(fee_exact),
+            "raw_order": raw,
+        }
+
     def _get_product_id(self) -> Optional[int]:
         if self._pid_cache:
             return self._pid_cache
@@ -960,49 +1046,68 @@ class OrderManager:
 
     def get_fill_details(self, order_id: str) -> Optional[Dict]:
         try:
-            data = self.get_order_status(order_id, retry_count=2)
+            resolved = None
+            if hasattr(self._adapter, "resolve_order_execution"):
+                try:
+                    resolved = self._adapter.resolve_order_execution(order_id)
+                except Exception as _rx_e:
+                    logger.debug(f"resolve_order_execution error for {order_id}: {_rx_e}")
+
+            data = (resolved or {}).get("raw_order") if isinstance(resolved, dict) else None
+            if not data:
+                data = self.get_order_status(order_id, retry_count=2)
             if not data:
                 return None
-            status     = self._adapter.extract_status(data)
-            fill_price = self._adapter.extract_fill_price(data)
-            filled_qty = self._adapter.extract_filled_qty(data)
+
+            status     = (resolved or {}).get("status") if isinstance(resolved, dict) else None
+            status     = status or self._adapter.extract_status(data)
+            fill_price = float((resolved or {}).get("fill_price") or 0.0) if isinstance(resolved, dict) else 0.0
+            if fill_price <= 0:
+                fill_price = self._adapter.extract_fill_price(data) or 0.0
+            filled_qty = float((resolved or {}).get("filled_qty") or 0.0) if isinstance(resolved, dict) else 0.0
+            if filled_qty <= 0:
+                filled_qty = self._adapter.extract_filled_qty(data)
+
             req_qty    = 0.0
-            for f in ("quantity", "size", "orig_qty"):
+            for f in ("quantity", "size_btc", "orig_qty"):
                 v = data.get(f)
                 if v:
                     try:
                         req_qty = float(v)
                         if req_qty > 0: break
                     except (ValueError, TypeError): pass
+            if req_qty <= 0 and hasattr(self._adapter, "_contracts_to_qty"):
+                for f in ("size", "requested_size"):
+                    v = data.get(f)
+                    if v:
+                        try:
+                            req_qty = self._adapter._contracts_to_qty(float(v))
+                            if req_qty > 0: break
+                        except Exception:
+                            pass
             is_partial = status == "PARTIAL_FILL"
             if filled_qty <= 0 and status == "FILLED":
                 filled_qty = req_qty
             fill_pct = (filled_qty / req_qty * 100) if req_qty > 0 else 0.0
 
-            # Extract exact paid_commission from Delta order response.
-            # data is the normalised dict from get_order_status; _raw holds the
-            # original Delta response which contains paid_commission (string).
-            _raw = data.get("_raw") or data
             paid_commission = 0.0
-            for _fee_key in ("paid_commission", "commission"):
-                _fv = _raw.get(_fee_key)
-                if _fv is not None:
-                    try:
-                        paid_commission = float(_fv)
-                        if paid_commission > 0:
-                            break
-                    except (ValueError, TypeError):
-                        pass
+            commission_exact = False
+            if isinstance(resolved, dict):
+                paid_commission = float(resolved.get("paid_commission", 0.0) or 0.0)
+                commission_exact = bool(resolved.get("paid_commission_exact", False))
+            if not commission_exact and hasattr(self._adapter, "_extract_paid_commission"):
+                paid_commission, commission_exact = self._adapter._extract_paid_commission(data)
 
             return {
-                "status":           status,
-                "fill_price":       fill_price,
-                "filled_qty":       filled_qty,
-                "requested_qty":    req_qty,
-                "is_partial":       is_partial,
-                "fill_pct":         fill_pct,
-                "paid_commission":  paid_commission,
-                "raw_data":         data,
+                "status":                 status,
+                "fill_price":             fill_price,
+                "filled_qty":             filled_qty,
+                "requested_qty":          req_qty,
+                "is_partial":             is_partial,
+                "fill_pct":               fill_pct,
+                "paid_commission":        paid_commission,
+                "paid_commission_exact":  commission_exact,
+                "raw_data":               data,
             }
         except Exception as e:
             logger.error(f"get_fill_details error: {e}", exc_info=True)
@@ -1034,7 +1139,18 @@ class OrderManager:
                     "timestamp": datetime.now().isoformat(),
                     "reduce_only": reduce_only,
                 })
-                logger.info(f"✅ Market order: {data['order_id']}")
+                try:
+                    details = self.get_fill_details(data["order_id"])
+                    if details:
+                        if float(details.get("fill_price", 0.0) or 0.0) > 0:
+                            data["fill_price"] = float(details.get("fill_price", 0.0) or 0.0)
+                        if float(details.get("filled_qty", 0.0) or 0.0) > 0:
+                            data["quantity"] = float(details.get("filled_qty", 0.0) or 0.0)
+                        data["paid_commission"] = float(details.get("paid_commission", 0.0) or 0.0)
+                        data["paid_commission_exact"] = bool(details.get("paid_commission_exact", False))
+                except Exception as _fee_e:
+                    logger.debug(f"market order exact fee lookup deferred: {_fee_e}")
+                logger.info(f"✅ Market order: {data['order_id']} fee=${float(data.get('paid_commission', 0.0) or 0.0):.4f} exact={bool(data.get('paid_commission_exact', False))}")
             return data
         except Exception as e:
             logger.error(f"place_market_order error: {e}", exc_info=True)
@@ -1138,7 +1254,8 @@ class OrderManager:
                 mdata = self.place_market_order(side=side, quantity=quantity)
                 if mdata:
                     mdata["fill_type"] = "taker"
-                    mdata["fill_price"] = 0.0
+                    if float(mdata.get("fill_price", 0.0) or 0.0) <= 0:
+                        mdata["fill_price"] = 0.0
                     if on_order_placed is not None:
                         try: on_order_placed(mdata.get("order_id", ""))
                         except Exception: pass
@@ -1175,8 +1292,10 @@ class OrderManager:
                 data["fill_type"]  = "maker"
                 data["fill_price"] = fill_px
                 data["paid_commission"] = float(details.get("paid_commission", 0) or 0)
+                data["paid_commission_exact"] = bool(details.get("paid_commission_exact", False))
                 logger.info(f"✅ Maker fill: {order_id[:8]}… @ ${fill_px:.2f}"
-                            f" fee=${data['paid_commission']:.4f}")
+                            f" fee=${data['paid_commission']:.4f}"
+                            f" exact={data['paid_commission_exact']}")
                 return data
 
             if status == "CANCELLED":
@@ -1192,6 +1311,7 @@ class OrderManager:
                 data["fill_price"] = fill_px
                 data["quantity"]   = filled_qty
                 data["paid_commission"] = float(details.get("paid_commission", 0) or 0)
+                data["paid_commission_exact"] = bool(details.get("paid_commission_exact", False))
                 return data
 
         # Timeout
@@ -1202,6 +1322,7 @@ class OrderManager:
             data["fill_type"]  = "maker"
             data["fill_price"] = fill_px
             data["paid_commission"] = float((details or {}).get("paid_commission", 0) or 0)
+            data["paid_commission_exact"] = bool((details or {}).get("paid_commission_exact", False))
             return data
 
         if fallback_to_market:
@@ -1209,7 +1330,8 @@ class OrderManager:
             mdata = self.place_market_order(side=side, quantity=quantity)
             if mdata:
                 mdata["fill_type"]  = "taker"
-                mdata["fill_price"] = 0.0
+                if float(mdata.get("fill_price", 0.0) or 0.0) <= 0:
+                    mdata["fill_price"] = 0.0
             return mdata
         logger.info(f"Limit order timeout after {timeout_sec:.0f}s — cancelled, no market fallback")
         return None
@@ -1285,8 +1407,10 @@ class OrderManager:
                 data["bracket_order"] = True
                 # Propagate exact entry fee from Delta paid_commission
                 data["paid_commission"] = float(details.get("paid_commission", 0) or 0)
+                data["paid_commission_exact"] = bool(details.get("paid_commission_exact", False))
                 logger.info(f"✅ Bracket fill: {order_id[:8]}… @ ${fill_px:.2f}"
-                            f" fee=${data['paid_commission']:.4f}")
+                            f" fee=${data['paid_commission']:.4f}"
+                            f" exact={data['paid_commission_exact']}")
 
                 # Query open orders to retrieve bracket SL/TP child order IDs.
                 # Delta creates children asynchronously after fill.
@@ -2024,6 +2148,7 @@ class OrderManager:
             "fill_price": 0.0,
             "order_id":   "",
             "fee_paid":   0.0,
+            "fee_exact":  False,
         }
 
         # Only _DeltaAdapter exposes query_order_exact / get_fills_recent
@@ -2079,22 +2204,24 @@ class OrderManager:
             exit_type = "tp"
 
         # Exact fee — paid_commission per Delta API response schema.
-        # Both "paid_commission" and "commission" are present per docs; prefer paid_commission.
-        fee_paid = float(
-            fired_raw.get("paid_commission",
-            fired_raw.get("commission", 0)) or 0
-        )
+        # Presence of the field is the exactness signal; value can be zero/negative.
+        fee_paid = 0.0
+        fee_exact = False
+        if hasattr(self._adapter, "_extract_paid_commission"):
+            fee_paid, fee_exact = self._adapter._extract_paid_commission(fired_raw)
 
-        # ── Step 3: Get exact fill price ──────────────────────────────────────
-        # Three sources, all exact exchange data — no estimation, no strategy state.
+        # ── Step 3: Get exact fill price + fill-level fee supplement ───────────
+        # All values come from Delta order/fill records. No estimates.
         fill_price = 0.0
 
-        # Source A: GET /v2/fills — per-fill execution price, match by order_id.
+        # Source A: GET /v2/fills — per-fill execution price and commission.
         # VWAP across fills for multi-fill orders: sum(price×size)/sum(size).
         try:
-            fills = self._adapter.get_fills_recent(page_size=5)
+            fills = self._adapter.get_fills_recent(page_size=20)
             _num = 0.0
             _den = 0.0
+            _fill_fee = 0.0
+            _fill_fee_seen = False
             for fill in (fills or []):
                 if str(fill.get("order_id", "") or "").strip() != fired_id:
                     continue
@@ -2103,10 +2230,18 @@ class OrderManager:
                 if fp > 0 and fsize > 0:
                     _num += fp * fsize
                     _den += fsize
+                if hasattr(self._adapter, "_extract_paid_commission"):
+                    _ff, _fx = self._adapter._extract_paid_commission(fill)
+                    if _fx:
+                        _fill_fee += _ff
+                        _fill_fee_seen = True
             if _den > 0:
                 fill_price = _num / _den
+            if _fill_fee_seen:
+                fee_paid = _fill_fee
+                fee_exact = True
         except Exception as e:
-            logger.debug(f"identify_exit_order: fills price lookup error: {e}")
+            logger.debug(f"identify_exit_order: fills lookup error: {e}")
 
         # Source B: average_fill_price from the order object.
         # Present in Delta closed-order responses even if not in the official schema.
@@ -2136,6 +2271,7 @@ class OrderManager:
             "fill_price": fill_price,
             "order_id":   fired_id,
             "fee_paid":   fee_paid,
+            "fee_exact":  bool(fee_exact),
         }
 
     # ── Balance ───────────────────────────────────────────────────────────────

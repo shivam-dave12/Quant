@@ -34,7 +34,7 @@ import config
 from core.pnl import gross_pnl_usd
 from core.instruments import current_instrument, instrument_scope
 from core.market_policy import policy_value, active_policy
-from telegram.notifier import send_telegram_message
+from telegram.notifier import send_telegram_message, format_entry_alert, format_exit_alert, format_partial_exit_alert
 from execution.order_manager import CancelResult
 try:
     from strategy.cross_asset_regime import logit_adjust_probability
@@ -630,7 +630,7 @@ def _calc_be_price(pos_side: str, entry_price: float, atr: float,
         _exact_fee = float(getattr(pos, 'entry_fee_paid', 0.0) or 0.0)
         _qty       = float(getattr(pos, 'quantity',       0.0) or 0.0)
 
-    if _exact_fee > 1e-6 and _qty > 1e-10:
+    if (bool(getattr(pos, 'entry_fee_exact', False)) or abs(_exact_fee) > 1e-12) and _qty > 1e-10:
         # Exact round-trip cost: entry paid_commission (exact) + estimated exit
         # fee (same rate applied symmetrically — we don't have the exit fee yet).
         _entry_fee_per_btc = _exact_fee / _qty
@@ -2464,6 +2464,13 @@ class PositionState:
     tp_ladder_realized_gross: float = 0.0
     tp_ladder_realized_fees: float = 0.0
     tp_ladder_recorded_order_ids: List[str] = field(default_factory=list)
+    # Reporting/P&L idempotency for TP-ladder partial fills. Delta fill_qty/paid_commission
+    # are cumulative per order, so we store the already-booked cumulative values and only
+    # book the delta on later PARTIAL_FILL -> FILLED updates.
+    tp_ladder_recorded_fill_qty_by_order: Dict[str, float] = field(default_factory=dict)
+    tp_ladder_recorded_exit_fee_by_order: Dict[str, float] = field(default_factory=dict)
+    tp_ladder_realized_entry_fees: float = 0.0
+    tp_ladder_realized_exit_fees: float = 0.0
     entry_order_id: Optional[str] = None; entry_time: float = 0.0
     initial_risk: float = 0.0; initial_sl_dist: float = 0.0
     trail_active: bool = False; last_trail_time: float = 0.0
@@ -2473,7 +2480,8 @@ class PositionState:
     last_seen_price: float = 0.0
     trade_mode: str = "reversion"  # "reversion" | "trend" | "momentum"
     entry_fill_type: str = "taker"  # v4.3: "maker" | "taker" — for correct PnL fee calc
-    entry_fee_paid: float = 0.0    # v8.1: exact paid_commission from Delta entry order (0 = use estimate)
+    entry_fee_paid: float = 0.0    # v8.1: exact paid_commission from Delta entry order
+    entry_fee_exact: bool = False  # True when fee came from Delta paid_commission / fill commission
     trail_override: Optional[bool] = None  # v4.3: None=use config, True=force on, False=force off
     hold_extensions: int = 0  # v4.6: how many times max-hold has been extended
     consecutive_trail_holds: int = 0  # v5.1: structural trail tracking
@@ -6312,7 +6320,8 @@ class QuantStrategy:
             )
             initial_qty = float(getattr(pos, "tp_ladder_initial_qty", 0.0) or getattr(pos, "quantity", 0.0) or 0.0)
             entry_fee_total = float(getattr(pos, "entry_fee_paid", 0.0) or 0.0)
-            entry_fee_alloc = entry_fee_total * (float(qty or 0.0) / max(initial_qty, 1e-9)) if entry_fee_total else 0.0
+            entry_fee_exact = bool(getattr(pos, "entry_fee_exact", False) or abs(entry_fee_total) > 1e-12)
+            entry_fee_alloc = entry_fee_total * (float(qty or 0.0) / max(initial_qty, 1e-9)) if entry_fee_exact else 0.0
             net = gross - entry_fee_alloc - float(exit_fee or 0.0)
             return net, gross, entry_fee_alloc, float(exit_fee or 0.0)
         except Exception:
@@ -6324,9 +6333,10 @@ class QuantStrategy:
 
         Delta reduce-only TP legs are separate orders from the native bracket.
         If we only shrink local position size, lifecycle PnL later ignores TP1..TPn.
-        This method records each filled internal leg exactly where possible;
-        if order state propagation is late, it uses the planned reduce-only TP
-        price rather than poisoning the trade ledger with a zero-PnL fallback.
+        This method records each filled internal leg only when the exchange
+        order/fill record has propagated. If Delta has not exposed the exact
+        fill and commission yet, booking is deferred — no planned-price or
+        synthetic-fee PnL is fabricated.
         """
         pos = self._pos
         if closed_qty <= 0 or not getattr(pos, "tp_ladder", None):
@@ -6346,7 +6356,7 @@ class QuantStrategy:
                 planned_px = float(leg.get("price", 0.0) or 0.0)
                 if planned_qty <= 0 or planned_px <= 0:
                     continue
-                fill_px = 0.0; fill_qty = 0.0; fee_paid = 0.0; confirmed = False
+                fill_px = 0.0; fill_qty = 0.0; fee_paid = 0.0; confirmed = False; fee_exact = False; status = ""
                 if oid and order_manager is not None and hasattr(order_manager, "get_fill_details"):
                     try:
                         details = order_manager.get_fill_details(oid) or {}
@@ -6354,33 +6364,76 @@ class QuantStrategy:
                         fill_px = float(details.get("fill_price", 0.0) or 0.0)
                         fill_qty = float(details.get("filled_qty", 0.0) or 0.0)
                         fee_paid = float(details.get("paid_commission", 0.0) or 0.0)
-                        confirmed = status in ("FILLED", "CLOSED", "PARTIAL_FILL") and fill_px > 0 and fill_qty > 0
+                        fee_exact = bool(details.get("paid_commission_exact", False))
+                        confirmed = status in ("FILLED", "CLOSED", "PARTIAL_FILL") and fill_px > 0 and fill_qty > 0 and fee_exact
                     except Exception as _fd_e:
                         logger.debug("TP_LADDER fill detail lookup failed for %s: %s", oid[:10], _fd_e)
                 if not confirmed:
-                    # We observed exchange position size fall. If exact leg fill
-                    # is not yet visible, allocate the observed closed quantity
-                    # to the next unrecorded planned TP leg at its planned price.
-                    fill_px = planned_px
-                    fill_qty = min(planned_qty, remaining_to_match if remaining_to_match > 0 else planned_qty)
-                    fee_paid = 0.0
-                if fill_qty <= 0:
+                    # No synthetic TP-ladder PnL. Delta exposes exact order/fill
+                    # fees; if the fill has not propagated yet, defer booking
+                    # rather than using the planned TP price or a zero-fee guess.
+                    logger.info(
+                        "TP_LADDER fill %s not exact yet — deferring realised PnL booking",
+                        oid[:10] if oid else role or "TP")
                     continue
-                net, gross, entry_fee_alloc, exit_fee = self._compute_leg_net_pnl(pos, fill_px, fill_qty, fee_paid)
+
+                # Delta fill_qty and paid_commission are cumulative for the order.
+                # Book ONLY the newly-filled delta so repeated reconcile ticks and
+                # true partial-fill updates cannot double-count or under-count P&L.
+                booked_qty_by_order = getattr(pos, "tp_ladder_recorded_fill_qty_by_order", {}) or {}
+                booked_fee_by_order = getattr(pos, "tp_ladder_recorded_exit_fee_by_order", {}) or {}
+                prev_qty = float(booked_qty_by_order.get(oid, 0.0) or 0.0) if oid else 0.0
+                prev_fee = float(booked_fee_by_order.get(oid, 0.0) or 0.0) if oid else 0.0
+                cumulative_qty = min(max(fill_qty, 0.0), planned_qty)
+                delta_qty = max(0.0, cumulative_qty - prev_qty)
+                delta_exit_fee = fee_paid - prev_fee
+                if delta_qty <= max(QCfg.MIN_QTY() * 0.001, 1e-12):
+                    logger.debug(
+                        "TP_LADDER fill %s already booked to qty %.8g fee %.6f; status=%s",
+                        oid[:10] if oid else role or "TP", prev_qty, prev_fee, status)
+                    continue
+
+                net, gross, entry_fee_alloc, exit_fee = self._compute_leg_net_pnl(pos, fill_px, delta_qty, delta_exit_fee)
                 with self._lock:
                     pos.tp_ladder_realized_pnl += net
                     pos.tp_ladder_realized_gross += gross
                     pos.tp_ladder_realized_fees += (entry_fee_alloc + exit_fee)
+                    pos.tp_ladder_realized_entry_fees += entry_fee_alloc
+                    pos.tp_ladder_realized_exit_fees += exit_fee
                     if oid:
-                        pos.tp_ladder_recorded_order_ids.append(oid)
-                        recorded.add(oid)
+                        pos.tp_ladder_recorded_fill_qty_by_order[oid] = cumulative_qty
+                        pos.tp_ladder_recorded_exit_fee_by_order[oid] = fee_paid
+                        if status in ("FILLED", "CLOSED") or cumulative_qty >= planned_qty - max(QCfg.MIN_QTY() * 0.001, 1e-12):
+                            if oid not in pos.tp_ladder_recorded_order_ids:
+                                pos.tp_ladder_recorded_order_ids.append(oid)
+                            recorded.add(oid)
                 booked_any = True
-                remaining_to_match = max(0.0, remaining_to_match - fill_qty)
+                remaining_to_match = max(0.0, remaining_to_match - delta_qty)
                 logger.info(
-                    "🎯 TP_LADDER realised %s qty=%.8g fill=$%.2f gross=%+.4f fees=%.4f net=%+.4f cumulative_net=%+.4f%s",
-                    role or "TP", fill_qty, fill_px, gross, entry_fee_alloc + exit_fee, net,
-                    float(getattr(pos, "tp_ladder_realized_pnl", 0.0) or 0.0),
-                    " exact" if confirmed else " estimated-from-planned-leg")
+                    "🎯 TP_LADDER realised %s qty=%.8g fill=$%.2f gross=%+.4f fees=%.4f net=%+.4f cumulative_net=%+.4f exact status=%s",
+                    role or "TP", delta_qty, fill_px, gross, entry_fee_alloc + exit_fee, net,
+                    float(getattr(pos, "tp_ladder_realized_pnl", 0.0) or 0.0), status)
+                try:
+                    self._send_telegram(
+                        format_partial_exit_alert(
+                            side=pos.side,
+                            role=role or "TP",
+                            fill_price=fill_px,
+                            qty_closed=delta_qty,
+                            qty_remaining=max(float(getattr(pos, "quantity", 0.0) or 0.0) - delta_qty, 0.0),
+                            gross=gross,
+                            fees=entry_fee_alloc + exit_fee,
+                            net=net,
+                            cumulative_net=float(getattr(pos, "tp_ladder_realized_pnl", 0.0) or 0.0),
+                            sl=float(getattr(pos, "sl_price", 0.0) or 0.0),
+                            final_tp=float(getattr(pos, "tp_price", 0.0) or 0.0),
+                            exact_fees=True,
+                            status=status,
+                        ),
+                        event_type="tp_ladder",
+                    )
+                except Exception:
+                    pass
                 if remaining_to_match <= max(QCfg.MIN_QTY() * 0.25, 1e-12):
                     break
             except Exception as _e:
@@ -6399,7 +6452,7 @@ class QuantStrategy:
                 return
             old_qty = float(self._pos.quantity or 0.0)
             new_qty = abs(float(ex_size or 0.0))
-            if old_qty <= 0 or new_qty <= 0:
+            if old_qty <= 0:
                 return
             min_delta = max(QCfg.MIN_QTY(), old_qty * 0.005)
             if new_qty < old_qty - min_delta:
@@ -6412,17 +6465,9 @@ class QuantStrategy:
                     "🎯 TP_LADDER partial exit detected: qty %.8g → %.8g (closed %.8g). "
                     "SL price remains fixed at $%.2f; fixed-SL policy; TP ladder manages monetisation.",
                     old_qty, new_qty, closed, float(self._pos.sl_price or 0.0))
-                try:
-                    self._send_telegram(
-                        f"🎯 <b>TP LADDER PARTIAL</b>\n"
-                        f"Closed: <code>{closed:.8g}</code>\n"
-                        f"Remaining: <code>{new_qty:.8g}</code>\n"
-                        f"SL unchanged: <b>${float(self._pos.sl_price or 0.0):,.2f}</b>\n"
-                        f"Final TP unchanged: <b>${float(self._pos.tp_price or 0.0):,.2f}</b>",
-                        event_type="tp_ladder",
-                    )
-                except Exception:
-                    pass
+                # The fill-booking path sends the user-facing TP ladder card once
+                # exact Delta fill + fee details are available. Keep this reconcile
+                # log local only to avoid plain duplicate Telegram messages.
         except Exception as _e:
             logger.debug("TP ladder quantity reconcile error: %s", _e)
 
@@ -6808,10 +6853,14 @@ class QuantStrategy:
             or price
         )
         actual_fill_type = entry_data.get("fill_type", "taker")
-        # v8.1: exact entry fee from Delta paid_commission (propagated by order_manager)
+        # v8.1: exact entry fee from Delta paid_commission / fill commission.
+        # Exactness is a boolean signal; the value can be zero or a maker rebate.
         entry_fee_paid = float(entry_data.get("paid_commission", 0) or 0)
-        if entry_fee_paid > 0:
-            logger.info(f"💰 Entry fee (exact): ${entry_fee_paid:.4f}")
+        entry_fee_exact = bool(entry_data.get("paid_commission_exact", False))
+        if entry_fee_exact:
+            logger.info(f"💰 Entry fee (Delta exact): ${entry_fee_paid:.4f}")
+        else:
+            logger.warning("Entry fee exactness missing from order response; PnL will not use a synthetic Delta fee")
 
         # v4.6 BUG FIX #8: Use actual filled quantity for partial fills
         # order_manager.place_limit_entry returns adjusted quantity on partial fill
@@ -7047,6 +7096,7 @@ class QuantStrategy:
             trade_mode      = mode,
             entry_fill_type = actual_fill_type,  # v4.3: for correct PnL fee calc
             entry_fee_paid  = entry_fee_paid,     # v8.1: exact from Delta paid_commission
+            entry_fee_exact = entry_fee_exact,    # exact fee present, even if 0/rebate
             ict_entry_tier  = ict_tier,           # v7.0: confidence tier for analytics
             entry_session   = entry_session,
             # FIX 8b: capture actual HTF scores at entry so _record_pnl can log them correctly
@@ -7250,27 +7300,35 @@ class QuantStrategy:
         except Exception:
             pass
         _sep = "━━━━━━━━━━━━━━━━━━━━"
-        self._send_telegram(
-            f"{'🟢' if side == 'long' else '🔴'} <b>{side.upper()} OPENED</b>  <code>{_et_label}</code>\n"
-            f"{_sep}\n"
-            f"<b>Decision</b>\n"
-            f"Posterior: <code>{_posterior}</code>\n"
-            f"Reason: <code>{_entry_reason[:180]}</code>\n"
-            f"\n<b>Execution</b>\n"
-            f"Entry: <b>${fill_price:,.2f}</b>   Qty: <code>{qty:.6f} BTC</code>\n"
-            f"Risk:  <code>${dollar_risk:.2f}</code>   Payoff/Risk: <code>1:{rr_a:.2f}</code>\n"
-            f"\n<b>Institutional Stop</b>\n"
-            f"SL: <b>${sl_price:,.2f}</b>  ({sl_dist_pts/max(self._atr_5m.atr,1):.2f} ATR)\n"
-            f"<code>{_sl_model}</code>\n"
-            f"\n<b>Expected-Utility Target Advisory</b>\n"
-            f"TP: <b>${tp_price:,.2f}</b>  ({tp_dist_pts/max(self._atr_5m.atr,1):.2f} ATR)\n"
-            f"<code>{_tp_model}</code>\n"
-            f"<code>{_runner_model}</code>\n"
-            f"{_swept_str}\n"
-            f"{_sep}\n"
-            f"Exit model: fixed SL + dynamic liquidity TP ladder (TP1..TPn → final TP)\n"
-            f"Monitor: /position  /thinking"
+        _fee_line = (f"Delta fee exact ${entry_fee_paid:.4f}" if entry_fee_exact else "Delta fee pending exact commission")
+        _entry_msg = format_entry_alert(
+            side=side,
+            entry=fill_price,
+            sl=sl_price,
+            tp=tp_price,
+            qty=qty,
+            mode=_et_label,
+            tier=ict_tier or "-",
+            sl_atr=sl_dist_pts/max(self._atr_5m.atr,1),
+            tp_atr=tp_dist_pts/max(self._atr_5m.atr,1),
+            rr=rr_a,
+            reason=_entry_reason,
+            session=entry_session,
+            flow_conv=float(_flow_conv_str) if _flow_conv_str not in ("—", "-") else 0.0,
+            posterior=_posterior,
+            expected_value=getattr(_best_t, 'full_position_utility', getattr(_best_t, 'utility', 0.0)) if _best_t is not None else 0.0,
+            target_realism=getattr(_best_t, 'probability', 0.0) if _best_t is not None else 0.0,
+            fee_line=_fee_line,
         )
+        _entry_msg += (
+            f"\n<code>RISK ${dollar_risk:.2f}   FEE {_fee_line}</code>"
+            f"\n<code>SL-AUDIT {_sl_model[:90]}</code>"
+            f"\n<code>TP-AUDIT {_tp_model[:90]}</code>"
+            f"\n<code>RUNNER {_runner_model[:90]}</code>"
+            f"{_swept_str}"
+            f"\n<i>Exit model: fixed SL + dynamic liquidity TP ladder · Monitor /position /thinking</i>"
+        )
+        self._send_telegram(_entry_msg, event_type="entry")
         logger.info(
             f"✅ ACTIVE {side.upper()} [{mode}] @ ${fill_price:,.2f} | "
             f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} | R:R=1:{rr_a:.2f}"
@@ -7821,6 +7879,7 @@ class QuantStrategy:
                     status = str((details or {}).get('status', '')).upper()
                     fill_price = float((details or {}).get('fill_price') or 0.0)
                     fee_paid = float((details or {}).get('paid_commission') or 0.0)
+                    fee_exact = bool((details or {}).get('paid_commission_exact', False))
                     if status in ('FILLED', 'CLOSED') and fill_price > 0:
                         exit_info = {
                             'confirmed': True,
@@ -7829,6 +7888,7 @@ class QuantStrategy:
                             'fill_price': fill_price,
                             'order_id': manual_exit_id,
                             'fee_paid': fee_paid,
+                            'fee_exact': fee_exact,
                         }
                         logger.info(
                             f"✅ Manual exit confirmed on attempt {_i+1}: order={manual_exit_id[:10]}… "
@@ -8053,18 +8113,12 @@ class QuantStrategy:
             getattr(_cfg_x, "EXECUTION_EXCHANGE", "").lower() == "delta"
             and getattr(_cfg_x, "DELTA_SYMBOL", "BTCUSD").upper() == "BTCUSD"
         )
-        exit_fee_is_exact = fee_paid > 0.0
-        if not exit_fee_is_exact and fill_price > 0 and getattr(pos, "quantity", 0.0) > 0:
-            if exit_type in ("sl", "trail_sl", "manual_exit"):
-                exit_rate = float(getattr(
-                    _cfg_x,
-                    "STOP_EXIT_COMMISSION_RATE",
-                    getattr(_cfg_x, "DELTA_COMMISSION_RATE", 0.00050) if _is_delta else QCfg.COMMISSION_RATE(),
-                ))
-                fee_paid = fill_price * pos.quantity * abs(exit_rate)
-                logger.info(
-                    f"Exit fee fallback: exchange returned $0.0000 for {exit_reason}; "
-                    f"using estimated taker fee ${fee_paid:.4f}")
+        exit_fee_is_exact = bool(exit_info.get("fee_exact", False))
+        if not exit_fee_is_exact:
+            logger.warning(
+                f"Exit fee not exact for {exit_reason}; no synthetic fee estimate will be booked. "
+                "Delta order/fill commission should populate on retry/reconcile."
+            )
 
         gross = gross_pnl_usd(
             pos.side,
@@ -8076,49 +8130,61 @@ class QuantStrategy:
 
         # Entry fee: prefer exact paid_commission captured at entry (v8.1).
         # Fallback: commission_rate × entry_notional (rate-exact, value estimated).
-        _entry_fee_exact = getattr(pos, "entry_fee_paid", 0.0) or 0.0
-        entry_fee_is_exact = _entry_fee_exact > 0
+        _entry_fee_exact = float(getattr(pos, "entry_fee_paid", 0.0) or 0.0)
+        entry_fee_is_exact = bool(getattr(pos, "entry_fee_exact", False) or abs(_entry_fee_exact) > 1e-12)
         if entry_fee_is_exact:
             entry_fee = _entry_fee_exact
         else:
-            fill_type  = getattr(pos, "entry_fill_type", "taker")
-            # FIX Bug-A: use exchange-specific maker rate.
-            # Delta maker = rebate (negative); CoinSwitch maker = positive cost.
-            if fill_type == "maker":
-                if _is_delta:
-                    entry_rate = float(getattr(_cfg_x, "DELTA_COMMISSION_RATE_MAKER", -0.00020))
-                else:
-                    entry_rate = float(getattr(_cfg_x, "COMMISSION_RATE_MAKER",
-                                               QCfg.COMMISSION_RATE() * 0.40))
+            if _is_delta:
+                # Delta exposes paid_commission. Do not fabricate a Delta fee if
+                # the exact field is temporarily missing; keep exact_fees=False.
+                entry_fee = 0.0
+                logger.warning("Entry fee not exact on position state; no synthetic Delta entry fee booked")
             else:
-                entry_rate = (float(getattr(_cfg_x, "DELTA_COMMISSION_RATE", 0.00050))
-                              if _is_delta else QCfg.COMMISSION_RATE())
-            entry_fee = pos.entry_price * pos.quantity * entry_rate
+                fill_type  = getattr(pos, "entry_fill_type", "taker")
+                if fill_type == "maker":
+                    entry_rate = float(getattr(_cfg_x, "COMMISSION_RATE_MAKER", QCfg.COMMISSION_RATE() * 0.40))
+                else:
+                    entry_rate = QCfg.COMMISSION_RATE()
+                entry_fee = pos.entry_price * pos.quantity * entry_rate
         exit_fee  = fee_paid
-        _exit_tag = "exact" if exit_fee_is_exact else "rate-est"
+        _exit_tag = "exact" if exit_fee_is_exact else "missing"
 
-        residual_pnl = gross - entry_fee - exit_fee
         ladder_pnl = float(getattr(pos, 'tp_ladder_realized_pnl', 0.0) or 0.0)
         ladder_gross = float(getattr(pos, 'tp_ladder_realized_gross', 0.0) or 0.0)
         ladder_fees = float(getattr(pos, 'tp_ladder_realized_fees', 0.0) or 0.0)
+        ladder_entry_fees = float(getattr(pos, 'tp_ladder_realized_entry_fees', 0.0) or 0.0)
+        ladder_exit_fees = float(getattr(pos, 'tp_ladder_realized_exit_fees', 0.0) or 0.0)
+
+        # Reporting/P&L fix: TP ladder partials already allocate their share of
+        # the exact entry commission. The final residual leg must subtract only
+        # the unallocated entry fee, otherwise scaled-out trades double-count
+        # entry fees and profitable partials can be reported as losses.
+        residual_entry_fee = entry_fee - ladder_entry_fees if entry_fee_is_exact else entry_fee
+        residual_pnl = gross - residual_entry_fee - exit_fee
         pnl = residual_pnl + ladder_pnl
 
-        _entry_tag = "exact" if entry_fee_is_exact else "rate-est"
+        _entry_tag = "exact" if entry_fee_is_exact else ("missing" if _is_delta else "rate-est")
         fee_breakdown: Dict = {
             "gross_pnl":  round(gross + ladder_gross, 4),
             "entry_fee":  round(entry_fee, 4),
+            "entry_fee_residual": round(residual_entry_fee, 4),
             "exit_fee":   round(exit_fee, 4),
-            "total_fees": round(entry_fee + exit_fee + ladder_fees, 4),
+            "total_fees": round(residual_entry_fee + exit_fee + ladder_fees, 4),
             "exact_fees": entry_fee_is_exact and exit_fee_is_exact,
             "residual_pnl": round(residual_pnl, 4),
             "tp_ladder_realized_pnl": round(ladder_pnl, 4),
+            "tp_ladder_gross": round(ladder_gross, 4),
+            "tp_ladder_fees": round(ladder_fees, 4),
+            "tp_ladder_entry_fees": round(ladder_entry_fees, 4),
+            "tp_ladder_exit_fees": round(ladder_exit_fees, 4),
         }
 
         logger.info(
             f"📊 Exit price=${fill_price:,.2f} reason={exit_reason} "
             f"entry=${pos.entry_price:,.2f} residual_gross=${gross:+.4f} "
-            f"entry_fee=${entry_fee:.4f}({_entry_tag}) exit_fee=${exit_fee:.4f}({_exit_tag}) "
-            f"ladder_net=${ladder_pnl:+.4f} lifecycle_net=${pnl:+.4f}"
+            f"entry_fee_total=${entry_fee:.4f}({_entry_tag}) residual_entry_fee=${residual_entry_fee:.4f} "
+            f"exit_fee=${exit_fee:.4f}({_exit_tag}) ladder_net=${ladder_pnl:+.4f} lifecycle_net=${pnl:+.4f}"
         )
 
         # ─── Step 3: Record PnL and trade history ─────────────────────────────
@@ -8191,8 +8257,9 @@ class QuantStrategy:
         _exit_margin_pct = 0.0
         _exit_margin_used = 0.0
         try:
-            if pos.entry_price > 0 and pos.quantity > 0:
-                _exit_notional = pos.entry_price * pos.quantity
+            _exit_qty_for_margin = float(getattr(pos, "tp_ladder_initial_qty", 0.0) or getattr(pos, "quantity", 0.0) or 0.0)
+            if pos.entry_price > 0 and _exit_qty_for_margin > 0:
+                _exit_notional = pos.entry_price * _exit_qty_for_margin
                 _exit_lev = QCfg.LEVERAGE()
                 _exit_margin_used = _exit_notional / _exit_lev if _exit_lev > 0 else _exit_notional
                 if _exit_margin_used > 1e-10:
@@ -8200,22 +8267,43 @@ class QuantStrategy:
         except Exception:
             pass
 
+        _lifecycle_qty = float(getattr(pos, "tp_ladder_initial_qty", 0.0) or getattr(pos, "quantity", 0.0) or 0.0)
+        _residual_qty = float(getattr(pos, "quantity", 0.0) or 0.0)
+        _partial_qty = max(0.0, _lifecycle_qty - _residual_qty)
+        _fee_source = (
+            f"entry total {_entry_tag} ${entry_fee:.4f} · residual entry ${residual_entry_fee:.4f} · "
+            f"ladder fees ${ladder_fees:.4f} · final exit {_exit_tag} ${exit_fee:.4f}"
+        )
         self._send_telegram(
-            f"{result_icon} <b>{result_color} — {result_label}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Side:     {pos.side.upper()} [{pos.trade_mode.upper()}]\n"
-            f"Entry:    ${pos.entry_price:,.2f}\n"
-            f"Exit:     <b>${fill_price:,.2f}</b>  ({'+' if raw_pts>=0 else ''}{raw_pts:.1f} pts)\n"
-            f"Gross:    ${gross:+.4f}\n"
-            f"Fees:     ${entry_fee + exit_fee:.4f} "
-            f"(exit {_exit_tag} ${exit_fee:.4f} + entry {_entry_tag} ${entry_fee:.4f})\n"
-            f"PnL:      <b>${pnl:+.2f} USDT</b>  ({_exit_margin_pct:+.1f}% on ${_exit_margin_used:.2f} margin)\n"
-            f"R:        {achieved_r:+.2f}R  (planned 1:{planned_rr:.2f}R)\n"
-            f"MFE:      {mfe_r:.2f}R  |  Hold: {hold_min:.1f}m\n"
-            + f"Exit:     fixed SL + TP ladder\n" +
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<i>Session: {self._total_trades}T | WR: {self._win_rate():.0%} | "
-            f"Total PnL: ${self._total_pnl:+.2f}</i>"
+            format_exit_alert(
+                side=pos.side,
+                entry=pos.entry_price,
+                exit_price=fill_price,
+                pnl=pnl,
+                r_realised=achieved_r,
+                mfe_r=mfe_r,
+                reason=exit_reason,
+                hold_min=hold_min,
+                fees=residual_entry_fee + exit_fee + ladder_fees,
+                qty=_lifecycle_qty,
+                gross=gross + ladder_gross,
+                raw_pts=raw_pts,
+                planned_rr=planned_rr,
+                margin_pct=_exit_margin_pct,
+                margin_used=_exit_margin_used,
+                fee_source=_fee_source,
+                exact_fees=entry_fee_is_exact and exit_fee_is_exact,
+                exit_model="fixed SL + dynamic liquidity TP ladder",
+                portfolio_pnl=self._total_pnl,
+                portfolio_open=0,
+                residual_qty=_residual_qty,
+                partial_qty=_partial_qty,
+                tp_ladder_net=ladder_pnl,
+                tp_ladder_gross=ladder_gross,
+                tp_ladder_fees=ladder_fees,
+                residual_net=residual_pnl,
+            ),
+            event_type="exit",
         )
         self._last_exit_side = pos.side
         self._finalise_exit()
@@ -8349,6 +8437,15 @@ class QuantStrategy:
             "exit_fee":     _fb.get("exit_fee",   0.0),
             "total_fees":   _fb.get("total_fees", 0.0),
             "exact_fees":   _fb.get("exact_fees", False),
+            "residual_pnl": _fb.get("residual_pnl", pnl),
+            "tp_ladder_realized_pnl": _fb.get("tp_ladder_realized_pnl", 0.0),
+            "tp_ladder_gross": _fb.get("tp_ladder_gross", 0.0),
+            "tp_ladder_fees": _fb.get("tp_ladder_fees", 0.0),
+            "tp_ladder_entry_fees": _fb.get("tp_ladder_entry_fees", 0.0),
+            "tp_ladder_exit_fees": _fb.get("tp_ladder_exit_fees", 0.0),
+            "lifecycle_qty": float(getattr(pos, "tp_ladder_initial_qty", 0.0) or getattr(pos, "quantity", 0.0) or 0.0),
+            "residual_qty": float(getattr(pos, "quantity", 0.0) or 0.0),
+            "partial_qty": max(0.0, float(getattr(pos, "tp_ladder_initial_qty", 0.0) or getattr(pos, "quantity", 0.0) or 0.0) - float(getattr(pos, "quantity", 0.0) or 0.0)),
             # ── v7.0: Signal attribution — enables post-trade analysis ─────
             # Which tier / signals drove this trade? Track these to learn
             # which combinations actually produce wins vs losses.
@@ -8437,7 +8534,7 @@ class QuantStrategy:
         _margin_used_final = 0.0
         try:
             _entry_px = getattr(pos, 'entry_price', 0.0)
-            _qty = getattr(pos, 'quantity', 0.0)
+            _qty = float(getattr(pos, 'tp_ladder_initial_qty', 0.0) or getattr(pos, 'quantity', 0.0) or 0.0)
             if _entry_px > 0 and _qty > 0:
                 _notional_f = _entry_px * _qty
                 _lev_f = QCfg.LEVERAGE()
