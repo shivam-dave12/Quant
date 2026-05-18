@@ -69,7 +69,7 @@ MIN_TIME_BETWEEN_TRADES_SEC = 300.0
 TRADE_COOLDOWN_SECONDS   = 300       # 5m cooldown after loss
 MIN_RISK_REWARD_RATIO    = 2.0       # expected-utility reference; thin R:R reduces size/EV
 TARGET_RISK_REWARD_RATIO = 3.0
-MAX_RR_RATIO             = 12.0
+MAX_RR_RATIO             = 20.0
 
 # ── Institutional dynamic execution audit ────────────────────────────────────
 # Style/quality signals are never hidden alpha vetoes. They are continuous
