@@ -39,10 +39,10 @@ COINSWITCH_SYMBOL        = "BTCUSDT"
 COINSWITCH_EXCHANGE      = "EXCHANGE_2"
 
 # ── Position sizing ───────────────────────────────────────────────────────────
-BALANCE_USAGE_PERCENTAGE = 80
+BALANCE_USAGE_PERCENTAGE = 36
 MAX_ENTRY_MARGIN_USAGE_PCT = BALANCE_USAGE_PERCENTAGE  # single-trade margin ceiling
-MIN_MARGIN_PER_TRADE     = 1
-MAX_MARGIN_PER_TRADE     = 10_000
+MIN_MARGIN_PER_TRADE     = 5
+MAX_MARGIN_PER_TRADE     = 15
 MIN_POSITION_SIZE        = 0.001
 MAX_POSITION_SIZE        = 1.0
 LOT_STEP_SIZE            = 0.001
@@ -56,20 +56,20 @@ REMAINDER_MIN_QTY        = 0.001
 #   The inconsistency caused 100× over-sizing (entire balance at risk per trade),
 #   triggering the "required margin > available — scaling down" warnings in logs.
 #   Fix: one convention (fraction), both consumers agree. See risk_manager.py line 266.
-RISK_PER_TRADE           = 0.05   # 5.0% of available balance per trade; one full loss hits 5% day circuit
+RISK_PER_TRADE           = 0.015  # 1.5% true SL risk; 3 full losses stay inside 5% day circuit
 MAX_DAILY_LOSS           = 10000
 MAX_DAILY_LOSS_PCT       = 5.0       # day circuit breaker
 MAX_DRAWDOWN_PCT         = 15.0      # realistic drawdown limit
-MAX_CONSECUTIVE_LOSSES   = 10     # risk-synchronized with 5% per-trade risk and 5% daily circuit
+MAX_CONSECUTIVE_LOSSES   = 3     # risk-synchronized with 1.5% per-trade risk and 5% daily circuit
 ALLOW_TIME_BASED_CONSEC_LOSS_RESET = False
 CONSEC_LOSS_AUTO_RESET_HOURS = 1.0
-MAX_DAILY_TRADES         = 20        # institutional selectivity over frequency
+MAX_DAILY_TRADES         = 6         # institutional selectivity; matches 3-6 trade/session design
 ONE_POSITION_AT_A_TIME   = True
 MIN_TIME_BETWEEN_TRADES_SEC = 300.0
 TRADE_COOLDOWN_SECONDS   = 300       # 5m cooldown after loss
 MIN_RISK_REWARD_RATIO    = 2.0       # expected-utility reference; thin R:R reduces size/EV
 TARGET_RISK_REWARD_RATIO = 3.0
-MAX_RR_RATIO             = 20.0
+MAX_RR_RATIO             = 12.0
 
 # ── Institutional dynamic execution audit ────────────────────────────────────
 # Style/quality signals are never hidden alpha vetoes. They are continuous
@@ -231,7 +231,7 @@ AGG_OB_DEPTH_LEVELS  = 10
 AGG_TRADE_WINDOW_SEC = 30.0
 
 # ── Quant Strategy ────────────────────────────────────────────────────────────
-QUANT_MARGIN_PCT               = 0.20
+QUANT_MARGIN_PCT               = 0.36
 QUANT_SLIPPAGE_TOLERANCE       = 0.0005
 QUANT_VWAP_ENTRY_ATR_MULT      = 1.2
 QUANT_CVD_DIVERGENCE_MIN       = 0.15
@@ -581,9 +581,9 @@ SUSPENDED_ASSET_CLASSES = ("equity", "index")
 # contract gets only one ENTERING/ACTIVE/EXITING slot.  The existing BTC-style
 # risk model is preserved by giving each contract a slot-scoped balance view
 # before QuantStrategy applies RISK_PER_TRADE and BALANCE_USAGE_PERCENTAGE.
-PORTFOLIO_MAX_OPEN_POSITIONS = 8
+PORTFOLIO_MAX_OPEN_POSITIONS = 6
 PORTFOLIO_MAX_OPEN_PER_CONTRACT = 1
-PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS = 4
+PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS = 3
 PORTFOLIO_BUDGET_MODE = "equal_slots"   # equal_slots | active_equal_slots
 # In multi-asset mode, margin/cash is slot-scoped but dollar-risk must remain
 # portfolio-aware.  This prevents BTC min-lot rejection when a valid minimum
@@ -631,7 +631,7 @@ POLICY_CRYPTO_RISK_MULT = 1.00
 POLICY_CRYPTO_LOOP_INTERVAL_SEC = 0.25
 
 POLICY_COMMODITY_RISK_MULT = 0.70
-POLICY_COMMODITY_MARGIN_PCT = 0.14
+POLICY_COMMODITY_MARGIN_PCT = 0.30
 POLICY_COMMODITY_MIN_MARGIN_USD = 0.50
 POLICY_COMMODITY_TICK_EVAL_SEC = 0.50
 POLICY_COMMODITY_LOOP_INTERVAL_SEC = 0.50
@@ -644,7 +644,7 @@ POLICY_COMMODITY_COOLDOWN_SEC = 210
 POLICY_COMMODITY_SL_BUFFER_ATR = 0.50
 
 POLICY_EQUITY_RISK_MULT = 0.55
-POLICY_EQUITY_MARGIN_PCT = 0.12
+POLICY_EQUITY_MARGIN_PCT = 0.24
 POLICY_EQUITY_MIN_MARGIN_USD = 0.50
 POLICY_EQUITY_TICK_EVAL_SEC = 0.75
 POLICY_EQUITY_LOOP_INTERVAL_SEC = 0.75
@@ -696,8 +696,8 @@ TRADING_DESKS = {
         "display_name": "Commodities Desk",
         "strategy": STRATEGY_CORE_NAME,
         "asset_classes": ("commodity",),
-        "risk_multiplier": 0.50,
-        "margin_pct": 0.10,
+        "risk_multiplier": 0.70,
+        "margin_pct": 0.30,
         "tick_eval_sec": 0.65,
         "loop_interval_sec": 0.65,
         "min_1m_bars": 100,
@@ -727,7 +727,7 @@ TRADING_DESKS = {
         "strategy": STRATEGY_CORE_NAME,
         "asset_classes": ("equity", "index"),
         "risk_multiplier": 0.40,
-        "margin_pct": 0.08,
+        "margin_pct": 0.24,
         "tick_eval_sec": 0.90,
         "loop_interval_sec": 0.90,
         "min_1m_bars": 110,
