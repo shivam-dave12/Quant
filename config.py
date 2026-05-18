@@ -58,8 +58,8 @@ REMAINDER_MIN_QTY        = 0.001
 #   Fix: one convention (fraction), both consumers agree. See risk_manager.py line 266.
 RISK_PER_TRADE           = 0.015  # 1.5% true SL risk; 3 full losses stay inside 5% day circuit
 MAX_DAILY_LOSS           = 10000
-MAX_DAILY_LOSS_PCT       = 5.0       # day circuit breaker
-MAX_DRAWDOWN_PCT         = 15.0      # realistic drawdown limit
+MAX_DAILY_LOSS_PCT       = 10.0       # day circuit breaker
+MAX_DRAWDOWN_PCT         = 25.0      # realistic drawdown limit
 MAX_CONSECUTIVE_LOSSES   = 3     # risk-synchronized with 1.5% per-trade risk and 5% daily circuit
 ALLOW_TIME_BASED_CONSEC_LOSS_RESET = False
 CONSEC_LOSS_AUTO_RESET_HOURS = 1.0
@@ -69,7 +69,7 @@ MIN_TIME_BETWEEN_TRADES_SEC = 300.0
 TRADE_COOLDOWN_SECONDS   = 300       # 5m cooldown after loss
 MIN_RISK_REWARD_RATIO    = 2.0       # expected-utility reference; thin R:R reduces size/EV
 TARGET_RISK_REWARD_RATIO = 3.0
-MAX_RR_RATIO             = 12.0
+MAX_RR_RATIO             = 20.0
 
 # ── Institutional dynamic execution audit ────────────────────────────────────
 # Style/quality signals are never hidden alpha vetoes. They are continuous
