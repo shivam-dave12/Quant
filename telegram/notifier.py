@@ -1743,12 +1743,20 @@ def format_periodic_report(
         move = (float(current_price or 0.0) - entry) if side == "LONG" else (entry - float(current_price or 0.0))
         risk = abs(entry - sl)
         r_now = move / risk if risk > 1e-10 else 0.0
-        upnl = move * qty if qty else move
+        if position.get("unrealised_pnl") is not None:
+            upnl = float(position.get("unrealised_pnl") or 0.0)
+        elif position.get("unrealized_pnl") is not None:
+            upnl = float(position.get("unrealized_pnl") or 0.0)
+        else:
+            upnl = move * qty if qty else move
+        realised_ladder = float(position.get("tp_ladder_realized_pnl", 0.0) or 0.0)
+        lifecycle_open = float(position.get("lifecycle_open_pnl", upnl + realised_ladder) or 0.0)
         rr = abs(tp - entry) / risk if risk > 1e-10 and tp else 0.0
         lines += [
             _tg_section("\U0001f512", "Active Position"),
             f"<code>SIDE    {_esc(side):<8} qty {qty:.6f}   R {r_now:+.2f}</code>",
             f"<code>ENTRY   {_tg_price(entry):>14}   UPNL {_tg_pnl(upnl):>14}</code>",
+            f"<code>LIVE    {_tg_pnl(lifecycle_open):>14}   ladder {_tg_pnl(realised_ladder):>12}</code>",
             f"<code>SL      {_tg_price(sl):>14}   TP {_tg_price(tp):>14}   RR 1:{rr:.2f}</code>",
         ]
         # Fixed-SL TP-ladder policy: no break-even lock line is rendered.

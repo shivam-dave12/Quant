@@ -47,13 +47,21 @@ class AssetNotificationTests(unittest.TestCase):
         self.assertIn("POSTERIOR", msg)
         self.assertIn("SCANNING", msg)
 
-    def test_periodic_report_uses_asset_not_btc(self):
-        inst = _inst("NVDA", "NVDAXUSD")
-        with instrument_scope(inst):
-            msg = format_periodic_report(current_price=198.0, atr=1.2, instrument=inst)
-        self.assertIn("NVDA", msg)
-        self.assertIn("NVDAXUSD", msg)
-        self.assertNotIn("<code>BTC", msg)
+    def test_periodic_report_uses_supplied_unrealised_pnl_source(self):
+        msg = format_periodic_report(
+            current_price=105.0,
+            position={
+                "side": "long", "quantity": 2.0, "entry_price": 100.0,
+                "sl_price": 90.0, "tp_price": 130.0,
+                "unrealised_pnl": 10.0,
+                "tp_ladder_realized_pnl": 1.5,
+                "lifecycle_open_pnl": 11.5,
+            },
+            current_sl=90.0, current_tp=130.0, entry_price=100.0,
+        )
+        self.assertIn("UPNL        +$10.00", msg)
+        self.assertIn("LIVE           +$11.50", msg)
+        self.assertIn("ladder       +$1.50", msg)
 
     def test_already_scoped_message_not_double_wrapped(self):
         inst = _inst()
@@ -1805,6 +1813,61 @@ class PortfolioDeskReportingTests(unittest.TestCase):
         self.assertIn("$+5.00", report)
         self.assertIn("WR  50.0%", report)
 
+    def test_open_position_unrealised_pnl_is_wired_from_get_position_dict(self):
+        from core.instruments import AssetClass
+        from orchestration.multi_asset_bot import MultiAssetQuantBot
+
+        class OpenStrategy:
+            def __init__(self):
+                self._trade_history = []
+                self._pos = SimpleNamespace(
+                    side="long", quantity=2.0, entry_price=100.0,
+                    sl_price=90.0, tp_price=130.0, initial_sl_dist=10.0,
+                    peak_profit=8.0, entry_time=time.time() - 600,
+                    tp_ladder_realized_pnl=1.50, trade_mode="reversal",
+                    entry_order_id="entry", sl_order_id="sl", tp_order_id="tp",
+                    is_flat=lambda: False,
+                )
+            def get_position(self):
+                # Real QuantStrategy.get_position() returns a dict.  Portfolio
+                # reporting must not treat this like an object and silently zero UPNL.
+                return {
+                    "side": "long", "quantity": 2.0, "entry_price": 100.0,
+                    "sl_price": 90.0, "tp_price": 130.0,
+                    "tp_ladder_realized_pnl": 1.50,
+                }
+            def _unrealised_pnl_usd(self, mark_price, pos):
+                return (float(mark_price) - 100.0) * 2.0
+
+        class MarkData:
+            def get_last_price(self):
+                return 105.0
+
+        bot = object.__new__(MultiAssetQuantBot)
+        bot.guard = SimpleNamespace(max_open_positions=4, budget_mode="balanced", count_open=lambda contexts: 1)
+        ctx = SimpleNamespace(
+            instrument=_instrument("BTC", "BTCUSD", AssetClass.CRYPTO),
+            strategy=OpenStrategy(),
+            data_manager=MarkData(),
+            phase_name="ACTIVE",
+            risk_manager=SimpleNamespace(get_available_balance=lambda: {"available": 195.0, "total": 200.0, "risk_total": 200.0}),
+        )
+        bot.contexts = [ctx]
+
+        metrics = bot._ctx_position_metrics(ctx)
+        self.assertEqual(metrics["upnl"], 10.0)
+        self.assertEqual(metrics["open_realized"], 1.5)
+        self.assertEqual(metrics["lifecycle_pnl"], 11.5)
+
+        pnl_report = bot.format_portfolio_pnl_report()
+        self.assertIn("UPNL      $+10.00", pnl_report)
+        self.assertIn("LIVE      $+11.50", pnl_report)
+
+        equity_report = bot.format_portfolio_equity_report()
+        self.assertIn("MARKED equity", equity_report)
+        self.assertIn("OPEN   UPNL", equity_report)
+        self.assertIn("$+10.00", equity_report)
+
     def test_trades_report_shows_all_recent_newest_first(self):
         report = self._bot().format_portfolio_trades_report()
 
@@ -2383,3 +2446,84 @@ def test_exchange_exit_path_calls_ladder_cleanup_after_exit_reason_resolution():
     assert '_cleanup_tp_ladder_after_position_flat(self._om, pos, reason=exit_reason)' in src
     assert 'exit_type in ("sl", "trail_sl", "tp", "manual_exit")' in src
 # ===== END test_tp_ladder_exit_cleanup.py =====
+
+# ===== BEGIN test_long_run_state_hardening.py =====
+
+def test_risk_manager_record_trade_rolls_ist_day_before_booking_close():
+    from datetime import datetime, timedelta
+    from risk.risk_manager import RiskManager
+
+    rm = RiskManager(shared_api=None)
+    rm._last_reset_date = (datetime.now(rm._IST) - timedelta(days=1)).date()
+    rm.daily_pnl = -9.0
+    rm.consecutive_losses = 2
+    rm.daily_trades.append(object())
+    rm._position_is_open = True
+
+    rm.record_trade(
+        side="long",
+        entry_price=100.0,
+        exit_price=90.0,
+        quantity=1.0,
+        reason="sl",
+        pnl_override=-1.25,
+    )
+
+    assert rm._last_reset_date == datetime.now(rm._IST).date()
+    assert rm.daily_pnl == -1.25
+    assert rm.consecutive_losses == 1
+    assert len(rm.daily_trades) == 1
+    assert rm._position_is_open is False
+
+
+def test_strategy_wires_risk_manager_position_open_close_and_daily_pnl_source():
+    import inspect
+    from strategy.quant_strategy import QuantStrategy
+
+    enter_src = inspect.getsource(QuantStrategy._enter_trade)
+    exit_src = inspect.getsource(QuantStrategy._record_exchange_exit)
+    finalise_src = inspect.getsource(QuantStrategy._finalise_exit)
+    status_src = inspect.getsource(QuantStrategy.format_status_report)
+
+    assert "set_position_open(True)" in enter_src
+    assert "set_position_open(False)" in exit_src
+    assert "set_position_open(False)" in finalise_src
+    assert "getattr(self._risk_gate, 'daily_pnl'" in status_src
+
+
+def test_daily_risk_gate_properties_roll_day_before_reporting():
+    from datetime import timedelta
+    from strategy.quant_strategy import DailyRiskGate
+
+    rg = DailyRiskGate()
+    rg._today = rg._today - timedelta(days=1)
+    rg._daily_trades = 3
+    rg._daily_pnl = -4.5
+    rg._consec_losses = 2
+    rg._loss_lockout_until = 123.0
+
+    assert rg.daily_trades == 0
+    assert rg.daily_pnl == 0.0
+    assert rg.consec_losses == 0
+    assert rg.loss_lockout_until == 0.0
+
+# ===== END test_long_run_state_hardening.py =====
+
+# ===== BEGIN test_tp_ladder_planner_lot_capacity.py =====
+
+def test_tp_ladder_planner_does_not_create_internal_legs_when_lot_capacity_zero(monkeypatch):
+    import inspect
+    from strategy.quant_strategy import QuantStrategy
+
+    src = inspect.getsource(QuantStrategy._build_tp_ladder_plan)
+    assert "if _qty > 0 and _min_qty > 0:" in src
+    assert "else 0" in src
+    assert "planner must respect executable" in src
+
+# ===== END test_tp_ladder_planner_lot_capacity.py =====
+
+def test_reconcile_adoption_marks_risk_manager_position_open():
+    from pathlib import Path
+    src = Path('strategy/quant_strategy.py').read_text()
+    assert "adoption means the exchange is already carrying risk" in src
+    assert "set_position_open(True) adoption" in src

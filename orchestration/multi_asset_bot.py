@@ -185,7 +185,14 @@ class MultiAssetQuantBot:
                 pol_txt = self.guard.report_line(ctx)
             except Exception:
                 pol_txt = "policy=n/a"
-            lines.append(f"• <b>{esc(inst.asset_id)}</b> primary={esc(inst.primary_exchange.value.upper())} {esc(inst.display_symbol)} [{esc(venues)}] — {esc(state)} @ {px:,.4f} · {esc(budget_txt)}{lev_txt} · {esc(pol_txt)}")
+            pnl_txt = ""
+            if pos:
+                try:
+                    m = self._ctx_position_metrics(ctx)
+                    pnl_txt = f" · uPnL={self._fmt_money(m.get('upnl', 0.0))} live={self._fmt_money(m.get('lifecycle_pnl', m.get('upnl', 0.0)))}"
+                except Exception:
+                    pnl_txt = ""
+            lines.append(f"• <b>{esc(inst.asset_id)}</b> primary={esc(inst.primary_exchange.value.upper())} {esc(inst.display_symbol)} [{esc(venues)}] — {esc(state)} @ {px:,.4f} · {esc(budget_txt)}{lev_txt} · {esc(pol_txt)}{pnl_txt}")
         if self.discovery_report and self.discovery_report.unavailable:
             lines.append("\n<b>Unavailable:</b>")
             for aid, reason in self.discovery_report.unavailable.items():
@@ -223,45 +230,86 @@ class MultiAssetQuantBot:
 
     def _ctx_position_metrics(self, ctx: AssetContext) -> Dict[str, Any]:
         inst = ctx.instrument
-        pos = ctx.strategy.get_position()
+        pos_snapshot = ctx.strategy.get_position()
         px = 0.0
-        try: px = float(ctx.data_manager.get_last_price() or 0.0)
-        except Exception: pass
+        try:
+            px = float(ctx.data_manager.get_last_price() or 0.0)
+        except Exception:
+            pass
         pol = active_policy(inst)
         out: Dict[str, Any] = {
             "asset": inst.asset_id, "symbol": inst.display_symbol,
             "venue": inst.primary_exchange.value.upper(), "class": pol.asset_class,
             "desk": pol.desk_id, "desk_name": pol.desk_name, "strategy": pol.strategy_key,
-            "price": px, "position": pos, "upnl": 0.0, "r": 0.0,
-            "mfe_r": 0.0, "hold_min": 0.0, "state": ctx.phase_name,
+            "price": px, "position": pos_snapshot, "upnl": 0.0,
+            "unrealised_pnl": 0.0, "unrealized_pnl": 0.0,
+            "open_realized": 0.0, "lifecycle_pnl": 0.0,
+            "r": 0.0, "mfe_r": 0.0, "hold_min": 0.0, "state": ctx.phase_name,
             "sl": 0.0, "tp": 0.0, "entry": 0.0,
             "qty": 0.0, "side": "", "policy": pol,
         }
-        if not pos:
+        if not pos_snapshot:
             return out
+
+        # get_position() returns a dict, while the strategy keeps the richer
+        # PositionState at _pos.  Older portfolio reports treated the dict like
+        # an object, swallowed AttributeError, and therefore rendered UPNL as 0.
+        pos_obj = getattr(ctx.strategy, "_pos", None)
         try:
-            side = str(pos.side or "").upper()
-            entry = float(pos.entry_price or 0.0)
-            qty = float(pos.quantity or 0.0)
-            move_pts = (px - entry) if side == "LONG" else (entry - px)
+            if pos_obj is not None and callable(getattr(pos_obj, "is_flat", None)) and not pos_obj.is_flat():
+                live = pos_obj
+            else:
+                live = pos_snapshot
+        except Exception:
+            live = pos_snapshot
+
+        def _get(key: str, default: Any = 0.0) -> Any:
             try:
+                if isinstance(live, dict):
+                    return live.get(key, default)
+                return getattr(live, key, default)
+            except Exception:
+                return default
+
+        try:
+            side = str(_get("side", "") or "").upper()
+            entry = float(_get("entry_price", 0.0) or 0.0)
+            qty = float(_get("quantity", 0.0) or 0.0)
+            sl_price = float(_get("sl_price", 0.0) or 0.0)
+            tp_price = float(_get("tp_price", 0.0) or 0.0)
+            move_pts = (px - entry) if side == "LONG" else (entry - px)
+
+            # Prefer the strategy's authoritative unrealised P&L calculator so
+            # single-asset and portfolio Telegram reports cannot diverge.
+            upnl = 0.0
+            calc = getattr(ctx.strategy, "_unrealised_pnl_usd", None)
+            if callable(calc):
+                upnl = float(calc(px, live) or 0.0)
+            else:
                 inv = (
                     inst.primary_exchange == ExchangeName.DELTA
                     and str(inst.execution_symbol).upper() == "BTCUSD"
                 )
                 upnl = gross_pnl_usd(side, entry, px, qty, inverse=bool(inv))
-            except Exception:
-                upnl = move_pts * qty
-            init_dist = float(pos.initial_sl_dist or 0.0) or abs(entry - float(pos.sl_price or 0.0))
+
+            init_dist = float(_get("initial_sl_dist", 0.0) or 0.0) or abs(entry - sl_price)
             r_now = move_pts / init_dist if init_dist > 1e-10 else 0.0
-            mfe_r = float(pos.peak_profit or 0.0) / init_dist if init_dist > 1e-10 else 0.0
-            hold_m = (time.time() - float(pos.entry_time or time.time())) / 60.0
+            mfe_r = float(_get("peak_profit", 0.0) or 0.0) / init_dist if init_dist > 1e-10 else 0.0
+            entry_time = float(_get("entry_time", time.time()) or time.time())
+            hold_m = (time.time() - entry_time) / 60.0
+            open_realized = float(_get("tp_ladder_realized_pnl", 0.0) or 0.0)
             out.update({
-                "side": side, "entry": entry, "qty": qty, "upnl": upnl, "r": r_now,
-                "mfe_r": mfe_r, "hold_min": hold_m, "sl": float(pos.sl_price or 0.0),
-                "tp": float(pos.tp_price or 0.0),
-                "trade_mode": getattr(pos, "trade_mode", ""), "entry_id": getattr(pos, "entry_order_id", ""),
-                "sl_id": getattr(pos, "sl_order_id", ""), "tp_id": getattr(pos, "tp_order_id", ""),
+                "position": live,
+                "side": side, "entry": entry, "qty": qty,
+                "upnl": upnl, "unrealised_pnl": upnl, "unrealized_pnl": upnl,
+                "open_realized": open_realized,
+                "lifecycle_pnl": upnl + open_realized,
+                "r": r_now, "mfe_r": mfe_r, "hold_min": hold_m,
+                "sl": sl_price, "tp": tp_price,
+                "trade_mode": _get("trade_mode", ""),
+                "entry_id": _get("entry_order_id", ""),
+                "sl_id": _get("sl_order_id", ""),
+                "tp_id": _get("tp_order_id", ""),
             })
         except Exception:
             pass
@@ -310,7 +358,8 @@ class MultiAssetQuantBot:
     def _blank_pnl_bucket() -> Dict[str, Any]:
         return {
             "trades": 0, "wins": 0, "losses": 0, "net": 0.0, "gross": 0.0,
-            "fees": 0.0, "upnl": 0.0, "open": 0, "win_sum": 0.0,
+            "fees": 0.0, "upnl": 0.0, "open_realized": 0.0,
+            "live": 0.0, "open": 0, "win_sum": 0.0,
             "loss_sum": 0.0, "r_sum": 0.0,
         }
 
@@ -396,11 +445,19 @@ class MultiAssetQuantBot:
                 assets[asset]["symbol"] = r.get("symbol", asset)
             if r.get("position"):
                 upnl = self._float_val(r.get("upnl"), 0.0)
+                open_realized = self._float_val(r.get("open_realized"), 0.0)
+                live_pnl = self._float_val(r.get("lifecycle_pnl"), upnl + open_realized)
                 desks[desk_id]["upnl"] += upnl
+                desks[desk_id]["open_realized"] += open_realized
+                desks[desk_id]["live"] += live_pnl
                 desks[desk_id]["open"] += 1
                 assets[asset]["upnl"] += upnl
+                assets[asset]["open_realized"] += open_realized
+                assets[asset]["live"] += live_pnl
                 assets[asset]["open"] += 1
                 total_bucket["upnl"] += upnl
+                total_bucket["open_realized"] += open_realized
+                total_bucket["live"] += live_pnl
                 total_bucket["open"] += 1
 
         for t in trades:
@@ -421,14 +478,16 @@ class MultiAssetQuantBot:
         total_gross = float(total_bucket["gross"])
         total_fees = float(total_bucket["fees"])
         total_upnl = float(total_bucket["upnl"])
+        total_live = float(total_bucket.get("live", total_upnl))
         total = int(total_bucket["trades"])
         wr = self._bucket_wr(total_bucket)
-        icon = "🟢" if total_realised + total_upnl >= 0 else "🔴"
+        icon = "🟢" if total_realised + total_live >= 0 else "🔴"
         lines = [
             f"{icon} <b>INSTITUTIONAL PORTFOLIO P&L</b>",
             "<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>",
-            f"<code>NET {self._fmt_money(total_realised):>12}  UPNL {self._fmt_money(total_upnl):>12}  TOTAL {self._fmt_money(total_realised + total_upnl):>12}</code>",
-            f"<code>GROSS {self._fmt_money(total_gross):>10}  FEES ${total_fees:>9,.2f}  TRADES {total:>4}  WR {wr:>5.1f}%</code>",
+            f"<code>NET {self._fmt_money(total_realised):>12}  UPNL {self._fmt_money(total_upnl):>12}  LIVE {self._fmt_money(total_live):>12}</code>",
+            f"<code>TOTAL {self._fmt_money(total_realised + total_live):>10}  GROSS {self._fmt_money(total_gross):>10}  FEES ${total_fees:>8,.2f}</code>",
+            f"<code>TRADES {total:>4}  WR {wr:>5.1f}%</code>",
             f"<code>AVG WIN {self._fmt_money(self._bucket_avg_win(total_bucket)):>10}  AVG LOSS {self._fmt_money(self._bucket_avg_loss(total_bucket)):>10}  OPEN {len(open_rows):>2}/{self.guard.max_open_positions:<2}</code>",
             f"<code>BUDGET {self._esc(self.guard.budget_mode)}</code>",
             "\n<b>🏛 Desk PnL / P&L</b>",
@@ -436,30 +495,30 @@ class MultiAssetQuantBot:
         for desk_id in desk_order:
             st = desks.get(desk_id) or self._blank_pnl_bucket()
             name = self._clip(desk_names.get(desk_id, desk_id), 13)
-            total_desk = self._float_val(st.get("net"), 0.0) + self._float_val(st.get("upnl"), 0.0)
+            total_desk = self._float_val(st.get("net"), 0.0) + self._float_val(st.get("live", st.get("upnl", 0.0)), 0.0)
             lines.append(
                 f"<code>{self._esc(name):<13} net {self._fmt_money(st['net']):>10} "
-                f"upnl {self._fmt_money(st['upnl']):>10} total {self._fmt_money(total_desk):>10} "
-                f"T {int(st['trades']):>3} WR {self._bucket_wr(st):>5.1f}%</code>"
+                f"upnl {self._fmt_money(st['upnl']):>10} live {self._fmt_money(st.get('live', st['upnl'])):>10} "
+                f"tot {self._fmt_money(total_desk):>10} T {int(st['trades']):>3} WR {self._bucket_wr(st):>5.1f}%</code>"
             )
 
         lines.append("\n<b>📦 Asset PnL / P&L</b>")
         for asset, st in sorted(assets.items(), key=lambda kv: (str(kv[1].get("desk", "")), kv[0])):
             desk_id = self._clip(st.get("desk", ""), 5)
             asset_label = self._clip(asset, 8)
-            total_asset = self._float_val(st.get("net"), 0.0) + self._float_val(st.get("upnl"), 0.0)
+            total_asset = self._float_val(st.get("net"), 0.0) + self._float_val(st.get("live", st.get("upnl", 0.0)), 0.0)
             lines.append(
                 f"<code>{self._esc(asset_label):<8} {self._esc(desk_id):<5} net {self._fmt_money(st['net']):>10} "
-                f"upnl {self._fmt_money(st['upnl']):>10} total {self._fmt_money(total_asset):>10} "
-                f"T {int(st['trades']):>3} WR {self._bucket_wr(st):>5.1f}%</code>"
+                f"upnl {self._fmt_money(st['upnl']):>10} live {self._fmt_money(st.get('live', st['upnl'])):>10} "
+                f"tot {self._fmt_money(total_asset):>10} T {int(st['trades']):>3} WR {self._bucket_wr(st):>5.1f}%</code>"
             )
 
         if open_rows:
             lines.append("\n<b>📡 Open Positions</b>")
             for r in sorted(open_rows, key=lambda x: (str(x.get("desk")), str(x.get("asset")))):
                 lines.append(
-                    f"<code>{self._esc(r['desk']):<5} {self._esc(r['asset']):<8} {self._esc(r['side']):<5} {self._fmt_money(r['upnl']):>11} "
-                    f"R {float(r['r']):+5.2f} MFE {float(r['mfe_r']):>4.2f} LADDER</code>"
+                    f"<code>{self._esc(r['desk']):<5} {self._esc(r['asset']):<8} {self._esc(r['side']):<5} UPNL {self._fmt_money(r['upnl']):>10} "
+                    f"LIVE {self._fmt_money(r.get('lifecycle_pnl', r['upnl'])):>10} R {float(r['r']):+5.2f} MFE {float(r['mfe_r']):>4.2f}</code>"
                 )
                 lines.append(
                     f"<code>       px {self._fmt_price(r['price']):>12} entry {self._fmt_price(r['entry']):>12} SL {self._fmt_price(r['sl']):>12}</code>"
@@ -494,6 +553,9 @@ class MultiAssetQuantBot:
                 f"<code>ENTRY {self._fmt_price(r['entry']):>12}  PX {self._fmt_price(r['price']):>12}  UPNL {self._fmt_money(r['upnl']):>11}</code>"
             )
             lines.append(
+                f"<code>LIVE  {self._fmt_money(r.get('lifecycle_pnl', r['upnl'])):>12}  ladder {self._fmt_money(r.get('open_realized', 0.0)):>10}</code>"
+            )
+            lines.append(
                 f"<code>SL    {self._fmt_price(r['sl']):>12}  FINAL TP {self._fmt_price(r['tp']):>12}  LADDER</code>"
             )
             if r.get("sl_id") or r.get("tp_id"):
@@ -507,6 +569,10 @@ class MultiAssetQuantBot:
 
     def format_portfolio_equity_report(self) -> str:
         lines = ["💼 <b>INSTITUTIONAL EQUITY / BUDGET</b>", "<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>"]
+        rows = [self._ctx_position_metrics(c) for c in self.contexts]
+        open_upnl = sum(self._float_val(r.get("upnl"), 0.0) for r in rows if r.get("position"))
+        open_ladder = sum(self._float_val(r.get("open_realized"), 0.0) for r in rows if r.get("position"))
+        open_live = sum(self._float_val(r.get("lifecycle_pnl"), self._float_val(r.get("upnl"), 0.0)) for r in rows if r.get("position"))
         raw_total = raw_avail = 0.0
         got = False
         for ctx in self.contexts[:1]:
@@ -519,14 +585,19 @@ class MultiAssetQuantBot:
                 pass
         if got:
             lines.append(f"<code>ACCOUNT available {self._fmt_price(raw_avail):>12}  total {self._fmt_price(raw_total):>12}</code>")
+            lines.append(f"<code>MARKED equity {self._fmt_price(raw_total + open_live):>12}  live {self._fmt_money(open_live):>12}</code>")
+        lines.append(f"<code>OPEN   UPNL {self._fmt_money(open_upnl):>10}  ladder {self._fmt_money(open_ladder):>10}</code>")
         lines.append(f"<code>SLOTS   used {self.guard.count_open(self.contexts):>2}/{self.guard.max_open_positions:<2}  mode {self._esc(self.guard.budget_mode)}</code>")
-        for ctx in self.contexts:
+        for ctx, r in zip(self.contexts, rows):
             try:
                 bal = ctx.risk_manager.get_available_balance() or {}
                 pol = active_policy(ctx.instrument)
+                pos_tail = ""
+                if r.get("position"):
+                    pos_tail = f" uPnL {self._fmt_money(r.get('upnl', 0.0))} live {self._fmt_money(r.get('lifecycle_pnl', r.get('upnl', 0.0)))}"
                 lines.append(
                     f"<code>{self._esc(ctx.instrument.asset_id):<6} cash {self._fmt_price(float(bal.get('available',0) or 0)):>10} "
-                    f"riskbase {self._fmt_price(float(bal.get('risk_total',0) or 0)):>10} lev {pol.leverage:>2}x margin {pol.margin_pct:.0%} risk×{pol.risk_multiplier:.2f}</code>"
+                    f"riskbase {self._fmt_price(float(bal.get('risk_total',0) or 0)):>10} lev {pol.leverage:>2}x margin {pol.margin_pct:.0%} risk×{pol.risk_multiplier:.2f}{self._esc(pos_tail)}</code>"
                 )
             except Exception:
                 continue

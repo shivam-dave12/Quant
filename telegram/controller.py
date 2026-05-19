@@ -36,6 +36,7 @@ import sys
 import sys, os as _os; sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import telegram.config as telegram_config
 import config
+from core.pnl import gross_pnl_usd
 from telegram.notifier import _sanitize_html
 
 logger = logging.getLogger(__name__)
@@ -106,6 +107,27 @@ try:
     _DISPLAY_ENGINE = True
 except ImportError:
     _DISPLAY_ENGINE = False
+
+
+def _fallback_unrealised_pnl_usd(strat, price: float, pos) -> float:
+    try:
+        calc = getattr(strat, "_unrealised_pnl_usd", None)
+        if callable(calc):
+            return float(calc(price, pos) or 0.0)
+    except Exception:
+        pass
+    try:
+        inst = getattr(strat, "_instrument", None)
+        ex = str(getattr(getattr(inst, "primary_exchange", ""), "value", getattr(inst, "primary_exchange", ""))).lower()
+        sym = str(getattr(inst, "execution_symbol", "") or getattr(config, "DELTA_SYMBOL", "BTCUSD")).upper()
+        inverse = ex == "delta" and sym == "BTCUSD"
+        return gross_pnl_usd(pos.side, pos.entry_price, price, pos.quantity, inverse=bool(inverse))
+    except Exception:
+        try:
+            move = (price - pos.entry_price) if str(pos.side).lower() == "long" else (pos.entry_price - price)
+            return move * float(pos.quantity or 0.0)
+        except Exception:
+            return 0.0
 
 
 def _esc(s) -> str:
@@ -1061,7 +1083,7 @@ class TelegramBotController:
             current_r  = 0.0
             planned_rr = 0.0
 
-        upnl      = ((price - entry) * qty if side == "LONG" else (entry - price) * qty)
+        upnl      = _fallback_unrealised_pnl_usd(strat, price, p)
         hold_min  = (time.time() - p.entry_time) / 60.0 if p.entry_time > 0 else 0.0
         peak_prof = getattr(p, 'peak_profit', 0.0)
         mfe_r     = peak_prof / sl_dist if sl_dist > 1e-10 else 0.0
@@ -1194,6 +1216,7 @@ class TelegramBotController:
         _partial_qty = max(0.0, _life_qty - float(qty or 0.0))
         _ladder_net = float(getattr(p, 'tp_ladder_realized_pnl', 0.0) or 0.0)
         _ladder_fees = float(getattr(p, 'tp_ladder_realized_fees', 0.0) or 0.0)
+        _lifecycle_open = upnl + _ladder_net
 
         return (
             f"{_side_icon} <b>INSTITUTIONAL POSITION · {side}{_es_type}</b>\n"
@@ -1203,8 +1226,8 @@ class TelegramBotController:
             f"<code>ENTRY ${entry:>12,.2f}   MARK ${price:>12,.2f}   R {current_r:+6.2f}</code>\n"
             f"<code>SL    ${sl:>12,.2f}   dist ${current_sl_dist:>9,.0f}   {current_sl_dist/max(atr,1):>5.2f}ATR</code>\n"
             f"<code>TP    ${tp:>12,.2f}   R:R 1:{planned_rr:.2f}</code>{_pool_tp_src}{pool_tp_note}\n"
-            f"{_upnl_icon} <code>UPNL ${upnl:+11,.2f}   life {_life_qty:.6f}   left {float(qty or 0.0):.6f}</code>\n"
-            f"<code>HOLD {hold_min:>7.1f}m   partial {_partial_qty:.6f}</code>\n"
+            f"{_upnl_icon} <code>UPNL ${upnl:+11,.2f}   LIVE ${_lifecycle_open:+11,.2f}   left {float(qty or 0.0):.6f}</code>\n"
+            f"<code>HOLD {hold_min:>7.1f}m   life {_life_qty:.6f}   partial {_partial_qty:.6f}</code>\n"
             f"<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>\n"
             f"📈 <b>R Progress</b>\n"
             f"<code>[{_prog_bar}]   MFE {mfe_r:>5.2f}R   NOW {current_r:+6.2f}R</code>\n"
@@ -2019,6 +2042,7 @@ class TelegramBotController:
             life_qty = float(getattr(p, 'tp_ladder_initial_qty', 0.0) or qty)
             partial_qty = max(0.0, life_qty - qty)
             upnl_pts = (price - entry) if side == "LONG" else (entry - price)
+            upnl_usd = _fallback_unrealised_pnl_usd(strat, price, p)
             init_dist = p.initial_sl_dist if p.initial_sl_dist > 1e-10 else abs(entry - p.sl_price)
             cur_r  = upnl_pts / init_dist if init_dist > 1e-10 else 0.0
             mfe_r  = float(getattr(p, 'peak_profit', 0.0) or 0.0) / init_dist if init_dist > 1e-10 else 0.0
@@ -2034,7 +2058,7 @@ class TelegramBotController:
                     _u_lev = int(getattr(__import__('config'), 'LEVERAGE', 30))
                     _u_margin_used = _u_notional / _u_lev if _u_lev > 0 else _u_notional
                     if _u_margin_used > 1e-10:
-                        _u_upnl_usd = upnl_pts * qty + realised_ladder
+                        _u_upnl_usd = upnl_usd + realised_ladder
                         _u_margin_pct = (_u_upnl_usd / _u_margin_used) * 100.0
             except Exception:
                 pass
@@ -2043,8 +2067,9 @@ class TelegramBotController:
             lines.extend([
                 f"{u_icon} <b>OPEN {_esc(side)}</b>  <code>life {life_qty:.6f} · left {qty:.6f}</code>",
                 f"<code>ENTRY ${entry:>12,.2f}   MARK ${price:>12,.2f}   R {cur_r:+6.2f}</code>",
-                f"<code>UPNL  {upnl_pts:+9.1f} pts   MFE {mfe_r:>5.2f}R   HOLD {hold_m:>6.1f}m</code>",
-                f"<code>SL    ${float(p.sl_price or 0.0):>12,.2f}   TP ${float(p.tp_price or 0.0):>12,.2f}</code>",
+                f"<code>UPNL  ${upnl_usd:+10,.2f}   {upnl_pts:+9.1f} pts   MFE {mfe_r:>5.2f}R</code>",
+                f"<code>LIVE  ${upnl_usd + realised_ladder:+10,.2f}   HOLD {hold_m:>6.1f}m   TP ${float(p.tp_price or 0.0):>12,.2f}</code>",
+                f"<code>SL    ${float(p.sl_price or 0.0):>12,.2f}</code>",
                 f"🎯 <code>LADDER realised ${realised_ladder:+9,.2f}   partial {partial_qty:.6f}   fees ${ladder_fees:.4f}</code>",
                 f"💼 <code>MARGIN ${_u_margin_used:>10,.2f}   lifecycle ROI {_u_margin_pct:+8.2f}%</code>",
                 "<code>──────────────────────────────</code>",
@@ -2253,10 +2278,13 @@ class TelegramBotController:
             if pos:
                 p = strat._pos
                 price = dm.get_last_price()
-                upnl = (price - p.entry_price) if p.side == "long" else (p.entry_price - price)
-                upnl_usd = upnl * p.quantity
-                lines.append(f"\nUnrealised: ${upnl_usd:+.4f} ({upnl:+.1f}pts)")
-                lines.append(f"Equity: <b>${total + upnl_usd:,.2f}</b>")
+                upnl_pts = (price - p.entry_price) if p.side == "long" else (p.entry_price - price)
+                upnl_usd = _fallback_unrealised_pnl_usd(strat, price, p)
+                ladder_net = float(getattr(p, 'tp_ladder_realized_pnl', 0.0) or 0.0)
+                live_pnl = upnl_usd + ladder_net
+                lines.append(f"\nUnrealised: ${upnl_usd:+.4f} ({upnl_pts:+.1f}pts)")
+                lines.append(f"Live P&L: ${live_pnl:+.4f} incl. ladder ${ladder_net:+.4f}")
+                lines.append(f"Equity: <b>${total + live_pnl:,.2f}</b>")
             else:
                 lines.append(f"\nEquity: <b>${total:,.2f}</b>")
 

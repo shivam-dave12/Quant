@@ -2622,10 +2622,27 @@ class DailyRiskGate:
 
     @property
     def daily_trades(self):
-        with self._lock: return self._daily_trades
+        with self._lock:
+            self._reset_if_new_day()
+            return self._daily_trades
+
+    @property
+    def daily_pnl(self):
+        with self._lock:
+            self._reset_if_new_day()
+            return self._daily_pnl
+
     @property
     def consec_losses(self):
-        with self._lock: return self._consec_losses
+        with self._lock:
+            self._reset_if_new_day()
+            return self._consec_losses
+
+    @property
+    def loss_lockout_until(self):
+        with self._lock:
+            self._reset_if_new_day()
+            return self._loss_lockout_until
 
 # ═══════════════════════════════════════════════════════════════
 # MAIN STRATEGY CLASS
@@ -6081,7 +6098,14 @@ class QuantStrategy:
             _rr = abs(float(final_tp) - float(entry_price)) / max(abs(float(entry_price) - float(sl_price)), 1e-9)
             _path_information = max(0.0, _final_dist_atr) * (0.70 + 0.30 * min(1.0, _rr / 4.0))
             _info_capacity = max(1, int(math.ceil(math.sqrt(max(_path_information, 1.0))))) if _final_dist_atr >= 1.25 else 0
-            _max_internal_legs = min(_lot_capacity, _info_capacity) if _lot_capacity > 0 else _info_capacity
+            # Long-run execution hardening: the planner must respect executable
+            # lot capacity before it creates/logs internal TP legs.  If total qty
+            # can only support the native final runner, do not build a theoretical
+            # ladder and leave placement to reject it later.
+            if _qty > 0 and _min_qty > 0:
+                _max_internal_legs = min(_lot_capacity, _info_capacity) if _lot_capacity > 0 else 0
+            else:
+                _max_internal_legs = _info_capacity
             _target_spacing_atr = (_final_dist_atr / max(_max_internal_legs + 1, 1)) if _max_internal_legs > 0 else _final_dist_atr
             _min_spacing_atr = self._clamp_ladder_value(max(0.35, 0.58 * _target_spacing_atr, 0.55 * _risk_atr), 0.35, 1.35)
             plan = build_tp_ladder(
@@ -7136,6 +7160,15 @@ class QuantStrategy:
         # Moving it here prevents aborted entries (TP-gate, fee-gate, exchange
         # error) from consuming the daily trade cap with no actual order sent.
         self._risk_gate.record_trade_start()
+        # Long-run RiskManager bookkeeping: mark the shared risk manager as
+        # position-open after the exchange confirms the fill. This makes its
+        # deferred midnight reset logic accurate during multi-day unattended runs.
+        try:
+            _rm_open = getattr(self, '_risk_manager_ref', None)
+            if _rm_open is not None and hasattr(_rm_open, 'set_position_open'):
+                _rm_open.set_position_open(True)
+        except Exception as _rm_open_e:
+            logger.debug(f"risk_manager.set_position_open(True) error (non-fatal): {_rm_open_e}")
         # CONVICTION GATE: arm MIN_ENTRY_INTERVAL pacing timer and increment
         # entries_taken ONLY after the order is confirmed filled and the position
         # is ACTIVE.  Calling this here (not in evaluate()) ensures that signals
@@ -8230,6 +8263,8 @@ class QuantStrategy:
         try:
             _rm = getattr(self, '_risk_manager_ref', None)
             if _rm is not None:
+                if hasattr(_rm, 'set_position_open'):
+                    _rm.set_position_open(False)
                 _rm.record_trade(
                     side         = pos.side,
                     entry_price  = pos.entry_price,
@@ -8617,6 +8652,15 @@ class QuantStrategy:
         # Resetting them here was the v7.0 root cause of double-counting:
         # _finalise_exit() ran, reset the guard, then a late sync/reconcile
         # thread called _record_pnl() and the guard was open → duplicate.
+        # Belt-and-suspenders: ensure the shared RiskManager is flat even if an
+        # exchange/manual-exit path skipped the normal record_trade branch.
+        try:
+            _rm_flat = getattr(self, '_risk_manager_ref', None)
+            if _rm_flat is not None and hasattr(_rm_flat, 'set_position_open'):
+                _rm_flat.set_position_open(False)
+        except Exception as _rm_flat_e:
+            logger.debug(f"risk_manager.set_position_open(False) error (non-fatal): {_rm_flat_e}")
+
         self._pos = PositionState(); self._last_exit_time = time.time()
         self.current_sl_price = 0.0; self.current_tp_price = 0.0
         self._last_structure_fingerprint = None
@@ -9418,6 +9462,51 @@ class QuantStrategy:
             f"net=${realized_pnl:.4f} [{'delta_inv' if _is_delta else 'linear'}]")
         return realized_pnl
 
+    def _is_inverse_btc_contract(self) -> bool:
+        """True only for Delta BTCUSD inverse-style accounting.
+
+        All Telegram reports must use the same mark-to-market formula as final
+        trade accounting.  Keeping this in the strategy prevents each report from
+        inventing its own linear approximation and drifting over long runs.
+        """
+        try:
+            inst = getattr(self, "_instrument", None) or current_instrument()
+            ex = str(getattr(getattr(inst, "primary_exchange", ""), "value", getattr(inst, "primary_exchange", ""))).lower()
+            sym = str(getattr(inst, "execution_symbol", "") or getattr(config, "DELTA_SYMBOL", "BTCUSD")).upper()
+            return ex == "delta" and sym == "BTCUSD"
+        except Exception:
+            return (str(getattr(config, "EXECUTION_EXCHANGE", "")).lower() == "delta"
+                    and str(getattr(config, "DELTA_SYMBOL", "BTCUSD")).upper() == "BTCUSD")
+
+    def _unrealised_pnl_usd(self, mark_price: Optional[float] = None, pos: Optional[PositionState] = None) -> float:
+        """Authoritative open-position mark-to-market P&L in USD.
+
+        Used by Telegram/status/equity reporting.  This is intentionally gross
+        unrealised P&L on the remaining live quantity; realised internal TP
+        ladder fills are exposed separately as tp_ladder_realized_pnl and can be
+        added by reports as lifecycle open P&L.
+        """
+        p = pos or getattr(self, "_pos", None)
+        if p is None or p.is_flat():
+            return 0.0
+        try:
+            price = float(mark_price if mark_price is not None else getattr(self, "_last_known_price", 0.0) or 0.0)
+            if price <= 0 or float(p.entry_price or 0.0) <= 0 or float(p.quantity or 0.0) <= 0:
+                return 0.0
+            return gross_pnl_usd(
+                p.side,
+                float(p.entry_price),
+                price,
+                float(p.quantity),
+                inverse=bool(self._is_inverse_btc_contract()),
+            )
+        except Exception:
+            try:
+                move = (float(mark_price or 0.0) - float(p.entry_price or 0.0)) if str(p.side).lower() == "long" else (float(p.entry_price or 0.0) - float(mark_price or 0.0))
+                return move * float(p.quantity or 0.0)
+            except Exception:
+                return 0.0
+
     def _win_rate(self): return self._winning_trades/self._total_trades if self._total_trades else 0.0
 
     def get_stats(self):
@@ -9452,7 +9541,10 @@ class QuantStrategy:
         wins     = self._winning_trades
         wr       = wins / total_t * 100.0 if total_t > 0 else 0.0
         total_pnl = self._total_pnl
-        daily_pnl = getattr(self, '_daily_pnl', total_pnl)
+        # Daily P&L belongs to DailyRiskGate; self._total_pnl is lifetime/session
+        # strategy P&L. Using total_pnl here made the heartbeat/reporting show the
+        # whole multi-day run as today's P&L after the bot ran for days.
+        daily_pnl = float(getattr(self._risk_gate, 'daily_pnl', 0.0) or 0.0)
 
         # ── Balance ──────────────────────────────────────────────────────
         balance = 0.0
@@ -9579,11 +9671,18 @@ class QuantStrategy:
         be_moved = False
         locked_r = 0.0
         if not p.is_flat():
+            _unrealised_usd = self._unrealised_pnl_usd(price, p)
+            _ladder_realised = float(getattr(p, 'tp_ladder_realized_pnl', 0.0) or 0.0)
             pos_dict = {
                 "side": p.side,
                 "entry_price": p.entry_price,
                 "quantity": p.quantity,
                 "peak_profit": p.peak_profit,
+                "mark_price": price,
+                "unrealised_pnl": _unrealised_usd,
+                "unrealized_pnl": _unrealised_usd,
+                "tp_ladder_realized_pnl": _ladder_realised,
+                "lifecycle_open_pnl": _unrealised_usd + _ladder_realised,
             }
             pos_entry = p.entry_price
             pos_sl = p.sl_price
@@ -9622,10 +9721,11 @@ class QuantStrategy:
                 _rpt_lev = QCfg.LEVERAGE()
                 _rpt_margin = _rpt_notional / _rpt_lev if _rpt_lev > 0 else _rpt_notional
                 if _rpt_margin > 1e-10:
-                    _rpt_profit = (price - p.entry_price) if p.side == "long" else (p.entry_price - price)
-                    _rpt_upnl = _rpt_profit * p.quantity
-                    _rpt_pct = (_rpt_upnl / _rpt_margin) * 100.0
-                    extra.append(f"  Open P&L: {_rpt_pct:+.1f}% on ${_rpt_margin:.2f} margin")
+                    _rpt_upnl = self._unrealised_pnl_usd(price, p)
+                    _rpt_ladder = float(getattr(p, 'tp_ladder_realized_pnl', 0.0) or 0.0)
+                    _rpt_life = _rpt_upnl + _rpt_ladder
+                    _rpt_pct = (_rpt_life / _rpt_margin) * 100.0
+                    extra.append(f"  Open P&L: ${_rpt_upnl:+.2f} uPnL | life ${_rpt_life:+.2f} ({_rpt_pct:+.1f}% on ${_rpt_margin:.2f})")
             except Exception:
                 pass
 
@@ -9855,6 +9955,15 @@ class QuantStrategy:
                 last_seen_price=ex_entry)
             self.current_sl_price=sl_p; self.current_tp_price=tp_p
             self._confirm_long=self._confirm_short=0
+            # Reconcile adoption means the exchange is already carrying risk.
+            # Keep RiskManager's open-position flag aligned so midnight reset
+            # deferral/booking remains correct even after recovery/adoption paths.
+            try:
+                _rm_adopt = getattr(self, '_risk_manager_ref', None)
+                if _rm_adopt is not None and hasattr(_rm_adopt, 'set_position_open'):
+                    _rm_adopt.set_position_open(True)
+            except Exception as _rm_adopt_e:
+                logger.debug(f"risk_manager.set_position_open(True) adoption error (non-fatal): {_rm_adopt_e}")
             # Reset duplicate guards for the newly adopted position
             self._exit_completed = False
             logger.warning(f"⚡ RECONCILE: adopted {iside.upper()} @ ${ex_entry:,.2f}")

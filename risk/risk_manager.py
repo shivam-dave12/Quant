@@ -204,7 +204,20 @@ class RiskManager:
     # =========================================================================
 
     def can_trade(self) -> tuple[bool, str]:
-        with self._lock:
+        """Return whether a new trade may be opened.
+
+        Long-run safety fix:
+        - Do not hold the risk-manager lock while fetching balance over REST.
+          The previous implementation called get_available_balance() from inside
+          the outer lock. Because the lock is re-entrant, the inner method's
+          "REST call outside lock" still happened while the outer can_trade()
+          lock was held, blocking Telegram/status/exit bookkeeping during slow
+          balance calls.
+        - Run all gates again after the balance bootstrap so a fresh daily reset,
+          cooldown, or trade count cannot be skipped by the unlocked fetch gap.
+        """
+
+        def _locked_gate(allow_bootstrap_request: bool) -> tuple[bool, str, bool]:
             now = time.time()
 
             # Reset daily counters FIRST — must happen before any gate check
@@ -217,46 +230,29 @@ class RiskManager:
             if (self.last_trade_time > 0 and
                     time_since_last < min_trade_gap_sec):
                 remaining = int(min_trade_gap_sec - time_since_last)
-                return False, f"Cooldown: {remaining}s remaining"
+                return False, f"Cooldown: {remaining}s remaining", False
 
-            # ── Loss cooldown — Bug #3 fix ────────────────────────────────────
-            # The original code compared TRADE_COOLDOWN_SECONDS against
-            # time_since_last (the same timer as MIN_TIME_BETWEEN_TRADES_SEC).
-            # If the pacing interval is shorter than TRADE_COOLDOWN_SECONDS,
-            # (0.5 min × 60 = 30s vs TRADE_COOLDOWN_SECONDS default 300s),
-            # so the min-interval gate fired first and the loss cooldown
-            # check was reached only after the pacing interval had already
-            # elapsed — meaning TRADE_COOLDOWN_SECONDS never blocked anything.
-            #
-            # Fix: track last_loss_time separately, set only after a losing trade.
-            # The cooldown is measured from the close of the losing trade,
-            # independent of the pacing timer.
+            # ── Loss cooldown — measured from the close of the last losing trade
             cooldown = getattr(config, "TRADE_COOLDOWN_SECONDS", 300)
             _last_loss = getattr(self, '_last_loss_time', 0.0)
             if (self.consecutive_losses > 0 and
                     _last_loss > 0 and
                     (now - _last_loss) < cooldown):
                 remaining = int(cooldown - (now - _last_loss))
-                return False, f"Loss cooldown: {remaining}s remaining"
+                return False, f"Loss cooldown: {remaining}s remaining", False
 
-            # RISK-HARDENING: bootstrap balance before gate checks.
-            # A zero current_balance disables percentage drawdown gates; fetch once
-            # before the first trade so daily-loss and drawdown checks are live.
-            if self.current_balance <= 0 and self.api is not None:
-                try:
-                    bal = self.get_available_balance()
-                    if isinstance(bal, dict) and bal.get("error"):
-                        return False, f"Balance unavailable: {bal.get('error')}"
-                except Exception as _bal_gate_err:
-                    return False, f"Balance unavailable: {_bal_gate_err}"
+            # Bootstrap balance before percentage drawdown checks.  The caller
+            # performs the REST call outside the lock, then re-enters this gate.
+            if allow_bootstrap_request and self.current_balance <= 0 and self.api is not None:
+                return False, "BALANCE_BOOTSTRAP_REQUIRED", True
 
             # ── Daily trade limit ─────────────────────────────────────────────
             if len(self.daily_trades) >= self.max_daily_trades:
-                return False, f"Daily trade limit ({self.max_daily_trades})"
+                return False, f"Daily trade limit ({self.max_daily_trades})", False
 
             # ── Daily loss limit (USDT) ───────────────────────────────────────
             if self.daily_pnl <= -self.daily_loss_limit:
-                return False, f"Daily loss limit hit (${abs(self.daily_pnl):.2f})"
+                return False, f"Daily loss limit hit (${abs(self.daily_pnl):.2f})", False
 
             # ── Daily loss limit (% of balance) ──────────────────────────────
             if self.current_balance > 0:
@@ -264,7 +260,7 @@ class RiskManager:
                 max_daily_pct  = getattr(config, "MAX_DAILY_LOSS_PCT", 5.0)
                 if self.daily_pnl < 0 and daily_loss_pct >= max_daily_pct:
                     return False, (f"Daily loss % limit hit "
-                                   f"({daily_loss_pct:.1f}% >= {max_daily_pct}%)")
+                                   f"({daily_loss_pct:.1f}% >= {max_daily_pct}%)"), False
 
             # ── Max drawdown ──────────────────────────────────────────────────
             if self.initial_balance > 0 and self.current_balance > 0:
@@ -273,7 +269,7 @@ class RiskManager:
                 max_dd = getattr(config, "MAX_DRAWDOWN_PCT", 15.0)
                 if drawdown_pct >= max_dd:
                     return False, (f"Max drawdown hit "
-                                   f"({drawdown_pct:.1f}% >= {max_dd}%)")
+                                   f"({drawdown_pct:.1f}% >= {max_dd}%)"), False
 
             # ── Consecutive losses ────────────────────────────────────────────
             if self.consecutive_losses >= self.max_consecutive_losses:
@@ -297,9 +293,26 @@ class RiskManager:
                     return False, (
                         f"Max consecutive losses ({self.consecutive_losses}) — "
                         f"{reset_hint}"
-                    )
+                    ), False
 
-            return True, "OK"
+            return True, "OK", False
+
+        with self._lock:
+            allowed, reason, needs_balance = _locked_gate(allow_bootstrap_request=True)
+            if not needs_balance:
+                return allowed, reason
+
+        # Network I/O is intentionally outside self._lock.
+        try:
+            bal = self.get_available_balance()
+            if isinstance(bal, dict) and bal.get("error"):
+                return False, f"Balance unavailable: {bal.get('error')}"
+        except Exception as _bal_gate_err:
+            return False, f"Balance unavailable: {_bal_gate_err}"
+
+        with self._lock:
+            allowed, reason, _ = _locked_gate(allow_bootstrap_request=False)
+            return allowed, reason
 
     # =========================================================================
     # RECORD TRADE
@@ -330,15 +343,19 @@ class RiskManager:
             exit_price  = float(exit_price)
             quantity    = float(quantity)
 
-            # If a midnight reset was deferred because a position was open,
-            # apply it NOW — before recording this trade — so the closing
-            # trade is counted in the new day, not the previous one.
-            if self._pending_reset:
+            # Long-run reset hardening: record_trade() is called at position close,
+            # so the closing fill must be booked into the current IST trading day.
+            # Do not depend on can_trade() having run exactly at midnight, and do
+            # not depend on the strategy remembering to call set_position_open(False)
+            # first.  Over 5-6 day unattended runs, either assumption can drift.
+            today = datetime.now(self._IST).date()
+            if today > self._last_reset_date or self._pending_reset:
                 logger.info(
-                    "🔄 Applying deferred daily reset inside record_trade "
-                    "(position closed — booking trade in the new day)."
+                    "🔄 Applying daily reset inside record_trade before booking close "
+                    f"({self._last_reset_date} → {today})."
                 )
                 self._apply_daily_reset()
+            self._position_is_open = False
 
             if pnl_override is not None:
                 pnl = float(pnl_override)
