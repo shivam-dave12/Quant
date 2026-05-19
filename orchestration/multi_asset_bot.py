@@ -247,6 +247,7 @@ class MultiAssetQuantBot:
             "r": 0.0, "mfe_r": 0.0, "hold_min": 0.0, "state": ctx.phase_name,
             "sl": 0.0, "tp": 0.0, "entry": 0.0,
             "qty": 0.0, "side": "", "policy": pol,
+            "entry_leverage": 0.0, "leverage": 0.0, "margin_used": 0.0,
         }
         if not pos_snapshot:
             return out
@@ -298,6 +299,8 @@ class MultiAssetQuantBot:
             entry_time = float(_get("entry_time", time.time()) or time.time())
             hold_m = (time.time() - entry_time) / 60.0
             open_realized = float(_get("tp_ladder_realized_pnl", 0.0) or 0.0)
+            entry_lev = float(_get("entry_leverage", 0.0) or getattr(ctx.strategy, "_active_effective_leverage", 0.0) or pol.leverage or 0.0)
+            margin_used = (entry * qty / entry_lev) if entry > 0 and qty > 0 and entry_lev > 0 else 0.0
             out.update({
                 "position": live,
                 "side": side, "entry": entry, "qty": qty,
@@ -306,6 +309,7 @@ class MultiAssetQuantBot:
                 "lifecycle_pnl": upnl + open_realized,
                 "r": r_now, "mfe_r": mfe_r, "hold_min": hold_m,
                 "sl": sl_price, "tp": tp_price,
+                "entry_leverage": entry_lev, "leverage": entry_lev, "margin_used": margin_used,
                 "trade_mode": _get("trade_mode", ""),
                 "entry_id": _get("entry_order_id", ""),
                 "sl_id": _get("sl_order_id", ""),
@@ -521,7 +525,10 @@ class MultiAssetQuantBot:
                     f"LIVE {self._fmt_money(r.get('lifecycle_pnl', r['upnl'])):>10} R {float(r['r']):+5.2f} MFE {float(r['mfe_r']):>4.2f}</code>"
                 )
                 lines.append(
-                    f"<code>       px {self._fmt_price(r['price']):>12} entry {self._fmt_price(r['entry']):>12} SL {self._fmt_price(r['sl']):>12}</code>"
+                    f"<code>       lev {float(r.get('entry_leverage', 0.0) or 0.0):>4.0f}x margin {self._fmt_price(r.get('margin_used', 0.0)):>10} px {self._fmt_price(r['price']):>12}</code>"
+                )
+                lines.append(
+                    f"<code>       entry {self._fmt_price(r['entry']):>12} SL {self._fmt_price(r['sl']):>12}</code>"
                 )
         if trades:
             lines.append("\n<b>🧾 Recent Realised Trades</b>")
@@ -547,7 +554,10 @@ class MultiAssetQuantBot:
                 f"\n<b>{self._esc(r['asset'])}</b>  <code>{self._esc(r['venue'])}:{self._esc(r['symbol'])}</code> · {self._esc(pol.asset_class)}"
             )
             lines.append(
-                f"<code>{self._esc(r['side']):<5} qty {float(r['qty']):.6f}   R {float(r['r']):+.2f}   MFE {float(r['mfe_r']):.2f}   hold {float(r['hold_min']):.0f}m</code>"
+                f"<code>{self._esc(r['side']):<5} qty {float(r['qty']):.6f}   lev {float(r.get('entry_leverage', 0.0) or 0.0):.0f}x   R {float(r['r']):+.2f}   MFE {float(r['mfe_r']):.2f}   hold {float(r['hold_min']):.0f}m</code>"
+            )
+            lines.append(
+                f"<code>MARGIN {self._fmt_price(r.get('margin_used', 0.0)):>11}  policy cap {float(getattr(pol, 'leverage', 0.0) or 0.0):.0f}x</code>"
             )
             lines.append(
                 f"<code>ENTRY {self._fmt_price(r['entry']):>12}  PX {self._fmt_price(r['price']):>12}  UPNL {self._fmt_money(r['upnl']):>11}</code>"
@@ -593,11 +603,12 @@ class MultiAssetQuantBot:
                 bal = ctx.risk_manager.get_available_balance() or {}
                 pol = active_policy(ctx.instrument)
                 pos_tail = ""
+                lev_display = float(r.get("entry_leverage", 0.0) or pol.leverage or 0.0) if r.get("position") else float(pol.leverage or 0.0)
                 if r.get("position"):
-                    pos_tail = f" uPnL {self._fmt_money(r.get('upnl', 0.0))} live {self._fmt_money(r.get('lifecycle_pnl', r.get('upnl', 0.0)))}"
+                    pos_tail = f" margin {self._fmt_price(r.get('margin_used', 0.0))} uPnL {self._fmt_money(r.get('upnl', 0.0))} live {self._fmt_money(r.get('lifecycle_pnl', r.get('upnl', 0.0)))}"
                 lines.append(
                     f"<code>{self._esc(ctx.instrument.asset_id):<6} cash {self._fmt_price(float(bal.get('available',0) or 0)):>10} "
-                    f"riskbase {self._fmt_price(float(bal.get('risk_total',0) or 0)):>10} lev {pol.leverage:>2}x margin {pol.margin_pct:.0%} risk×{pol.risk_multiplier:.2f}{self._esc(pos_tail)}</code>"
+                    f"riskbase {self._fmt_price(float(bal.get('risk_total',0) or 0)):>10} lev {lev_display:>2.0f}x margin {pol.margin_pct:.0%} risk×{pol.risk_multiplier:.2f}{self._esc(pos_tail)}</code>"
                 )
             except Exception:
                 continue

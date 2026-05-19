@@ -382,7 +382,12 @@ def _tg_asset_header(inst=None, event_type: str = "", context: Optional[Dict[str
                 continue
         venue_txt = _esc(", ".join(venues) if venues else f"{primary_name}:{symbol}")
         pol = _tg_asset_policy(inst)
-        lev = getattr(pol, "leverage", None) or context.get("leverage") or getattr(inst, "max_leverage", 0) or "-"
+        # Prefer actual runtime/entry leverage over policy/config leverage.
+        # Policy leverage is only a cap/default; after dynamic margin-risk sizing
+        # the exchange can be asserted at e.g. 8x/14x while config remains 40x.
+        lev = (context.get("entry_leverage") or context.get("actual_leverage")
+               or context.get("leverage") or getattr(pol, "leverage", None)
+               or getattr(inst, "max_leverage", 0) or "-")
         margin = getattr(pol, "margin_pct", None)
         risk_mult = getattr(pol, "risk_multiplier", None)
         cadence = getattr(pol, "evaluation_interval_sec", None)
@@ -1752,11 +1757,17 @@ def format_periodic_report(
         realised_ladder = float(position.get("tp_ladder_realized_pnl", 0.0) or 0.0)
         lifecycle_open = float(position.get("lifecycle_open_pnl", upnl + realised_ladder) or 0.0)
         rr = abs(tp - entry) / risk if risk > 1e-10 and tp else 0.0
+        entry_lev = float(position.get("entry_leverage") or position.get("actual_leverage")
+                          or _kw.get("entry_leverage") or _kw.get("leverage") or 0.0)
+        margin_used = 0.0
+        if entry_lev > 0 and entry > 0 and qty > 0:
+            margin_used = entry * qty / entry_lev
         lines += [
             _tg_section("\U0001f512", "Active Position"),
             f"<code>SIDE    {_esc(side):<8} qty {qty:.6f}   R {r_now:+.2f}</code>",
             f"<code>ENTRY   {_tg_price(entry):>14}   UPNL {_tg_pnl(upnl):>14}</code>",
             f"<code>LIVE    {_tg_pnl(lifecycle_open):>14}   ladder {_tg_pnl(realised_ladder):>12}</code>",
+            f"<code>LEV     {entry_lev:>6.0f}x       margin {_tg_price(margin_used):>14}</code>" if entry_lev > 0 else "<code>LEV     -            margin              -</code>",
             f"<code>SL      {_tg_price(sl):>14}   TP {_tg_price(tp):>14}   RR 1:{rr:.2f}</code>",
         ]
         # Fixed-SL TP-ladder policy: no break-even lock line is rendered.

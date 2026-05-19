@@ -630,6 +630,123 @@ def _tf_rank(tf: str) -> int:
     return _TF_RANK.get(str(tf).lower(), 2)
 
 
+def _target_tf_sources(target: Any) -> List[str]:
+    """Return all known timeframe sources for a liquidity target.
+
+    The final TP selector must treat a pool confirmed by 15m/1h/4h history
+    differently from a single fresh LTF wick.  Liquidity snapshots in this
+    codebase expose that information with slightly different field names
+    depending on the builder, so this helper deliberately accepts all common
+    variants and de-duplicates them.
+    """
+    out: List[str] = []
+    pool = _safe(target, "pool", None)
+    for obj in (target, pool):
+        if obj is None:
+            continue
+        for attr in ("tf_sources", "timeframes", "source_timeframes"):
+            try:
+                vals = list(getattr(obj, attr, []) or [])
+            except Exception:
+                vals = []
+            out.extend(str(v).lower() for v in vals if str(v or ""))
+        tf = str(_safe(obj, "timeframe", "") or "").lower()
+        if tf:
+            out.append(tf)
+    # Stable de-duplication while preserving approximate source order.
+    seen = set()
+    uniq: List[str] = []
+    for tf in out:
+        if tf not in seen:
+            seen.add(tf); uniq.append(tf)
+    return uniq
+
+
+def _historical_liquidity_score(target: Any) -> Tuple[float, Dict[str, float]]:
+    """Score how durable/historical a candidate final liquidity pool is.
+
+    This is the prop-desk correction to "nearest pool wins".  A final TP is
+    not merely the next same-side wick; it should be a durable liquidity
+    objective with historical memory, multi-timeframe confirmation, and enough
+    structural significance to justify holding the runner.
+
+    Returns a [0, ~1] quality score plus components.  The score is used as a
+    *soft ranking input*, not as a hard veto, so we keep the system adaptive.
+    """
+    pool = _safe(target, "pool", None)
+    sources = _target_tf_sources(target)
+    tf = str(_safe(pool, "timeframe", "5m") or "5m").lower()
+    rank_max = max([_tf_rank(tf)] + [_tf_rank(x) for x in sources])
+    sig = max(float(_safe(target, "significance", 0.0) or 0.0),
+              float(_safe(pool, "significance", 0.0) or 0.0))
+    try:
+        htf_count = float(_safe(pool, "htf_count", 0.0) or 0.0)
+    except Exception:
+        htf_count = 0.0
+    source_n = max(len(sources), int(htf_count or 0.0), 1)
+    touches = max(int(_safe(pool, "touches", 1) or 1), 1)
+
+    # Durable memory comes from high TF rank, multiple TF confirmations, and
+    # significance. Touches add validity up to a point; excessive touches are
+    # already penalised elsewhere by _touch_penalty.
+    tf_quality = _clamp((rank_max - 1.0) / 5.0, 0.0, 1.0)
+    source_quality = _clamp((source_n - 1.0) / 4.0, 0.0, 1.0)
+    sig_quality = _clamp(math.log1p(max(sig, 0.0)) / math.log1p(24.0), 0.0, 1.0)
+    touch_quality = _clamp((touches - 1.0) / 3.0, 0.0, 1.0)
+    structural = 0.0
+    if bool(_safe(pool, "ob_aligned", False)):
+        structural += 0.5
+    if bool(_safe(pool, "fvg_aligned", False)):
+        structural += 0.5
+
+    score = _clamp(
+        0.32 * tf_quality
+        + 0.26 * source_quality
+        + 0.28 * sig_quality
+        + 0.08 * touch_quality
+        + 0.06 * structural,
+        0.0,
+        1.15,
+    )
+    return score, {
+        "tf_quality": tf_quality,
+        "source_quality": source_quality,
+        "sig_quality": sig_quality,
+        "touch_quality": touch_quality,
+        "rank_max": float(rank_max),
+        "source_n": float(source_n),
+        "score": score,
+    }
+
+
+def _final_tp_frontier_multiplier(rr: float, rr_floor: float, distance_atr: float,
+                                  historical_score: float, ladder_path_score: float,
+                                  terminal_target: bool) -> float:
+    """Soft preference for durable external liquidity over nearest liquidity.
+
+    We still require positive EV/probability. This multiplier only resolves the
+    common institutional problem where the nearest pool has higher first-touch
+    probability but is a weak final target. The farther candidate earns a
+    ranking bonus only when it has payoff surplus, broad/historical liquidity
+    quality, or an executable ladder path.
+    """
+    rr_surplus = _clamp((float(rr) - float(rr_floor)) / max(float(rr_floor), 1e-9), 0.0, 1.75)
+    range_quality = 1.0 - math.exp(-max(float(distance_atr) - 1.0, 0.0) / 3.25)
+    hist = _clamp(float(historical_score or 0.0), 0.0, 1.15)
+    ladder = _clamp(float(ladder_path_score or 0.0), 0.0, 1.25)
+
+    mult = 1.0
+    mult += 0.38 * rr_surplus * range_quality
+    mult += 0.30 * hist * range_quality
+    mult += 0.16 * ladder * range_quality
+    if terminal_target:
+        mult += 0.10 * hist
+
+    # A final TP very near entry should not win just because P(sweep) is high.
+    # This is a soft compression, not a fixed distance veto.
+    if distance_atr < 1.25 and rr_surplus < 0.25:
+        mult *= 0.78 + 0.14 * hist
+    return _clamp(mult, 0.55, 2.35)
 
 
 def _fib_geometry(snap, side: str, entry: float, sl: float, tp_price: float, atr: float, target: Any):
@@ -972,6 +1089,7 @@ def score_tp_pools(
 
             ladder_path_score, ladder_path_components = _tp_ladder_path_score(
                 snap, side, entry, tp_price, atr)
+            historical_score, historical_components = _historical_liquidity_score(target)
             reach_mult = _tp_reach_multiplier(
                 dist_atr, tf, selector_profile, terminal_target, ladder_path_score)
 
@@ -1006,6 +1124,9 @@ def score_tp_pools(
             ev = utility * _W_PROBABILITY * confluence * gauntlet_mult
             selection_ev = _tp_selection_value(
                 ev, rr, rr_floor, dist_atr, ladder_path_score, terminal_target)
+            frontier_mult = _final_tp_frontier_multiplier(
+                rr, rr_floor, dist_atr, historical_score, ladder_path_score, terminal_target)
+            selection_ev *= frontier_mult
             selection_ev = _apply_cross_asset_tp_overlay(selection_ev, type("_Row", (), {"distance_atr": dist_atr, "rr": rr})(), cross_adj)
 
             reasons: List[str] = []
@@ -1017,6 +1138,12 @@ def score_tp_pools(
                     f"{str(getattr(fib_geo, 'role', ''))} ×{fib_mult:.2f}")
             if n_gauntlet > 0:
                 reasons.append(f"gauntlet {n_gauntlet} pools −{(1-gauntlet_mult)*100:.0f}%")
+            if historical_score >= 0.50:
+                reasons.append(
+                    f"historical/MTF liquidity {historical_score:.2f} "
+                    f"({int(historical_components.get('source_n', 1))}TF maxRank={int(historical_components.get('rank_max', 0))})")
+            if frontier_mult > 1.10:
+                reasons.append(f"external-final frontier×{frontier_mult:.2f}")
             if terminal_target:
                 reasons.append(
                     f"final-runner target beyond first-sweep reach ({dist_atr:.1f}>{max_reach:.1f}ATR; reach×{reach_mult:.2f})")
@@ -1054,6 +1181,12 @@ def score_tp_pools(
                     "reach_mult":  utility_components.get("reach_mult", 1.0),
                     "max_reach_atr": utility_components.get("max_reach_atr", max_reach),
                     "selection_ev": selection_ev,
+                    "frontier_mult": frontier_mult,
+                    "historical_score": historical_score,
+                    "historical_tf_quality": historical_components.get("tf_quality", 0.0),
+                    "historical_source_quality": historical_components.get("source_quality", 0.0),
+                    "historical_rank_max": historical_components.get("rank_max", 0.0),
+                    "historical_source_n": historical_components.get("source_n", 0.0),
                     "be_move":     utility_components["be_move"],
                     "ladder_path_score": ladder_path_score,
                     "ladder_path_n": ladder_path_components.get("n", 0.0),
@@ -1325,6 +1458,7 @@ def diagnose_tp_pools(
             ladder_path_score, ladder_path_components = _tp_ladder_path_score(
                 snap, side, entry, row.tp_price, atr)
             row.ladder_path_score = ladder_path_score
+            historical_score, historical_components = _historical_liquidity_score(target)
             reach_mult = _tp_reach_multiplier(
                 row.distance_atr, tf, selector_profile, terminal_target, ladder_path_score)
             n_gauntlet, gauntlet_mult = _gauntlet_penalty(target, sig, snap, side, entry, atr)
@@ -1359,10 +1493,18 @@ def diagnose_tp_pools(
             row.ev = utility * _W_PROBABILITY * confluence * gauntlet_mult
             selection_ev = _tp_selection_value(
                 row.ev, row.rr, rr_floor, row.distance_atr, ladder_path_score, terminal_target)
-            row.selection_ev = _apply_cross_asset_tp_overlay(selection_ev, row, cross_adj)
+            frontier_mult = _final_tp_frontier_multiplier(
+                row.rr, rr_floor, row.distance_atr, historical_score, ladder_path_score, terminal_target)
+            row.selection_ev = _apply_cross_asset_tp_overlay(selection_ev * frontier_mult, row, cross_adj)
             row.eligible = True
             row.reason = "eligible; payoff-adjusted EV candidate"
             row.notes = []
+            if historical_score >= 0.50:
+                row.notes.append(
+                    f"historical/MTF {historical_score:.2f} "
+                    f"({int(historical_components.get('source_n', 1))}TF maxRank={int(historical_components.get('rank_max', 0))})")
+            if frontier_mult > 1.10:
+                row.notes.append(f"external frontier×{frontier_mult:.2f}")
             if terminal_target:
                 row.notes.append(f"final-runner TP; reach×{reach_mult:.2f}")
                 if ladder_path_score > 0.10:

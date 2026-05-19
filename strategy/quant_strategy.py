@@ -6183,7 +6183,8 @@ class QuantStrategy:
         return max(float(lo), min(float(hi), v))
 
     def _build_tp_ladder_plan(self, side: str, entry_price: float, sl_price: float,
-                              final_tp: float, quantity: float, atr: float):
+                              final_tp: float, quantity: float, atr: float,
+                              use_maker_entry: bool = True):
         """Build TP1..TPn from internal liquidity; final TP remains unchanged."""
         if build_tp_ladder is None:
             return None
@@ -6218,6 +6219,16 @@ class QuantStrategy:
                 _max_internal_legs = _info_capacity
             _target_spacing_atr = (_final_dist_atr / max(_max_internal_legs + 1, 1)) if _max_internal_legs > 0 else _final_dist_atr
             _min_spacing_atr = self._clamp_ladder_value(max(0.35, 0.58 * _target_spacing_atr, 0.55 * _risk_atr), 0.35, 1.35)
+            _rt_cost_bps = 0.0
+            try:
+                _rt_cost_pts, _rt_cost_bps = self._roundtrip_cost_points(float(entry_price), bool(use_maker_entry))
+            except Exception:
+                _rt_cost_bps = 0.0
+            _fee_floor_mult = 1.20
+            try:
+                _fee_floor_mult = float(getattr(config, "FEE_FLOOR_ABS_MIN_MULT", 1.20) or 1.20)
+            except Exception:
+                _fee_floor_mult = 1.20
             plan = build_tp_ladder(
                 side=side,
                 entry=float(entry_price),
@@ -6232,6 +6243,8 @@ class QuantStrategy:
                 min_leg_fraction=_min_leg_fraction,
                 min_spacing_atr=_min_spacing_atr,
                 max_internal_legs=_max_internal_legs,
+                roundtrip_cost_bps=_rt_cost_bps,
+                fee_floor_mult=_fee_floor_mult,
             )
             if plan is not None and getattr(plan, "legs", None):
                 logger.info(
@@ -7228,7 +7241,8 @@ class QuantStrategy:
         # ── Dynamic TP ladder: internal liquidity TP1..TPn, final TP unchanged ─────
         tp_ladder_plan = self._build_tp_ladder_plan(
             side=side, entry_price=fill_price, sl_price=sl_price,
-            final_tp=tp_price, quantity=qty, atr=atr)
+            final_tp=tp_price, quantity=qty, atr=atr,
+            use_maker_entry=(str(actual_fill_type or "").lower() == "maker"))
         tp_ladder_dicts, tp_ladder_order_ids = self._place_internal_tp_ladder(
             order_manager=order_manager, side=side, quantity=qty, final_tp=tp_price,
             native_final_tp_order_id=(tp_data or {}).get("order_id", ""),
@@ -9958,7 +9972,7 @@ class QuantStrategy:
                     _rpt_ladder = float(getattr(p, 'tp_ladder_realized_pnl', 0.0) or 0.0)
                     _rpt_life = _rpt_upnl + _rpt_ladder
                     _rpt_pct = (_rpt_life / _rpt_margin) * 100.0
-                    extra.append(f"  Open P&L: ${_rpt_upnl:+.2f} uPnL | life ${_rpt_life:+.2f} ({_rpt_pct:+.1f}% on ${_rpt_margin:.2f})")
+                    extra.append(f"  Open P&L: ${_rpt_upnl:+.2f} uPnL | life ${_rpt_life:+.2f} ({_rpt_pct:+.1f}% on ${_rpt_margin:.2f} @ {_rpt_lev:g}x)")
             except Exception:
                 pass
 
@@ -10049,6 +10063,7 @@ class QuantStrategy:
             direction_hunt=direction_hunt,
             direction_ps_analysis=direction_ps_analysis,
             instrument=getattr(self, "_instrument", None),
+            entry_leverage=(float(getattr(p, "entry_leverage", 0.0) or getattr(self, "_active_effective_leverage", 0.0) or QCfg.LEVERAGE()) if p is not None else QCfg.LEVERAGE()),
         )
 
     # ─── RECONCILIATION (unchanged logic, fixed PnL) ───

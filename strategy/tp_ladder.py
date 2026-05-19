@@ -426,6 +426,90 @@ def _fib_fallback_internals(*, side: str, entry: float, sl: float, final_tp: flo
     return out
 
 
+
+def _cost_points_from_bps(entry: float, roundtrip_cost_bps: float) -> float:
+    try:
+        bps = max(0.0, float(roundtrip_cost_bps or 0.0))
+        px = max(0.0, float(entry or 0.0))
+        return px * bps / 10_000.0
+    except Exception:
+        return 0.0
+
+
+def _row_cost_points(row: Dict[str, Any], *, risk_points: float, rt_cost_points: float) -> float:
+    """Best available per-unit friction estimate for an internal TP.
+
+    Cost is measured in price points, not dollars, so the same rule works for
+    BTC, gold, silver, and tokenised equities before exchange contract sizing.
+    The live execution-cost engine supplies ``rt_cost_points``.  Liquidity rows
+    may also carry ``cost_r`` from the selector; use the larger estimate so a
+    stale low fee snapshot cannot make a dust TP look tradable.
+    """
+    risk = max(float(risk_points or 0.0), 1e-9)
+    row_cost_r = _num(row.get("cost_r", 0.0), 0.0) if isinstance(row, dict) else 0.0
+    return max(0.0, float(rt_cost_points or 0.0), max(0.0, row_cost_r) * risk)
+
+
+def _prop_desk_internal_reward_floor(row: Dict[str, Any], *, risk_points: float,
+                                     rt_cost_points: float, base_fee_floor_mult: float) -> tuple[float, float]:
+    """Return (required_reward_points, effective_cost_points).
+
+    Internal TPs are not targets just because a pool exists. A prop desk only
+    monetises the path if the partial exit clears fees/slippage with enough net
+    edge to justify creating another exchange order and reducing final-runner
+    optionality.
+    """
+    cost_pts = _row_cost_points(row, risk_points=risk_points, rt_cost_points=rt_cost_points)
+    if cost_pts <= 0.0:
+        return 0.0, 0.0
+    dp = _clamp(_num(row.get("delivery_prob", row.get("sweep_prob", 0.55)), 0.55), 0.05, 0.95)
+    qual = _clamp(_num(row.get("quality", 0.55), 0.55), 0.0, 1.0)
+    path = _clamp(_num(row.get("_ladder_path_frac", 0.0), 0.0), 0.0, 1.0)
+    src = str(row.get("_ladder_source", row.get("source", "")) or "").lower()
+
+    # The minimum multiple is fee-engine derived.  It increases only when the
+    # candidate itself is weaker: near-entry/noisy, low delivery probability,
+    # low quality, or synthetic Fib-only geometry.
+    mult = max(1.0, float(base_fee_floor_mult or 1.0))
+    mult *= 1.0 + 0.22 * (1.0 - dp) + 0.16 * (1.0 - qual) + 0.18 * max(0.0, 0.35 - path)
+    if "fib" in src and "liquidity" not in src:
+        mult *= 1.08
+    mult = _clamp(mult, 1.05, 2.15)
+    return cost_pts * mult, cost_pts
+
+
+def _filter_internal_levels_by_net_edge(rows: List[Dict[str, Any]], *, side: str, entry: float,
+                                        risk_points: float, rt_cost_points: float,
+                                        base_fee_floor_mult: float) -> tuple[List[Dict[str, Any]], List[str]]:
+    if not rows or rt_cost_points <= 0.0:
+        return rows, []
+    kept: List[Dict[str, Any]] = []
+    notes: List[str] = []
+    dropped = 0
+    nearest_note = ""
+    for r in rows:
+        px = _num(r.get("_ladder_price", r.get("tp_price", r.get("pool_price", 0.0))), 0.0)
+        reward_pts = abs(px - entry)
+        req_pts, cost_pts = _prop_desk_internal_reward_floor(
+            r, risk_points=risk_points, rt_cost_points=rt_cost_points,
+            base_fee_floor_mult=base_fee_floor_mult,
+        )
+        if req_pts > 0.0 and reward_pts <= req_pts:
+            dropped += 1
+            if not nearest_note:
+                nearest_note = (
+                    f"first skipped level reward={reward_pts:.2f}pts does not clear "
+                    f"friction floor={req_pts:.2f}pts (cost≈{cost_pts:.2f}pts)"
+                )
+            continue
+        kept.append(r)
+    if dropped:
+        notes.append(
+            f"prop-desk net-edge filter: {dropped} internal TP level(s) removed; "
+            + (nearest_note or "net reward did not clear fees/slippage")
+        )
+    return kept, notes
+
 def _sigmoid(x: float) -> float:
     try:
         return 1.0 / (1.0 + math.exp(-float(x)))
@@ -839,6 +923,8 @@ def build_tp_ladder(
     min_leg_fraction: float = 0.0,
     min_spacing_atr: float = 0.35,
     max_internal_legs: int = 0,
+    roundtrip_cost_bps: float = 0.0,
+    fee_floor_mult: float = 1.20,
 ) -> TPLadderPlan:
     side = str(side or "").lower()
     entry = float(entry or 0.0)
@@ -864,8 +950,11 @@ def build_tp_ladder(
         return plan
 
     final_dist_atr = abs(final_tp - entry) / atr
-    final_rr = abs(final_tp - entry) / max(abs(entry - sl), 1e-9)
+    risk_points = max(abs(entry - sl), 1e-9)
+    final_rr = abs(final_tp - entry) / risk_points
     sponsorship = _cross_asset_sponsorship(cross_asset_state, side, asset_id)
+    rt_cost_points = _cost_points_from_bps(entry, roundtrip_cost_bps)
+    rt_cost_r = rt_cost_points / risk_points if rt_cost_points > 0 else 0.0
 
     rows: List[Dict[str, Any]] = []
     if isinstance(pool_report, dict):
@@ -907,6 +996,51 @@ def build_tp_ladder(
     final_fib_mult = max([_clamp(_num(r.get("fib_confluence", r.get("fib_multiplier", 1.0)), 1.0), 0.90, 1.32) for r in final_rows] or [1.0])
     final_fib_ratio = max([_num(r.get("fib_ratio", 0.0), 0.0) for r in final_rows] or [0.0])
 
+    selector_cost_r = max([_clamp(_num(r.get("cost_r", 0.0), 0.0), 0.0, 0.85) for r in rows] or [0.0])
+    effective_cost_r = max(rt_cost_r, selector_cost_r if rt_cost_points > 0.0 else 0.0)
+
+    def _return_final_only(reason: str, note: str = "") -> TPLadderPlan:
+        plan.final_fraction = 1.0
+        plan.internal_budget = 0.0
+        if note:
+            plan.regime_notes.append(note)
+        plan.final_runner_model = {
+            "path_strength": 0.0,
+            "reason": "final_only_" + str(reason or "native_final_tp"),
+            "fib_score": final_fib_score,
+            "fib_multiplier": final_fib_mult,
+            "fib_ratio": final_fib_ratio,
+            "roundtrip_cost_bps": float(roundtrip_cost_bps or 0.0),
+            "rt_cost_r": float(rt_cost_r or 0.0),
+            "selector_cost_r": float(selector_cost_r or 0.0),
+        }
+        plan.legs = [TPLadderLeg(
+            index=1, role="FINAL", price=final_tp, qty_fraction=1.0,
+            quantity=total_quantity, source="selected_final_tp",
+            distance_atr=final_dist_atr, rr=final_rr,
+            fib_confluence=final_fib_mult, fib_score=final_fib_score, fib_ratio=final_fib_ratio,
+            reason=reason,
+        )]
+        return plan
+
+    # Prop-desk staging rule: an internal ladder only makes sense when the
+    # terminal target has enough net runway after fees/slippage.  If the final TP
+    # is already close, adding TP1/TP2 just pays more fees and cuts the runner.
+    # Apply this only when a live execution-cost estimate is available; otherwise
+    # legacy/offline tests keep the selector's own cost_r behaviour.
+    if rt_cost_points > 0.0:
+        min_final_net_r_for_ladder = _clamp(1.20 + 1.60 * effective_cost_r, 1.25, 2.35)
+        final_net_r = final_rr - effective_cost_r
+        if final_net_r < min_final_net_r_for_ladder:
+            return _return_final_only(
+                "final TP kept as single native bracket target; terminal objective is too close for cost-efficient internal staging",
+                (
+                    "prop-desk final-only: final net runway "
+                    f"{final_net_r:.2f}R < {min_final_net_r_for_ladder:.2f}R after fees/slippage; "
+                    "no internal TP ladder"
+                ),
+            )
+
     internals = _cluster_effective_liquidity(
         raw_internals,
         side=side,
@@ -914,6 +1048,12 @@ def build_tp_ladder(
         final_tp=final_tp,
         min_spacing=min_spacing,
     )
+    if internals:
+        internals, _net_edge_notes = _filter_internal_levels_by_net_edge(
+            internals, side=side, entry=entry, risk_points=risk_points,
+            rt_cost_points=rt_cost_points, base_fee_floor_mult=fee_floor_mult,
+        )
+        plan.regime_notes.extend(_net_edge_notes)
     if internals:
         plan.regime_notes.append(f"MTF liquidity clustering: {len(raw_internals)} raw pools → {len(internals)} effective zones")
         internals = _add_fib_gap_fillers(
@@ -932,6 +1072,11 @@ def build_tp_ladder(
         )
         if len(internals) > len(_cluster_effective_liquidity(raw_internals, side=side, entry=entry, final_tp=final_tp, min_spacing=min_spacing)):
             plan.regime_notes.append("sparse path: Fibonacci gap-fillers added between liquidity zones")
+        internals, _net_edge_notes = _filter_internal_levels_by_net_edge(
+            internals, side=side, entry=entry, risk_points=risk_points,
+            rt_cost_points=rt_cost_points, base_fee_floor_mult=fee_floor_mult,
+        )
+        plan.regime_notes.extend(_net_edge_notes)
         if max_internal_legs > 0 and len(internals) > max_internal_legs:
             internals = internals[:max_internal_legs]
             plan.regime_notes.append(f"internal targets capped by executable lot capacity at {max_internal_legs}")
@@ -954,31 +1099,30 @@ def build_tp_ladder(
             final_dist_atr=final_dist_atr,
         )
         if fib_internals:
+            fib_internals, _net_edge_notes = _filter_internal_levels_by_net_edge(
+                fib_internals, side=side, entry=entry, risk_points=risk_points,
+                rt_cost_points=rt_cost_points, base_fee_floor_mult=fee_floor_mult,
+            )
+            plan.regime_notes.extend(_net_edge_notes)
+        if fib_internals:
             internals = fib_internals
             plan.regime_notes.append(
                 f"no internal liquidity: using Fibonacci path-monetisation fallback ({len(internals)} legs)"
             )
         else:
-            plan.final_fraction = 1.0
-            plan.internal_budget = 0.0
-            reason = "no valid internal liquidity between entry and final TP"
+            reason = "no valid cost-efficient internal liquidity between entry and final TP"
             if max_internal_legs <= 0:
                 reason += "; position size not splittable under exchange lot/min-qty constraints"
-                plan.regime_notes.append("no internal/fib ladder: quantity cannot be split under exchange lot size")
+                note = "no internal/fib ladder: quantity cannot be split under exchange lot size"
             elif final_dist_atr < 1.65:
                 reason += "; final TP too close for non-noisy Fibonacci staging"
-                plan.regime_notes.append("no internal/fib ladder: final TP too close for non-noisy staging")
+                note = "no internal/fib ladder: final TP too close for non-noisy staging"
+            elif rt_cost_points > 0.0:
+                reason += "; all internal levels failed prop-desk net-edge cost filter"
+                note = "no internal/fib ladder: internal levels could not clear fees/slippage with net edge"
             else:
-                plan.regime_notes.append("no internal/fib ladder: no robust Fibonacci staging level survived cost/noise filters")
-            plan.final_runner_model = {"path_strength": 0.0, "reason": "no_internal_liquidity_or_fib_capacity", "fib_score": final_fib_score, "fib_multiplier": final_fib_mult, "fib_ratio": final_fib_ratio, "max_internal_legs": float(max_internal_legs)}
-            plan.legs = [TPLadderLeg(
-                index=1, role="FINAL", price=final_tp, qty_fraction=1.0,
-                quantity=total_quantity, source="selected_final_tp",
-                distance_atr=final_dist_atr,
-                rr=final_rr,
-                reason=reason,
-            )]
-            return plan
+                note = "no internal/fib ladder: no robust Fibonacci staging level survived cost/noise filters"
+            return _return_final_only(reason, note)
 
     for _c in internals:
         _c["_ladder_sponsorship"] = sponsorship

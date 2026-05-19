@@ -56,12 +56,14 @@ class AssetNotificationTests(unittest.TestCase):
                 "unrealised_pnl": 10.0,
                 "tp_ladder_realized_pnl": 1.5,
                 "lifecycle_open_pnl": 11.5,
+                "entry_leverage": 8.0,
             },
             current_sl=90.0, current_tp=130.0, entry_price=100.0,
         )
         self.assertIn("UPNL        +$10.00", msg)
         self.assertIn("LIVE           +$11.50", msg)
         self.assertIn("ladder       +$1.50", msg)
+        self.assertIn("LEV          8x", msg)
 
     def test_already_scoped_message_not_double_wrapped(self):
         inst = _inst()
@@ -1842,6 +1844,7 @@ class PortfolioDeskReportingTests(unittest.TestCase):
                     sl_price=90.0, tp_price=130.0, initial_sl_dist=10.0,
                     peak_profit=8.0, entry_time=time.time() - 600,
                     tp_ladder_realized_pnl=1.50, trade_mode="reversal",
+                    entry_leverage=14.0,
                     entry_order_id="entry", sl_order_id="sl", tp_order_id="tp",
                     is_flat=lambda: False,
                 )
@@ -1875,15 +1878,23 @@ class PortfolioDeskReportingTests(unittest.TestCase):
         self.assertEqual(metrics["upnl"], 10.0)
         self.assertEqual(metrics["open_realized"], 1.5)
         self.assertEqual(metrics["lifecycle_pnl"], 11.5)
+        self.assertEqual(metrics["entry_leverage"], 14.0)
+        self.assertAlmostEqual(metrics["margin_used"], 100.0 * 2.0 / 14.0, places=6)
 
         pnl_report = bot.format_portfolio_pnl_report()
         self.assertIn("UPNL      $+10.00", pnl_report)
         self.assertIn("LIVE      $+11.50", pnl_report)
+        self.assertIn("lev   14x", pnl_report)
+
+        pos_report = bot.format_portfolio_position_report()
+        self.assertIn("lev 14x", pos_report)
+        self.assertIn("policy cap", pos_report)
 
         equity_report = bot.format_portfolio_equity_report()
         self.assertIn("MARKED equity", equity_report)
         self.assertIn("OPEN   UPNL", equity_report)
         self.assertIn("$+10.00", equity_report)
+        self.assertIn("lev 14x", equity_report)
 
     def test_trades_report_shows_all_recent_newest_first(self):
         report = self._bot().format_portfolio_trades_report()
@@ -2396,6 +2407,62 @@ def test_tp_ladder_sparse_path_adds_fib_gap_filler_not_all_nearest():
     assert any(l.source == "fib_fallback_geometry" for l in internals)
     assert internals[0].qty_fraction < 0.90
 
+
+
+def test_final_tp_selector_prefers_historical_mtf_external_liquidity_over_nearest_pool():
+    from types import SimpleNamespace
+    from strategy.liquidity_pool_selector import select_tp_with_report
+
+    now = 1_700_000_000
+
+    def target(price, timeframe, significance, sources, touches=1, htf_count=1):
+        pool = SimpleNamespace(
+            price=price,
+            timeframe=timeframe,
+            side="BSL",
+            significance=significance,
+            htf_count=htf_count,
+            touches=touches,
+            status="DETECTED",
+            created_at=now,
+            ob_aligned=False,
+            fvg_aligned=False,
+            tf_sources=sources,
+        )
+        return SimpleNamespace(
+            pool=pool,
+            distance_atr=abs(price - 100.0),
+            significance=significance,
+            direction="long",
+            tf_sources=sources,
+        )
+
+    # Nearest BSL has better first-touch probability, but it is only a single
+    # LTF pocket.  The farther 4H/1D cluster is the proper final runner target.
+    near_ltf = target(104.4, "5m", 22.0, ["5m"], touches=1, htf_count=1)
+    external_htf = target(109.5, "4h", 16.0, ["15m", "1h", "4h", "1d"], touches=2, htf_count=4)
+    snap = SimpleNamespace(bsl_pools=[near_ltf, external_htf], ssl_pools=[], feed_reliability=0.95)
+
+    tp, selected_target, score, report = select_tp_with_report(
+        snap=snap,
+        side="long",
+        entry=100.0,
+        sl=98.0,
+        atr=1.0,
+        min_rr=2.20,
+        posterior_prob=0.88,
+        now=now,
+    )
+
+    assert tp is not None
+    assert selected_target is external_htf
+    assert score.components["historical_score"] >= 0.50
+    assert score.components["frontier_mult"] > 1.10
+    assert any("historical/MTF liquidity" in r for r in score.reasons)
+    payload = report.as_dict()
+    assert payload["selected"]["pool_price"] == external_htf.pool.price
+
+
 # ===== BEGIN test_institutional_tp_ladder_reserve_and_quantisation =====
 
 def test_sparse_silver_path_keeps_meaningful_final_runner_and_limits_tp_count():
@@ -2765,3 +2832,60 @@ def test_strategy_bracket_failure_log_includes_order_manager_reason():
     assert "reason=" in src
 
 # ===== END test_delta_native_bracket_payload_hardening.py =====
+
+# ===== BEGIN test_prop_desk_tp_ladder_net_edge.py =====
+
+def test_tp_ladder_final_only_when_terminal_tp_is_too_close_after_costs():
+    from strategy.tp_ladder import build_tp_ladder
+
+    # Reproduces the prop-desk problem from the GOLD screenshot: internal TP1 is
+    # close to entry and does not pay enough net edge after round-trip friction.
+    report = {
+        "candidates": [
+            {"pool_side": "SSL", "tp_price": 4542.01, "pool_price": 4542.01,
+             "quality": 0.70, "significance": 3.0, "delivery_prob": 0.72,
+             "selection_ev": 0.20, "timeframe": "1m"},
+            {"pool_side": "SSL", "tp_price": 4535.54, "pool_price": 4535.54,
+             "quality": 0.74, "significance": 3.2, "delivery_prob": 0.58,
+             "selection_ev": 0.24, "timeframe": "5m"},
+        ],
+        "selected": {"pool_side": "SSL", "tp_price": 4532.60, "pool_price": 4532.60,
+                     "quality": 0.78, "significance": 4.0, "delivery_prob": 0.42,
+                     "selection_ev": 0.35, "timeframe": "15m", "selected": True},
+    }
+    plan = build_tp_ladder(
+        side="short", entry=4546.85, sl=4554.04, final_tp=4532.60, atr=3.0,
+        total_quantity=151.0, pool_report=report, min_leg_fraction=1.0/151.0,
+        max_internal_legs=4, roundtrip_cost_bps=9.2, fee_floor_mult=1.20,
+    )
+    assert [l.role for l in plan.legs] == ["FINAL"], plan.as_dict()
+    assert any("prop-desk final-only" in n for n in plan.regime_notes), plan.regime_notes
+
+
+def test_tp_ladder_removes_fee_dominated_near_tp_but_keeps_deeper_levels():
+    from strategy.tp_ladder import build_tp_ladder
+
+    report = {
+        "candidates": [
+            {"pool_side": "BSL", "tp_price": 100.50, "pool_price": 100.50,
+             "quality": 0.45, "significance": 2.0, "delivery_prob": 0.50,
+             "selection_ev": 0.10, "timeframe": "1m"},
+            {"pool_side": "BSL", "tp_price": 103.00, "pool_price": 103.00,
+             "quality": 0.78, "significance": 4.0, "delivery_prob": 0.66,
+             "selection_ev": 0.45, "timeframe": "15m"},
+        ],
+        "selected": {"pool_side": "BSL", "tp_price": 110.00, "pool_price": 110.00,
+                     "quality": 0.85, "significance": 6.0, "delivery_prob": 0.38,
+                     "selection_ev": 0.80, "timeframe": "1h", "selected": True,
+                     "fib_score": 0.70, "fib_confluence": 1.18, "fib_ratio": 1.618},
+    }
+    plan = build_tp_ladder(
+        side="long", entry=100.0, sl=99.0, final_tp=110.0, atr=1.0,
+        total_quantity=20.0, pool_report=report, min_leg_fraction=0.05,
+        max_internal_legs=4, roundtrip_cost_bps=40.0, fee_floor_mult=1.20,
+    )
+    internals = [l for l in plan.legs if l.role != "FINAL"]
+    assert internals, plan.as_dict()
+    assert all(l.price > 100.50 + 1e-9 for l in internals), plan.compact()
+    assert any("prop-desk net-edge filter" in n for n in plan.regime_notes), plan.regime_notes
+# ===== END test_prop_desk_tp_ladder_net_edge.py =====

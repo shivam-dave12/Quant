@@ -1619,7 +1619,7 @@ class TelegramBotController:
                 f"Locked:     {_esc(f'${locked:,.2f}')} USDT\n"
                 f"Total:      {_esc(f'${total:,.2f}')} USDT\n"
                 f"\n"
-                f"<b>Sizing Headroom</b>  (leverage {_lev}x)\n"
+                f"<b>Sizing Headroom</b>  (configured cap {_lev}x; live trades show actual entry leverage)\n"
                 f"  Max notional:     {_esc(f'${_max_notional:,.0f}')}\n"
                 f"  Commission reserve: {_esc(f'${_fee_reserve:.2f}')}  "
                 f"<i>(2× taker × 1.15 safety)</i>\n"
@@ -2055,7 +2055,7 @@ class TelegramBotController:
             try:
                 if entry > 0 and life_qty > 0:
                     _u_notional = entry * life_qty
-                    _u_lev = int(getattr(__import__('config'), 'LEVERAGE', 30))
+                    _u_lev = float(getattr(p, 'entry_leverage', 0.0) or getattr(strat, '_active_effective_leverage', 0.0) or getattr(__import__('config'), 'LEVERAGE', 30))
                     _u_margin_used = _u_notional / _u_lev if _u_lev > 0 else _u_notional
                     if _u_margin_used > 1e-10:
                         _u_upnl_usd = upnl_usd + realised_ladder
@@ -2071,7 +2071,7 @@ class TelegramBotController:
                 f"<code>LIVE  ${upnl_usd + realised_ladder:+10,.2f}   HOLD {hold_m:>6.1f}m   TP ${float(p.tp_price or 0.0):>12,.2f}</code>",
                 f"<code>SL    ${float(p.sl_price or 0.0):>12,.2f}</code>",
                 f"🎯 <code>LADDER realised ${realised_ladder:+9,.2f}   partial {partial_qty:.6f}   fees ${ladder_fees:.4f}</code>",
-                f"💼 <code>MARGIN ${_u_margin_used:>10,.2f}   lifecycle ROI {_u_margin_pct:+8.2f}%</code>",
+                f"💼 <code>LEV {_u_lev:>5.0f}x   MARGIN ${_u_margin_used:>10,.2f}   lifecycle ROI {_u_margin_pct:+8.2f}%</code>",
                 "<code>──────────────────────────────</code>",
             ])
 
