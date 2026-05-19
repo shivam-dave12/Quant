@@ -509,6 +509,193 @@ def _runner_fraction_model(*, final_dist_atr: float, final_rr: float, sponsorshi
     }
 
 
+
+def _first_tp_balance_limits(row: Dict[str, Any], reward_r: float, final_rr: float,
+                             min_leg_fraction: float, floor_r: float) -> tuple[float, float, float]:
+    """Return (material_profit_r, max_fraction, required_fraction).
+
+    The first TP should be a real monetisation event, not a dust scalp, but it
+    also must not become an oversized early exit.  This function measures the
+    first TP in full-position R contribution:
+
+        realised_R_if_TP1_fills = qty_fraction * TP1_reward_R
+
+    If that contribution cannot become material without exceeding the earned
+    cap, the caller should demote the noisy/too-near first level and let the
+    next deeper liquidity/fib zone become TP1.
+    """
+    rr = max(0.0, float(reward_r or 0.0))
+    path_frac = _clamp(_num(row.get("_ladder_path_frac", 0.0), 0.0), 0.0, 1.0)
+    dp = _clamp(_num(row.get("delivery_prob", row.get("sweep_prob", 0.55)), 0.55), 0.05, 0.95)
+    qual = _clamp(_num(row.get("quality", 0.55), 0.55), 0.0, 1.0)
+    conf = _clamp(_num(row.get("confluence", 1.0), 1.0), 0.4, 2.5)
+    source = str(row.get("_ladder_source", row.get("source", "")) or "").lower()
+
+    # Materiality is measured in full-trade R, not percentage size.  It rises
+    # modestly with trade opportunity and execution uncertainty/cost, but stays
+    # bounded so a single early level cannot demand a huge allocation.
+    terminal_scale = 1.0 - math.exp(-max(0.0, float(final_rr or 0.0)) / 3.0)
+    material_r = _clamp(
+        0.055
+        + 0.040 * terminal_scale
+        + 0.030 * _clamp(float(floor_r or 0.0), 0.0, 0.35)
+        + 0.020 * (1.0 - dp),
+        0.060,
+        0.135,
+    )
+
+    # Earned TP1 cap: nearer/noisier first levels get capped harder; stronger
+    # delivery/liquidity quality earns more but never enough to dominate the
+    # trade.  Fib-only levels are slightly capped because they are execution
+    # geometry, not observed liquidity.
+    rr_credit = _clamp(rr / max(1.20, 0.45 * max(float(final_rr or 0.0), 1e-9)), 0.0, 1.0)
+    path_credit = math.sqrt(max(path_frac, 0.0))
+    max_fraction = _clamp(
+        0.070
+        + 0.070 * path_credit
+        + 0.055 * dp
+        + 0.040 * qual
+        + 0.025 * min(conf, 1.6) / 1.6
+        + 0.055 * rr_credit,
+        max(float(min_leg_fraction or 0.0), 0.025),
+        0.285,
+    )
+    if "fib" in source and "liquidity" not in source:
+        max_fraction *= 0.92
+    if path_frac < 0.16 and rr < 0.80:
+        max_fraction *= _clamp(0.72 + 1.10 * path_frac + 0.10 * rr, 0.62, 0.92)
+    max_fraction = _clamp(max_fraction, max(float(min_leg_fraction or 0.0), 0.015), 0.285)
+    required_fraction = material_r / max(rr, 1e-9)
+    return material_r, max_fraction, required_fraction
+
+
+def _redistribute_tp1_excess(fracs: List[float], start_idx: int, excess: float,
+                             internals: List[Dict[str, Any]], rewards_r: List[float],
+                             final_fraction: float) -> tuple[List[float], float]:
+    """Move early-exit excess to deeper path levels first, then final runner."""
+    if excess <= 1e-12:
+        return fracs, final_fraction
+    tail = list(range(max(0, start_idx), len(fracs)))
+    weights: List[float] = []
+    for j in tail:
+        row = internals[j]
+        path = _clamp(_num(row.get("_ladder_path_frac", 0.0), 0.0), 0.0, 1.0)
+        w = max(1e-6, _num(row.get("_ladder_weight", 1e-6), 1e-6))
+        w *= (1.0 + path) * (1.0 + 0.18 * min(max(0.0, rewards_r[j]), 4.0))
+        weights.append(w)
+    wsum = sum(weights)
+    if tail and wsum > 0:
+        for off, j in enumerate(tail):
+            fracs[j] += excess * weights[off] / wsum
+    else:
+        final_fraction += excess
+    return fracs, final_fraction
+
+
+def _balance_first_tp_materiality(*, internals: List[Dict[str, Any]], fracs: List[float],
+                                  final_fraction: float, rewards_r: List[float],
+                                  min_leg_fraction: float, floor_r: float,
+                                  min_final_fraction: float, final_rr: float) -> tuple[List[Dict[str, Any]], List[float], float, List[float], List[str]]:
+    """Keep TP1 economically meaningful without over-selling the first level.
+
+    If the nearest TP cannot produce a material booked R without requiring too
+    much quantity, it is not a good TP1; it is demoted and its size is pushed to
+    deeper liquidity/fib zones.  If the first level can be meaningful inside its
+    earned cap, it may receive a small transfer from later legs/final runner, but
+    never by violating the terminal-runner reserve.
+    """
+    notes: List[str] = []
+    internals = list(internals or [])
+    fracs = list(fracs or [])
+    rewards_r = list(rewards_r or [])
+    if not internals or not fracs or not rewards_r:
+        return internals, fracs, final_fraction, rewards_r, notes
+
+    # Strip too-near/noisy first levels that would need excessive early size to
+    # become meaningful.  This converts the next deeper level into TP1 instead
+    # of forcing the bot to sell many lots at a shallow liquidity pocket.
+    for _ in range(min(3, len(internals))):
+        if len(internals) <= 1:
+            break
+        material_r, cap, required = _first_tp_balance_limits(
+            internals[0], rewards_r[0], final_rr, min_leg_fraction, floor_r
+        )
+        realised_r = fracs[0] * max(rewards_r[0], 0.0)
+        capped_realised_r = min(fracs[0], cap) * max(rewards_r[0], 0.0)
+        cannot_be_material_without_oversize = required > cap and capped_realised_r < material_r * 0.92
+        very_near = _clamp(_num(internals[0].get("_ladder_path_frac", 0.0), 0.0), 0.0, 1.0) < 0.18 and rewards_r[0] < 0.85
+        if not (cannot_be_material_without_oversize and very_near):
+            break
+        dropped_frac = max(0.0, fracs.pop(0))
+        dropped = internals.pop(0)
+        dropped_rr = rewards_r.pop(0)
+        fracs, final_fraction = _redistribute_tp1_excess(
+            fracs, 0, dropped_frac, internals, rewards_r, final_fraction
+        )
+        notes.append(
+            "near TP1 demoted: first level could not book material R without oversized early quantity "
+            f"(rr={dropped_rr:.2f}, required={required:.0%}, cap={cap:.0%})"
+        )
+
+    if not internals or not fracs or not rewards_r:
+        return internals, fracs, final_fraction, rewards_r, notes
+
+    material_r, cap, required = _first_tp_balance_limits(
+        internals[0], rewards_r[0], final_rr, min_leg_fraction, floor_r
+    )
+    if fracs[0] > cap:
+        excess = fracs[0] - cap
+        fracs[0] = cap
+        fracs, final_fraction = _redistribute_tp1_excess(fracs, 1, excess, internals, rewards_r, final_fraction)
+        notes.append(
+            f"TP1 balanced: capped first exit at {cap:.0%}; excess pushed deeper/final"
+        )
+
+    realised_r = fracs[0] * max(rewards_r[0], 0.0)
+    if realised_r < material_r and required <= cap:
+        need = min(cap - fracs[0], required - fracs[0])
+        if need > 1e-9:
+            # Pull from later internals first.  Only borrow from final if it is
+            # above the earned runner reserve.
+            available_tail = sum(max(0.0, fracs[i] - max(min_leg_fraction * 0.50, 0.0)) for i in range(1, len(fracs)))
+            take = min(need, available_tail)
+            if take > 1e-12 and available_tail > 0:
+                for i in range(1, len(fracs)):
+                    avail = max(0.0, fracs[i] - max(min_leg_fraction * 0.50, 0.0))
+                    cut = take * avail / available_tail
+                    fracs[i] = max(0.0, fracs[i] - cut)
+                fracs[0] += take
+                need -= take
+            final_surplus = max(0.0, final_fraction - min_final_fraction)
+            take_final = min(need, final_surplus)
+            if take_final > 1e-12:
+                final_fraction -= take_final
+                fracs[0] += take_final
+            if fracs[0] * max(rewards_r[0], 0.0) >= material_r * 0.98:
+                notes.append(
+                    f"TP1 balanced: booked-R target {material_r:.2f}R reached with {fracs[0]:.0%} size"
+                )
+
+    # Final normalization while respecting the final-runner reserve as far as
+    # possible.  Do not let balancing create >100% allocation.
+    total = sum(fracs) + final_fraction
+    if total > 1.0 + 1e-9:
+        excess = total - 1.0
+        tail_idx = list(range(1, len(fracs))) or [0]
+        avail = sum(max(0.0, fracs[i] - min_leg_fraction) for i in tail_idx)
+        if avail > 0:
+            cut = min(excess, avail)
+            for i in tail_idx:
+                a = max(0.0, fracs[i] - min_leg_fraction)
+                fracs[i] = max(0.0, fracs[i] - cut * a / avail)
+            excess -= cut
+        if excess > 1e-9:
+            final_fraction = max(min_final_fraction, final_fraction - excess)
+    elif total < 1.0 - 1e-9:
+        final_fraction += 1.0 - total
+
+    return internals, fracs, _clamp(final_fraction, min_final_fraction, 1.0), rewards_r, notes
+
 def _weighted_allocate(cands: List[Dict[str, Any]], budget: float) -> List[float]:
     if not cands or budget <= 0:
         return [0.0 for _ in cands]
@@ -832,6 +1019,32 @@ def build_tp_ladder(
         floor_r=solvency_floor_r,
         min_final_fraction=min_final_fraction,
     )
+    internals, raw_fracs, final_fraction, rewards_r, _tp1_balance_notes = _balance_first_tp_materiality(
+        internals=internals,
+        fracs=raw_fracs,
+        final_fraction=final_fraction,
+        rewards_r=rewards_r,
+        min_leg_fraction=min_leg_fraction,
+        floor_r=solvency_floor_r,
+        min_final_fraction=min_final_fraction,
+        final_rr=final_rr,
+    )
+    for _note in _tp1_balance_notes:
+        plan.regime_notes.append(_note)
+    # TP1 balancing can move quantity away from the solvency checkpoint.  Re-run
+    # the same lifecycle proof on the balanced fractions so cost/worst-case
+    # protection remains true after the first-exit cap/demotion.
+    raw_fracs, final_fraction, checkpoint, worst_r, residual_dom = _enforce_lifecycle_solvency(
+        internals=internals,
+        fracs=raw_fracs,
+        final_fraction=final_fraction,
+        rewards_r=rewards_r,
+        min_leg_fraction=min_leg_fraction,
+        floor_r=solvency_floor_r,
+        min_final_fraction=min_final_fraction,
+    )
+    if checkpoint > len(raw_fracs):
+        checkpoint = len(raw_fracs)
 
     merged_internal: List[tuple[Dict[str, Any], float]] = []
     carry_to_final = 0.0

@@ -35,7 +35,7 @@ INSTITUTIONAL CONVICTION MODEL v3.1:
   SESSION LIMITS (from config):
     - Max entries per session: CONVICTION_MAX_ENTRIES_PER_SESSION
     - Min interval: CONVICTION_MIN_ENTRY_INTERVAL_SEC
-    - Max consecutive losses: CONVICTION_MAX_SESSION_LOSSES
+    - Max consecutive losses: TRADING_DESKS[desk]["conviction"]["max_session_losses"] with CONVICTION_MAX_SESSION_LOSSES fallback
     - Cumulative drawdown circuit breaker: SESSION_DRAWDOWN_CAP_PCT
 
   FEEDBACK LOOP:
@@ -46,9 +46,10 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,48 @@ MAX_SESSION_LOSSES = _CFG_MAX_SESS_LOSSES
 MIN_ENTRY_INTERVAL_SEC = _CFG_INTERVAL_SEC
 MAX_ENTRIES_PER_SESSION = _CFG_MAX_ENTRIES
 PRODUCT_MIN_CORE = _CFG_PRODUCT_MIN_CORE
+
+
+def _coerce_positive_int(value: Any, default: int) -> int:
+    """Small defensive parser for config values that may arrive as strings."""
+    try:
+        iv = int(value)
+        return iv if iv > 0 else int(default)
+    except Exception:
+        return int(default)
+
+
+def _desk_session_loss_limit(desk_id: str) -> int:
+    """
+    Resolve the max consecutive losses for this conviction session.
+
+    Institutional intent:
+      • global MAX_CONSECUTIVE_LOSSES is a portfolio/risk circuit;
+      • conviction session losses are a desk quality/pacing circuit;
+      • BTC losses must not pause commodities/stocks, and vice versa.
+    """
+    fallback = _coerce_positive_int(MAX_SESSION_LOSSES, 2)
+    key = str(desk_id or "").upper().strip()
+    if not key:
+        return fallback
+    try:
+        import config as _cfg  # local import keeps standalone tests resilient
+        desks = getattr(_cfg, "TRADING_DESKS", {}) or {}
+        desk_cfg = desks.get(key) or desks.get(key.upper()) or {}
+        conv_cfg = desk_cfg.get("conviction", {}) if isinstance(desk_cfg, dict) else {}
+        if isinstance(conv_cfg, dict) and "max_session_losses" in conv_cfg:
+            return _coerce_positive_int(conv_cfg.get("max_session_losses"), fallback)
+        if isinstance(desk_cfg, dict) and "max_session_losses" in desk_cfg:
+            return _coerce_positive_int(desk_cfg.get("max_session_losses"), fallback)
+        overrides = getattr(_cfg, "CONVICTION_MAX_SESSION_LOSSES_BY_DESK", {}) or {}
+        if isinstance(overrides, dict):
+            for k in (key, key.lower(), key.title()):
+                if k in overrides:
+                    return _coerce_positive_int(overrides.get(k), fallback)
+    except Exception:
+        pass
+    return fallback
+
 
 # ── Dealing range scoring zones ──────────────────────────────────────────────
 DR_LONG_MAX_PD = 0.62    # Longs preferred in discount; premium longs need strong structure
@@ -201,13 +244,45 @@ class ConvictionFilter:
     """
     Advisory/Safety attribution model. It may block only account/exchange safety events; alpha approval belongs to QuantPosterior.
     Drop-in replacement.  Same interface, institutional logic.
+
+    Desk/session counters are intentionally shared by desk_id.  In a multi-asset
+    deployment the commodities desk may run GOLD, SILVER and OIL strategy
+    instances at the same time; a session-level desk circuit must not silently
+    become an instrument-local circuit just because each symbol owns a separate
+    QuantStrategy instance.  Anonymous/standalone filters remain instance-local
+    for tests and one-off tooling.
     """
 
-    def __init__(self) -> None:
-        self._session_state = SessionState()
+    _DESK_SESSION_STATES: Dict[str, SessionState] = {}
+    _STATE_LOCK = threading.RLock()
+
+    def __init__(self, desk_id: str = "", desk_name: str = "") -> None:
+        self._desk_id = str(desk_id or "").upper().strip()
+        self._desk_name = str(desk_name or self._desk_id or "UNKNOWN")
+        self._shared_state_key = self._desk_id if self._desk_id else ""
+        if self._shared_state_key:
+            with self._STATE_LOCK:
+                self._session_state = self._DESK_SESSION_STATES.setdefault(
+                    self._shared_state_key, SessionState())
+        else:
+            self._session_state = SessionState()
         # Adaptive thresholds (modified by PostTradeAgent feedback)
         self._adaptive_amd_min_conf: float = 0.0
         self._adaptive_sl_buffer_mult: float = 1.0
+
+    def _reset_session_state_in_place(self, session_id: str = "") -> None:
+        """Reset only session-scoped fields while preserving lifetime W/L.
+
+        Keep the SessionState object identity stable so every live strategy
+        instance attached to the same desk sees the reset immediately.
+        """
+        with self._STATE_LOCK:
+            st = self._session_state
+            st.session_id = str(session_id or "").upper().strip()
+            st.entries_taken = 0
+            st.consecutive_losses = 0
+            st.last_entry_time = 0.0
+            st.session_pnl = 0.0
 
     def evaluate(
         self,
@@ -274,7 +349,12 @@ class ConvictionFilter:
         # that as "high-quality trade was mechanically paused" when the real cause was the
         # 300s pacing interval.
         # ══════════════════════════════════════════════════════════════════
-        timing_block = self._check_session_limits(now, session, live_balance=live_balance)
+        timing_block = self._check_session_limits(
+            now,
+            session,
+            live_balance=live_balance,
+            ict_engine=ict_engine,
+        )
         timing_safety_block = False
         if timing_block:
             logger.debug(
@@ -592,68 +672,96 @@ class ConvictionFilter:
     # SESSION MANAGEMENT
     # ─────────────────────────────────────────────────────────────────────
 
+    def _max_session_losses(self) -> int:
+        return _desk_session_loss_limit(self._desk_id)
+
+    def _canonical_session_id(self, session: str, ict_engine=None) -> str:
+        resolved = self._resolve_session(session, ict_engine)
+        if resolved:
+            return resolved
+        return str(session or "").upper().strip()
+
+    def _roll_session_if_needed(self, session: str, ict_engine=None) -> None:
+        session_id = self._canonical_session_id(session, ict_engine)
+        if not session_id:
+            return
+        if session_id != self._session_state.session_id:
+            self.on_session_change(session_id)
+
     def mark_entry_placed(self, now: float) -> None:
         """Called when a trade is confirmed filled."""
-        self._session_state.entries_taken += 1
-        self._session_state.last_entry_time = now
+        with self._STATE_LOCK:
+            self._session_state.entries_taken += 1
+            self._session_state.last_entry_time = now
+            entries_taken = self._session_state.entries_taken
         logger.info(
-            f"ConvictionFilter: entry placed — "
-            f"entries_taken={self._session_state.entries_taken}/{MAX_ENTRIES_PER_SESSION} "
+            f"ConvictionFilter[{self._desk_id or 'UNKNOWN'}]: entry placed — "
+            f"entries_taken={entries_taken}/{MAX_ENTRIES_PER_SESSION} "
             f"| next entry allowed in {MIN_ENTRY_INTERVAL_SEC}s")
 
     def on_session_change(self, new_session: str) -> None:
         """Called when killzone/session changes.  Resets session-scoped counters."""
+        normalized = self._canonical_session_id(new_session, None)
         old = self._session_state.session_id
-        if new_session == old:
+        if not normalized or normalized == old:
             return
         logger.info(
-            f"ConvictionFilter: session boundary {old!r} → {new_session!r} "
+            f"ConvictionFilter[{self._desk_id or 'UNKNOWN'}]: session boundary {old!r} → {normalized!r} "
             f"| resetting entries={self._session_state.entries_taken} "
-            f"consec_losses={self._session_state.consecutive_losses}")
-        self._session_state = SessionState(
-            session_id=new_session,
-            wins=self._session_state.wins,
-            losses=self._session_state.losses,
-        )
+            f"consec_losses={self._session_state.consecutive_losses} "
+            f"max_losses={self._max_session_losses()}")
+        self._reset_session_state_in_place(normalized)
 
     def record_trade_result(self, win: bool, pnl: float = 0.0) -> None:
         """Called after each trade closes."""
-        self._session_state.record_outcome(win, pnl)
+        with self._STATE_LOCK:
+            self._session_state.record_outcome(win, pnl)
+            wins = self._session_state.wins
+            losses = self._session_state.losses
+            consec_losses = self._session_state.consecutive_losses
+            session_pnl = self._session_state.session_pnl
         logger.info(
-            f"ConvictionFilter: {'WIN' if win else 'LOSS'} pnl=${pnl:.4f} | "
-            f"W/L={self._session_state.wins}/{self._session_state.losses} "
-            f"consec_losses={self._session_state.consecutive_losses} "
-            f"session_pnl=${self._session_state.session_pnl:.4f}")
+            f"ConvictionFilter[{self._desk_id or 'UNKNOWN'}]: {'WIN' if win else 'LOSS'} pnl=${pnl:.4f} | "
+            f"W/L={wins}/{losses} "
+            f"consec_losses={consec_losses} "
+            f"session_pnl=${session_pnl:.4f}")
 
     def get_session_state_summary(self) -> Dict:
-        st = self._session_state
-        cooldown_remaining = 0
-        if st.last_entry_time > 0:
-            cooldown_remaining = max(0, MIN_ENTRY_INTERVAL_SEC - (time.time() - st.last_entry_time))
-        return {
-            "session_id": st.session_id,
-            "entries_taken": st.entries_taken,
-            "max_entries": MAX_ENTRIES_PER_SESSION,
-            "consecutive_losses": st.consecutive_losses,
-            "max_losses": MAX_SESSION_LOSSES,
-            "wins": st.wins,
-            "losses": st.losses,
-            "session_pnl": st.session_pnl,
-            "cooldown_remaining_s": int(cooldown_remaining),
-            "cooldown_active": cooldown_remaining > 0,
-        }
+        with self._STATE_LOCK:
+            st = self._session_state
+            cooldown_remaining = 0
+            if st.last_entry_time > 0:
+                cooldown_remaining = max(0, MIN_ENTRY_INTERVAL_SEC - (time.time() - st.last_entry_time))
+            return {
+                "desk_id": self._desk_id,
+                "desk_name": self._desk_name,
+                "session_id": st.session_id,
+                "entries_taken": st.entries_taken,
+                "max_entries": MAX_ENTRIES_PER_SESSION,
+                "consecutive_losses": st.consecutive_losses,
+                "max_losses": self._max_session_losses(),
+                "wins": st.wins,
+                "losses": st.losses,
+                "session_pnl": st.session_pnl,
+                "cooldown_remaining_s": int(cooldown_remaining),
+                "cooldown_active": cooldown_remaining > 0,
+            }
 
     def reset_session(self, reason: str = "manual") -> None:
         wins, losses = self._session_state.wins, self._session_state.losses
-        logger.info(f"ConvictionFilter: full reset ({reason}) W/L={wins}/{losses}")
-        self._session_state = SessionState(wins=wins, losses=losses)
+        logger.info(f"ConvictionFilter[{self._desk_id or 'UNKNOWN'}]: full reset ({reason}) W/L={wins}/{losses}")
+        self._reset_session_state_in_place("")
 
     # ─────────────────────────────────────────────────────────────────────
     # SESSION LIMITS
     # ─────────────────────────────────────────────────────────────────────
 
     def _check_session_limits(
-        self, now: float, session: str, live_balance: float = 0.0,
+        self,
+        now: float,
+        session: str,
+        live_balance: float = 0.0,
+        ict_engine=None,
     ) -> Optional[str]:
         """Check timing/pacing gates.  Returns reason string if blocked.
 
@@ -671,7 +779,9 @@ class ConvictionFilter:
           • live_balance == 0 → fall back to SESSION_DRAWDOWN_NOTIONAL config
                                 (set this to your actual balance in config.py)
         """
+        self._roll_session_if_needed(session, ict_engine)
         st = self._session_state
+        max_session_losses = self._max_session_losses()
 
         # Pacing interval
         if st.last_entry_time > 0:
@@ -681,10 +791,11 @@ class ConvictionFilter:
                 return f"INTERVAL: {wait}s remaining (min {MIN_ENTRY_INTERVAL_SEC}s between entries)"
 
         # Consecutive loss circuit breaker
-        if st.consecutive_losses >= MAX_SESSION_LOSSES:
+        if st.consecutive_losses >= max_session_losses:
             return (
-                f"CIRCUIT_BREAKER: {st.consecutive_losses} consecutive losses "
-                f"(max={MAX_SESSION_LOSSES}). Session invalidated.")
+                f"CIRCUIT_BREAKER[{self._desk_id or 'UNKNOWN'}:{st.session_id or 'UNKNOWN'}]: "
+                f"{st.consecutive_losses} consecutive losses "
+                f"(max={max_session_losses}). Session invalidated.")
 
         # Entry cap per session
         if st.entries_taken >= MAX_ENTRIES_PER_SESSION:

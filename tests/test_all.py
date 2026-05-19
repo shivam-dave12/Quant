@@ -2089,6 +2089,10 @@ def test_config_uses_margin_target_with_coherent_daily_budget():
 
     assert abs(_config.RISK_PER_TRADE - 0.015) < 1e-12
     assert _config.MAX_CONSECUTIVE_LOSSES == 3
+    # Conviction/session loss limit is deliberately separate from the global
+    # risk-manager loss streak.  Desk-specific overrides live in TRADING_DESKS.
+    assert _config.CONVICTION_MAX_SESSION_LOSSES == 2
+    assert _config.CONVICTION_MAX_SESSION_LOSSES != _config.MAX_CONSECUTIVE_LOSSES
     assert abs(cfg.risk.RISK_PER_TRADE - 0.015) < 1e-12
     assert cfg.risk.MAX_CONSECUTIVE_LOSSES == 3
     assert cfg.risk.RISK_PER_TRADE * cfg.risk.MAX_CONSECUTIVE_LOSSES <= cfg.risk.MAX_DAILY_LOSS_PCT / 100.0 + 1e-12
@@ -2096,6 +2100,69 @@ def test_config_uses_margin_target_with_coherent_daily_budget():
     assert _config.MAX_MARGIN_PER_TRADE == 15
     assert abs(_config.QUANT_MARGIN_PCT - 0.36) < 1e-12
 
+
+def test_conviction_session_loss_limit_is_desk_scoped_and_resets_on_session_change():
+    import time
+    import config as _config
+    from strategy.conviction_filter import ConvictionFilter
+
+    assert _config.TRADING_DESKS["BTC"]["conviction"]["max_session_losses"] == 2
+    assert _config.TRADING_DESKS["COMMODITIES"]["conviction"]["max_session_losses"] == 2
+    assert _config.TRADING_DESKS["STOCKS"]["conviction"]["max_session_losses"] == 1
+
+    btc = ConvictionFilter(desk_id="BTC", desk_name="BTC Desk")
+    stocks = ConvictionFilter(desk_id="STOCKS", desk_name="Stocks Desk")
+    assert btc.get_session_state_summary()["max_losses"] == 2
+    assert stocks.get_session_state_summary()["max_losses"] == 1
+
+    btc.on_session_change("LONDON")
+    btc.record_trade_result(win=False, pnl=-1.0)
+    btc.record_trade_result(win=False, pnl=-1.0)
+    blocked = btc._check_session_limits(time.time(), "LONDON")
+    assert blocked and "CIRCUIT_BREAKER[BTC:LONDON]" in blocked
+    assert "max=2" in blocked
+
+    # A new session must clear only session-scoped counters; lifetime W/L stays.
+    assert btc._check_session_limits(time.time(), "NEW_YORK") is None
+    summary = btc.get_session_state_summary()
+    assert summary["session_id"] == "NY"
+    assert summary["consecutive_losses"] == 0
+    assert summary["entries_taken"] == 0
+    assert summary["losses"] == 2
+
+
+
+def test_conviction_session_state_is_shared_per_desk_but_isolated_across_desks():
+    import time
+    from strategy.conviction_filter import ConvictionFilter
+
+    # Prevent state leakage from previous test order; production code keeps the
+    # store warm for the process lifetime.
+    ConvictionFilter._DESK_SESSION_STATES.pop("BTC", None)
+    ConvictionFilter._DESK_SESSION_STATES.pop("COMMODITIES", None)
+
+    btc_primary = ConvictionFilter(desk_id="BTC", desk_name="BTC Desk")
+    btc_shadow = ConvictionFilter(desk_id="BTC", desk_name="BTC Desk")
+    commodities = ConvictionFilter(desk_id="COMMODITIES", desk_name="Commodities Desk")
+
+    btc_primary.on_session_change("LONDON")
+    btc_primary.record_trade_result(win=False, pnl=-1.0)
+    btc_primary.record_trade_result(win=False, pnl=-1.0)
+
+    # Same desk, different strategy instance: must see the same desk-level circuit.
+    blocked = btc_shadow._check_session_limits(time.time(), "LONDON")
+    assert blocked and "CIRCUIT_BREAKER[BTC:LONDON]" in blocked
+
+    # Different desk: BTC losses must not pause commodities.
+    assert commodities._check_session_limits(time.time(), "LONDON") is None
+    assert commodities.get_session_state_summary()["consecutive_losses"] == 0
+
+    # Session boundary must reset the shared BTC desk state for every live instance.
+    assert btc_shadow._check_session_limits(time.time(), "NEW_YORK") is None
+    assert btc_primary.get_session_state_summary()["session_id"] == "NY"
+    assert btc_primary.get_session_state_summary()["consecutive_losses"] == 0
+    assert btc_shadow.get_session_state_summary()["consecutive_losses"] == 0
+    assert btc_shadow.get_session_state_summary()["losses"] == 2
 
 def test_stock_desk_suspension_filters_equity_and_index_before_context_creation():
     import config as _config
@@ -2232,6 +2299,37 @@ def test_tp_ladder_exchange_quantisation_cannot_sell_full_size_before_final(monk
     assert internal_qty <= 8.0
     assert 10.0 - internal_qty >= 2.0
     assert all(q >= 1.0 and abs(q - round(q)) < 1e-12 for _, q in executable)
+
+
+
+def test_tp_ladder_balances_tp1_materiality_without_overselling_first_lot():
+    from strategy.tp_ladder import build_tp_ladder
+
+    report = {
+        "candidates": [
+            {"pool_side": "SSL", "tp_price": 70.40, "pool_price": 70.40,
+             "quality": 0.70, "significance": 3.0, "delivery_prob": 0.72,
+             "selection_ev": 0.40, "timeframe": "1m"},
+        ],
+        "selected": {"pool_side": "SSL", "tp_price": 67.42, "pool_price": 67.42,
+                     "quality": 0.82, "significance": 5.0, "delivery_prob": 0.12,
+                     "selection_ev": 0.77, "timeframe": "4h", "selected": True,
+                     "fib_score": 0.75, "fib_confluence": 1.20, "fib_ratio": 1.618},
+    }
+    plan = build_tp_ladder(
+        side="short", entry=70.66, sl=71.26, final_tp=67.42, atr=0.367,
+        total_quantity=10.0, pool_report=report, min_leg_fraction=0.10,
+        min_spacing_atr=0.85, max_internal_legs=3,
+    )
+    internals = [l for l in plan.legs if l.role != "FINAL"]
+    assert internals, plan.as_dict()
+    # The old nearest pool was a shallow 0.43R monetisation point that required
+    # too much quantity to matter.  New TP1 must produce a material full-trade R
+    # contribution while staying below a concentrated first-exit allocation.
+    assert internals[0].rr >= 1.0, plan.compact()
+    assert internals[0].qty_fraction <= 0.30, plan.compact()
+    assert internals[0].qty_fraction * internals[0].rr >= 0.12, plan.compact()
+    assert any("near TP1 demoted" in n or "TP1 balanced" in n for n in plan.regime_notes)
 
 # ===== END test_institutional_tp_ladder_reserve_and_quantisation =====
 

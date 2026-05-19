@@ -2750,9 +2750,20 @@ class QuantStrategy:
         # Evaluates 7 ICT factors before any entry order is placed.
         # Advisory quality observations: pool TF, dealing range, AMD phase, session.
         # Weighted score must reach 0.75; tracks session-level quality state.
-        self._conviction: Optional[object] = (
-            ConvictionFilter() if _CONVICTION_FILTER_AVAILABLE else None
-        )
+        if _CONVICTION_FILTER_AVAILABLE:
+            try:
+                _pol = active_policy(instrument)
+                _conv_desk_id = str(getattr(_pol, "desk_id", "") or "")
+                _conv_desk_name = str(getattr(_pol, "desk_name", "") or "")
+            except Exception:
+                _conv_desk_id = ""
+                _conv_desk_name = ""
+            self._conviction: Optional[object] = ConvictionFilter(
+                desk_id=_conv_desk_id,
+                desk_name=_conv_desk_name,
+            )
+        else:
+            self._conviction: Optional[object] = None
 
         self._liq_trail: Optional[object] = None
         self._flow_streak_dir_v2 = ""

@@ -429,7 +429,7 @@ CONVICTION_OTE_FIB_LOW             = 0.500
 CONVICTION_OTE_FIB_HIGH            = 0.786
 CONVICTION_MIN_RR                  = 2.0     # match risk management R:R
 CONVICTION_PRODUCT_MIN_CORE        = 0.68    # pool/displacement/CISD must each be real
-CONVICTION_MAX_SESSION_LOSSES      = 2
+CONVICTION_MAX_SESSION_LOSSES      = 2       # fallback only; desk-specific overrides live in TRADING_DESKS[*]["conviction"]
 CONVICTION_MIN_ENTRY_INTERVAL_SEC  = 420
 CONVICTION_MAX_ENTRIES_PER_SESSION = 3
 
@@ -691,6 +691,11 @@ TRADING_DESKS = {
             "tp_min_rr_reversion": 1.80,
             "tp_min_rr_trend": 2.50,
         },
+        "conviction": {
+            # BTC is always-on and liquid: allow two thesis failures per session,
+            # then wait for the next session regime instead of forcing trades.
+            "max_session_losses": 2,
+        },
     },
     "COMMODITIES": {
         "display_name": "Commodities Desk",
@@ -719,6 +724,11 @@ TRADING_DESKS = {
         "exit": {
             "tp_min_rr_reversion": 2.20,
             "tp_min_rr_trend": 2.80,
+        },
+        "conviction": {
+            # Commodities can trend hard but also stop-run aggressively; keep a
+            # separate desk quota so BTC losses never pause gold/silver/oil.
+            "max_session_losses": 2,
         },
     },
     "STOCKS": {
@@ -749,6 +759,12 @@ TRADING_DESKS = {
         "exit": {
             "tp_min_rr_reversion": 2.40,
             "tp_min_rr_trend": 3.20,
+        },
+        "conviction": {
+            # Equity/index token desk is slower/thinner than BTC; fail fast per
+            # session and wait for a fresh market window.  Suspended desks keep
+            # the policy for future re-enable without sharing BTC state.
+            "max_session_losses": 1,
         },
     },
 }
