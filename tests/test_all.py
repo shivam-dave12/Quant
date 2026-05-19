@@ -2220,9 +2220,13 @@ def test_margin_risk_sizing_uses_margin_budget_and_dynamic_leverage():
     lev = float(strategy._active_effective_leverage)
     margin_used = qty * price / lev
     dollar_risk = qty * sl_dist
-    assert lev <= 9.0
-    assert margin_used <= 200.0 * 0.36 + 1e-9
-    assert dollar_risk <= margin_used * 0.015 * 1.02 + 1e-9
+    # Aggressive allocator: approved trades may use higher leverage than the
+    # conservative base-risk cap, but remain inside the daily-circuit-derived
+    # effective margin-risk envelope.
+    assert 16.0 <= lev <= 18.0
+    assert margin_used >= 60.0
+    assert margin_used <= 200.0 * 0.36 * 1.15 + 1e-9
+    assert dollar_risk <= margin_used * strategy._active_margin_risk_pct + 0.20
 
 
 def test_dynamic_leverage_is_set_before_entry_order_for_margin_risk():
@@ -2613,6 +2617,36 @@ def test_reconcile_adoption_marks_risk_manager_position_open():
     assert "set_position_open(True) adoption" in src
 
 # ===== BEGIN test_margin_based_sizing_invariants.py =====
+
+def test_aggressive_margin_risk_pct_derives_from_daily_circuit(monkeypatch):
+    import config
+    from strategy.quant_strategy import QuantStrategy
+
+    monkeypatch.setattr(config, "RISK_PER_TRADE", 0.015, raising=False)
+    monkeypatch.setattr(config, "MAX_DAILY_LOSS_PCT", 10.0, raising=False)
+    monkeypatch.setattr(config, "MAX_CONSECUTIVE_LOSSES", 3, raising=False)
+    qs = object.__new__(QuantStrategy)
+
+    base = qs._risk_pct_fraction()
+    cap = qs._daily_safe_margin_risk_cap(base)
+    eff = qs._aggressive_margin_risk_pct(base, margin_intensity=1.0)
+
+    assert base == 0.015
+    assert 0.029 <= cap <= 0.031
+    assert 0.029 <= eff <= 0.031
+
+
+def test_aggressive_margin_allocator_prevents_dust_collapse():
+    from strategy.quant_strategy import QuantStrategy
+
+    qs = object.__new__(QuantStrategy)
+    intensity = qs._aggressive_margin_intensity(
+        inst_mult=0.20, cross_asset_mult=0.70, fee_drag_mult=0.60,
+        tier_mult=0.80, comp_mod=-0.10, amd_mod=0.0,
+    )
+
+    assert 0.50 <= intensity <= 0.70
+
 
 def test_margin_risk_leverage_math_matches_btc_example(monkeypatch):
     import config

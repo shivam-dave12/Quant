@@ -3450,6 +3450,70 @@ class QuantStrategy:
         if not math.isfinite(cap) or cap < 1.0:
             return 0.0
         return max(1.0, min(configured, math.floor(cap)))
+    def _daily_safe_margin_risk_cap(self, base_risk_pct: float) -> float:
+        """Dynamic upper bound for aggressive margin-risk per trade.
+
+        The bot is allowed to be aggressive, but a normal loss streak must still
+        fit inside the daily circuit.  This is derived from existing risk
+        controls instead of introducing another hard dollar cap.
+        """
+        base = max(float(base_risk_pct or 0.0), 0.0)
+        if base <= 0.0:
+            return 0.0
+        try:
+            daily_pct = float(_cfg("MAX_DAILY_LOSS_PCT", 10.0) or 10.0) / 100.0
+        except Exception:
+            daily_pct = 0.10
+        try:
+            max_losses = max(1.0, float(_cfg("MAX_CONSECUTIVE_LOSSES", 3) or 3))
+        except Exception:
+            max_losses = 3.0
+        # Keep a small daily-circuit reserve, while still allowing a strong setup
+        # to use materially more than the base per-margin risk.
+        streak_safe = max(base, daily_pct * 0.90 / max_losses)
+        return max(base, min(base * 3.0, streak_safe, 0.060))
+
+    def _aggressive_margin_intensity(self, inst_mult: float = 1.0,
+                                     cross_asset_mult: float = 1.0,
+                                     fee_drag_mult: float = 1.0,
+                                     tier_mult: float = 1.0,
+                                     comp_mod: float = 0.0,
+                                     amd_mod: float = 0.0) -> float:
+        """Capital-deployment pressure for approved entries.
+
+        Previous builds multiplied every caution signal directly into the dollar
+        risk budget. That made good approved trades collapse to dust size. This
+        function keeps approved trades aggressive by default, while adverse
+        cross-asset/fee/quality signals still reduce deployment smoothly.
+        """
+        inst = self._bounded(inst_mult, 0.0, 1.20)
+        cross = self._bounded(cross_asset_mult, 0.35, 1.10)
+        fee = self._bounded(fee_drag_mult, 0.20, 1.05)
+        tier = self._bounded(tier_mult + comp_mod + amd_mod, 0.35, 1.20)
+        # Approved setup: use a meaningful fraction of desk margin target even
+        # when conviction/fees are not perfect. Strong setups can slightly exceed
+        # the nominal desk target, limited only by live free cash/fees.
+        intensity = (0.55 + 0.45 * min(inst, 1.0))
+        intensity *= (0.88 + 0.12 * cross)
+        intensity *= (0.85 + 0.15 * fee)
+        intensity *= (0.90 + 0.10 * min(tier, 1.0))
+        return self._bounded(intensity, 0.35, 1.15)
+
+    def _aggressive_margin_risk_pct(self, base_risk_pct: float, margin_intensity: float) -> float:
+        """Effective SL-risk as % of deployed margin for aggressive sizing.
+
+        Base RISK_PER_TRADE remains the conservative anchor.  Higher conviction
+        increases the allowed margin-risk toward the daily-loss-derived ceiling,
+        which permits higher leverage and fuller margin use without becoming
+        unlimited or notional-based.
+        """
+        base = self._risk_pct_fraction(base_risk_pct)
+        cap = self._daily_safe_margin_risk_cap(base)
+        if cap <= base:
+            return base
+        pressure = self._bounded(margin_intensity, 0.0, 1.0)
+        return base + (cap - base) * pressure
+
 
     def _sl_liquidation_sanity(self, side: str, entry: float, sl: float, leverage_override: float = None):
         entry = float(entry or 0.0)
@@ -9098,14 +9162,19 @@ class QuantStrategy:
         """
         Risk-calibrated position sizing — sweep-posterior (CRIT-1 fix).
 
-        FORMULA (industry standard):
-          sl_dist      = |price − sl_price|                         (points)
-          margin_budget = available_balance × desk_margin_pct       (USD margin target)
-          risk_capital  = margin_budget × RISK_PER_TRADE          (USD loss budget at SL)
-          leverage      = min(config_leverage, floor(risk_pct × price / sl_dist))
-          qty_raw       = min(risk_capital / sl_dist, margin_budget × leverage / price)
+        FORMULA (aggressive institutional allocator):
+          sl_dist          = |price − sl_price|                       (points)
+          desk_margin_base = live_available_funds × desk_margin_pct   (USD target)
+          margin_intensity = continuous quality/fee/cross-asset pressure
+          margin_budget    = desk_margin_base × margin_intensity      (USD margin)
+          risk_pct_eff     = dynamic margin-risk %, capped by daily circuit
+          leverage         = min(config_leverage, floor(risk_pct_eff × price / sl_dist))
+          qty_raw          = min(margin_budget × leverage / price,
+                                 margin_budget × risk_pct_eff / sl_dist)
 
-        This keeps risk percentages margin-based, not leveraged-notional based.
+        This is aggressive because approved trades deploy meaningful margin and
+        higher safe leverage. It is cautious because risk remains SL/bracket,
+        liquidation, fee, cash, and daily-circuit bounded.
 
         total_mult is a confidence scalar clamped to [0.40, 1.05]:
           ICT tier base:
@@ -9317,30 +9386,6 @@ class QuantStrategy:
                 f"RISK_PER_TRADE={raw_risk_pct:.4f} exceeds 5% hard cap; "
                 "clamping to 5.000%")
 
-        # ── Margin-risk leverage normalization ───────────────────────────────
-        # Institutional semantics used here:
-        #   QUANT_MARGIN_PCT / desk margin_pct => target margin budget
-        #   RISK_PER_TRADE                    => max loss at SL as % of margin
-        #
-        # For a linear/inverse perp approximation:
-        #   loss_at_SL / margin_used = sl_dist / (price / leverage)
-        #                            = sl_dist * leverage / price
-        # Quantity cancels out, so changing qty alone cannot make a 40x trade
-        # risk 1.5% of margin. The only correct control is leverage.
-        configured_leverage = max(float(QCfg.LEVERAGE()), 1.0)
-        margin_risk_leverage_cap = self._margin_risk_leverage_cap(price, sl_dist, risk_pct=risk_pct)
-        if not math.isfinite(margin_risk_leverage_cap) or margin_risk_leverage_cap < 1.0:
-            logger.warning(
-                f"Sizing rejected: SL distance too wide for margin-risk budget | "
-                f"risk_pct={risk_pct:.3%} price=${price:.2f} SL-dist={sl_dist:.2f}pts "
-                f"max_leverage={margin_risk_leverage_cap:.2f}x < 1x")
-            return None
-        effective_leverage = self._effective_margin_risk_leverage(
-            price, sl_dist, risk_pct=risk_pct, configured_leverage=configured_leverage)
-        leverage = float(effective_leverage)
-        self._active_effective_leverage = float(effective_leverage)
-        self._active_margin_risk_pct = (sl_dist * leverage / price) if price > 0 else 0.0
-
         # ── Dynamic available-funds margin envelope ──────────────────────────
         # One sizing authority only:
         #   • policy margin_pct / QUANT_MARGIN_PCT defines the dynamic target
@@ -9370,13 +9415,48 @@ class QuantStrategy:
         policy_target_margin = margin_budget_base * policy_margin_frac
         legacy_entry_cap = margin_budget_base * _entry_margin_cap_frac
         margin_capacity = min(cash_available, legacy_entry_cap, max_trade_margin)
-        target_margin_budget = min(margin_capacity, policy_target_margin)
+
+        # Aggressive allocator: do not let a passed entry collapse to dust only
+        # because several continuous caution scalars multiplied together.  The
+        # scalars shape capital pressure, but approved trades must still deploy
+        # meaningful margin from the live available-funds base.
+        margin_intensity = self._aggressive_margin_intensity(
+            inst_mult=inst_mult,
+            cross_asset_mult=cross_asset_mult,
+            fee_drag_mult=fee_drag_mult,
+            tier_mult=tier_mult,
+            comp_mod=comp_mod,
+            amd_mod=amd_mod,
+        )
+        target_margin_budget = min(margin_capacity, policy_target_margin * margin_intensity)
+        effective_risk_pct = self._aggressive_margin_risk_pct(risk_pct, margin_intensity)
+
+        # ── Margin-risk leverage normalization ───────────────────────────────
+        # Leverage is now selected aggressively from the dynamic margin-risk
+        # allowance, not from the conservative base risk alone.  This gives the
+        # bot higher leverage on approved trades while keeping the SL loss inside
+        # the daily-circuit-derived risk envelope.
+        configured_leverage = max(float(QCfg.LEVERAGE()), 1.0)
+        margin_risk_leverage_cap = self._margin_risk_leverage_cap(price, sl_dist, risk_pct=effective_risk_pct)
+        if not math.isfinite(margin_risk_leverage_cap) or margin_risk_leverage_cap < 1.0:
+            logger.warning(
+                f"Sizing rejected: SL distance too wide for margin-risk budget (aggressive) | "
+                f"base_risk={risk_pct:.3%} effective_risk={effective_risk_pct:.3%} "
+                f"price=${price:.2f} SL-dist={sl_dist:.2f}pts "
+                f"max_leverage={margin_risk_leverage_cap:.2f}x < 1x")
+            return None
+        effective_leverage = self._effective_margin_risk_leverage(
+            price, sl_dist, risk_pct=effective_risk_pct, configured_leverage=configured_leverage)
+        leverage = float(effective_leverage)
+        self._active_effective_leverage = float(effective_leverage)
+        self._active_margin_risk_pct = (sl_dist * leverage / price) if price > 0 else 0.0
 
         if target_margin_budget <= 1e-9:
             logger.warning(
                 f"Sizing rejected: dynamic margin target is zero | "
                 f"cash_available=${cash_available:.2f} available=${available:.2f} "
-                f"policy_margin={policy_margin_frac:.1%} margin_base=${margin_budget_base:.2f}")
+                f"policy_margin={policy_margin_frac:.1%} margin_base=${margin_budget_base:.2f} "
+                f"margin_intensity={margin_intensity:.2f}")
             return None
         if margin_capacity <= 1e-9:
             logger.warning(
@@ -9408,13 +9488,12 @@ class QuantStrategy:
                 f"cash_available=${cash_available:.2f} slot_available=${available:.2f} step={step:.8f}")
             return None
 
-        # RISK_PER_TRADE is margin-based, not notional/equity based:
-        # a 1.5% risk setting means the SL-loss budget is 1.5% of the target
-        # margin allocation for this trade. Confidence multipliers scale the
-        # usable margin/risk budget but never convert it into leveraged notional
-        # risk.
+        # RISK_PER_TRADE is margin-based, not notional/equity based.  The
+        # aggressive allocator does not multiply the risk budget down to dust;
+        # instead it selects a dynamic margin-risk percentage bounded by the
+        # daily circuit and then sizes against the bracket SL.
         target_risk_base = target_margin_budget
-        risk_capital = target_risk_base * risk_pct * total_mult
+        risk_capital = target_risk_base * effective_risk_pct
         qty_by_risk = risk_capital / sl_dist
         qty_by_target_margin = target_margin_budget * leverage / price
         qty_raw = min(qty_by_risk, qty_by_target_margin, executable_qty_cap)
@@ -9422,7 +9501,7 @@ class QuantStrategy:
         min_lot_risk_mult = float(_cfg("PORTFOLIO_MIN_LOT_MAX_RISK_MULT", 1.15))
         max_risk_cap = max(
             risk_capital * 1.15,
-            target_margin_budget * risk_pct * max(1.0, min_lot_risk_mult),
+            target_margin_budget * effective_risk_pct * max(1.0, min_lot_risk_mult),
         )
 
         # ── Lot-step + hard limits ────────────────────────────────────────────
@@ -9525,16 +9604,18 @@ class QuantStrategy:
             return None
 
         logger.info(
-            f"✅ Sizing [risk_based] | RISK_PCT={risk_pct:.3%} | "
+            f"✅ Sizing [aggressive_margin_risk] | "
+            f"RISK_BASE={risk_pct:.3%} RISK_EFF={effective_risk_pct:.3%} | "
             f"tier={ict_tier or 'none'} "
-            f"mult={total_mult:.2f} (t={tier_mult:.2f} c={comp_mod:+.2f} "
-            f"a={amd_mod:+.2f} i={inst_mult:.2f} fee={fee_drag_mult:.2f}) | "
+            f"raw_mult={total_mult:.2f} margin_intensity={margin_intensity:.2f} "
+            f"(t={tier_mult:.2f} c={comp_mod:+.2f} a={amd_mod:+.2f} "
+            f"i={inst_mult:.2f} x={cross_asset_mult:.2f} fee={fee_drag_mult:.2f}) | "
             f"target_risk=${risk_capital:.2f} risk_qty={qty_by_risk:.4f} "
             f"margin_qty={qty_by_target_margin:.4f} raw_qty={qty_raw:.4f} | "
             f"SL-dist={sl_dist:.1f}pts | $risk=${dollar_risk:.2f} "
             f"({risk_pct_act:.2f}% risk-base; {slot_risk_pct:.2f}% slot) | "
             f"margin=${margin_used:.2f} target=${target_margin_budget:.2f} "
-            f"min=${min_trade_margin:.2f} cap=${max_allowed_margin:.2f} | "
+            f"policy_target=${policy_target_margin:.2f} min=${min_trade_margin:.2f} cap=${max_allowed_margin:.2f} | "
             f"lev={leverage:.0f}x margin_risk={self._active_margin_risk_pct:.2%} | "
             f"fees≈${actual_fees:.3f} ({fee_to_risk:.2f}R) | "
             f"cash=${required_cash:.2f}/${cash_available:.2f} | "
