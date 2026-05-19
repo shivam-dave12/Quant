@@ -55,6 +55,11 @@ class TPLadderLeg:
     fib_score: float = 0.0
     fib_ratio: float = 0.0
     fib_role: str = ""
+    gross_rr: float = 0.0
+    cost_r: float = 0.0
+    net_rr: float = 0.0
+    reward_floor_r: float = 0.0
+    edge_ratio: float = 0.0
     reason: str = ""
     order_id: str = ""
     placed: bool = False
@@ -184,6 +189,15 @@ def _candidate_weight(row: Dict[str, Any], path_frac: float) -> float:
     fib_mult = _clamp(_num(row.get("fib_confluence", row.get("fib_multiplier", 1.0)), 1.0), 0.90, 1.32)
     fib_score = _clamp(_num(row.get("fib_score", 0.0), 0.0), 0.0, 1.0)
     gauntlet = max(0, int(_num(row.get("gauntlet_n", 0), 0)))
+    gross_rr = max(0.0, _num(row.get("_ladder_gross_rr", row.get("rr", 0.0)), 0.0))
+    net_rr = _num(row.get("_ladder_net_rr", gross_rr), gross_rr)
+    edge_ratio = _num(row.get("_ladder_edge_ratio", 1.0), 1.0)
+    if net_rr <= 0.0:
+        edge_mult = 0.08
+    else:
+        net_quality = _clamp(net_rr / max(gross_rr, 1e-9), 0.05, 1.0)
+        edge_mult = _clamp(0.42 + 0.58 * net_quality, 0.10, 1.0)
+        edge_mult *= _clamp(edge_ratio / 1.55, 0.30, 1.28)
     # Effective liquidity score: do not blindly overweight the nearest pool.
     # Institutional monetisation should prefer pools where liquidity quality,
     # delivery and multi-timeframe confluence are strong enough to pay costs,
@@ -197,7 +211,8 @@ def _candidate_weight(row: Dict[str, Any], path_frac: float) -> float:
         * (0.75 + 0.25 * confluence)
         * (0.88 + 0.12 * fib_mult + 0.10 * fib_score)
         * path_shape * too_near_pen
-        * gauntlet_pen * (1.0 + 0.10 * min(ev, 3.0)) * (1.0 + 0.18 * ladder_score),
+        * gauntlet_pen * (1.0 + 0.10 * min(ev, 3.0)) * (1.0 + 0.18 * ladder_score)
+        * edge_mult,
 
     )
 
@@ -436,7 +451,8 @@ def _cost_points_from_bps(entry: float, roundtrip_cost_bps: float) -> float:
         return 0.0
 
 
-def _row_cost_points(row: Dict[str, Any], *, risk_points: float, rt_cost_points: float) -> float:
+def _row_cost_points(row: Dict[str, Any], *, risk_points: float, rt_cost_points: float,
+                     fallback_cost_r: float = 0.0) -> float:
     """Best available per-unit friction estimate for an internal TP.
 
     Cost is measured in price points, not dollars, so the same rule works for
@@ -447,11 +463,17 @@ def _row_cost_points(row: Dict[str, Any], *, risk_points: float, rt_cost_points:
     """
     risk = max(float(risk_points or 0.0), 1e-9)
     row_cost_r = _num(row.get("cost_r", 0.0), 0.0) if isinstance(row, dict) else 0.0
-    return max(0.0, float(rt_cost_points or 0.0), max(0.0, row_cost_r) * risk)
+    return max(
+        0.0,
+        float(rt_cost_points or 0.0),
+        max(0.0, row_cost_r) * risk,
+        max(0.0, float(fallback_cost_r or 0.0)) * risk,
+    )
 
 
 def _prop_desk_internal_reward_floor(row: Dict[str, Any], *, risk_points: float,
-                                     rt_cost_points: float, base_fee_floor_mult: float) -> tuple[float, float]:
+                                     rt_cost_points: float, base_fee_floor_mult: float,
+                                     fallback_cost_r: float = 0.0, atr: float = 0.0) -> tuple[float, float]:
     """Return (required_reward_points, effective_cost_points).
 
     Internal TPs are not targets just because a pool exists. A prop desk only
@@ -459,12 +481,19 @@ def _prop_desk_internal_reward_floor(row: Dict[str, Any], *, risk_points: float,
     edge to justify creating another exchange order and reducing final-runner
     optionality.
     """
-    cost_pts = _row_cost_points(row, risk_points=risk_points, rt_cost_points=rt_cost_points)
+    cost_pts = _row_cost_points(
+        row,
+        risk_points=risk_points,
+        rt_cost_points=rt_cost_points,
+        fallback_cost_r=fallback_cost_r,
+    )
     if cost_pts <= 0.0:
         return 0.0, 0.0
     dp = _clamp(_num(row.get("delivery_prob", row.get("sweep_prob", 0.55)), 0.55), 0.05, 0.95)
     qual = _clamp(_num(row.get("quality", 0.55), 0.55), 0.0, 1.0)
     path = _clamp(_num(row.get("_ladder_path_frac", 0.0), 0.0), 0.0, 1.0)
+    risk = max(float(risk_points or 0.0), 1e-9)
+    atr_f = max(float(atr or 0.0), 0.0)
     src = str(row.get("_ladder_source", row.get("source", "")) or "").lower()
 
     # The minimum multiple is fee-engine derived.  It increases only when the
@@ -475,14 +504,80 @@ def _prop_desk_internal_reward_floor(row: Dict[str, Any], *, risk_points: float,
     if "fib" in src and "liquidity" not in src:
         mult *= 1.08
     mult = _clamp(mult, 1.05, 2.15)
-    return cost_pts * mult, cost_pts
+    # Fees are only one part of the required move. A very near TP also has to
+    # clear auction noise; otherwise the partial fill can be positive per unit
+    # while still being immaterial to the lifecycle. Noise is scaled by ATR,
+    # liquidity quality, delivery probability, and path depth.
+    noise_pts = 0.0
+    if atr_f > 0.0:
+        noise_mult = (
+            0.05
+            + 0.10 * (1.0 - dp)
+            + 0.08 * (1.0 - qual)
+            + 0.08 * max(0.0, 0.32 - path)
+        )
+        if "fib" in src and "liquidity" not in src:
+            noise_mult += 0.03
+        noise_pts = atr_f * _clamp(noise_mult, 0.04, 0.30)
+    required = max(cost_pts * mult, cost_pts + noise_pts, 0.18 * risk)
+    return required, cost_pts
+
+
+def _annotate_internal_level_economics(rows: List[Dict[str, Any]], *, side: str, entry: float,
+                                       risk_points: float, rt_cost_points: float,
+                                       base_fee_floor_mult: float, fallback_cost_r: float = 0.0,
+                                       atr: float = 0.0) -> List[Dict[str, Any]]:
+    annotated: List[Dict[str, Any]] = []
+    risk = max(float(risk_points or 0.0), 1e-9)
+    for r in rows or []:
+        c = dict(r)
+        px = _num(c.get("_ladder_price", c.get("tp_price", c.get("pool_price", 0.0))), 0.0)
+        reward_pts = abs(px - entry)
+        path = _path_fraction(side, entry, _num(c.get("_ladder_final_tp", c.get("final_tp", px)), px), px)
+        if "_ladder_path_frac" not in c:
+            c["_ladder_path_frac"] = path
+        req_pts, cost_pts = _prop_desk_internal_reward_floor(
+            c,
+            risk_points=risk,
+            rt_cost_points=rt_cost_points,
+            base_fee_floor_mult=base_fee_floor_mult,
+            fallback_cost_r=fallback_cost_r,
+            atr=atr,
+        )
+        gross_rr = reward_pts / risk
+        cost_r = cost_pts / risk
+        net_rr = (reward_pts - cost_pts) / risk
+        floor_r = req_pts / risk if req_pts > 0.0 else 0.0
+        denom = max(req_pts, cost_pts, 1e-9)
+        edge_ratio = reward_pts / denom if denom > 0.0 else 1.0
+        c["_ladder_gross_rr"] = gross_rr
+        c["_ladder_cost_r"] = cost_r
+        c["_ladder_net_rr"] = net_rr
+        c["_ladder_reward_floor_r"] = floor_r
+        c["_ladder_edge_ratio"] = edge_ratio
+        c["_ladder_reward_floor_pts"] = req_pts
+        c["_ladder_cost_pts"] = cost_pts
+        c["_ladder_weight"] = _candidate_weight(c, _clamp(_num(c.get("_ladder_path_frac", 0.0), 0.0), 0.0, 1.0))
+        annotated.append(c)
+    return annotated
 
 
 def _filter_internal_levels_by_net_edge(rows: List[Dict[str, Any]], *, side: str, entry: float,
                                         risk_points: float, rt_cost_points: float,
-                                        base_fee_floor_mult: float) -> tuple[List[Dict[str, Any]], List[str]]:
-    if not rows or rt_cost_points <= 0.0:
+                                        base_fee_floor_mult: float, fallback_cost_r: float = 0.0,
+                                        atr: float = 0.0) -> tuple[List[Dict[str, Any]], List[str]]:
+    if not rows:
         return rows, []
+    rows = _annotate_internal_level_economics(
+        rows,
+        side=side,
+        entry=entry,
+        risk_points=risk_points,
+        rt_cost_points=rt_cost_points,
+        base_fee_floor_mult=base_fee_floor_mult,
+        fallback_cost_r=fallback_cost_r,
+        atr=atr,
+    )
     kept: List[Dict[str, Any]] = []
     notes: List[str] = []
     dropped = 0
@@ -493,13 +588,16 @@ def _filter_internal_levels_by_net_edge(rows: List[Dict[str, Any]], *, side: str
         req_pts, cost_pts = _prop_desk_internal_reward_floor(
             r, risk_points=risk_points, rt_cost_points=rt_cost_points,
             base_fee_floor_mult=base_fee_floor_mult,
+            fallback_cost_r=fallback_cost_r,
+            atr=atr,
         )
-        if req_pts > 0.0 and reward_pts <= req_pts:
+        net_rr = _num(r.get("_ladder_net_rr", 0.0), 0.0)
+        if (req_pts > 0.0 and reward_pts <= req_pts) or net_rr <= 0.0:
             dropped += 1
             if not nearest_note:
                 nearest_note = (
                     f"first skipped level reward={reward_pts:.2f}pts does not clear "
-                    f"friction floor={req_pts:.2f}pts (cost≈{cost_pts:.2f}pts)"
+                    f"friction floor={req_pts:.2f}pts (cost~{cost_pts:.2f}pts)"
                 )
             continue
         kept.append(r)
@@ -788,33 +886,42 @@ def _weighted_allocate(cands: List[Dict[str, Any]], budget: float) -> List[float
     return [float(budget) * w / wsum for w in weights]
 
 
-def _prefix_solvency_r(fracs: List[float], rewards_r: List[float], k: int) -> float:
+def _prefix_solvency_r(fracs: List[float], rewards_r: List[float], k: int,
+                       residual_loss_r: float = 1.0) -> float:
     filled = sum(fracs[:k])
     profit = sum(fracs[i] * rewards_r[i] for i in range(min(k, len(fracs))))
-    return profit - max(0.0, 1.0 - filled)
+    return profit - max(0.0, 1.0 - filled) * max(0.0, float(residual_loss_r or 1.0))
 
 
-def _select_solvency_checkpoint(internals: List[Dict[str, Any]], rewards_r: List[float], max_internal_budget: float, floor_r: float) -> int:
+def _select_solvency_checkpoint(internals: List[Dict[str, Any]], rewards_r: List[float],
+                                max_internal_budget: float, floor_r: float,
+                                residual_loss_r: float = 1.0) -> int:
     """Earliest data-supported checkpoint where reversal to original SL can remain solvent."""
     if not internals:
         return 0
+    residual_loss_r = max(0.0, float(residual_loss_r or 1.0))
     for k in range(1, len(internals) + 1):
         prefix = internals[:k]
         pweights = [max(1e-6, _num(c.get("_ladder_weight"), 1e-6)) for c in prefix]
         wsum = sum(pweights) or 1.0
         avg_r = sum((pweights[i] / wsum) * rewards_r[i] for i in range(k))
-        required_frac = (1.0 + floor_r) / max(1.0 + avg_r, 1e-9)
+        required_frac = (residual_loss_r + floor_r) / max(residual_loss_r + avg_r, 1e-9)
         path_frac = _num(prefix[-1].get("_ladder_path_frac"), 0.0)
-        proof_needed = _clamp(1.0 / max(1.0 + max(rewards_r), 1e-9), 0.08, 0.42)
+        proof_needed = _clamp(residual_loss_r / max(residual_loss_r + max(rewards_r), 1e-9), 0.08, 0.42)
         if required_frac <= max_internal_budget + 1e-9 and path_frac >= proof_needed:
             return k
     return len(internals)
 
 
-def _enforce_lifecycle_solvency(*, internals: List[Dict[str, Any]], fracs: List[float], final_fraction: float, rewards_r: List[float], min_leg_fraction: float, floor_r: float, min_final_fraction: float = 0.0) -> tuple[List[float], float, int, float, float]:
+def _enforce_lifecycle_solvency(*, internals: List[Dict[str, Any]], fracs: List[float],
+                                final_fraction: float, rewards_r: List[float],
+                                min_leg_fraction: float, floor_r: float,
+                                min_final_fraction: float = 0.0,
+                                residual_loss_r: float = 1.0) -> tuple[List[float], float, int, float, float]:
     """Front-load enough internal liquidity so TP checkpoint + original SL remains solvent."""
     if not internals:
         return fracs, final_fraction, 0, 0.0, 0.0
+    residual_loss_r = max(0.0, float(residual_loss_r or 1.0))
     min_final_fraction = _clamp(float(min_final_fraction or 0.0), 0.0, 0.95)
     final_fraction = _clamp(final_fraction, min_final_fraction, 1.0)
     internal_budget = _clamp(1.0 - final_fraction, 0.0, 1.0)
@@ -823,18 +930,19 @@ def _enforce_lifecycle_solvency(*, internals: List[Dict[str, Any]], fracs: List[
         rewards_r,
         max_internal_budget=1.0 - _clamp(final_fraction * 0.25, 0.0, 0.95),
         floor_r=floor_r,
+        residual_loss_r=residual_loss_r,
     )
     if checkpoint <= 0:
         return fracs, final_fraction, 0, 0.0, 0.0
     if not fracs or len(fracs) != len(internals):
         fracs = _weighted_allocate(internals, internal_budget)
     for _ in range(24):
-        solv = _prefix_solvency_r(fracs, rewards_r, checkpoint)
+        solv = _prefix_solvency_r(fracs, rewards_r, checkpoint, residual_loss_r=residual_loss_r)
         if solv >= floor_r - 1e-9:
             break
-        prefix_weights = [(1.0 + rewards_r[i]) * max(1e-6, _num(internals[i].get("_ladder_weight"), 1e-6)) for i in range(checkpoint)]
+        prefix_weights = [(residual_loss_r + rewards_r[i]) * max(1e-6, _num(internals[i].get("_ladder_weight"), 1e-6)) for i in range(checkpoint)]
         psum = sum(prefix_weights) or 1.0
-        avg_eff = sum((prefix_weights[i] / psum) * (1.0 + rewards_r[i]) for i in range(checkpoint))
+        avg_eff = sum((prefix_weights[i] / psum) * (residual_loss_r + rewards_r[i]) for i in range(checkpoint))
         need = max(0.0, (floor_r - solv) / max(avg_eff, 1e-9))
         move = min(need, max(0.0, final_fraction - min_final_fraction))
         if move > 1e-9:
@@ -891,12 +999,6 @@ def _enforce_lifecycle_solvency(*, internals: List[Dict[str, Any]], fracs: List[
         fracs = [f * scale for f in fracs]
     elif total < 1.0 - 1e-9:
         final_fraction += 1.0 - total
-    worst = _prefix_solvency_r(fracs, rewards_r, checkpoint)
-    expected_internal = sum(
-        fracs[i] * rewards_r[i] * _clamp(_num(internals[i].get("delivery_prob", internals[i].get("sweep_prob", 0.5)), 0.5), 0.05, 0.95)
-        for i in range(len(fracs))
-    )
-    residual_domination = _clamp(final_fraction, 0.0, 1.0) / max(expected_internal, 1e-9)
     if final_fraction < min_final_fraction:
         deficit = min_final_fraction - final_fraction
         available = sum(max(0.0, f) for f in fracs)
@@ -905,6 +1007,23 @@ def _enforce_lifecycle_solvency(*, internals: List[Dict[str, Any]], fracs: List[
                 take = deficit * max(0.0, fracs[i]) / available
                 fracs[i] = max(0.0, fracs[i] - take)
             final_fraction = min_final_fraction
+    actual_checkpoint = 0
+    worst = _prefix_solvency_r(fracs, rewards_r, checkpoint, residual_loss_r=residual_loss_r)
+    for k in range(1, len(fracs) + 1):
+        solv = _prefix_solvency_r(fracs, rewards_r, k, residual_loss_r=residual_loss_r)
+        if solv >= floor_r - 1e-9:
+            actual_checkpoint = k
+            worst = solv
+            break
+    if actual_checkpoint <= 0:
+        actual_checkpoint = len(fracs)
+        worst = _prefix_solvency_r(fracs, rewards_r, actual_checkpoint, residual_loss_r=residual_loss_r)
+    checkpoint = actual_checkpoint
+    expected_internal = sum(
+        fracs[i] * rewards_r[i] * _clamp(_num(internals[i].get("delivery_prob", internals[i].get("sweep_prob", 0.5)), 0.5), 0.05, 0.95)
+        for i in range(len(fracs))
+    )
+    residual_domination = (_clamp(final_fraction, 0.0, 1.0) * residual_loss_r) / max(expected_internal, 1e-9)
     return fracs, _clamp(final_fraction, min_final_fraction, 1.0), checkpoint, worst, residual_domination
 
 
@@ -917,7 +1036,6 @@ def build_tp_ladder(
     atr: float,
     total_quantity: float,
     pool_report: Optional[Dict[str, Any]] = None,
-    target_surface: Any = None,
     cross_asset_state: Any = None,
     asset_id: str = "",
     min_leg_fraction: float = 0.0,
@@ -965,6 +1083,19 @@ def build_tp_ladder(
         if isinstance(sel, dict):
             rows.append(sel)
 
+    selected_rows = [r for r in rows if r.get("selected") is True]
+    final_rows = selected_rows or [r for r in rows if abs(_num(r.get("tp_price") or r.get("pool_price"), 0.0) - final_tp) <= max(0.35 * atr, 1e-9)]
+    final_fib_score = max([_clamp(_num(r.get("fib_score", 0.0), 0.0), 0.0, 1.0) for r in final_rows] or [0.0])
+    final_fib_mult = max([_clamp(_num(r.get("fib_confluence", r.get("fib_multiplier", 1.0)), 1.0), 0.90, 1.32) for r in final_rows] or [1.0])
+    final_fib_ratio = max([_num(r.get("fib_ratio", 0.0), 0.0) for r in final_rows] or [0.0])
+
+    selector_cost_r = max([_clamp(_num(r.get("cost_r", 0.0), 0.0), 0.0, 0.85) for r in rows] or [0.0])
+    effective_cost_r = max(rt_cost_r, selector_cost_r)
+    planning_cost_points = max(rt_cost_points, effective_cost_r * risk_points)
+    final_gross_rr = final_rr
+    final_net_rr = final_gross_rr - effective_cost_r
+    residual_loss_r = 1.0 + effective_cost_r
+
     raw_internals: List[Dict[str, Any]] = []
     min_spacing = max(min_spacing_atr * atr, 1e-9)
     for r in rows:
@@ -986,18 +1117,21 @@ def build_tp_ladder(
         rr_path = _path_fraction(side, entry, final_tp, px)
         c = dict(r)
         c["_ladder_price"] = px
+        c["_ladder_final_tp"] = final_tp
+        c["_ladder_gross_rr"] = rr
         c["_ladder_path_frac"] = rr_path
-        c["_ladder_weight"] = _candidate_weight(c, rr_path)
         raw_internals.append(c)
-
-    selected_rows = [r for r in rows if r.get("selected") is True]
-    final_rows = selected_rows or [r for r in rows if abs(_num(r.get("tp_price") or r.get("pool_price"), 0.0) - final_tp) <= max(0.35 * atr, 1e-9)]
-    final_fib_score = max([_clamp(_num(r.get("fib_score", 0.0), 0.0), 0.0, 1.0) for r in final_rows] or [0.0])
-    final_fib_mult = max([_clamp(_num(r.get("fib_confluence", r.get("fib_multiplier", 1.0)), 1.0), 0.90, 1.32) for r in final_rows] or [1.0])
-    final_fib_ratio = max([_num(r.get("fib_ratio", 0.0), 0.0) for r in final_rows] or [0.0])
-
-    selector_cost_r = max([_clamp(_num(r.get("cost_r", 0.0), 0.0), 0.0, 0.85) for r in rows] or [0.0])
-    effective_cost_r = max(rt_cost_r, selector_cost_r if rt_cost_points > 0.0 else 0.0)
+    if raw_internals:
+        raw_internals = _annotate_internal_level_economics(
+            raw_internals,
+            side=side,
+            entry=entry,
+            risk_points=risk_points,
+            rt_cost_points=planning_cost_points,
+            base_fee_floor_mult=fee_floor_mult,
+            fallback_cost_r=effective_cost_r,
+            atr=atr,
+        )
 
     def _return_final_only(reason: str, note: str = "") -> TPLadderPlan:
         plan.final_fraction = 1.0
@@ -1013,12 +1147,16 @@ def build_tp_ladder(
             "roundtrip_cost_bps": float(roundtrip_cost_bps or 0.0),
             "rt_cost_r": float(rt_cost_r or 0.0),
             "selector_cost_r": float(selector_cost_r or 0.0),
+            "effective_cost_r": float(effective_cost_r or 0.0),
+            "residual_loss_r": float(residual_loss_r or 1.0),
+            "final_net_rr": float(final_net_rr or 0.0),
         }
         plan.legs = [TPLadderLeg(
             index=1, role="FINAL", price=final_tp, qty_fraction=1.0,
             quantity=total_quantity, source="selected_final_tp",
-            distance_atr=final_dist_atr, rr=final_rr,
+            distance_atr=final_dist_atr, rr=final_gross_rr,
             fib_confluence=final_fib_mult, fib_score=final_fib_score, fib_ratio=final_fib_ratio,
+            gross_rr=final_gross_rr, cost_r=effective_cost_r, net_rr=final_net_rr,
             reason=reason,
         )]
         return plan
@@ -1028,9 +1166,9 @@ def build_tp_ladder(
     # is already close, adding TP1/TP2 just pays more fees and cuts the runner.
     # Apply this only when a live execution-cost estimate is available; otherwise
     # legacy/offline tests keep the selector's own cost_r behaviour.
-    if rt_cost_points > 0.0:
+    if planning_cost_points > 0.0:
         min_final_net_r_for_ladder = _clamp(1.20 + 1.60 * effective_cost_r, 1.25, 2.35)
-        final_net_r = final_rr - effective_cost_r
+        final_net_r = final_net_rr
         if final_net_r < min_final_net_r_for_ladder:
             return _return_final_only(
                 "final TP kept as single native bracket target; terminal objective is too close for cost-efficient internal staging",
@@ -1051,7 +1189,8 @@ def build_tp_ladder(
     if internals:
         internals, _net_edge_notes = _filter_internal_levels_by_net_edge(
             internals, side=side, entry=entry, risk_points=risk_points,
-            rt_cost_points=rt_cost_points, base_fee_floor_mult=fee_floor_mult,
+            rt_cost_points=planning_cost_points, base_fee_floor_mult=fee_floor_mult,
+            fallback_cost_r=effective_cost_r, atr=atr,
         )
         plan.regime_notes.extend(_net_edge_notes)
     if internals:
@@ -1074,7 +1213,8 @@ def build_tp_ladder(
             plan.regime_notes.append("sparse path: Fibonacci gap-fillers added between liquidity zones")
         internals, _net_edge_notes = _filter_internal_levels_by_net_edge(
             internals, side=side, entry=entry, risk_points=risk_points,
-            rt_cost_points=rt_cost_points, base_fee_floor_mult=fee_floor_mult,
+            rt_cost_points=planning_cost_points, base_fee_floor_mult=fee_floor_mult,
+            fallback_cost_r=effective_cost_r, atr=atr,
         )
         plan.regime_notes.extend(_net_edge_notes)
         if max_internal_legs > 0 and len(internals) > max_internal_legs:
@@ -1101,7 +1241,8 @@ def build_tp_ladder(
         if fib_internals:
             fib_internals, _net_edge_notes = _filter_internal_levels_by_net_edge(
                 fib_internals, side=side, entry=entry, risk_points=risk_points,
-                rt_cost_points=rt_cost_points, base_fee_floor_mult=fee_floor_mult,
+                rt_cost_points=planning_cost_points, base_fee_floor_mult=fee_floor_mult,
+                fallback_cost_r=effective_cost_r, atr=atr,
             )
             plan.regime_notes.extend(_net_edge_notes)
         if fib_internals:
@@ -1152,8 +1293,18 @@ def build_tp_ladder(
     final_fraction = _clamp(_num(runner_model.get("final_fraction"), 1.0), min_final_fraction, 1.0)
     internal_budget = _clamp(1.0 - final_fraction, 0.0, 0.96)
     raw_fracs = _weighted_allocate(internals, internal_budget)
-    rewards_r = [abs(_num(c.get("_ladder_price"), entry) - entry) / max(abs(entry - sl), 1e-9) for c in internals]
-    solvency_floor_r = _estimate_cost_floor_r(internals, selected_rows)
+    gross_rewards_r = [
+        _num(c.get("_ladder_gross_rr"), abs(_num(c.get("_ladder_price"), entry) - entry) / max(abs(entry - sl), 1e-9))
+        for c in internals
+    ]
+    rewards_r = [
+        _num(c.get("_ladder_net_rr"), gross_rewards_r[i] - effective_cost_r)
+        for i, c in enumerate(internals)
+    ]
+    solvency_floor_r = max(
+        _estimate_cost_floor_r(internals, selected_rows),
+        _clamp(0.85 * effective_cost_r, 0.0, 0.85),
+    )
     raw_fracs, final_fraction, checkpoint, worst_r, residual_dom = _enforce_lifecycle_solvency(
         internals=internals,
         fracs=raw_fracs,
@@ -1162,6 +1313,7 @@ def build_tp_ladder(
         min_leg_fraction=min_leg_fraction,
         floor_r=solvency_floor_r,
         min_final_fraction=min_final_fraction,
+        residual_loss_r=residual_loss_r,
     )
     internals, raw_fracs, final_fraction, rewards_r, _tp1_balance_notes = _balance_first_tp_materiality(
         internals=internals,
@@ -1171,7 +1323,7 @@ def build_tp_ladder(
         min_leg_fraction=min_leg_fraction,
         floor_r=solvency_floor_r,
         min_final_fraction=min_final_fraction,
-        final_rr=final_rr,
+        final_rr=final_net_rr,
     )
     for _note in _tp1_balance_notes:
         plan.regime_notes.append(_note)
@@ -1186,6 +1338,7 @@ def build_tp_ladder(
         min_leg_fraction=min_leg_fraction,
         floor_r=solvency_floor_r,
         min_final_fraction=min_final_fraction,
+        residual_loss_r=residual_loss_r,
     )
     if checkpoint > len(raw_fracs):
         checkpoint = len(raw_fracs)
@@ -1221,6 +1374,11 @@ def build_tp_ladder(
         px = _num(c.get("_ladder_price"), 0.0)
         qty = total_quantity * frac
         role = f"TP{idx}"
+        gross_rr = _num(c.get("_ladder_gross_rr"), abs(px - entry) / max(abs(entry - sl), 1e-9))
+        cost_r = _num(c.get("_ladder_cost_r"), effective_cost_r)
+        net_rr = _num(c.get("_ladder_net_rr"), gross_rr - cost_r)
+        reward_floor_r = _num(c.get("_ladder_reward_floor_r"), 0.0)
+        edge_ratio = _num(c.get("_ladder_edge_ratio"), 0.0)
         legs.append(TPLadderLeg(
             index=idx,
             role=role,
@@ -1231,7 +1389,7 @@ def build_tp_ladder(
             pool_timeframe=str(c.get("timeframe", "") or ""),
             pool_price=_num(c.get("pool_price"), px),
             distance_atr=abs(px - entry) / atr,
-            rr=abs(px - entry) / max(abs(entry - sl), 1e-9),
+            rr=gross_rr,
             delivery_prob=_num(c.get("delivery_prob", c.get("sweep_prob", 0.0)), 0.0),
             ev=_num(c.get("selection_ev", c.get("ev", 0.0)), 0.0),
             gauntlet_n=int(_num(c.get("gauntlet_n", 0), 0)),
@@ -1239,6 +1397,11 @@ def build_tp_ladder(
             fib_score=_num(c.get("fib_score", 0.0), 0.0),
             fib_ratio=_num(c.get("fib_ratio", 0.0), 0.0),
             fib_role=str(c.get("fib_role", "") or ""),
+            gross_rr=gross_rr,
+            cost_r=cost_r,
+            net_rr=net_rr,
+            reward_floor_r=reward_floor_r,
+            edge_ratio=edge_ratio,
             reason=str(c.get("reason", "internal liquidity monetisation") or "internal liquidity monetisation")[:240],
         ))
         idx += 1
@@ -1260,11 +1423,14 @@ def build_tp_ladder(
         quantity=total_quantity * final_fraction,
         source="selected_final_tp",
         distance_atr=final_dist_atr,
-        rr=abs(final_tp - entry) / max(abs(entry - sl), 1e-9),
+        rr=final_gross_rr,
         fib_confluence=final_fib_mult,
         fib_score=final_fib_score,
         fib_ratio=final_fib_ratio,
         fib_role="final_runner_projection" if final_fib_score > 0 else "",
+        gross_rr=final_gross_rr,
+        cost_r=effective_cost_r,
+        net_rr=final_net_rr,
         reason="strategy-selected final liquidity TP; native bracket remains as fallback/final target",
     ))
 
@@ -1275,21 +1441,32 @@ def build_tp_ladder(
     plan.solvency_floor_r = float(solvency_floor_r or 0.0)
     try:
         _fr = [float(getattr(l, "qty_fraction", 0.0) or 0.0) for l in legs if str(getattr(l, "role", "")).upper() != "FINAL"]
-        _rr = [float(getattr(l, "rr", 0.0) or 0.0) for l in legs if str(getattr(l, "role", "")).upper() != "FINAL"]
+        _rr = [float(getattr(l, "net_rr", 0.0) or 0.0) for l in legs if str(getattr(l, "role", "")).upper() != "FINAL"]
         if plan.solvency_checkpoint_index > 0:
-            plan.worst_case_after_checkpoint_r = _prefix_solvency_r(_fr, _rr, min(plan.solvency_checkpoint_index, len(_fr)))
+            plan.worst_case_after_checkpoint_r = _prefix_solvency_r(
+                _fr, _rr, min(plan.solvency_checkpoint_index, len(_fr)),
+                residual_loss_r=residual_loss_r,
+            )
             if abs(plan.worst_case_after_checkpoint_r - plan.solvency_floor_r) <= 1e-8:
                 plan.worst_case_after_checkpoint_r = plan.solvency_floor_r
         plan.expected_internal_profit_r = sum(
             float(getattr(l, "qty_fraction", 0.0) or 0.0)
-            * float(getattr(l, "rr", 0.0) or 0.0)
+            * float(getattr(l, "net_rr", 0.0) or 0.0)
             * _clamp(float(getattr(l, "delivery_prob", 0.0) or 0.5), 0.05, 0.95)
             for l in legs if str(getattr(l, "role", "")).upper() != "FINAL"
         )
-        plan.residual_domination = float(final_fraction) / max(plan.expected_internal_profit_r, 1e-9)
+        plan.residual_domination = (float(final_fraction) * residual_loss_r) / max(plan.expected_internal_profit_r, 1e-9)
     except Exception:
         plan.worst_case_after_checkpoint_r = float(worst_r or 0.0)
         plan.residual_domination = float(residual_dom or 0.0)
+    runner_model.update({
+        "roundtrip_cost_bps": float(roundtrip_cost_bps or 0.0),
+        "rt_cost_r": float(rt_cost_r or 0.0),
+        "selector_cost_r": float(selector_cost_r or 0.0),
+        "effective_cost_r": float(effective_cost_r or 0.0),
+        "residual_loss_r": float(residual_loss_r or 1.0),
+        "final_net_rr": float(final_net_rr or 0.0),
+    })
     plan.final_runner_model = dict(runner_model)
     if min_final_fraction > 0:
         plan.regime_notes.append(f"terminal-runner reserve {min_final_fraction:.0%}: final TP kept executable after path monetisation")

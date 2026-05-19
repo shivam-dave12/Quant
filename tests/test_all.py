@@ -2188,8 +2188,9 @@ def test_config_uses_margin_target_with_coherent_daily_budget():
     assert cfg.risk.MAX_CONSECUTIVE_LOSSES == 3
     assert cfg.risk.RISK_PER_TRADE * cfg.risk.MAX_CONSECUTIVE_LOSSES <= cfg.risk.MAX_DAILY_LOSS_PCT / 100.0 + 1e-12
     assert _config.MIN_MARGIN_PER_TRADE == 0
-    assert _config.MAX_MARGIN_PER_TRADE == 0
-    assert _config.MAX_ENTRY_MARGIN_USAGE_PCT == 0
+    assert not hasattr(_config, "MAX_MARGIN_PER_TRADE")
+    assert not hasattr(_config, "MAX_ENTRY_MARGIN_USAGE_PCT")
+    assert not hasattr(_config, "BALANCE_USAGE_PERCENTAGE")
     assert _config.PORTFOLIO_BUDGET_MODE == "available_funds"
     assert abs(_config.QUANT_MARGIN_PCT - 0.36) < 1e-12
 
@@ -2234,8 +2235,8 @@ def test_margin_risk_sizing_uses_margin_budget_and_dynamic_leverage():
     # Aggressive allocator: approved trades may use higher leverage than the
     # conservative base-risk cap, but remain inside the daily-circuit-derived
     # effective margin-risk envelope.
-    assert 16.0 <= lev <= 18.0
-    assert margin_used >= 60.0
+    assert 30.0 <= lev <= 33.0
+    assert margin_used >= 35.0
     assert margin_used <= 200.0 * 0.36 * 1.15 + 1e-9
     assert dollar_risk <= margin_used * strategy._active_margin_risk_pct + 0.20
 
@@ -2731,6 +2732,24 @@ def test_margin_risk_leverage_math_matches_btc_example(monkeypatch):
     assert (128.3 * lev / 76951.0) <= 0.015 + 1e-12
 
 
+def test_roe_leverage_pressure_raises_effective_leverage_without_changing_base_cap(monkeypatch):
+    import config
+    from strategy.quant_strategy import QuantStrategy
+
+    monkeypatch.setattr(config, "LEVERAGE", 40, raising=False)
+    qs = object.__new__(QuantStrategy)
+
+    base = qs._effective_margin_risk_leverage(
+        price=76951.0, sl_dist=128.3, risk_pct=0.03,
+        configured_leverage=40, leverage_pressure=1.0)
+    aggressive = qs._effective_margin_risk_leverage(
+        price=76951.0, sl_dist=128.3, risk_pct=0.03,
+        configured_leverage=40, leverage_pressure=qs._roe_leverage_pressure(1.0))
+
+    assert 17.0 <= base <= 18.0
+    assert 31.0 <= aggressive <= 33.0
+
+
 def test_liquidation_guard_accepts_lower_effective_leverage_override():
     from strategy.quant_strategy import QuantStrategy
 
@@ -2887,5 +2906,67 @@ def test_tp_ladder_removes_fee_dominated_near_tp_but_keeps_deeper_levels():
     internals = [l for l in plan.legs if l.role != "FINAL"]
     assert internals, plan.as_dict()
     assert all(l.price > 100.50 + 1e-9 for l in internals), plan.compact()
+    assert any("prop-desk net-edge filter" in n for n in plan.regime_notes), plan.regime_notes
+
+
+def test_tp_ladder_sizes_internal_legs_from_net_reward_not_gross_move():
+    from strategy.tp_ladder import build_tp_ladder
+
+    report = {
+        "candidates": [
+            {"pool_side": "BSL", "tp_price": 101.05, "pool_price": 101.05,
+             "quality": 0.72, "significance": 4.0, "delivery_prob": 0.76,
+             "selection_ev": 0.35, "timeframe": "1m"},
+            {"pool_side": "BSL", "tp_price": 102.60, "pool_price": 102.60,
+             "quality": 0.82, "significance": 5.0, "delivery_prob": 0.62,
+             "selection_ev": 0.55, "timeframe": "15m"},
+        ],
+        "selected": {"pool_side": "BSL", "tp_price": 108.0, "pool_price": 108.0,
+                     "quality": 0.86, "significance": 7.0, "delivery_prob": 0.38,
+                     "selection_ev": 0.90, "timeframe": "1h", "selected": True,
+                     "fib_score": 0.75, "fib_confluence": 1.20, "fib_ratio": 1.618},
+    }
+    plan = build_tp_ladder(
+        side="long", entry=100.0, sl=99.0, final_tp=108.0, atr=1.0,
+        total_quantity=20.0, pool_report=report, min_leg_fraction=0.05,
+        max_internal_legs=4, roundtrip_cost_bps=100.0, fee_floor_mult=1.20,
+    )
+    internals = [l for l in plan.legs if l.role != "FINAL"]
+    assert internals, plan.as_dict()
+    assert internals[0].price >= 102.60 - 1e-9, plan.compact()
+    assert all(l.net_rr > 0.0 for l in internals), plan.as_dict()
+    assert all(l.rr >= l.reward_floor_r for l in internals), plan.as_dict()
+    assert internals[0].qty_fraction * internals[0].net_rr >= 0.12, plan.compact()
+    assert plan.worst_case_after_checkpoint_r >= plan.solvency_floor_r, plan.as_dict()
+    assert any("prop-desk net-edge filter" in n for n in plan.regime_notes), plan.regime_notes
+
+
+def test_tp_ladder_uses_selector_cost_when_live_bps_unavailable():
+    from strategy.tp_ladder import build_tp_ladder
+
+    report = {
+        "candidates": [
+            {"pool_side": "BSL", "tp_price": 100.55, "pool_price": 100.55,
+             "quality": 0.65, "significance": 3.0, "delivery_prob": 0.74,
+             "selection_ev": 0.20, "timeframe": "1m"},
+            {"pool_side": "BSL", "tp_price": 102.20, "pool_price": 102.20,
+             "quality": 0.82, "significance": 5.0, "delivery_prob": 0.62,
+             "selection_ev": 0.55, "timeframe": "15m"},
+        ],
+        "selected": {"pool_side": "BSL", "tp_price": 107.00, "pool_price": 107.00,
+                     "quality": 0.86, "significance": 7.0, "delivery_prob": 0.38,
+                     "selection_ev": 0.90, "timeframe": "1h", "selected": True,
+                     "cost_r": 0.80, "fib_score": 0.72,
+                     "fib_confluence": 1.19, "fib_ratio": 1.618},
+    }
+    plan = build_tp_ladder(
+        side="long", entry=100.0, sl=99.0, final_tp=107.0, atr=1.0,
+        total_quantity=20.0, pool_report=report, min_leg_fraction=0.05,
+        max_internal_legs=4,
+    )
+    internals = [l for l in plan.legs if l.role != "FINAL"]
+    assert internals, plan.as_dict()
+    assert all(l.price > 100.55 + 1e-9 for l in internals), plan.compact()
+    assert all(l.cost_r >= 0.80 - 1e-9 for l in plan.legs), plan.as_dict()
     assert any("prop-desk net-edge filter" in n for n in plan.regime_notes), plan.regime_notes
 # ===== END test_prop_desk_tp_ladder_net_edge.py =====

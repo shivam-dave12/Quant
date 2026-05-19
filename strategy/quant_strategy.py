@@ -3440,7 +3440,8 @@ class QuantStrategy:
 
     def _effective_margin_risk_leverage(self, price: float, sl_dist: float,
                                         risk_pct: float = None,
-                                        configured_leverage: float = None) -> float:
+                                        configured_leverage: float = None,
+                                        leverage_pressure: float = 1.0) -> float:
         """
         Leverage assumed by every pre-order risk calculation.  This mirrors the
         actual leverage asserted to the exchange before bracket placement.
@@ -3449,7 +3450,14 @@ class QuantStrategy:
         cap = self._margin_risk_leverage_cap(price, sl_dist, risk_pct=risk_pct)
         if not math.isfinite(cap) or cap < 1.0:
             return 0.0
+        cap *= self._bounded(leverage_pressure, 1.0, 1.85)
         return max(1.0, min(configured, math.floor(cap)))
+
+    def _roe_leverage_pressure(self, margin_intensity: float) -> float:
+        """Raise return on equity for approved trades without changing SL dollar risk."""
+        intensity = self._bounded(margin_intensity, 0.0, 1.0)
+        return self._bounded(1.25 + 0.55 * intensity, 1.20, 1.85)
+
     def _daily_safe_margin_risk_cap(self, base_risk_pct: float) -> float:
         """Dynamic upper bound for aggressive margin-risk per trade.
 
@@ -6237,7 +6245,6 @@ class QuantStrategy:
                 atr=float(atr or 0.0),
                 total_quantity=_qty,
                 pool_report=pool_report,
-                target_surface=getattr(getattr(self, "_last_entry_signal", None), "target_surface", None),
                 cross_asset_state=getattr(self, "_cross_asset_state", None),
                 asset_id=str(getattr(getattr(self, "_instrument", None), "asset_id", "") or ""),
                 min_leg_fraction=_min_leg_fraction,
@@ -6911,6 +6918,17 @@ class QuantStrategy:
             # No order was sent. Treat as a pre-order rejection, not a trade
             # exit/failure. Otherwise QUANT_COOLDOWN_SEC starts and entry
             # evaluation appears to stop after a minimum-lot sizing reject.
+            with self._lock:
+                self._last_tp_gate_rejection = time.time()
+            return
+
+        _actual_entry_lev = float(getattr(self, "_active_effective_leverage", QCfg.LEVERAGE()) or QCfg.LEVERAGE())
+        _liq_ok, _liq_px, _liq_guard, _liq_reason = self._sl_liquidation_sanity(
+            side, entry_ref, sl_price, leverage_override=_actual_entry_lev)
+        if not _liq_ok:
+            logger.warning(
+                f"Entry rejected by actual-leverage liquidation guard: {side.upper()} "
+                f"entry=${entry_ref:,.1f} SL=${sl_price:,.1f} lev={_actual_entry_lev:.0f}x | {_liq_reason}")
             with self._lock:
                 self._last_tp_gate_rejection = time.time()
             return
@@ -9318,20 +9336,6 @@ class QuantStrategy:
                 f"MIN_MARGIN_USDT ${QCfg.MIN_MARGIN_USDT():.2f}"
             )
             return None
-        # Legacy BALANCE_USAGE/MAX_ENTRY_MARGIN_USAGE caps are intentionally
-        # disabled when <= 0.  Live sizing is driven by exchange free cash and
-        # the desk/instrument margin_pct target, not by an arbitrary hard ceiling.
-        try:
-            _entry_margin_cap_cfg = float(_cfg("MAX_ENTRY_MARGIN_USAGE_PCT", 0.0) or 0.0)
-        except Exception:
-            _entry_margin_cap_cfg = 0.0
-        if _entry_margin_cap_cfg > 1.0:
-            _entry_margin_cap_frac = min(1.0, _entry_margin_cap_cfg / 100.0)
-        elif _entry_margin_cap_cfg > 0.0:
-            _entry_margin_cap_frac = min(1.0, _entry_margin_cap_cfg)
-        else:
-            _entry_margin_cap_frac = 1.0
-
         # ── BUG 3 FIX: commission reserve ─────────────────────────────────────
         # Reserve: we charge an aggressive 2× the live taker rate (entry taker
         # worst-case + exit taker) plus a 15 % safety margin for slippage
@@ -9406,9 +9410,6 @@ class QuantStrategy:
         #     margin for the active desk/instrument.
         #   • exchange free cash proves feasibility; open brackets naturally
         #     reduce free cash instead of a fixed equal-slot/hard-dollar cap.
-        #   • MAX_MARGIN_PER_TRADE/MAX_ENTRY_MARGIN_USAGE_PCT are treated as
-        #     optional legacy caps only when explicitly set > 0.  In the live
-        #     config they are 0/disabled.
         #   • no arbitrary dollar minimum is required; exchange min_qty/step
         #     controls executability.
         try:
@@ -9420,15 +9421,9 @@ class QuantStrategy:
         policy_margin_frac = max(0.0, min(1.0, policy_margin_frac))
 
         min_trade_margin = max(0.0, float(QCfg.MIN_MARGIN_USDT()))
-        try:
-            max_trade_margin_cfg = float(_cfg("MAX_MARGIN_PER_TRADE", 0.0) or 0.0)
-        except Exception:
-            max_trade_margin_cfg = 0.0
-        max_trade_margin = max_trade_margin_cfg if max_trade_margin_cfg > 0.0 else float("inf")
 
         policy_target_margin = margin_budget_base * policy_margin_frac
-        legacy_entry_cap = margin_budget_base * _entry_margin_cap_frac
-        margin_capacity = min(cash_available, legacy_entry_cap, max_trade_margin)
+        margin_capacity = cash_available
 
         # Aggressive allocator: do not let a passed entry collapse to dust only
         # because several continuous caution scalars multiplied together.  The
@@ -9444,15 +9439,17 @@ class QuantStrategy:
         )
         target_margin_budget = min(margin_capacity, policy_target_margin * margin_intensity)
         effective_risk_pct = self._aggressive_margin_risk_pct(risk_pct, margin_intensity)
+        roe_leverage_pressure = self._roe_leverage_pressure(margin_intensity)
 
         # ── Margin-risk leverage normalization ───────────────────────────────
         # Leverage is now selected aggressively from the dynamic margin-risk
-        # allowance, not from the conservative base risk alone.  This gives the
-        # bot higher leverage on approved trades while keeping the SL loss inside
-        # the daily-circuit-derived risk envelope.
+        # allowance and ROE pressure, not from the conservative base risk alone.
+        # This gives the bot higher leverage on approved trades while keeping
+        # the SL loss inside the daily-circuit-derived risk envelope.
         configured_leverage = max(float(QCfg.LEVERAGE()), 1.0)
-        margin_risk_leverage_cap = self._margin_risk_leverage_cap(price, sl_dist, risk_pct=effective_risk_pct)
-        if not math.isfinite(margin_risk_leverage_cap) or margin_risk_leverage_cap < 1.0:
+        base_margin_risk_leverage_cap = self._margin_risk_leverage_cap(price, sl_dist, risk_pct=effective_risk_pct)
+        margin_risk_leverage_cap = base_margin_risk_leverage_cap * roe_leverage_pressure
+        if not math.isfinite(base_margin_risk_leverage_cap) or base_margin_risk_leverage_cap < 1.0:
             logger.warning(
                 f"Sizing rejected: SL distance too wide for margin-risk budget (aggressive) | "
                 f"base_risk={risk_pct:.3%} effective_risk={effective_risk_pct:.3%} "
@@ -9460,7 +9457,10 @@ class QuantStrategy:
                 f"max_leverage={margin_risk_leverage_cap:.2f}x < 1x")
             return None
         effective_leverage = self._effective_margin_risk_leverage(
-            price, sl_dist, risk_pct=effective_risk_pct, configured_leverage=configured_leverage)
+            price, sl_dist, risk_pct=effective_risk_pct,
+            configured_leverage=configured_leverage,
+            leverage_pressure=roe_leverage_pressure,
+        )
         leverage = float(effective_leverage)
         self._active_effective_leverage = float(effective_leverage)
         self._active_margin_risk_pct = (sl_dist * leverage / price) if price > 0 else 0.0
@@ -9475,9 +9475,7 @@ class QuantStrategy:
         if margin_capacity <= 1e-9:
             logger.warning(
                 f"Sizing rejected: no live margin capacity | "
-                f"cash_available=${cash_available:.2f} available=${available:.2f} "
-                f"legacy_entry_cap={'disabled' if _entry_margin_cap_cfg <= 0 else f'{_entry_margin_cap_cfg:.2f}'} "
-                f"max_margin=${max_trade_margin_cfg:.2f}")
+                f"cash_available=${cash_available:.2f} available=${available:.2f}")
             return None
 
         taker_rate = abs(float(_cfg("COMMISSION_RATE", 0.00055)))
@@ -9489,8 +9487,7 @@ class QuantStrategy:
         cash_per_btc = margin_per_btc + reserve_fee_per_btc
 
         # Cash feasibility uses live exchange free cash.  Margin feasibility uses
-        # the dynamic margin capacity (cash after optional legacy caps, disabled
-        # in live config) so fees cannot eat the margin budget.
+        # the dynamic margin capacity, so fees cannot eat the margin budget.
         max_qty_cash = math.floor((cash_available / max(cash_per_btc, 1e-12)) / step) * step
         max_qty_margin = math.floor(((margin_capacity * leverage / price) / step)) * step
         executable_qty_cap = round(max(0.0, min(max_qty, max_qty_cash, max_qty_margin)), 8)
@@ -9574,17 +9571,14 @@ class QuantStrategy:
 
         # ── Margin feasibility guard ─────────────────────────────────────────
         # This is not an arbitrary per-trade ceiling.  It only proves the order
-        # can be funded by live free cash after fees and any explicitly enabled
-        # legacy cap.  In the live config, the legacy caps are disabled.
+        # can be funded by live free cash after fees.
         required_margin = qty * price / leverage
         required_cash = required_margin + qty * reserve_fee_per_btc
         if required_margin > max_allowed_margin:
             logger.warning(
                 f"Sizing guard: required margin ${required_margin:.2f} > "
                 f"dynamic margin capacity ${max_allowed_margin:.2f} "
-                f"(target=${target_margin_budget:.2f}, cash_available=${cash_available:.2f}, "
-                f"legacy_entry_cap={'disabled' if _entry_margin_cap_cfg <= 0 else f'{_entry_margin_cap_cfg:.2f}'}, "
-                f"max_margin=${max_trade_margin_cfg:.2f})"
+                f"(target=${target_margin_budget:.2f}, cash_available=${cash_available:.2f})"
             )
             return None
 
@@ -9630,7 +9624,8 @@ class QuantStrategy:
             f"({risk_pct_act:.2f}% risk-base; {slot_risk_pct:.2f}% slot) | "
             f"margin=${margin_used:.2f} target=${target_margin_budget:.2f} "
             f"policy_target=${policy_target_margin:.2f} min=${min_trade_margin:.2f} cap=${max_allowed_margin:.2f} | "
-            f"lev={leverage:.0f}x margin_risk={self._active_margin_risk_pct:.2%} | "
+            f"lev={leverage:.0f}x roe_pressure={roe_leverage_pressure:.2f} "
+            f"margin_risk={self._active_margin_risk_pct:.2%} | "
             f"fees≈${actual_fees:.3f} ({fee_to_risk:.2f}R) | "
             f"cash=${required_cash:.2f}/${cash_available:.2f} | "
             f"risk_base=${target_risk_base:.2f} margin_base=${margin_budget_base:.2f} slot_available=${available:.2f} | "

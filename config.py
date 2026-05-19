@@ -39,10 +39,7 @@ COINSWITCH_SYMBOL        = "BTCUSDT"
 COINSWITCH_EXCHANGE      = "EXCHANGE_2"
 
 # ── Position sizing ───────────────────────────────────────────────────────────
-BALANCE_USAGE_PERCENTAGE = 100  # legacy/display only; sizing uses dynamic available funds + desk margin_pct
-MAX_ENTRY_MARGIN_USAGE_PCT = 0     # 0 = disabled; no arbitrary single-trade margin ceiling
 MIN_MARGIN_PER_TRADE     = 0       # 0 = no arbitrary dollar floor; exchange min_qty/step controls executability
-MAX_MARGIN_PER_TRADE     = 0       # 0 = no absolute dollar cap; dynamic available cash owns feasibility
 MIN_POSITION_SIZE        = 0.001
 MAX_POSITION_SIZE        = 100.0
 LOT_STEP_SIZE            = 0.001
