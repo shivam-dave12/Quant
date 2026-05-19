@@ -319,6 +319,84 @@ class _DeltaAdapter:
             cv = float(getattr(config, 'DELTA_CONTRACT_VALUE_BTC', 0.001) or 0.001)
         return abs(float(contracts)) * cv
 
+    def _active_tick_size(self) -> float:
+        try:
+            tick = float(getattr(self, "tick_size", 0.0) or 0.0)
+            if tick > 0:
+                return tick
+        except Exception:
+            pass
+        getter = getattr(config, "get_tick_size", None)
+        if callable(getter):
+            try:
+                tick = float(getter() or 0.0)
+                if tick > 0:
+                    return tick
+            except Exception:
+                pass
+        return float(getattr(config, "TICK_SIZE", 0.1) or 0.1)
+
+    def _round_nearest_tick(self, price: float) -> float:
+        tick = max(self._active_tick_size(), 1e-12)
+        return round(round(float(price) / tick) * tick, 10)
+
+    def _round_floor_tick(self, price: float) -> float:
+        import math
+        tick = max(self._active_tick_size(), 1e-12)
+        # Add a tiny epsilon before flooring to avoid 68.96 / 0.01 becoming
+        # 6895.999999999 and incorrectly flooring to 68.95.
+        return round(math.floor((float(price) + tick * 1e-9) / tick) * tick, 10)
+
+    def _round_ceil_tick(self, price: float) -> float:
+        import math
+        tick = max(self._active_tick_size(), 1e-12)
+        # Subtract a tiny epsilon before ceiling for the same floating-point
+        # boundary case. Directional safety is preserved because the epsilon is
+        # far below one tick.
+        return round(math.ceil((float(price) - tick * 1e-9) / tick) * tick, 10)
+
+    def _normalise_bracket_prices(self, side: str, limit_price: float,
+                                  sl_price: float, tp_price: float) -> Dict[str, float]:
+        """Return Delta-safe native bracket prices.
+
+        Directional rounding prevents the payload from becoming less protective
+        after tick normalisation.  The bracket child limit prices are sent
+        explicitly because Delta's CreateOrderRequest schema supports them and
+        some non-BTC contracts reject trigger-only native brackets.
+        """
+        s = str(side or "").lower().strip()
+        tick = max(self._active_tick_size(), 1e-12)
+        sl_offset_ticks = max(1, int(getattr(config, "SL_LIMIT_OFFSET_TICKS", 20) or 20))
+        sl_offset = tick * sl_offset_ticks
+
+        if s in ("buy", "long"):
+            entry = self._round_floor_tick(limit_price)
+            sl_trig = self._round_floor_tick(sl_price)
+            tp_trig = self._round_ceil_tick(tp_price)
+            sl_limit = self._round_floor_tick(sl_trig - sl_offset)
+            tp_limit = tp_trig
+            valid = sl_trig < entry < tp_trig and sl_limit <= sl_trig
+        else:
+            entry = self._round_ceil_tick(limit_price)
+            sl_trig = self._round_ceil_tick(sl_price)
+            tp_trig = self._round_floor_tick(tp_price)
+            sl_limit = self._round_ceil_tick(sl_trig + sl_offset)
+            tp_limit = tp_trig
+            valid = tp_trig < entry < sl_trig and sl_limit >= sl_trig
+
+        if not valid:
+            raise ValueError(
+                f"invalid native bracket geometry side={side} entry={entry} "
+                f"sl={sl_trig} sl_limit={sl_limit} tp={tp_trig}"
+            )
+        return {
+            "limit_price": entry,
+            "bracket_stop_loss_price": sl_trig,
+            "bracket_stop_loss_limit_price": sl_limit,
+            "bracket_take_profit_price": tp_trig,
+            "bracket_take_profit_limit_price": tp_limit,
+        }
+
     @staticmethod
     def _num(value, default: float = 0.0) -> float:
         try:
@@ -500,19 +578,35 @@ class _DeltaAdapter:
                                   sl_price: float,
                                   tp_price: float) -> Optional[Dict]:
         # Bracket limit order: entry + SL + TP in a single Delta API call.
-        # Avoids bad_schema from separate stop/take-profit order placement.
+        # Avoids naked-entry fallback and sends a complete Delta native-bracket
+        # payload (trigger + child limit prices + trigger method), which is
+        # materially safer for non-BTC products such as SLVON/PAXG/xStocks.
         self.limiter.wait()
-        contracts = self._qty_to_contracts(quantity)
+        try:
+            contracts = self._qty_to_contracts(quantity)
+            if contracts <= 0:
+                raise ValueError(f"invalid contracts={contracts} from quantity={quantity}")
+            prices = self._normalise_bracket_prices(side, limit_price, sl_price, tp_price)
+        except Exception as e:
+            return {
+                "_raw": {"error": {"code": "local_bracket_preflight_failed", "message": str(e)}},
+                "_sc": 0,
+                "_error": True,
+            }
+
         resp = self.api.place_order(
-            symbol                    = self.symbol,
-            side                      = side.lower(),
-            order_type                = "limit",
-            size                      = contracts,
-            limit_price               = float(limit_price),
-            bracket_stop_loss_price   = float(sl_price),
-            bracket_take_profit_price = float(tp_price),
-            post_only                 = False,
-            time_in_force             = "gtc",
+            symbol                           = self.symbol,
+            side                             = side.lower(),
+            order_type                       = "limit",
+            size                             = contracts,
+            limit_price                      = prices["limit_price"],
+            bracket_stop_loss_price          = prices["bracket_stop_loss_price"],
+            bracket_stop_loss_limit_price    = prices["bracket_stop_loss_limit_price"],
+            bracket_take_profit_price        = prices["bracket_take_profit_price"],
+            bracket_take_profit_limit_price  = prices["bracket_take_profit_limit_price"],
+            bracket_stop_trigger_method      = str(getattr(config, "DELTA_BRACKET_STOP_TRIGGER_METHOD", "last_traded_price") or "last_traded_price"),
+            post_only                        = False,
+            time_in_force                    = "gtc",
         )
         oid = self.extract_order_id(resp)
         if not oid:
@@ -520,6 +614,8 @@ class _DeltaAdapter:
             return {"_raw": resp, "_sc": sc, "_error": True}
         result = resp.get("result", {}) if isinstance(resp, dict) else {}
         result["order_id"] = oid
+        result["submitted_contracts"] = int(contracts)
+        result["submitted_prices"] = prices
         return result
 
     def cancel_order(self, order_id: str) -> Dict:
@@ -797,6 +893,7 @@ class OrderManager:
         # 1 000 entries covers well over a year of daily trading; oldest records
         # are evicted automatically once the cap is reached.
         self.order_history: deque = deque(maxlen=1_000)
+        self.last_order_error: Optional[Dict] = None
         self._rate_window_start = time.time()
         self._rate_window_count = 0
         self._open_orders_404   = False
@@ -832,6 +929,25 @@ class OrderManager:
         return self._adapter.limiter
 
     # ── Internal helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _compact_error(raw) -> str:
+        try:
+            if isinstance(raw, dict):
+                err = raw.get("error")
+                if isinstance(err, dict):
+                    code = err.get("code") or ""
+                    msg = err.get("message") or ""
+                    ctx = err.get("context") or {}
+                    ctx_s = f" ctx={ctx}" if ctx else ""
+                    return f"{code}: {msg}{ctx_s}".strip(": ")
+                if raw.get("error"):
+                    return str(raw.get("error"))
+                if raw.get("message"):
+                    return str(raw.get("message"))
+            return str(raw)[:500]
+        except Exception:
+            return str(raw)[:500]
 
     @staticmethod
     def _normalize_side(side: str) -> str:
@@ -1357,6 +1473,7 @@ class OrderManager:
           begins.  Used by the strategy watchdog to switch from Stage-A
           (pre-order) to Stage-B (post-order) timing. Never raises.
         """
+        self.last_order_error = None
         if not hasattr(self._adapter, "place_bracket_limit_entry"):
             return None  # Non-Delta: caller uses place_limit_entry + separate SL/TP
 
@@ -1372,7 +1489,14 @@ class OrderManager:
         if not data or data.get("_error"):
             sc = (data or {}).get("_sc", 0)
             raw = (data or {}).get("_raw", {})
-            logger.error(f"Bracket order failed: sc={sc} raw={raw}")
+            reason = self._compact_error(raw)
+            self.last_order_error = {
+                "stage": "delta_native_bracket_entry",
+                "status_code": sc,
+                "reason": reason,
+                "raw": raw,
+            }
+            logger.error(f"Bracket order failed: sc={sc} reason={reason} raw={raw}")
             return None
 
         order_id = data.get("order_id", "")

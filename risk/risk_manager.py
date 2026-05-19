@@ -326,6 +326,7 @@ class RiskManager:
         quantity:      float,
         reason:        str,
         pnl_override:  float = None,
+        entry_leverage: float = None,
     ):
         """
         Record a completed trade.
@@ -381,7 +382,12 @@ class RiskManager:
             is_win = pnl > 0
 
             notional_at_entry = entry_price * quantity
-            margin_used       = notional_at_entry / config.LEVERAGE if config.LEVERAGE > 0 else notional_at_entry
+            try:
+                _lev_for_margin = float(entry_leverage or getattr(config, "LEVERAGE", 1.0) or 1.0)
+            except Exception:
+                _lev_for_margin = 1.0
+            _lev_for_margin = max(_lev_for_margin, 1.0)
+            margin_used       = notional_at_entry / _lev_for_margin if _lev_for_margin > 0 else notional_at_entry
             return_on_margin  = (pnl / margin_used * 100) if margin_used > 0 else 0.0
 
             trade = TradeRecord(

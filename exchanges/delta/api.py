@@ -883,6 +883,14 @@ class DeltaAPI:
         # Delta Exchange uses it to distinguish SL vs TP conditional orders
         # that share the same base order_type (market_order + stop_price).
         stop_order_type: Optional[str]    = None,
+        # ── Delta native bracket child fields ─────────────────────────────────
+        # The public CreateOrderRequest schema supports both trigger and limit
+        # prices for native bracket children.  Supplying only trigger prices can
+        # be accepted on some contracts but rejected on others, especially
+        # non-BTC tokenised commodity/equity products.
+        bracket_stop_loss_limit_price: Optional[float] = None,
+        bracket_take_profit_limit_price: Optional[float] = None,
+        bracket_stop_trigger_method: Optional[str] = None,
         # isomorphic_slippage_check is passed through if provided (advanced)
         isomorphic_slippage_check: Optional[bool] = None,
     ) -> Dict:
@@ -947,8 +955,14 @@ class DeltaAPI:
             body["client_order_id"] = client_order_id
         if bracket_stop_loss_price is not None:
             body["bracket_stop_loss_price"] = str(bracket_stop_loss_price)
+        if bracket_stop_loss_limit_price is not None:
+            body["bracket_stop_loss_limit_price"] = str(bracket_stop_loss_limit_price)
         if bracket_take_profit_price is not None:
             body["bracket_take_profit_price"] = str(bracket_take_profit_price)
+        if bracket_take_profit_limit_price is not None:
+            body["bracket_take_profit_limit_price"] = str(bracket_take_profit_limit_price)
+        if bracket_stop_trigger_method:
+            body["bracket_stop_trigger_method"] = str(bracket_stop_trigger_method)
         if trailing_stop_delta is not None:
             body["trailing_stop_delta"] = str(trailing_stop_delta)
         if mmp:

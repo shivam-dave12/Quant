@@ -205,6 +205,10 @@ class ExecutionRouter:
         return CancelResult
 
     @property
+    def last_order_error(self):
+        return getattr(self.active, "last_order_error", None)
+
+    @property
     def _open_orders_404(self):
         return self.active._open_orders_404
 

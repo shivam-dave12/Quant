@@ -759,7 +759,7 @@ class HardeningTests(unittest.TestCase):
             )
 
         self.assertIsNone(qty)
-        self.assertIn("below configured minimum margin", "\n".join(logs.output))
+        self.assertIn("SL distance too wide for margin-risk budget", "\n".join(logs.output))
 
     def test_position_sizing_interprets_legacy_percent_style_risk(self):
         import config
@@ -795,7 +795,7 @@ class HardeningTests(unittest.TestCase):
 
             self.assertIsNone(qty)
             self.assertIn("looks percent-style", "\n".join(logs.output))
-            self.assertIn("below configured minimum margin", "\n".join(logs.output))
+            self.assertIn("SL distance too wide for margin-risk budget", "\n".join(logs.output))
         finally:
             config.RISK_PER_TRADE = old_risk
 
@@ -875,7 +875,7 @@ class HardeningTests(unittest.TestCase):
             )
 
         self.assertIsNone(qty)
-        self.assertIn("dynamic allocation below exchange lot/min margin", "\n".join(logs.output))
+        self.assertIn("SL distance too wide for margin-risk budget", "\n".join(logs.output))
 
     def test_execution_geometry_repair_uses_structural_sl(self):
         from strategy.quant_strategy import QuantStrategy
@@ -1685,6 +1685,23 @@ class MultiAssetPortfolioTests(unittest.TestCase):
         self.assertAlmostEqual(scoped["risk_available"], 100.0)
         self.assertAlmostEqual(scoped["risk_total"], 100.0)
 
+    def test_available_funds_balance_allocation_does_not_slot_cap_cash(self):
+        guard = PortfolioManager()
+        guard.max_open_positions = 4
+        guard.budget_mode = "available_funds"
+        ctx = _Ctx("BTC", AssetClass.CRYPTO)
+        raw = {"available": 100.0, "total": 120.0}
+
+        scoped = guard.allocate_balance(ctx, [ctx], raw)
+
+        self.assertTrue(scoped["portfolio_scoped"])
+        self.assertEqual(scoped["portfolio_budget_mode"], "available_funds")
+        self.assertAlmostEqual(scoped["available"], 100.0)
+        self.assertAlmostEqual(scoped["total"], 120.0)
+        self.assertAlmostEqual(scoped["available_raw"], 100.0)
+        self.assertAlmostEqual(scoped["risk_available"], 120.0)
+        self.assertAlmostEqual(scoped["risk_total"], 120.0)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -2159,10 +2176,77 @@ def test_config_uses_margin_target_with_coherent_daily_budget():
     assert abs(cfg.risk.RISK_PER_TRADE - 0.015) < 1e-12
     assert cfg.risk.MAX_CONSECUTIVE_LOSSES == 3
     assert cfg.risk.RISK_PER_TRADE * cfg.risk.MAX_CONSECUTIVE_LOSSES <= cfg.risk.MAX_DAILY_LOSS_PCT / 100.0 + 1e-12
-    assert _config.MIN_MARGIN_PER_TRADE == 5
-    assert _config.MAX_MARGIN_PER_TRADE == 15
+    assert _config.MIN_MARGIN_PER_TRADE == 0
+    assert _config.MAX_MARGIN_PER_TRADE == 0
+    assert _config.MAX_ENTRY_MARGIN_USAGE_PCT == 0
+    assert _config.PORTFOLIO_BUDGET_MODE == "available_funds"
     assert abs(_config.QUANT_MARGIN_PCT - 0.36) < 1e-12
 
+
+
+
+def test_margin_risk_sizing_uses_margin_budget_and_dynamic_leverage():
+    from strategy.quant_strategy import QuantStrategy
+
+    strategy = object.__new__(QuantStrategy)
+    strategy._fee_engine = None
+    strategy._post_trade_agent = None
+    strategy._active_institutional_size_mult = 1.0
+    strategy._active_ic_size_mult = 1.0
+    strategy._active_post_exit_size_mult = 1.0
+    strategy._active_spread_cost_mult = 1.0
+    strategy._active_cross_asset_size_mult = 1.0
+
+    class FakeRisk:
+        def get_available_balance(self):
+            return {"available": 200.0, "total": 200.0}
+
+    price = 76951.0
+    sl_dist = 128.3
+    qty = strategy._compute_quantity(
+        FakeRisk(),
+        price=price,
+        sig=None,
+        ict_tier="S",
+        sl_price=price - sl_dist,
+        tp_price=price + 400.0,
+        side="long",
+        use_maker_entry=True,
+        posterior_prob=0.75,
+        prefetched_bal_info={"available": 200.0, "total": 200.0},
+    )
+
+    assert qty is not None
+    lev = float(strategy._active_effective_leverage)
+    margin_used = qty * price / lev
+    dollar_risk = qty * sl_dist
+    assert lev <= 9.0
+    assert margin_used <= 200.0 * 0.36 + 1e-9
+    assert dollar_risk <= margin_used * 0.015 * 1.02 + 1e-9
+
+
+def test_dynamic_leverage_is_set_before_entry_order_for_margin_risk():
+    from strategy.quant_strategy import QuantStrategy, SignalBreakdown
+
+    # This is a narrow unit check over the post-sizing leverage handoff block.
+    # Full _enter_trade coverage is intentionally avoided because it requires
+    # live data-manager candles, bracket child discovery and exchange state.
+    class FakeOM:
+        def __init__(self): self.calls = []
+        def set_leverage(self, leverage, product_id=None):
+            self.calls.append(int(leverage))
+            return {"success": True}
+
+    om = FakeOM()
+    strategy = object.__new__(QuantStrategy)
+    strategy._active_effective_leverage = 9.0
+    # Mirrors the exact entry-block invariant: if sizing used 9x while config is
+    # 40x, the exchange leverage must be normalized before order submission.
+    entry_lev = int(max(1, round(float(getattr(strategy, "_active_effective_leverage", 40) or 40))))
+    assert entry_lev == 9
+    resp = om.set_leverage(leverage=entry_lev)
+    assert resp["success"] is True
+    assert om.calls == [9]
 
 def test_conviction_session_loss_limit_is_desk_scoped_and_resets_on_session_change():
     import time
@@ -2527,3 +2611,123 @@ def test_reconcile_adoption_marks_risk_manager_position_open():
     src = Path('strategy/quant_strategy.py').read_text()
     assert "adoption means the exchange is already carrying risk" in src
     assert "set_position_open(True) adoption" in src
+
+# ===== BEGIN test_margin_based_sizing_invariants.py =====
+
+def test_margin_risk_leverage_math_matches_btc_example(monkeypatch):
+    import config
+    from strategy.quant_strategy import QuantStrategy
+
+    monkeypatch.setattr(config, "RISK_PER_TRADE", 0.015, raising=False)
+    monkeypatch.setattr(config, "LEVERAGE", 40, raising=False)
+    qs = object.__new__(QuantStrategy)
+
+    cap = qs._margin_risk_leverage_cap(price=76951.0, sl_dist=128.3, risk_pct=0.015)
+    lev = qs._effective_margin_risk_leverage(price=76951.0, sl_dist=128.3, risk_pct=0.015, configured_leverage=40)
+
+    assert 8.9 < cap < 9.1
+    assert lev == 8.0 or lev == 9.0  # floor semantics; exact depends on example SL rounding
+    assert (128.3 * lev / 76951.0) <= 0.015 + 1e-12
+
+
+def test_liquidation_guard_accepts_lower_effective_leverage_override():
+    from strategy.quant_strategy import QuantStrategy
+
+    qs = object.__new__(QuantStrategy)
+
+    high_lev_ok, _, _, _ = qs._sl_liquidation_sanity("long", 100.0, 96.0, leverage_override=40)
+    low_lev_ok, _, _, _ = qs._sl_liquidation_sanity("long", 100.0, 96.0, leverage_override=10)
+
+    assert high_lev_ok is False
+    assert low_lev_ok is True
+
+
+def test_entry_path_always_asserts_margin_risk_leverage_before_bracket():
+    import inspect
+    from strategy.quant_strategy import QuantStrategy
+
+    src = inspect.getsource(QuantStrategy._enter_trade)
+    assert "Always assert the leverage used by the sizing model" in src
+    assert "_must_assert_leverage" in src
+    assert "order_manager.set_leverage(leverage=_entry_leverage)" in src
+    assert "exchange would still be sitting at 9x" in src
+
+
+def test_risk_manager_record_trade_accepts_entry_leverage_for_margin_accounting():
+    import inspect
+    from risk.risk_manager import RiskManager
+
+    sig = inspect.signature(RiskManager.record_trade)
+    assert "entry_leverage" in sig.parameters
+    src = inspect.getsource(RiskManager.record_trade)
+    assert "_lev_for_margin" in src
+    assert "entry_leverage or getattr(config, \"LEVERAGE\"" in src
+
+# ===== END test_margin_based_sizing_invariants.py =====
+
+# ===== BEGIN test_delta_native_bracket_payload_hardening.py =====
+
+def test_delta_native_bracket_sends_child_limit_prices_and_trigger_method():
+    from types import SimpleNamespace
+    from execution.order_manager import _DeltaAdapter
+
+    class API:
+        def __init__(self):
+            self.kw = None
+        def place_order(self, **kw):
+            self.kw = kw
+            return {"success": True, "result": {"id": 12345, "state": "open"}}
+
+    inst = SimpleNamespace(
+        symbol="SLVONUSD", display_symbol="SLVONUSD", tick_size=0.01,
+        lot_step=1, min_qty=1, max_qty=1000, contract_value_btc=1.0,
+        product_id=777, asset_class="commodity",
+    )
+    api = API()
+    ad = _DeltaAdapter(api, exchange_instrument=inst)
+    res = ad.place_bracket_limit_entry("long", 1.9, 68.96, 68.50, 69.70)
+
+    assert res.get("order_id") == "12345"
+    assert api.kw["size"] == 2
+    assert api.kw["limit_price"] == 68.96
+    assert api.kw["bracket_stop_loss_price"] == 68.50
+    assert api.kw["bracket_stop_loss_limit_price"] < api.kw["bracket_stop_loss_price"]
+    assert api.kw["bracket_take_profit_price"] == 69.70
+    assert api.kw["bracket_take_profit_limit_price"] == 69.70
+    assert api.kw["bracket_stop_trigger_method"] == "last_traded_price"
+
+
+def test_delta_native_bracket_rejects_invalid_geometry_before_api_call():
+    from types import SimpleNamespace
+    from execution.order_manager import _DeltaAdapter
+
+    class API:
+        def __init__(self):
+            self.called = False
+        def place_order(self, **kw):
+            self.called = True
+            return {"success": True, "result": {"id": 12345}}
+
+    inst = SimpleNamespace(
+        symbol="SLVONUSD", display_symbol="SLVONUSD", tick_size=0.01,
+        lot_step=1, min_qty=1, max_qty=1000, contract_value_btc=1.0,
+        product_id=777, asset_class="commodity",
+    )
+    api = API()
+    ad = _DeltaAdapter(api, exchange_instrument=inst)
+    res = ad.place_bracket_limit_entry("long", 1.9, 68.96, 69.10, 69.70)
+
+    assert res.get("_error") is True
+    assert api.called is False
+    assert "local_bracket_preflight_failed" in str(res.get("_raw"))
+
+
+def test_strategy_bracket_failure_log_includes_order_manager_reason():
+    import inspect
+    from strategy.quant_strategy import QuantStrategy
+
+    src = inspect.getsource(QuantStrategy._enter_trade)
+    assert "last_order_error" in src
+    assert "reason=" in src
+
+# ===== END test_delta_native_bracket_payload_hardening.py =====

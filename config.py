@@ -39,10 +39,10 @@ COINSWITCH_SYMBOL        = "BTCUSDT"
 COINSWITCH_EXCHANGE      = "EXCHANGE_2"
 
 # ── Position sizing ───────────────────────────────────────────────────────────
-BALANCE_USAGE_PERCENTAGE = 36
-MAX_ENTRY_MARGIN_USAGE_PCT = BALANCE_USAGE_PERCENTAGE  # single-trade margin ceiling
-MIN_MARGIN_PER_TRADE     = 5
-MAX_MARGIN_PER_TRADE     = 15
+BALANCE_USAGE_PERCENTAGE = 100  # legacy/display only; sizing uses dynamic available funds + desk margin_pct
+MAX_ENTRY_MARGIN_USAGE_PCT = 0     # 0 = disabled; no arbitrary single-trade margin ceiling
+MIN_MARGIN_PER_TRADE     = 0       # 0 = no arbitrary dollar floor; exchange min_qty/step controls executability
+MAX_MARGIN_PER_TRADE     = 0       # 0 = no absolute dollar cap; dynamic available cash owns feasibility
 MIN_POSITION_SIZE        = 0.001
 MAX_POSITION_SIZE        = 100.0
 LOT_STEP_SIZE            = 0.001
@@ -578,16 +578,16 @@ SUSPENDED_TRADING_DESKS = ("STOCKS",)
 SUSPENDED_ASSET_CLASSES = ("equity", "index")
 
 # Portfolio slots: the bot may hold multiple contracts at once, but each
-# contract gets only one ENTERING/ACTIVE/EXITING slot.  The existing BTC-style
-# risk model is preserved by giving each contract a slot-scoped balance view
-# before QuantStrategy applies RISK_PER_TRADE and BALANCE_USAGE_PERCENTAGE.
+# contract gets only one ENTERING/ACTIVE/EXITING slot.  Sizing is not divided
+# into fixed equal buckets.  Each candidate sees live free cash from the
+# exchange and then applies its own desk/instrument margin_pct dynamically.
 PORTFOLIO_MAX_OPEN_POSITIONS = 6
 PORTFOLIO_MAX_OPEN_PER_CONTRACT = 1
 PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS = 3
-PORTFOLIO_BUDGET_MODE = "equal_slots"   # equal_slots | active_equal_slots
-# In multi-asset mode, margin/cash is slot-scoped but dollar-risk must remain
-# portfolio-aware.  This prevents BTC min-lot rejection when a valid minimum
-# order is inside the portfolio risk cap but above the confidence-haircut target.
+PORTFOLIO_BUDGET_MODE = "available_funds"   # available_funds | equal_slots | active_equal_slots
+# In multi-asset mode, margin/cash is live-free-cash aware while dollar-risk
+# remains portfolio-aware.  This prevents stale equal-slot caps while still
+# keeping true risk anchored to account equity.
 PORTFOLIO_RISK_BUDGET_MODE = "portfolio_equity"  # portfolio_equity | slot_equity
 PORTFOLIO_MIN_LOT_MAX_RISK_MULT = 1.15
 
@@ -632,7 +632,7 @@ POLICY_CRYPTO_LOOP_INTERVAL_SEC = 0.25
 
 POLICY_COMMODITY_RISK_MULT = 1.00
 POLICY_COMMODITY_MARGIN_PCT = 0.36
-POLICY_COMMODITY_MIN_MARGIN_USD = 5.00
+POLICY_COMMODITY_MIN_MARGIN_USD = 0.00
 POLICY_COMMODITY_TICK_EVAL_SEC = 0.50
 POLICY_COMMODITY_LOOP_INTERVAL_SEC = 0.50
 POLICY_COMMODITY_MIN_1M_BARS = 85
@@ -645,7 +645,7 @@ POLICY_COMMODITY_SL_BUFFER_ATR = 0.50
 
 POLICY_EQUITY_RISK_MULT = 0.55
 POLICY_EQUITY_MARGIN_PCT = 0.18
-POLICY_EQUITY_MIN_MARGIN_USD = 5.00
+POLICY_EQUITY_MIN_MARGIN_USD = 0.00
 POLICY_EQUITY_TICK_EVAL_SEC = 0.75
 POLICY_EQUITY_LOOP_INTERVAL_SEC = 0.75
 POLICY_EQUITY_MIN_1M_BARS = 90

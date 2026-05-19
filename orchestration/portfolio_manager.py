@@ -28,7 +28,7 @@ class PortfolioManager:
         self.max_open_positions = max(1, int(getattr(config, 'PORTFOLIO_MAX_OPEN_POSITIONS', 4)))
         self.max_same_class = max(1, int(getattr(config, 'PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS', self.max_open_positions)))
         self.max_per_contract = max(1, int(getattr(config, 'PORTFOLIO_MAX_OPEN_PER_CONTRACT', 1)))
-        self.budget_mode = str(getattr(config, 'PORTFOLIO_BUDGET_MODE', 'equal_slots')).lower()
+        self.budget_mode = str(getattr(config, 'PORTFOLIO_BUDGET_MODE', 'available_funds')).lower()
         self.risk_budget_mode = str(getattr(config, 'PORTFOLIO_RISK_BUDGET_MODE', 'portfolio_equity')).lower()
         self._lock = threading.RLock()
         self._balance_cache: Dict[str, Dict[str, Any]] = {}
@@ -101,29 +101,40 @@ class PortfolioManager:
 
         configured_slots = max(1, self.max_open_positions)
         active_universe = max(1, len(contexts or []))
-        slot_count = min(configured_slots, active_universe) if self.budget_mode in {'active_equal_slots', 'active_slots'} else configured_slots
-        slot_equity = raw_total / float(slot_count) if slot_count > 0 else raw_total
-        slot_available = min(slot_equity, raw_available)
+        mode = self.budget_mode
+        if mode in {'equal_slots', 'active_equal_slots', 'active_slots'}:
+            # Legacy/testable mode: split cash into fixed slots.
+            slot_count = min(configured_slots, active_universe) if mode in {'active_equal_slots', 'active_slots'} else configured_slots
+            slot_equity = raw_total / float(slot_count) if slot_count > 0 else raw_total
+            slot_available = min(slot_equity, raw_available)
+            allocation_mode = mode
+        else:
+            # Institutional live mode: no arbitrary per-slot cash cap.  Open
+            # brackets already reduce exchange free cash; the sizing engine then
+            # applies desk margin_pct, confidence, SL geometry, fees, lot rules
+            # and liquidation checks to the actual available funds.
+            slot_count = configured_slots
+            slot_equity = raw_total
+            slot_available = raw_available
+            allocation_mode = 'available_funds'
 
         pol = active_policy(getattr(ctx, 'instrument', None) if ctx is not None else None)
-        # Margin/cash budget is slot-scoped and per-policy.  Risk-dollar base is
-        # portfolio equity by default, then multiplied by the instrument policy.
+        # Margin/cash budget is live-free-cash aware and per-policy.  Risk-dollar
+        # base is portfolio equity by default, then multiplied by instrument policy.
         adjusted = dict(raw_balance)
         adjusted['available_raw'] = raw_available
         adjusted['total_raw'] = raw_total
         adjusted['available'] = max(0.0, slot_available)
         adjusted['total'] = max(0.0, slot_equity)
-        # Risk sizing must be based on portfolio equity, not exchange free cash.
-        # Free cash shrinks as earlier brackets reserve margin; using it as the
-        # risk base makes the 2nd/3rd trade mechanically smaller even when the
-        # portfolio equity is unchanged.  Margin feasibility remains protected by
-        # the slot-scoped `available` field above, so we do not fabricate spendable
-        # cash; we only keep dollar-risk sizing anchored to the account equity.
+        # Risk reporting can remain based on portfolio equity, but margin/cash
+        # feasibility is based on actual exchange free cash.  Earlier brackets
+        # naturally reduce raw_available, so later trades adapt without fixed
+        # slot caps or fabricated spendable cash.
         adjusted['risk_available'] = raw_total if self.risk_budget_mode == 'portfolio_equity' else slot_available
         adjusted['risk_total'] = raw_total if self.risk_budget_mode == 'portfolio_equity' else slot_equity
         adjusted['portfolio_free_cash_after_reserves'] = raw_available
         adjusted['portfolio_scoped'] = True
-        adjusted['portfolio_budget_mode'] = self.budget_mode
+        adjusted['portfolio_budget_mode'] = allocation_mode
         adjusted['portfolio_risk_budget_mode'] = self.risk_budget_mode
         adjusted['portfolio_slot_count'] = slot_count
         adjusted['portfolio_slot_available'] = slot_available

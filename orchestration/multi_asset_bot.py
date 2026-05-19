@@ -801,7 +801,7 @@ class MultiAssetQuantBot:
         lines.append("<b>Portfolio rules:</b>")
         lines.append(f"• Multiple simultaneous contracts allowed: {self.guard.max_open_positions} portfolio slots")
         lines.append(f"• One live/entering/exit slot per contract: max {self.guard.max_per_contract}")
-        lines.append(f"• Balance allocation: {self.guard.budget_mode}; cash is slot-scoped, risk base is {self.guard.risk_budget_mode}; sizing uses per-instrument policy, not BTC defaults")
+        lines.append(f"• Balance allocation: {self.guard.budget_mode}; cash uses live available funds, risk base is {self.guard.risk_budget_mode}; sizing uses per-instrument policy, not BTC defaults")
         lines.append("• Live exchange products only; no synthetic symbols. Stock/equity/index desk is suspended and excluded before discovery.")
         lines.append("• Alpha remains posterior/EV based; PortfolioManager only controls exposure mechanics")
         lines.append("• Cross-asset overlay active for BTC/GOLD/SILVER: correlation, relative value, TP reach and cluster risk drive sizing/TP; unsponsored opposite metal-pair exposure is blocked as portfolio-risk, not as a retail signal filter")
