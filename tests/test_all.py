@@ -746,22 +746,22 @@ class HardeningTests(unittest.TestCase):
 
         price = 10000.0
         sl_dist = 5.0 / 0.00175
-        with self.assertLogs("strategy.quant_strategy", level="WARNING") as logs:
-            qty = strategy._compute_quantity(
-                FakeRisk(),
-                price=price,
-                sig=None,
-                ict_tier="S",
-                sl_price=price - sl_dist,
-                tp_price=price + 6000.0,
-                side="long",
-                use_maker_entry=True,
-                posterior_prob=0.75,
-                prefetched_bal_info={"available": 1000.0, "total": 1000.0},
-            )
+        qty = strategy._compute_quantity(
+            FakeRisk(),
+            price=price,
+            sig=None,
+            ict_tier="S",
+            sl_price=price - sl_dist,
+            tp_price=price + 6000.0,
+            side="long",
+            use_maker_entry=True,
+            posterior_prob=0.75,
+            prefetched_bal_info={"available": 1000.0, "total": 1000.0},
+        )
 
-        self.assertIsNone(qty)
-        self.assertIn("SL distance too wide for margin-risk budget", "\n".join(logs.output))
+        self.assertIsNotNone(qty)
+        self.assertGreaterEqual(float(strategy._active_effective_leverage), 3.0)
+        self.assertGreater(qty * price / float(strategy._active_effective_leverage), 10.0)
 
     def test_position_sizing_interprets_legacy_percent_style_risk(self):
         import config
@@ -795,9 +795,9 @@ class HardeningTests(unittest.TestCase):
                     prefetched_bal_info={"available": 1000.0, "total": 1000.0},
                 )
 
-            self.assertIsNone(qty)
+            self.assertIsNotNone(qty)
             self.assertIn("looks percent-style", "\n".join(logs.output))
-            self.assertIn("SL distance too wide for margin-risk budget", "\n".join(logs.output))
+            self.assertGreaterEqual(float(strategy._active_effective_leverage), 9.0)
         finally:
             config.RISK_PER_TRADE = old_risk
 
@@ -845,7 +845,7 @@ class HardeningTests(unittest.TestCase):
         self.assertIsNotNone(qty)
         self.assertGreaterEqual(qty, 0.001)
         self.assertLessEqual(qty * sl_dist, 204.86 * config.RISK_PER_TRADE * 1.15 + 1e-9)
-        required_margin = qty * price / 40.0
+        required_margin = qty * price / float(strategy._active_effective_leverage)
         self.assertLessEqual(required_margin, 51.21 * 0.60 + 1e-9)
 
     def test_position_sizing_rejects_min_lot_above_haircut_risk_budget(self):
@@ -877,7 +877,7 @@ class HardeningTests(unittest.TestCase):
             )
 
         self.assertIsNone(qty)
-        self.assertIn("SL distance too wide for margin-risk budget", "\n".join(logs.output))
+        self.assertIn("dynamic allocation below exchange lot/min margin", "\n".join(logs.output))
 
     def test_execution_geometry_repair_uses_structural_sl(self):
         from strategy.quant_strategy import QuantStrategy
@@ -2178,13 +2178,13 @@ def test_config_uses_margin_target_with_coherent_daily_budget():
     import config as _config
     from config_schema import cfg
 
-    assert abs(_config.RISK_PER_TRADE - 0.015) < 1e-12
+    assert abs(_config.RISK_PER_TRADE - 0.020) < 1e-12
     assert _config.MAX_CONSECUTIVE_LOSSES == 3
     # Conviction/session loss limit is deliberately separate from the global
     # risk-manager loss streak.  Desk-specific overrides live in TRADING_DESKS.
     assert _config.CONVICTION_MAX_SESSION_LOSSES == 2
     assert _config.CONVICTION_MAX_SESSION_LOSSES != _config.MAX_CONSECUTIVE_LOSSES
-    assert abs(cfg.risk.RISK_PER_TRADE - 0.015) < 1e-12
+    assert abs(cfg.risk.RISK_PER_TRADE - 0.020) < 1e-12
     assert cfg.risk.MAX_CONSECUTIVE_LOSSES == 3
     assert cfg.risk.RISK_PER_TRADE * cfg.risk.MAX_CONSECUTIVE_LOSSES <= cfg.risk.MAX_DAILY_LOSS_PCT / 100.0 + 1e-12
     assert _config.MIN_MARGIN_PER_TRADE == 0
@@ -2192,7 +2192,7 @@ def test_config_uses_margin_target_with_coherent_daily_budget():
     assert not hasattr(_config, "MAX_ENTRY_MARGIN_USAGE_PCT")
     assert not hasattr(_config, "BALANCE_USAGE_PERCENTAGE")
     assert _config.PORTFOLIO_BUDGET_MODE == "available_funds"
-    assert abs(_config.QUANT_MARGIN_PCT - 0.36) < 1e-12
+    assert abs(_config.QUANT_MARGIN_PCT - 0.50) < 1e-12
 
 
 
@@ -2232,12 +2232,11 @@ def test_margin_risk_sizing_uses_margin_budget_and_dynamic_leverage():
     lev = float(strategy._active_effective_leverage)
     margin_used = qty * price / lev
     dollar_risk = qty * sl_dist
-    # Aggressive allocator: approved trades may use higher leverage than the
-    # conservative base-risk cap, but remain inside the daily-circuit-derived
-    # effective margin-risk envelope.
-    assert 30.0 <= lev <= 33.0
-    assert margin_used >= 35.0
-    assert margin_used <= 200.0 * 0.36 * 1.15 + 1e-9
+    # Aggressive allocator: approved trades now target the exchange-max
+    # leverage band for ROE; quantity carries the dollar-risk control.
+    assert 44.0 <= lev <= 45.0
+    assert margin_used >= 25.0
+    assert margin_used <= 200.0 * 0.50 * 1.15 + 1e-9
     assert dollar_risk <= margin_used * strategy._active_margin_risk_pct + 0.20
 
 
@@ -2690,7 +2689,7 @@ def test_aggressive_margin_risk_pct_derives_from_daily_circuit(monkeypatch):
     import config
     from strategy.quant_strategy import QuantStrategy
 
-    monkeypatch.setattr(config, "RISK_PER_TRADE", 0.015, raising=False)
+    monkeypatch.setattr(config, "RISK_PER_TRADE", 0.020, raising=False)
     monkeypatch.setattr(config, "MAX_DAILY_LOSS_PCT", 10.0, raising=False)
     monkeypatch.setattr(config, "MAX_CONSECUTIVE_LOSSES", 3, raising=False)
     qs = object.__new__(QuantStrategy)
@@ -2699,7 +2698,7 @@ def test_aggressive_margin_risk_pct_derives_from_daily_circuit(monkeypatch):
     cap = qs._daily_safe_margin_risk_cap(base)
     eff = qs._aggressive_margin_risk_pct(base, margin_intensity=1.0)
 
-    assert base == 0.015
+    assert base == 0.020
     assert 0.029 <= cap <= 0.031
     assert 0.029 <= eff <= 0.031
 
@@ -2728,26 +2727,47 @@ def test_margin_risk_leverage_math_matches_btc_example(monkeypatch):
     lev = qs._effective_margin_risk_leverage(price=76951.0, sl_dist=128.3, risk_pct=0.015, configured_leverage=40)
 
     assert 8.9 < cap < 9.1
-    assert lev == 8.0 or lev == 9.0  # floor semantics; exact depends on example SL rounding
-    assert (128.3 * lev / 76951.0) <= 0.015 + 1e-12
+    assert lev == 40.0
+    assert cap < lev  # diagnostic only; leverage is no longer capped by retail margin-risk math
+    assert (128.3 * lev / 76951.0) < 0.07
 
 
-def test_roe_leverage_pressure_raises_effective_leverage_without_changing_base_cap(monkeypatch):
+def test_aggressive_leverage_targets_exchange_max_band_after_risk_cap(monkeypatch):
     import config
     from strategy.quant_strategy import QuantStrategy
 
-    monkeypatch.setattr(config, "LEVERAGE", 40, raising=False)
+    monkeypatch.setattr(config, "LEVERAGE", 45, raising=False)
     qs = object.__new__(QuantStrategy)
 
-    base = qs._effective_margin_risk_leverage(
+    capped_exchange = qs._effective_margin_risk_leverage(
         price=76951.0, sl_dist=128.3, risk_pct=0.03,
         configured_leverage=40, leverage_pressure=1.0)
-    aggressive = qs._effective_margin_risk_leverage(
+    full_exchange = qs._effective_margin_risk_leverage(
         price=76951.0, sl_dist=128.3, risk_pct=0.03,
-        configured_leverage=40, leverage_pressure=qs._roe_leverage_pressure(1.0))
+        configured_leverage=45, margin_intensity=1.0)
 
-    assert 17.0 <= base <= 18.0
-    assert 31.0 <= aggressive <= 33.0
+    assert capped_exchange == 40.0
+    assert full_exchange == 45.0
+    assert qs._margin_risk_leverage_cap(price=76951.0, sl_dist=128.3, risk_pct=0.03) < full_exchange
+
+
+def test_aggressive_leverage_clips_to_liquidation_cap_without_rejecting_frequency(monkeypatch):
+    import config
+    from strategy.quant_strategy import QuantStrategy
+
+    monkeypatch.setattr(config, "LEVERAGE", 45, raising=False)
+    qs = object.__new__(QuantStrategy)
+
+    liq_cap = qs._liquidation_safe_leverage_cap(
+        "long", 100.0, 96.0, configured_leverage=45)
+    lev = qs._effective_margin_risk_leverage(
+        price=100.0, sl_dist=4.0, configured_leverage=45,
+        side="long", sl_price=96.0, margin_intensity=1.0)
+    unsafe, _, _, _ = qs._sl_liquidation_sanity("long", 100.0, 96.0, leverage_override=45)
+
+    assert 20.0 <= liq_cap <= 21.0
+    assert 19.0 <= lev <= 20.0
+    assert unsafe is False
 
 
 def test_liquidation_guard_accepts_lower_effective_leverage_override():

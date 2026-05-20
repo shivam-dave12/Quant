@@ -3438,20 +3438,91 @@ class QuantStrategy:
             return 0.0
         return (risk_pct * price) / max(sl_dist, 1e-12)
 
+    def _aggressive_leverage_target(self, configured_leverage: float = None,
+                                    margin_intensity: float = 1.0) -> float:
+        """Institutional leverage target: press toward 40-45x, capped by venue max."""
+        exchange_max = max(float(QCfg.LEVERAGE() if configured_leverage is None else configured_leverage), 1.0)
+        low = max(1.0, float(_cfg("AGGRESSIVE_LEVERAGE_FLOOR", 40.0) or 40.0))
+        high = max(low, float(_cfg("AGGRESSIVE_LEVERAGE_TARGET", 45.0) or 45.0))
+        if exchange_max <= low:
+            return exchange_max
+        top = min(exchange_max, high)
+        pressure = math.sqrt(self._bounded(margin_intensity, 0.0, 1.0))
+        return self._bounded(low + (top - low) * pressure, 1.0, exchange_max)
+
+    def _aggressive_leverage_floor(self, configured_leverage: float = None) -> float:
+        """Preferred floor for the aggressive-leverage regime; not a trade veto."""
+        exchange_max = max(float(QCfg.LEVERAGE() if configured_leverage is None else configured_leverage), 1.0)
+        floor = max(1.0, float(_cfg("AGGRESSIVE_LEVERAGE_FLOOR", 40.0) or 40.0))
+        return min(exchange_max, floor)
+
+    def _liquidation_safe_leverage_cap(self, side: str, entry: float, sl: float,
+                                       configured_leverage: float = None) -> float:
+        """Highest leverage that leaves the actual SL before the liquidation guard."""
+        configured = max(float(QCfg.LEVERAGE() if configured_leverage is None else configured_leverage), 1.0)
+        side = str(side or "").lower()
+        entry = float(entry or 0.0)
+        sl = float(sl or 0.0)
+        if side not in ("long", "short") or entry <= 0.0 or sl <= 0.0:
+            return 0.0
+        ok, _, _, _ = self._sl_liquidation_sanity(side, entry, sl, leverage_override=configured)
+        if ok:
+            return configured
+        ok_min, _, _, _ = self._sl_liquidation_sanity(side, entry, sl, leverage_override=1.0)
+        if not ok_min:
+            return 0.0
+        lo, hi = 1.0, configured
+        for _ in range(32):
+            mid = (lo + hi) / 2.0
+            ok_mid, _, _, _ = self._sl_liquidation_sanity(side, entry, sl, leverage_override=mid)
+            if ok_mid:
+                lo = mid
+            else:
+                hi = mid
+        return max(1.0, lo)
+
     def _effective_margin_risk_leverage(self, price: float, sl_dist: float,
                                         risk_pct: float = None,
                                         configured_leverage: float = None,
-                                        leverage_pressure: float = 1.0) -> float:
+                                        leverage_pressure: float = 1.0,
+                                        side: str = None,
+                                        sl_price: float = None,
+                                        margin_intensity: float = None) -> float:
         """
-        Leverage assumed by every pre-order risk calculation.  This mirrors the
-        actual leverage asserted to the exchange before bracket placement.
+        Leverage asserted to the exchange before bracket placement.
+
+        Dollar risk is controlled by quantity sizing.  Leverage is therefore
+        selected from the aggressive venue-max band first, then clipped only by
+        the actual SL/liquidation geometry.
         """
         configured = max(float(QCfg.LEVERAGE() if configured_leverage is None else configured_leverage), 1.0)
-        cap = self._margin_risk_leverage_cap(price, sl_dist, risk_pct=risk_pct)
-        if not math.isfinite(cap) or cap < 1.0:
+        price = float(price or 0.0)
+        sl_dist = abs(float(sl_dist or 0.0))
+        if price <= 0.0 or sl_dist <= 0.0:
             return 0.0
-        cap *= self._bounded(leverage_pressure, 1.0, 1.85)
-        return max(1.0, min(configured, math.floor(cap)))
+        if margin_intensity is None:
+            margin_intensity = self._bounded((float(leverage_pressure or 1.0) - 1.0) / 0.85, 0.0, 1.0)
+            if abs(float(leverage_pressure or 1.0) - 1.0) <= 1e-9:
+                margin_intensity = 1.0
+        target = self._aggressive_leverage_target(
+            configured_leverage=configured,
+            margin_intensity=margin_intensity,
+        )
+        side_l = str(side or "").lower()
+        if sl_price is None:
+            if side_l == "short":
+                sl = price + sl_dist
+            else:
+                side_l = "long"
+                sl = price - sl_dist
+        else:
+            sl = float(sl_price or 0.0)
+            if side_l not in ("long", "short"):
+                side_l = "long" if sl < price else "short"
+        liq_cap = self._liquidation_safe_leverage_cap(side_l, price, sl, configured_leverage=configured)
+        if liq_cap <= 0.0:
+            return 0.0
+        return max(1.0, min(configured, math.floor(min(target, liq_cap))))
 
     def _roe_leverage_pressure(self, margin_intensity: float) -> float:
         """Raise return on equity for approved trades without changing SL dollar risk."""
@@ -3710,7 +3781,8 @@ class QuantStrategy:
         sl_atr = sl_dist / max(float(atr or 0.0), 1e-9)
         tp_atr = tp_dist / max(float(atr or 0.0), 1e-9)
 
-        _liq_preview_lev = self._effective_margin_risk_leverage(entry, sl_dist) or QCfg.LEVERAGE()
+        _liq_preview_lev = self._effective_margin_risk_leverage(
+            entry, sl_dist, side=side, sl_price=sl) or QCfg.LEVERAGE()
         liq_ok, liq_price, liq_guard, liq_reason = self._sl_liquidation_sanity(
             side, entry, sl, leverage_override=_liq_preview_lev)
         if not liq_ok:
@@ -6845,7 +6917,8 @@ class QuantStrategy:
         if sd < 1e-10: return
         rr = td / sd
         _liq_entry_ref = entry_ref
-        _liq_preview_lev = self._effective_margin_risk_leverage(_liq_entry_ref, sd) or QCfg.LEVERAGE()
+        _liq_preview_lev = self._effective_margin_risk_leverage(
+            _liq_entry_ref, sd, side=side, sl_price=sl_price) or QCfg.LEVERAGE()
         _liq_ok, _liq_px, _liq_guard, _liq_reason = self._sl_liquidation_sanity(
             side, _liq_entry_ref, sl_price, leverage_override=_liq_preview_lev)
         if not _liq_ok:
@@ -9447,20 +9520,35 @@ class QuantStrategy:
         # This gives the bot higher leverage on approved trades while keeping
         # the SL loss inside the daily-circuit-derived risk envelope.
         configured_leverage = max(float(QCfg.LEVERAGE()), 1.0)
-        base_margin_risk_leverage_cap = self._margin_risk_leverage_cap(price, sl_dist, risk_pct=effective_risk_pct)
-        margin_risk_leverage_cap = base_margin_risk_leverage_cap * roe_leverage_pressure
-        if not math.isfinite(base_margin_risk_leverage_cap) or base_margin_risk_leverage_cap < 1.0:
+        aggressive_leverage_target = self._aggressive_leverage_target(
+            configured_leverage=configured_leverage,
+            margin_intensity=margin_intensity,
+        )
+        liquidation_leverage_cap = self._liquidation_safe_leverage_cap(
+            exec_side, price, sl_price, configured_leverage=configured_leverage,
+        )
+        if liquidation_leverage_cap <= 0.0:
             logger.warning(
-                f"Sizing rejected: SL distance too wide for margin-risk budget (aggressive) | "
+                f"Sizing rejected: SL is beyond liquidation guard for aggressive leverage | "
                 f"base_risk={risk_pct:.3%} effective_risk={effective_risk_pct:.3%} "
                 f"price=${price:.2f} SL-dist={sl_dist:.2f}pts "
-                f"max_leverage={margin_risk_leverage_cap:.2f}x < 1x")
+                f"exchange_max={configured_leverage:.0f}x")
             return None
         effective_leverage = self._effective_margin_risk_leverage(
             price, sl_dist, risk_pct=effective_risk_pct,
             configured_leverage=configured_leverage,
             leverage_pressure=roe_leverage_pressure,
+            side=exec_side,
+            sl_price=sl_price,
+            margin_intensity=margin_intensity,
         )
+        if not math.isfinite(effective_leverage) or effective_leverage < 1.0:
+            logger.warning(
+                f"Sizing rejected: no executable aggressive leverage | "
+                f"target={aggressive_leverage_target:.1f}x "
+                f"liq_cap={liquidation_leverage_cap:.1f}x "
+                f"exchange_max={configured_leverage:.0f}x")
+            return None
         leverage = float(effective_leverage)
         self._active_effective_leverage = float(effective_leverage)
         self._active_margin_risk_pct = (sl_dist * leverage / price) if price > 0 else 0.0
@@ -9624,7 +9712,8 @@ class QuantStrategy:
             f"({risk_pct_act:.2f}% risk-base; {slot_risk_pct:.2f}% slot) | "
             f"margin=${margin_used:.2f} target=${target_margin_budget:.2f} "
             f"policy_target=${policy_target_margin:.2f} min=${min_trade_margin:.2f} cap=${max_allowed_margin:.2f} | "
-            f"lev={leverage:.0f}x roe_pressure={roe_leverage_pressure:.2f} "
+            f"lev={leverage:.0f}x target={aggressive_leverage_target:.1f}x "
+            f"liq_cap={liquidation_leverage_cap:.1f}x roe_pressure={roe_leverage_pressure:.2f} "
             f"margin_risk={self._active_margin_risk_pct:.2%} | "
             f"fees≈${actual_fees:.3f} ({fee_to_risk:.2f}R) | "
             f"cash=${required_cash:.2f}/${cash_available:.2f} | "

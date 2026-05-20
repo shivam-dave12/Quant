@@ -31,7 +31,9 @@ if not DELTA_API_KEY and not COINSWITCH_API_KEY:
 
 # ── Symbol / Leverage ─────────────────────────────────────────────────────────
 SYMBOL                   = "BTCUSDT"
-LEVERAGE                 = 40
+LEVERAGE                 = 45
+AGGRESSIVE_LEVERAGE_FLOOR = 40
+AGGRESSIVE_LEVERAGE_TARGET = 45
 DELTA_SYMBOL             = "BTCUSD"
 DELTA_CONTRACT_VALUE_BTC = 0.001
 DELTA_BALANCE_CURRENCY   = "USD"
@@ -53,11 +55,11 @@ REMAINDER_MIN_QTY        = 0.001
 #   The inconsistency caused 100× over-sizing (entire balance at risk per trade),
 #   triggering the "required margin > available — scaling down" warnings in logs.
 #   Fix: one convention (fraction), both consumers agree. See risk_manager.py line 266.
-RISK_PER_TRADE           = 0.015  # 1.5% true SL risk; 3 full losses stay inside 5% day circuit
+RISK_PER_TRADE           = 0.020  # 2.0% true SL risk; aggressive ROE while staying inside day circuit
 MAX_DAILY_LOSS           = 10000
 MAX_DAILY_LOSS_PCT       = 10.0       # day circuit breaker
 MAX_DRAWDOWN_PCT         = 25.0      # realistic drawdown limit
-MAX_CONSECUTIVE_LOSSES   = 3     # risk-synchronized with 1.5% per-trade risk and 5% daily circuit
+MAX_CONSECUTIVE_LOSSES   = 3     # risk-synchronized with 2.0% per-trade risk and 10% daily circuit
 ALLOW_TIME_BASED_CONSEC_LOSS_RESET = False
 CONSEC_LOSS_AUTO_RESET_HOURS = 1.0
 MAX_DAILY_TRADES         = 6         # institutional selectivity; matches 3-6 trade/session design
@@ -228,7 +230,7 @@ AGG_OB_DEPTH_LEVELS  = 10
 AGG_TRADE_WINDOW_SEC = 30.0
 
 # ── Quant Strategy ────────────────────────────────────────────────────────────
-QUANT_MARGIN_PCT               = 0.36
+QUANT_MARGIN_PCT               = 0.50
 QUANT_SLIPPAGE_TOLERANCE       = 0.0005
 QUANT_VWAP_ENTRY_ATR_MULT      = 1.2
 QUANT_CVD_DIVERGENCE_MIN       = 0.15
