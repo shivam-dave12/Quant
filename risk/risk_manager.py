@@ -416,11 +416,25 @@ class RiskManager:
                 self.consecutive_losses += 1
                 self._last_loss_time     = time.time()   # Bug #3 fix
 
+            qty_unit = "contracts"
+            try:
+                ctx_getter = getattr(self, "_portfolio_context_getter", None)
+                ctx = ctx_getter() if callable(ctx_getter) else None
+                inst = getattr(ctx, "instrument", None) if ctx is not None else None
+                qty_unit = str(
+                    getattr(inst, "asset_id", "")
+                    or getattr(inst, "display_name", "")
+                    or getattr(inst, "symbol", "")
+                    or qty_unit
+                ).upper()
+            except Exception:
+                qty_unit = "contracts"
+
             logger.info(
                 f"📊 Trade recorded: {side.upper()} | "
                 f"Net P&L: ${pnl:+.2f} | "
                 f"Return on margin: {return_on_margin:+.2f}% | "
-                f"Qty: {quantity:.4f} BTC | "
+                f"Qty: {quantity:.4f} {qty_unit} | "
                 f"Total trades: {self.total_trades}"
             )
 

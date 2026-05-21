@@ -7511,17 +7511,31 @@ class QuantStrategy:
         elif _delta_requires_native_bracket:
             _bracket_err = getattr(order_manager, "last_order_error", None)
             _err_reason = ""
+            _err_stage = ""
             try:
-                if isinstance(_bracket_err, dict) and _bracket_err.get("reason"):
-                    _err_reason = f" reason={_bracket_err.get('reason')}"
+                if isinstance(_bracket_err, dict):
+                    if _bracket_err.get("reason"):
+                        _err_reason = f" reason={_bracket_err.get('reason')}"
+                    _err_stage = str(_bracket_err.get("stage") or "")
             except Exception:
                 _err_reason = ""
-            logger.error(
-                "❌ Delta native bracket entry failed — refusing non-bracket fallback "
-                "so the position is not opened without exchange-attached TP/SL. "
-                f"side={side} qty={qty} entry=${limit_px:,.2f} "
-                f"SL=${sl_price:,.2f} TP=${tp_price:,.2f}{_err_reason}"
-            )
+                _err_stage = ""
+
+            if _err_stage == "delta_native_bracket_fill_timeout":
+                logger.warning(
+                    "⚠️ Delta native bracket entry timed out unfilled — order was "
+                    "cancelled safely; no non-bracket fallback was used, so no "
+                    "unprotected position was opened. "
+                    f"side={side} qty={qty} entry=${limit_px:,.2f} "
+                    f"SL=${sl_price:,.2f} TP=${tp_price:,.2f}{_err_reason}"
+                )
+            else:
+                logger.error(
+                    "❌ Delta native bracket entry failed — refusing non-bracket fallback "
+                    "so the position is not opened without exchange-attached TP/SL. "
+                    f"side={side} qty={qty} entry=${limit_px:,.2f} "
+                    f"SL=${sl_price:,.2f} TP=${tp_price:,.2f}{_err_reason}"
+                )
             self._last_exit_time = time.time()
             return
         else:

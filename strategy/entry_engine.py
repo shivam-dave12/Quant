@@ -57,6 +57,15 @@ except Exception:  # pragma: no cover - standalone tests
     from market_intelligence import build_market_profile, MarketProfile  # type: ignore
 
 try:
+    from strategy.dol_engine import assess_trade_thesis, DOLAssessment
+except Exception:  # pragma: no cover - standalone tests
+    try:
+        from dol_engine import assess_trade_thesis, DOLAssessment  # type: ignore
+    except Exception:  # pragma: no cover
+        assess_trade_thesis = None  # type: ignore
+        DOLAssessment = None  # type: ignore
+
+try:
     from strategy.liquidity_map import (
         LiquidityMap, LiquidityMapSnapshot, PoolTarget, SweepResult,
         PoolStatus, PoolSide, TF_HIERARCHY,
@@ -1612,6 +1621,13 @@ class EntryEngine:
                 return PostSweepDecision(
                     action="wait", direction="", confidence=0.0,
                     reason=f"DYNAMIC_QUALITY_WAIT: {gate_reason}")
+            dol_ok, dol_reason, _dol = self._institutional_thesis_gate(
+                snap, rev_dir, "reverse", price, atr, ict=ict, flow=flow,
+                label="DOL_PRECHECK", qd=qd)
+            if not dol_ok:
+                return PostSweepDecision(
+                    action="wait", direction="", confidence=0.0,
+                    reason=f"DOL_WAIT: {dol_reason}")
             score_conf = min(1.0, rev_total / 90.0)
             conf = 0.78 * qd.posterior + 0.22 * score_conf
             if ps.cisd_detected: conf = min(1.0, conf + 0.05)
@@ -1647,6 +1663,13 @@ class EntryEngine:
                 return PostSweepDecision(
                     action="wait", direction="", confidence=0.0,
                     reason=f"DYNAMIC_QUALITY_WAIT: {gate_reason}")
+            dol_ok, dol_reason, _dol = self._institutional_thesis_gate(
+                snap, cont_dir, "continue", price, atr, ict=ict, flow=flow,
+                label="DOL_PRECHECK", qd=qd)
+            if not dol_ok:
+                return PostSweepDecision(
+                    action="wait", direction="", confidence=0.0,
+                    reason=f"DOL_WAIT: {dol_reason}")
             cont_target = self._find_opposing_target(cont_dir, snap, price, atr)
             self._log_posterior_accept_once(
                 ("continue", cont_dir, phase, round(sweep.pool.price, 1), int(ps.entered_at)),
@@ -2193,8 +2216,82 @@ class EntryEngine:
         except Exception:
             pass
 
+        # Convert diagnostics into a real A/B/C grade.  This is not a blind
+        # filter stack: the hurdle is dynamic by playbook/regime.  Reversals
+        # after a genuine sweep can pass with slightly lower quality when CISD/OTE
+        # is present; continuations after a raid require cleaner proof because
+        # they are more often liquidity traps.
+        base_floor = 0.64 if action_l == "reverse" else 0.70
+        if cisd and ote:
+            base_floor -= 0.05
+        elif cisd or ote:
+            base_floor -= 0.025
+        if disp >= strong_disp:
+            base_floor -= 0.025
+        if phase.upper() in ("DISPLACEMENT", "CISD") and not (cisd or ote) and disp < strong_disp:
+            base_floor += 0.035
+        if action_l == "continue" and abs(float(getattr(flow, "conviction", 0.0) or 0.0)) < 0.30:
+            base_floor += 0.035
+        base_floor = max(0.54, min(0.78, base_floor))
+
         note = " | ".join(notes[:4]) if notes else "clean"
-        return True, f"dynamic_quality_score={score:.2f} {note} | {profile.compact()}"
+        grade = "A" if score >= 0.78 else "B" if score >= base_floor else "C" if score >= 0.52 else "D"
+        try:
+            self._last_sweep_analysis["quality_floor"] = base_floor
+            self._last_sweep_analysis["quality_grade"] = grade
+        except Exception:
+            pass
+        if score < base_floor:
+            return False, (
+                f"quality_grade={grade} score={score:.2f}<{base_floor:.2f} "
+                f"{note} | {profile.compact()}"
+            )
+        return True, f"quality_grade={grade} score={score:.2f}>={base_floor:.2f} {note} | {profile.compact()}"
+
+    def _institutional_thesis_gate(
+        self, snap, side: str, action: str, price: float, atr: float,
+        ict=None, flow=None, sl: Optional[float] = None, tp: Optional[float] = None,
+        label: str = "preflight", qd: Any = None,
+    ) -> tuple[bool, str, Any]:
+        """DOL-first executable-thesis gate.
+
+        A posterior score alone is not enough.  Before an entry becomes
+        actionable, the side must have a real draw-on-liquidity, enough
+        first-target probability, and positive payoff after the structural SL.
+        """
+        if assess_trade_thesis is None:
+            return True, "DOL engine unavailable; legacy gate path retained", None
+        # Unit/offline tests sometimes pass a bare namespace as snapshot.  Live
+        # LiquidityMapSnapshot always exposes bsl_pools/ssl_pools; only enforce
+        # DOL when the liquidity map actually exists.
+        if snap is None or (not hasattr(snap, "bsl_pools") and not hasattr(snap, "ssl_pools")):
+            return True, "DOL liquidity snapshot unavailable; thesis gate skipped for non-live snapshot", None
+        try:
+            posterior = 0.0
+            if qd is not None:
+                posterior = float(getattr(qd, "posterior", 0.0) or 0.0)
+            if posterior <= 0.0:
+                posterior = self._current_quant_posterior()
+            qscore = 0.0
+            try:
+                qscore = float((self._last_sweep_analysis or {}).get("quality_score", 0.0) or 0.0)
+            except Exception:
+                qscore = 0.0
+            thesis = assess_trade_thesis(
+                snap=snap, side=side, entry=price, atr=atr, ict=ict, flow=flow,
+                action=action, sl=sl, tp=tp, posterior=posterior, quality_score=qscore,
+            )
+            try:
+                self._last_sweep_analysis["dol_thesis"] = thesis.as_dict() if hasattr(thesis, "as_dict") else {}
+                self._last_sweep_analysis["dol_compact"] = thesis.compact() if hasattr(thesis, "compact") else str(thesis)
+            except Exception:
+                pass
+            if not bool(getattr(thesis, "accepted", False)):
+                return False, f"{label}: {getattr(thesis, 'reason', 'DOL rejected')} | {thesis.compact()}", thesis
+            return True, f"{label}: {thesis.compact()}", thesis
+        except Exception as exc:
+            logger.warning("DOL thesis gate error; deferring candidate safely: %s", exc, exc_info=True)
+            return False, f"DOL thesis gate error: {exc}", None
 
     def _evaluate_pending_refined_entry(
         self, snap, flow, ict, price: float, atr: float, now: float
@@ -2333,6 +2430,14 @@ class EntryEngine:
         rr_floor = self._last_selected_tp_rr_floor(_min_rr_ratio())
         if rr < rr_floor:
             p.last_reason = f"refined R:R {rr:.2f} < institutional floor {rr_floor:.2f}"
+            return
+
+        action_label = "reverse" if str(getattr(sig.entry_type, "name", sig.entry_type)).lower().endswith("reversal") else "continue"
+        thesis_ok, thesis_reason, _thesis = self._institutional_thesis_gate(
+            snap, side, action_label, price, atr, ict=ict, flow=flow,
+            sl=sl, tp=tp, label="REFINED_THESIS")
+        if not thesis_ok:
+            p.last_reason = f"refined DOL thesis unavailable: {thesis_reason}"
             return
 
         self._signal = EntrySignal(
@@ -2474,6 +2579,17 @@ class EntryEngine:
             self._reset(now)
             return
 
+        thesis_ok, thesis_reason, thesis = self._institutional_thesis_gate(
+            snap, side, "reverse", price, atr, ict=ict, flow=flow,
+            sl=sl, tp=tp, label="EXECUTABLE_THESIS")
+        if not thesis_ok:
+            logger.info(
+                f"CANDIDATE DEFERRED [dol_thesis]: side={side} "
+                f"sweep=${sweep.pool.price:.1f} entry=${price:.1f} sl=${sl:.1f} tp=${tp:.1f} | {thesis_reason}")
+            self._post_sweep = None
+            self._reset(now)
+            return
+
         disp = f" DISP={ps.max_displacement:.1f}ATR" if ps else ""
         cisd = f" CISD={ps.cisd_type}" if ps and ps.cisd_detected else ""
 
@@ -2604,6 +2720,17 @@ class EntryEngine:
                 f"⚠️ ENTRY CANDIDATE DEFERRED [payoff_geometry]: rr={rr:.2f} < institutional_floor={rr_floor:.2f} "
                 f"side={side} sweep=${sweep.pool.price:.1f} entry=${price:.1f} "
                 f"tp=${tp:.1f} sl=${sl:.1f} | {self._last_pool_plan_summary()}")
+            self._post_sweep = None
+            self._reset(now)
+            return
+
+        thesis_ok, thesis_reason, thesis = self._institutional_thesis_gate(
+            snap, side, "continue", price, atr, ict=ict, flow=flow,
+            sl=sl, tp=tp, label="EXECUTABLE_THESIS")
+        if not thesis_ok:
+            logger.info(
+                f"CANDIDATE DEFERRED [dol_thesis]: side={side} "
+                f"sweep=${sweep.pool.price:.1f} entry=${price:.1f} sl=${sl:.1f} tp=${tp:.1f} | {thesis_reason}")
             self._post_sweep = None
             self._reset(now)
             return

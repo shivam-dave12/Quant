@@ -511,6 +511,38 @@ def evaluate_post_sweep_quant(*, action: str, side: str, rev_score: float, cont_
             + outcome_w * logit(float(outcome.get("outcome_p", 0.50) or 0.50))
         )
 
+    # Institutional calibration cap: the model must not print 0.85+ confidence
+    # from score imbalance/flow alone when structure and HTF are both missing.
+    # This is the failure mode observed in live logs (struct=0.00, htf=0.00,
+    # yet POSTERIOR ACCEPTED).  Exceptional displacement can keep the thesis
+    # alive for DOL/quality validation, but it cannot become A-grade by itself.
+    structure_void = bool(structural < 0.15 and abs(st.htf_alignment) < 0.12)
+    uncalibrated = float(outcome.get("outcome_n", 0.0) or 0.0) < 12.0
+    posterior_cap = 0.95
+    cap_reasons = []
+    if structure_void:
+        exceptional_delivery = bool(disp_info >= 0.92 and evidence_consensus >= 0.72 and st.liquidity_quality >= 0.70)
+        posterior_cap = min(posterior_cap, 0.74 if exceptional_delivery else 0.66)
+        cap_reasons.append("structure_void")
+    if uncalibrated:
+        # A new bucket can trade only when the full thesis is strong downstream;
+        # it should not self-certify as 85% before outcome history exists.
+        posterior_cap = min(posterior_cap, 0.82 if evidence_consensus >= 0.70 else 0.76)
+        cap_reasons.append("uncalibrated_bucket")
+    outcome_p = float(outcome.get("outcome_p", 0.50) or 0.50)
+    outcome_n = float(outcome.get("outcome_n", 0.0) or 0.0)
+    if outcome_n >= 12.0 and outcome_p < 0.46:
+        # Negative closed-trade evidence must dominate the self-referential
+        # auction confidence for that setup bucket.  Otherwise the model can
+        # keep accepting a bucket that has already proven poor expectancy.
+        posterior_cap = min(posterior_cap, clamp(0.50 + 0.42 * outcome_p, 0.52, 0.70))
+        cap_reasons.append("negative_outcome_bucket")
+    if action == "continue" and structural < 0.25 and st.htf_alignment < 0.10:
+        posterior_cap = min(posterior_cap, 0.68)
+        cap_reasons.append("continuation_without_acceptance_structure")
+    if posterior > posterior_cap:
+        posterior = posterior_cap
+
     # EV in normalized risk units. Loss burden widens under uncertainty/toxicity;
     # reward is capped by liquidity quality and alignment. Far TP/RR cannot rescue
     # a low-quality posterior.
@@ -542,10 +574,14 @@ def evaluate_post_sweep_quant(*, action: str, side: str, rev_score: float, cont_
           f"edge={score_edge:+.2f} disp={disp_info:.2f} struct={structural:.2f} "
           f"cons={evidence_consensus:.2f} flow={flow_term:+.2f} "
           f"learned={float(outcome.get('outcome_p', 0.5)):.2f}/{float(outcome.get('outcome_n', 0.0)):.0f} "
+          f"cap={posterior_cap:.2f}{('/' + ','.join(cap_reasons)) if cap_reasons else ''} "
           f"EV={ev:+.3f} LLR={llr:.2f}/{dynamic_llr_barrier:.2f} | {st.compact()}"
     )
     return QuantDecision(accept, posterior, min_p, ev, llr, st.regime_uncertainty, reason,
                          {**components_seed, "llr_barrier": dynamic_llr_barrier,
+                          "structure_void": 1.0 if structure_void else 0.0,
+                          "posterior_cap": posterior_cap,
+                          "posterior_cap_reasons": ",".join(cap_reasons),
                           "outcome_p": float(outcome.get("outcome_p", 0.50) or 0.50),
                           "outcome_n": float(outcome.get("outcome_n", 0.0) or 0.0),
                           "outcome_r": float(outcome.get("outcome_r", 0.0) or 0.0),

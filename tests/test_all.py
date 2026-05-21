@@ -3131,3 +3131,82 @@ def test_sl_selector_chains_adjacent_pools_into_one_raid_zone():
     assert "cluster_n=3" in reasons
     assert "cluster_edge=97.5500" in reasons
     assert pick.sl_price < 97.55 - 0.80
+
+# ===== BEGIN test_dol_first_trade_thesis.py =====
+
+def _dol_pool(price, side, timeframe="15m", significance=14.0, status="ACTIVE"):
+    return SimpleNamespace(
+        pool=SimpleNamespace(
+            price=price,
+            side=side,
+            timeframe=timeframe,
+            significance=significance,
+            status=status,
+        ),
+        significance=significance,
+        distance_atr=0.0,
+    )
+
+
+def test_dol_first_gate_rejects_no_tp_side_liquidity():
+    from strategy.dol_engine import assess_trade_thesis
+
+    snap = SimpleNamespace(
+        bsl_pools=[],
+        ssl_pools=[_dol_pool(98.0, "SSL", significance=16.0)],
+    )
+    ict = SimpleNamespace(structure_15m="bullish", structure_4h="bullish", dealing_range_pd=0.25, choch_5m="bullish")
+    flow = SimpleNamespace(direction="long", conviction=0.70, cvd_trend=0.55)
+
+    thesis = assess_trade_thesis(
+        snap=snap, side="long", entry=100.0, atr=1.0,
+        ict=ict, flow=flow, action="reverse", posterior=0.82, quality_score=0.80,
+    )
+    assert not thesis.accepted
+    assert "no live TP-side liquidity" in thesis.reason
+
+
+def test_dol_first_gate_accepts_clean_reversal_thesis():
+    from strategy.dol_engine import assess_trade_thesis
+
+    snap = SimpleNamespace(
+        bsl_pools=[_dol_pool(103.8, "BSL", "1h", 20.0), _dol_pool(105.4, "BSL", "15m", 12.0)],
+        ssl_pools=[_dol_pool(97.4, "SSL", "15m", 9.0)],
+    )
+    ict = SimpleNamespace(structure_15m="bullish", structure_4h="bullish", dealing_range_pd=0.22, choch_5m="bullish")
+    flow = SimpleNamespace(direction="long", conviction=0.68, cvd_trend=0.60)
+
+    thesis = assess_trade_thesis(
+        snap=snap, side="long", entry=100.0, atr=1.0,
+        ict=ict, flow=flow, action="reverse", sl=97.8, tp=103.8,
+        posterior=0.82, quality_score=0.82,
+    )
+    assert thesis.accepted
+    assert thesis.grade in ("A", "B")
+    assert thesis.first_target_probability >= 0.55
+    assert thesis.rr > 1.0
+
+
+def test_quant_posterior_rejects_score_only_structure_void():
+    from strategy import quantitative_models as qm
+
+    old_calibrator = qm.GLOBAL_QUANT_CALIBRATOR
+    qm.GLOBAL_QUANT_CALIBRATOR = qm.AdaptiveQuantCalibrator()
+    try:
+        snap = SimpleNamespace(
+            bsl_pools=[_dol_pool(103.0, "BSL", significance=18.0)],
+            ssl_pools=[_dol_pool(97.0, "SSL", significance=18.0)],
+        )
+        flow = SimpleNamespace(direction="long", conviction=0.75, cvd_trend=0.70)
+        ict = SimpleNamespace(structure_15m="ranging", structure_4h="ranging", dealing_range_pd=0.50)
+        qd = qm.evaluate_post_sweep_quant(
+            action="continue", side="long", rev_score=10.0, cont_score=120.0,
+            displacement_atr=1.40, cisd=False, ote=False, phase="DISPLACEMENT",
+            price=100.0, atr=1.0, snap=snap, flow=flow, ict=ict,
+        )
+        assert qd.posterior <= 0.68
+        assert not qd.accept
+        assert qd.components.get("structure_void") == 1.0
+    finally:
+        qm.GLOBAL_QUANT_CALIBRATOR = old_calibrator
+# ===== END test_dol_first_trade_thesis.py =====

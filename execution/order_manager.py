@@ -2074,9 +2074,27 @@ class OrderManager:
                 logger.info(f"Bracket order {order_id[:8]}… cancelled by exchange")
                 break
 
-        # Timeout — cancel and signal caller to retry after cooldown
-        self.cancel_order(order_id)
-        logger.info(f"Bracket order timeout after {timeout_sec:.0f}s — cancelled")
+        # Timeout — cancel and signal caller to retry after cooldown.
+        # This is not a native-bracket schema/API failure: the protected entry
+        # order reached Delta, but the maker limit did not fill inside the
+        # allowed window.  Preserve a structured reason so the strategy can log
+        # it as a safe unfilled-entry abort instead of a false critical failure.
+        try:
+            cancel_resp = self.cancel_order(order_id) or {}
+        except Exception as cancel_e:
+            cancel_resp = {"cancel_error": str(cancel_e)}
+        self.last_order_error = {
+            "stage": "delta_native_bracket_fill_timeout",
+            "status_code": 0,
+            "reason": f"entry_limit_not_filled_within_{timeout_sec:.0f}s",
+            "order_id": order_id,
+            "timeout_sec": float(timeout_sec),
+            "raw": {"cancel_response": cancel_resp},
+        }
+        logger.warning(
+            f"Bracket entry {order_id[:8]}… not filled within {timeout_sec:.0f}s — "
+            "cancelled safely; no position opened"
+        )
         return None
 
     def place_stop_loss(self, side: str, quantity: float,
