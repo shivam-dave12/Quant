@@ -28,6 +28,14 @@ from exchanges.coinswitch.api import FuturesAPI as CoinSwitchAPI
 from exchanges.coinswitch.data_manager import CoinSwitchDataManager
 from exchanges.delta.api import DeltaAPI
 from exchanges.delta.data_manager import DeltaDataManager
+try:
+    from exchanges.icici.api import BreezeRestClient
+    from exchanges.icici.data_manager import ICICIOptionDataManager
+    from exchanges.icici.underlying_data_manager import ICICIUnderlyingDataManager
+except Exception:  # pragma: no cover - ICICI is optional at runtime
+    BreezeRestClient = None  # type: ignore
+    ICICIOptionDataManager = None  # type: ignore
+    ICICIUnderlyingDataManager = None  # type: ignore
 from risk.risk_manager import RiskManager
 from orchestration.portfolio_manager import PortfolioManager, PortfolioRiskManager
 from core.market_policy import active_policy
@@ -86,10 +94,17 @@ class MultiAssetQuantBot:
     def _build_api_clients(self):
         has_delta = bool(config.DELTA_API_KEY and config.DELTA_SECRET_KEY)
         has_cs = bool(config.COINSWITCH_API_KEY and config.COINSWITCH_SECRET_KEY)
+        has_icici = bool(
+            getattr(config, "ICICI_ENABLED", False)
+            and getattr(config, "BREEZE_API_KEY", "")
+            and getattr(config, "BREEZE_SECRET_KEY", "")
+            and BreezeRestClient is not None
+        )
         delta_api = DeltaAPI(config.DELTA_API_KEY, config.DELTA_SECRET_KEY,
                              testnet=getattr(config, "DELTA_TESTNET", False)) if has_delta else None
         cs_api = CoinSwitchAPI(config.COINSWITCH_API_KEY, config.COINSWITCH_SECRET_KEY) if has_cs else None
-        return delta_api, cs_api
+        icici_api = BreezeRestClient() if has_icici else None
+        return delta_api, cs_api, icici_api
 
 
     def _instrument_leverage(self, inst: TradableInstrument) -> int:
@@ -677,12 +692,15 @@ class MultiAssetQuantBot:
             logger.info("⚡ MULTI-ASSET INSTITUTIONAL LIQUIDITY SCANNER")
             logger.info("   Live exchange catalogs only — stock desk suspended; no synthetic feeds")
             logger.info("=" * 92)
-            delta_api, cs_api = self._build_api_clients()
+            delta_api, cs_api, icici_api = self._build_api_clients()
             self.registry = InstrumentRegistry(execution_preference=getattr(config, "EXECUTION_EXCHANGE", "delta"))
             requested = self._filter_suspended_requests(getattr(config, "MULTI_ASSET_REQUESTS", None))
             self.discovery_report = self.registry.discover(
                 delta_api=delta_api,
                 coinswitch_api=cs_api,
+                icici_api=icici_api,
+                include_exchanges=getattr(config, "UNIVERSE_INCLUDE_EXCHANGES", "delta,coinswitch"),
+                icici_security_master_url=getattr(config, "ICICI_SECURITY_MASTER_URL", None),
                 requested=requested,
                 max_active=int(getattr(config, "SCANNER_MAX_ACTIVE_INSTRUMENTS", 8)),
                 require_primary=False,
@@ -691,10 +709,10 @@ class MultiAssetQuantBot:
                 logger.info(line)
             if not self.discovery_report.matched:
                 logger.error("No confirmed tradable instruments found. Scanner will not start.")
-                return False
+            return False
 
             for inst in self.discovery_report.matched:
-                ctx = self._build_asset_context(inst, delta_api, cs_api)
+                ctx = self._build_asset_context(inst, delta_api, cs_api, icici_api)
                 if ctx is not None:
                     self.contexts.append(ctx)
             if not self.contexts:
@@ -706,26 +724,38 @@ class MultiAssetQuantBot:
             logger.exception("MultiAssetQuantBot initialisation failed")
             return False
 
-    def _build_asset_context(self, inst: TradableInstrument, delta_api, cs_api) -> Optional[AssetContext]:
+    def _build_asset_context(self, inst: TradableInstrument, delta_api, cs_api, icici_api=None) -> Optional[AssetContext]:
         primary_ex = inst.primary_exchange
         cs_om = None
         delta_om = None
+        icici_om = None
         if ExchangeName.COINSWITCH in inst.by_exchange and cs_api is not None:
             cs_om = OrderManager(cs_api, exchange_name="coinswitch", instrument=inst)
         if ExchangeName.DELTA in inst.by_exchange and delta_api is not None:
             delta_om = OrderManager(delta_api, exchange_name="delta", instrument=inst)
-        if not cs_om and not delta_om:
+        if ExchangeName.ICICI in inst.by_exchange and icici_api is not None:
+            icici_om = OrderManager(icici_api, exchange_name="icici", instrument=inst)
+        if not cs_om and not delta_om and not icici_om:
             logger.warning("%s skipped: no executable order manager", inst.asset_id)
             return None
-        router = ExecutionRouter(coinswitch_om=cs_om, delta_om=delta_om, default=primary_ex.value)
+        router = ExecutionRouter(coinswitch_om=cs_om, delta_om=delta_om, icici_om=icici_om, default=primary_ex.value)
 
         if primary_ex == ExchangeName.DELTA:
             primary_dm = DeltaDataManager(instrument=inst)
             secondary_dm = CoinSwitchDataManager(instrument=inst) if ExchangeName.COINSWITCH in inst.by_exchange and cs_api else None
+            analysis_dm = None
+        elif primary_ex == ExchangeName.ICICI:
+            if ICICIOptionDataManager is None or ICICIUnderlyingDataManager is None or icici_api is None:
+                logger.warning("%s skipped: ICICI data managers unavailable", inst.asset_id)
+                return None
+            primary_dm = ICICIOptionDataManager(instrument=inst, api=icici_api)
+            secondary_dm = None
+            analysis_dm = ICICIUnderlyingDataManager(instrument=inst, api=icici_api)
         else:
             primary_dm = CoinSwitchDataManager(instrument=inst)
             secondary_dm = DeltaDataManager(instrument=inst) if ExchangeName.DELTA in inst.by_exchange and delta_api else None
-        data = MarketAggregator(primary_dm=primary_dm, secondary_dm=secondary_dm, instrument=inst)
+            analysis_dm = None
+        data = MarketAggregator(primary_dm=primary_dm, secondary_dm=secondary_dm, instrument=inst, analysis_dm=analysis_dm)
 
         # Context is created after the risk manager, so use a tiny holder to let
         # PortfolioRiskManager resolve its owning context at call-time.
@@ -963,4 +993,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

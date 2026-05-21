@@ -22,11 +22,15 @@ class AssetClass(str, Enum):
     COMMODITY = "commodity"
     INDEX = "index"
     EQUITY = "equity"
+    OPTION = "option"
+    FUTURE = "future"
+    CASH = "cash"
 
 
 class ExchangeName(str, Enum):
     DELTA = "delta"
     COINSWITCH = "coinswitch"
+    ICICI = "icici"
 
 
 @dataclass(frozen=True)
@@ -175,6 +179,8 @@ def default_asset_intents() -> List[AssetIntent]:
     return [
         AssetIntent("BTC", "Bitcoin", AssetClass.CRYPTO,
                     ("BTCUSD", "BTCUSDT", "BTC/USDT", "XBTUSD", "BTC"), priority=0),
+        AssetIntent("NIFTY", "NIFTY 50 index options", AssetClass.OPTION,
+                    ("NIFTY", "NIFTY50", "CNXNIFTY", "NSE NIFTY"), priority=5),
         AssetIntent("OIL", "Crude Oil / WTI", AssetClass.COMMODITY,
                     ("OIL", "WTI", "CL", "USOIL", "CRUDE", "CRUDEOIL", "OILUSD", "OILUSDT", "WTIUSDT"), priority=10),
         AssetIntent("GOLD", "Gold token derivatives", AssetClass.COMMODITY,

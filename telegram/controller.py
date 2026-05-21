@@ -176,6 +176,11 @@ class TelegramBotController:
         self._getupdates_http_failures: int = 0
         self._getupdates_backoff_base: float = float(getattr(config, "TELEGRAM_GETUPDATES_BACKOFF_BASE_SEC", 2.0))
         self._getupdates_backoff_max: float = float(getattr(config, "TELEGRAM_GETUPDATES_BACKOFF_MAX_SEC", 30.0))
+        self._icici_otp_cv = threading.Condition()
+        self._icici_pending_otp: str = ""
+        self._icici_waiting_for_otp: bool = False
+        self._icici_refresh_thread: Optional[threading.Thread] = None
+        self._icici_refresh_result: str = ""
 
         if not self.bot_token or not self.chat_id:
             raise ValueError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set")
@@ -329,6 +334,9 @@ class TelegramBotController:
                 {"command": "watchdog_heal", "description": "Watchdog auto-heal on/off"},
                 {"command": "watchdog_freeze", "description": "Engage watchdog breaker"},
                 {"command": "watchdog_unfreeze", "description": "Clear watchdog breaker"},
+                {"command": "icici_status", "description": "ICICI Breeze session status"},
+                {"command": "icici_token",  "description": "Refresh ICICI Breeze session"},
+                {"command": "icici_otp",    "description": "Submit ICICI OTP"},
                 {"command": "pause",       "description": "Pause trading"},
                 {"command": "resume",      "description": "Resume trading"},
                 {"command": "config",      "description": "Show config values"},
@@ -366,6 +374,8 @@ class TelegramBotController:
             "learn", "watchdog", "watchdog_status", "watchdog_heal",
             "watchdog_heal_on", "watchdog_heal_off",
             "watchdog_freeze", "watchdog_unfreeze",
+            "icici", "icici_status", "icici_token", "icici_refresh",
+            "icici_login", "icici_otp",
         }
         if not t.startswith("/"):
             parts = t.split(None, 1)
@@ -420,6 +430,12 @@ class TelegramBotController:
                 return self._cmd_watchdog_freeze()
             elif cmd == "/watchdog_unfreeze":
                 return self._cmd_watchdog_unfreeze()
+            elif cmd in ("/icici", "/icici_status"):
+                return self._cmd_icici_status()
+            elif cmd in ("/icici_token", "/icici_refresh", "/icici_login"):
+                return self._cmd_icici_token()
+            elif cmd == "/icici_otp":
+                return self._cmd_icici_otp(args)
             else:
                 return f"Unknown command: {cmd}\n\n" + self._cmd_help()
         except Exception as e:
@@ -427,6 +443,97 @@ class TelegramBotController:
             return f"❌ Error in {_esc(cmd)}: {_esc(e)}"
 
     # ================================================================
+    # ICICI / Breeze token flow
+    # ================================================================
+
+    def _icici_otp_getter(self) -> str:
+        with self._icici_otp_cv:
+            self._icici_waiting_for_otp = True
+            self._icici_pending_otp = ""
+        self.send_message(
+            "<b>ICICI Breeze OTP required</b>\n"
+            "Send <code>/icici_otp 123456</code> within 180 seconds.",
+            parse_mode="HTML",
+        )
+        deadline = time.time() + 180.0
+        with self._icici_otp_cv:
+            while not self._icici_pending_otp and time.time() < deadline:
+                self._icici_otp_cv.wait(timeout=max(0.5, min(5.0, deadline - time.time())))
+            otp = self._icici_pending_otp.strip()
+            self._icici_pending_otp = ""
+            self._icici_waiting_for_otp = False
+        if not otp:
+            raise RuntimeError("ICICI OTP wait timed out")
+        return otp
+
+    def _cmd_icici_status(self) -> str:
+        try:
+            from exchanges.icici.breeze_auth import BreezeTokenService
+            svc = BreezeTokenService()
+            status = svc.session_status()
+            configured = svc.has_minimum_config()
+            refreshable = svc.can_refresh_without_operator()
+            valid = bool(status.get("valid"))
+            reason = str(status.get("reason") or "")
+            age = status.get("age_sec")
+            age_txt = "n/a" if age is None else f"{float(age):.0f}s"
+            return (
+                "<b>ICICI Breeze Session</b>\n"
+                f"Configured: <code>{configured}</code>\n"
+                f"Valid: <code>{valid}</code> ({_esc(reason)})\n"
+                f"Age: <code>{_esc(age_txt)}</code>\n"
+                f"Same trading day: <code>{bool(status.get('same_trading_day'))}</code>\n"
+                f"Operator-free refresh: <code>{refreshable}</code>\n"
+                f"Created: <code>{_esc(status.get('created_local') or '')}</code>\n"
+                f"Now: <code>{_esc(status.get('now_local') or '')}</code>"
+            )
+        except Exception as e:
+            return f"ICICI status error: {_esc(e)}"
+
+    def _cmd_icici_token(self) -> str:
+        if self._icici_refresh_thread is not None and self._icici_refresh_thread.is_alive():
+            return (
+                "ICICI token refresh is already running.\n"
+                "If it is waiting for OTP, send <code>/icici_otp 123456</code>."
+            )
+
+        def _worker():
+            try:
+                from exchanges.icici.breeze_auth import BreezeTokenService
+                svc = BreezeTokenService()
+                session = svc.get_session(force_refresh=True, otp_getter=self._icici_otp_getter)
+                status = svc.session_status(session)
+                self._icici_refresh_result = (
+                    "<b>ICICI Breeze session refreshed</b>\n"
+                    f"Valid: <code>{bool(status.get('valid'))}</code>\n"
+                    f"Reason: <code>{_esc(status.get('reason') or '')}</code>\n"
+                    f"Created: <code>{_esc(status.get('created_local') or '')}</code>"
+                )
+            except Exception as e:
+                self._icici_refresh_result = f"<b>ICICI Breeze refresh failed</b>\n<code>{_esc(e)}</code>"
+            try:
+                self.send_message(self._icici_refresh_result, parse_mode="HTML")
+            except Exception:
+                pass
+
+        self._icici_refresh_result = "running"
+        self._icici_refresh_thread = threading.Thread(target=_worker, name="icici-token-refresh", daemon=True)
+        self._icici_refresh_thread.start()
+        return (
+            "ICICI Breeze token refresh started.\n"
+            "If ICICI asks for OTP, I will prompt here. Then send <code>/icici_otp 123456</code>."
+        )
+
+    def _cmd_icici_otp(self, args: str) -> str:
+        otp = re.sub(r"\D", "", str(args or ""))
+        if len(otp) < 4:
+            return "Send the OTP like: <code>/icici_otp 123456</code>"
+        with self._icici_otp_cv:
+            self._icici_pending_otp = otp
+            self._icici_waiting_for_otp = False
+            self._icici_otp_cv.notify_all()
+        return "ICICI OTP received. Continuing Breeze session refresh."
+
     # /help
     # ================================================================
 

@@ -17,6 +17,14 @@ from core.instruments import (
     AssetClass, AssetIntent, ExchangeInstrument, ExchangeName, TradableInstrument,
     configured_asset_intents, first_positive, normalise_symbol, slash_symbol,
 )
+try:
+    import config
+except Exception:  # pragma: no cover
+    config = None  # type: ignore
+try:
+    from agents.icici_chain_architect import build_underlying_payload
+except Exception:  # pragma: no cover
+    build_underlying_payload = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +42,51 @@ def _safe_int(v, default: int = 0) -> int:
         return int(v)
     except Exception:
         return default
+
+
+def _cfg(name: str, default):
+    return getattr(config, name, default) if config is not None else default
+
+
+def _csv_symbols(raw) -> list[str]:
+    if isinstance(raw, str):
+        vals = raw.replace(";", ",").split(",")
+    elif raw is None:
+        vals = []
+    else:
+        vals = list(raw)
+    out = []
+    seen = set()
+    for value in vals:
+        sym = normalise_symbol(str(value))
+        if sym and sym not in seen:
+            out.append(sym)
+            seen.add(sym)
+    return out
+
+
+def _parse_csv_set(value) -> set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        vals = value.replace(";", ",").split(",")
+    else:
+        vals = list(value)
+    return {str(x).strip().lower() for x in vals if str(x).strip()}
+
+
+def _allow_value(value: str, allowed: set[str]) -> bool:
+    return not allowed or "all" in allowed or str(value or "").lower() in allowed
+
+
+def _icici_breeze_code(underlying: str) -> str:
+    key = normalise_symbol(underlying)
+    raw = _cfg("ICICI_INDEX_BREEZE_STOCK_CODE_BY_UNDERLYING", {})
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if normalise_symbol(str(k)) == key and normalise_symbol(str(v)):
+                return normalise_symbol(str(v))
+    return key
 
 
 def _deep_first_float(obj, names) -> float:
@@ -192,6 +245,7 @@ class InstrumentRegistry:
             self.execution_preference = ExchangeName.DELTA
         self.delta: Dict[str, ExchangeInstrument] = {}
         self.coinswitch: Dict[str, ExchangeInstrument] = {}
+        self.icici: Dict[str, ExchangeInstrument] = {}
         self.report = DiscoveryReport()
 
     # ──────────────────────────────────────────────────────────────────────
@@ -319,6 +373,53 @@ class InstrumentRegistry:
         self.coinswitch = out
         return out
 
+    def load_icici(self, api, *, security_master_url: str | None = None) -> Dict[str, ExchangeInstrument]:
+        """Load ICICI index-option desk instruments.
+
+        v508 uses the underlying-first path for NIFTY: one desk instrument is
+        discovered now, and the exact CE/PE strike/expiry is selected after the
+        strategy produces a bullish/bearish NIFTY thesis.
+        """
+        out: Dict[str, ExchangeInstrument] = {}
+        if api is None or not bool(_cfg("ICICI_ENABLED", False)):
+            self.icici = out
+            return out
+        underlyings = _csv_symbols(_cfg("ICICI_INDEX_UNDERLYINGS", "NIFTY"))
+        if not underlyings:
+            underlyings = ["NIFTY"]
+        if build_underlying_payload is None:
+            logger.warning("ICICI discovery skipped: agents.icici_chain_architect unavailable")
+            self.icici = out
+            return out
+        for priority, underlying in enumerate(underlyings, 1):
+            raw = build_underlying_payload(underlying, "ICICI_INDEX_OPTIONS", [])
+            raw["underlying_display"] = underlying
+            raw["breeze_stock_code"] = _icici_breeze_code(underlying)
+            raw["chain_source"] = "configured_index"
+            raw["chain_candidates_deferred"] = True
+            ei = ExchangeInstrument(
+                exchange=ExchangeName.ICICI,
+                symbol=underlying,
+                ws_symbol=underlying,
+                display_symbol=underlying,
+                asset_id=underlying,
+                asset_class=AssetClass.OPTION,
+                product_id=None,
+                quote_asset="INR",
+                base_asset=underlying,
+                contract_type="option_chain",
+                status="active",
+                tick_size=float(_cfg("ICICI_OPTION_TICK_SIZE", 0.05)),
+                lot_step=1.0,
+                min_qty=1.0,
+                max_leverage=1.0,
+                raw={**raw, "configured_priority": priority},
+            )
+            out[normalise_symbol(underlying)] = ei
+        self.icici = out
+        logger.info("ICICI configured-index discovery active: underlyings=%s", ",".join(out.keys()) or "none")
+        return out
+
     def _augment_coinswitch_from_requested(self, out: Dict[str, ExchangeInstrument], api, intents: List[AssetIntent]) -> Dict[str, ExchangeInstrument]:
         """Validate configured crypto symbols against CoinSwitch live ticker endpoint.
 
@@ -392,13 +493,20 @@ class InstrumentRegistry:
     # Matching
     # ──────────────────────────────────────────────────────────────────────
     def discover(self, delta_api=None, coinswitch_api=None, requested=None,
-                 max_active: int = 12, require_primary: bool = True) -> DiscoveryReport:
+                 max_active: int = 12, require_primary: bool = True,
+                 include_exchanges=None, icici_api=None,
+                 icici_security_master_url: str | None = None) -> DiscoveryReport:
         intents = configured_asset_intents(requested)
-        delta = self.load_delta(delta_api)
-        coins = self.load_coinswitch(coinswitch_api)
-        coins = self._augment_coinswitch_from_requested(coins, coinswitch_api, intents)
+        include_exs = _parse_csv_set(include_exchanges)
+        delta = self.load_delta(delta_api) if _allow_value("delta", include_exs) else {}
+        coins = self.load_coinswitch(coinswitch_api) if _allow_value("coinswitch", include_exs) else {}
+        if _allow_value("coinswitch", include_exs):
+            coins = self._augment_coinswitch_from_requested(coins, coinswitch_api, intents)
+        icici = self.load_icici(icici_api, security_master_url=icici_security_master_url) if _allow_value("icici", include_exs) else {}
         self.report = DiscoveryReport(requested=intents, raw_counts={
-            "delta": len(delta), "coinswitch": len({id(v) for v in coins.values()})
+            "delta": len(delta),
+            "coinswitch": len({id(v) for v in coins.values()}),
+            "icici": len({id(v) for v in icici.values()}),
         })
 
         matched: List[TradableInstrument] = []
@@ -407,12 +515,15 @@ class InstrumentRegistry:
             by_ex: Dict[ExchangeName, ExchangeInstrument] = {}
             dmatch = self._match_one(delta, aliases)
             cmatch = self._match_one(coins, aliases)
+            imatch = self._match_one(icici, aliases)
             if dmatch is not None:
                 by_ex[ExchangeName.DELTA] = self._retag(dmatch, intent)
             if cmatch is not None:
                 by_ex[ExchangeName.COINSWITCH] = self._retag(cmatch, intent)
+            if imatch is not None:
+                by_ex[ExchangeName.ICICI] = self._retag(imatch, intent)
             if not by_ex:
-                self.report.unavailable[intent.asset_id] = "not present in live Delta/CoinSwitch catalog; not traded"
+                self.report.unavailable[intent.asset_id] = "not present in live Delta/CoinSwitch/ICICI catalog; not traded"
                 continue
             primary = self.execution_preference if self.execution_preference in by_ex else next(iter(by_ex.keys()))
             if require_primary and self.execution_preference not in by_ex:

@@ -166,6 +166,8 @@ def _cap_leverage(inst: Optional[TradableInstrument], default: int) -> int:
     base = max(1, int(default))
     if inst is None:
         return base
+    if getattr(inst, "asset_class", None) in (AssetClass.OPTION, AssetClass.CASH):
+        return 1
     try:
         mx = float(getattr(inst, 'max_leverage', 0.0) or 0.0)
         if mx > 0:
@@ -230,6 +232,40 @@ def build_instrument_policy(inst: Optional[TradableInstrument]) -> InstrumentPol
         "exit_tp_min_rr_reversion": _desk_float(desk, "tp_min_rr_reversion", _desk_float(desk, "min_rr", base_rr), "exit"),
         "exit_tp_min_rr_trend": _desk_float(desk, "tp_min_rr_trend", _desk_float(desk, "min_rr", base_rr), "exit"),
     }
+
+    if ac == AssetClass.OPTION:
+        return InstrumentPolicy(
+            asset_id=asset_id, asset_class=ac.value, leverage=1,
+            margin_pct=_desk_float(desk, "margin_pct", _f('POLICY_OPTION_MARGIN_PCT', 0.42)),
+            risk_multiplier=_desk_float(desk, "risk_multiplier", _f('POLICY_OPTION_RISK_MULT', 0.85)),
+            min_margin_usd=_min_margin_floor(_f('POLICY_OPTION_MIN_MARGIN_USD', 0.0)),
+            tick_eval_sec=_desk_float(desk, "tick_eval_sec", _f('POLICY_OPTION_TICK_EVAL_SEC', 0.50)),
+            loop_interval_sec=_desk_float(desk, "loop_interval_sec", _f('POLICY_OPTION_LOOP_INTERVAL_SEC', 0.50)),
+            min_1m_bars=_desk_int(desk, "min_1m_bars", _i('POLICY_OPTION_MIN_1M_BARS', 45)),
+            min_5m_bars=_desk_int(desk, "min_5m_bars", _i('POLICY_OPTION_MIN_5M_BARS', 35)),
+            atr_min_pctile=_f('POLICY_OPTION_ATR_MIN_PCTILE', 0.02),
+            atr_max_pctile=_f('POLICY_OPTION_ATR_MAX_PCTILE', 0.995),
+            max_hold_sec=_desk_int(desk, "max_hold_sec", _i('POLICY_OPTION_MAX_HOLD_SEC', 2700)),
+            cooldown_sec=_desk_int(desk, "cooldown_sec", _i('POLICY_OPTION_COOLDOWN_SEC', 120)),
+            loss_lockout_sec=_i('POLICY_OPTION_LOSS_LOCKOUT_SEC', 1200),
+            min_rr=_desk_float(desk, "min_rr", _f('POLICY_OPTION_MIN_RR', 1.60)),
+            max_rr=_desk_float(desk, "max_rr", _f('POLICY_OPTION_MAX_RR', 4.00)),
+            sl_buffer_atr_mult=_desk_float(desk, "sl_buffer_atr", _f('POLICY_OPTION_SL_BUFFER_ATR', 0.75)),
+            trail_min_move_atr=_f('POLICY_OPTION_TRAIL_MIN_MOVE_ATR', 0.10),
+            slippage_tolerance=_f('POLICY_OPTION_SLIPPAGE_TOL', 0.0030),
+            spread_soft_atr_ratio=_f('QUANT_SPREAD_SOFT_ATR_RATIO_OPTION', 0.65),
+            spread_max_atr_ratio=_f('QUANT_MAX_SPREAD_ATR_RATIO_OPTION', 3.00),
+            spread_max_bps=_f('QUANT_MAX_SPREAD_BPS_OPTION', 180.0),
+            spread_max_ticks=_f('QUANT_MAX_SPREAD_TICKS_OPTION', 20.0),
+            spread_min_size_mult=_f('QUANT_SPREAD_MIN_SIZE_MULT', 0.35),
+            spread_haircut_max=_f('QUANT_SPREAD_SIZE_HAIRCUT_MAX', 0.65),
+            ob_depth_levels=_i('POLICY_OPTION_OB_DEPTH_LEVELS', 3),
+            tick_agg_window_sec=_f('POLICY_OPTION_TICK_AGG_WINDOW_SEC', 30.0),
+            vwap_window=_i('POLICY_OPTION_VWAP_WINDOW', 35),
+            cvd_window=_i('POLICY_OPTION_CVD_WINDOW', 18),
+            notes='ICICI long-premium options policy; underlying-first, premium-funded',
+            **desk_fields,
+        )
 
     if ac == AssetClass.EQUITY:
         return InstrumentPolicy(

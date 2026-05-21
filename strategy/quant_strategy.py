@@ -27,7 +27,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone, timedelta
 from enum import Enum, auto
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import sys, os as _os; sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import config
@@ -193,15 +193,10 @@ class QCfg:
         return str(inst.primary_exchange.value if inst is not None else getattr(config, "EXCHANGE", getattr(config, "EXECUTION_EXCHANGE", "delta")))
     @staticmethod
     def LEVERAGE() -> int:
-        base = max(1, int(_cfg("LEVERAGE", 30)))
-        inst = current_instrument()
         try:
-            max_lev = float(getattr(inst, "max_leverage", 0.0) or 0.0) if inst is not None else 0.0
-            if max_lev > 0:
-                return max(1, min(base, int(max_lev)))
+            return max(1, int(policy_value("leverage", _cfg("LEVERAGE", 30))))
         except Exception:
-            pass
-        return base
+            return max(1, int(_cfg("LEVERAGE", 30)))
     @staticmethod
     def MARGIN_PCT() -> float: return float(policy_value("margin_pct", _cfg("QUANT_MARGIN_PCT", 0.20)))
     @staticmethod
@@ -544,6 +539,227 @@ class QCfg:
 def _round_to_tick(price: float) -> float:
     tick = QCfg.TICK_SIZE()
     return round(round(price / tick) * tick, 10) if tick > 0 else price
+
+
+def _icici_primary_raw(instrument: Any = None) -> Dict[str, Any]:
+    inst = instrument if instrument is not None else current_instrument()
+    try:
+        raw = getattr(getattr(inst, "primary", None), "raw", {}) or {}
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _icici_exchange_name(instrument: Any = None) -> str:
+    inst = instrument if instrument is not None else current_instrument()
+    try:
+        return str(getattr(getattr(inst, "primary_exchange", ""), "value", getattr(inst, "primary_exchange", ""))).lower()
+    except Exception:
+        return ""
+
+
+def _is_icici_underlying_chain_instrument(instrument: Any = None) -> bool:
+    raw = _icici_primary_raw(instrument)
+    return bool(
+        _icici_exchange_name(instrument) == "icici"
+        and raw.get("icici_underlying_desk")
+        and str(raw.get("contract_selector_mode") or "").lower() == "post_thesis"
+        and not raw.get("selected_option_contract")
+    )
+
+
+def _is_icici_option_instrument(instrument: Any = None) -> bool:
+    raw = _icici_primary_raw(instrument)
+    if _icici_exchange_name(instrument) != "icici":
+        return False
+    if raw.get("selected_option_contract"):
+        return True
+    txt = " ".join(str(raw.get(k, "")) for k in ("product_type", "product", "contract_type", "right", "option_type", "OptionType"))
+    return "option" in txt.lower() or _icici_option_right(raw) in ("call", "put")
+
+
+def _icici_selected_contract_dict(instrument: Any = None) -> Dict[str, Any]:
+    raw = _icici_primary_raw(instrument)
+    selected = raw.get("selected_option_contract")
+    if isinstance(selected, dict):
+        merged = dict(raw)
+        selected_raw = selected.get("raw")
+        if isinstance(selected_raw, dict):
+            merged.update(selected_raw)
+        merged.update({k: v for k, v in selected.items() if k != "raw"})
+        return merged
+    return raw
+
+
+def _icici_option_right(raw_or_instrument: Any = None) -> str:
+    raw = raw_or_instrument if isinstance(raw_or_instrument, dict) else _icici_selected_contract_dict(raw_or_instrument)
+    value = str(
+        raw.get("right")
+        or raw.get("option_type")
+        or raw.get("OptionType")
+        or raw.get("Right")
+        or raw.get("CallPut")
+        or ""
+    ).strip().lower()
+    if value in ("c", "ce", "call"):
+        return "call"
+    if value in ("p", "pe", "put"):
+        return "put"
+    return ""
+
+
+def _icici_allowed_thesis_side(instrument: Any, thesis_side: str) -> bool:
+    side = str(thesis_side or "").lower()
+    right = _icici_option_right(instrument)
+    if right == "call":
+        return side == "long"
+    if right == "put":
+        return side == "short"
+    return side in ("long", "short")
+
+
+def _icici_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            value = value.strip().replace(",", "")
+            if not value:
+                return default
+        out = float(value)
+        return out if math.isfinite(out) else default
+    except Exception:
+        return default
+
+
+def _icici_selected_delta(instrument: Any = None) -> float:
+    raw = _icici_selected_contract_dict(instrument)
+    for key in ("delta", "Delta", "bs_delta", "runtime_delta"):
+        v = _icici_float(raw.get(key), 0.0)
+        if abs(v) > 0.01:
+            return abs(v)
+    target = _icici_float(_cfg("ICICI_INDEX_OPTION_TARGET_ABS_DELTA", 0.45), 0.45)
+    return max(0.05, min(0.95, abs(target)))
+
+
+def _icici_runtime_lot_size(instrument: Any = None) -> float:
+    raw = _icici_selected_contract_dict(instrument)
+    for key in ("runtime_lot_size", "LotSize", "lot_size", "lotSize", "MinimumLotQty", "min_qty"):
+        lot = _icici_float(raw.get(key), 0.0)
+        if lot > 0:
+            return lot
+    return max(1.0, _icici_float(_cfg("ICICI_OPTION_DEFAULT_LOT_SIZE", 1.0), 1.0))
+
+
+def _icici_selected_premium(instrument: Any = None, fallback: float = 0.0) -> float:
+    raw = _icici_selected_contract_dict(instrument)
+    for key in ("selected_entry_premium", "ltp", "last_price", "lastPrice", "close", "price", "settlement_price"):
+        px = _icici_float(raw.get(key), 0.0)
+        if px > 0:
+            return px
+    return float(fallback or 0.0)
+
+
+def _icici_select_contract_for_thesis(
+    instrument: Any,
+    data_manager: Any,
+    thesis_side: str,
+    *,
+    underlying_spot: float = 0.0,
+    available_funds: float = 0.0,
+):
+    primary = getattr(data_manager, "_primary", data_manager)
+    selector = getattr(primary, "select_contract_for_thesis", None)
+    if not callable(selector):
+        return None
+    return selector(
+        thesis_side,
+        underlying_spot=float(underlying_spot or 0.0),
+        available_funds=float(available_funds or 0.0),
+    )
+
+
+def _icici_execution_atr(data_manager: Any, entry_premium: float = 0.0, period: int = 14) -> float:
+    try:
+        getter = getattr(data_manager, "get_execution_candles", None) or getattr(data_manager, "get_candles", None)
+        candles = getter("5m", max(period + 2, 25)) if callable(getter) else []
+        rows = list(candles or [])
+        trs: List[float] = []
+        prev_close = 0.0
+        for c in rows[-(period + 1):]:
+            h = _icici_float(c.get("h", c.get("high")), 0.0)
+            l = _icici_float(c.get("l", c.get("low")), 0.0)
+            close = _icici_float(c.get("c", c.get("close")), 0.0)
+            if h <= 0 or l <= 0 or close <= 0:
+                continue
+            tr = max(h - l, abs(h - prev_close) if prev_close > 0 else 0.0, abs(l - prev_close) if prev_close > 0 else 0.0)
+            if tr > 0:
+                trs.append(tr)
+            prev_close = close
+        if trs:
+            return sum(trs[-period:]) / max(1, min(period, len(trs)))
+    except Exception:
+        pass
+    prem = float(entry_premium or 0.0)
+    return prem * max(0.02, _icici_float(_cfg("ICICI_OPTION_MIN_PREMIUM_RISK_PCT", 0.14), 0.14) * 0.50) if prem > 0 else 0.0
+
+
+def _icici_market_session_open() -> tuple[bool, str]:
+    try:
+        from exchanges.icici.market_session import icici_market_session_state
+        state = icici_market_session_state()
+        return bool(state.is_open), str(state.reason)
+    except Exception as exc:
+        return False, f"ICICI market session unavailable: {exc}"
+
+
+def _icici_option_premium_levels(
+    *,
+    thesis_side: str,
+    premium_entry: float,
+    underlying_entry: float,
+    underlying_sl: float,
+    underlying_tp: float,
+    instrument: Any = None,
+) -> tuple[Optional[float], Optional[float], str]:
+    side = str(thesis_side or "").lower()
+    prem = float(premium_entry or 0.0)
+    u_entry = float(underlying_entry or 0.0)
+    u_sl = float(underlying_sl or 0.0)
+    u_tp = float(underlying_tp or 0.0)
+    if side not in ("long", "short") or prem <= 0 or u_entry <= 0 or u_sl <= 0 or u_tp <= 0:
+        return None, None, "missing_underlying_or_premium_level"
+    if side == "long" and not (u_sl < u_entry < u_tp):
+        return None, None, "bullish_underlying_levels_not_protective"
+    if side == "short" and not (u_tp < u_entry < u_sl):
+        return None, None, "bearish_underlying_levels_not_protective"
+
+    delta_abs = _icici_selected_delta(instrument)
+    mult = max(0.25, _icici_float(_cfg("ICICI_OPTION_SLTP_DELTA_MULT", 1.0), 1.0))
+    convex_bonus = max(0.0, _icici_float(_cfg("ICICI_OPTION_PREMIUM_TP_CONVEXITY_BONUS", 0.08), 0.08))
+    min_risk_pct = max(0.01, _icici_float(_cfg("ICICI_OPTION_MIN_PREMIUM_RISK_PCT", 0.14), 0.14))
+    max_risk_pct = max(min_risk_pct, _icici_float(_cfg("ICICI_OPTION_MAX_PREMIUM_RISK_PCT", 0.58), 0.58))
+    min_tp_pct = max(0.01, _icici_float(_cfg("ICICI_OPTION_MIN_TP_PREMIUM_PCT", 0.18), 0.18))
+    min_rr = max(1.0, float(policy_value("min_rr", _cfg("MIN_RISK_REWARD_RATIO", 1.6), instrument)))
+    max_rr = max(min_rr, float(policy_value("max_rr", _cfg("QUANT_TP_MAX_RR", 4.0), instrument)))
+
+    u_sl_dist = abs(u_entry - u_sl)
+    u_tp_dist = abs(u_tp - u_entry)
+    sl_dist = u_sl_dist * delta_abs * mult
+    tp_dist = u_tp_dist * delta_abs * mult * (1.0 + convex_bonus)
+    sl_dist = max(prem * min_risk_pct, min(sl_dist, prem * max_risk_pct))
+    tp_dist = max(tp_dist, prem * min_tp_pct, sl_dist * min_rr)
+    tp_dist = min(tp_dist, sl_dist * max_rr)
+    tick = max(QCfg.TICK_SIZE(), _icici_float(_cfg("ICICI_OPTION_TICK_SIZE", 0.05), 0.05), 1e-9)
+    sl = prem - sl_dist
+    if sl <= tick:
+        return None, None, "option_premium_stop_would_be_near_zero"
+    tp = prem + tp_dist
+    reason = (
+        f"delta={delta_abs:.2f} uSL={u_sl_dist:.1f} uTP={u_tp_dist:.1f} "
+        f"premium_risk={sl_dist:.2f} premium_tp={tp_dist:.2f} rr={tp_dist / max(sl_dist, 1e-9):.2f}"
+    )
+    return sl, tp, reason
 
 
 def _round_to_tick_protective(pos_side: str, price: float) -> float:
@@ -6729,8 +6945,31 @@ class QuantStrategy:
         between the two calls — no position is open at this point).
         """
         self._last_execution_viability = None
+        _icici_chain_mode = bool(getattr(config, "ICICI_LONG_PREMIUM_ONLY", True)) and _is_icici_underlying_chain_instrument(self._instrument)
+        _icici_option_mode = bool(getattr(config, "ICICI_LONG_PREMIUM_ONLY", True)) and _is_icici_option_instrument(self._instrument)
+        _icici_mode = bool(_icici_chain_mode or _icici_option_mode)
+        _icici_thesis_side = str(side or "").lower()
+        _icici_underlying_entry = float(getattr(self._last_entry_signal, "entry_price", 0.0) or 0.0)
+        _icici_selected_choice = None
+        if _icici_mode:
+            _session_open, _session_reason = _icici_market_session_open()
+            if not _session_open:
+                logger.info("ICICI options entry skipped: %s", _session_reason)
+                with self._lock:
+                    self._last_tp_gate_rejection = time.time()
+                return
+            if _icici_option_mode and not _icici_chain_mode and not _icici_allowed_thesis_side(self._instrument, _icici_thesis_side):
+                logger.info(
+                    "ICICI options entry skipped: selected %s does not match %s underlying thesis",
+                    _icici_option_right(self._instrument) or "unknown",
+                    _icici_thesis_side or "unknown",
+                )
+                with self._lock:
+                    self._last_tp_gate_rejection = time.time()
+                return
         price = data_manager.get_last_price()
-        if price < 1.0: return
+        _min_price = max(QCfg.TICK_SIZE(), 1e-6) if _icici_mode else 1.0
+        if price < _min_price: return
         atr = self._atr_5m.atr
         if atr < 1e-10: return
 
@@ -6745,6 +6984,51 @@ class QuantStrategy:
         if bal_info is None: return
         total_bal = float(bal_info.get("total", bal_info.get("available", 0.0)))
         self._risk_gate.set_opening_balance(total_bal)
+        if _icici_chain_mode:
+            available_funds = float(bal_info.get("available_raw", bal_info.get("available", 0.0)) or 0.0)
+            if _icici_underlying_entry <= 0.0:
+                _icici_underlying_entry = float(data_manager.get_last_price() or 0.0)
+            _icici_selected_choice = _icici_select_contract_for_thesis(
+                self._instrument,
+                data_manager,
+                _icici_thesis_side,
+                underlying_spot=_icici_underlying_entry,
+                available_funds=available_funds,
+            )
+            if _icici_selected_choice is None:
+                logger.info(
+                    "ICICI options entry rejected: no affordable %s contract fit live F&O funds %.2f",
+                    "call" if _icici_thesis_side == "long" else "put" if _icici_thesis_side == "short" else "option",
+                    available_funds,
+                )
+                with self._lock:
+                    self._last_tp_gate_rejection = time.time()
+                return
+            side = "long"
+            price = float(data_manager.get_last_price() or 0.0)
+            if price <= max(QCfg.TICK_SIZE(), 1e-6):
+                price = _icici_selected_premium(self._instrument, fallback=0.0)
+            if price <= max(QCfg.TICK_SIZE(), 1e-6):
+                logger.info("ICICI options entry rejected: selected option premium is unavailable after contract selection")
+                with self._lock:
+                    self._last_tp_gate_rejection = time.time()
+                return
+            exec_atr = _icici_execution_atr(data_manager, entry_premium=price)
+            if exec_atr > 1e-10:
+                atr = exec_atr
+            logger.info(
+                "ICICI options execution vehicle selected: %s %s strike=%s expiry=%s premium=%.2f lot=%.0f cost=%.2f funds=%.2f",
+                getattr(_icici_selected_choice, "right", ""),
+                getattr(_icici_selected_choice, "selected_symbol", ""),
+                getattr(_icici_selected_choice, "strike", 0.0),
+                getattr(_icici_selected_choice, "expiry", ""),
+                price,
+                _icici_runtime_lot_size(self._instrument),
+                _icici_runtime_lot_size(self._instrument) * price,
+                available_funds,
+            )
+        elif _icici_option_mode:
+            side = "long"
         # NOTE: risk gate already checked in _evaluate_entry — no duplicate check here
 
         # ── Map composite score → signal_confidence [0, 1] (PATCH 5a) ───────────
@@ -6780,6 +7064,11 @@ class QuantStrategy:
         offset    = float(getattr(config, 'LIMIT_ORDER_OFFSET_TICKS', 3)) * tick
 
         _sig_entry = getattr(self._last_entry_signal, 'entry_price', 0.0) or 0.0
+        if _icici_mode:
+            # The signal entry is the NIFTY underlying OTE level. ICICI routing
+            # must price the selected option premium, not send an index level as
+            # an option limit.
+            _sig_entry = 0.0
         _stale_threshold = 2.0 * atr if atr > 1e-10 else float('inf')
         _sig_is_valid = (
             _sig_entry > 0
@@ -6849,6 +7138,8 @@ class QuantStrategy:
             except Exception as _fe_err:
                 logger.debug(f"FeeEngine.decide_entry_type error (non-fatal): {_fe_err}")
 
+        if _icici_mode and limit_px > 0:
+            limit_px = _round_to_tick(max(limit_px, QCfg.TICK_SIZE()))
         entry_ref = limit_px if limit_px > 0 else price
         logger.info(f"Entry routing: {'LIMIT/maker' if use_maker else 'MARKET/taker'} | {mt_reason}")
 
@@ -6866,8 +7157,28 @@ class QuantStrategy:
         _force_tp = getattr(self, '_force_tp', None)
         _using_force_levels = False
         if _force_sl is not None and _force_tp is not None and _force_sl > 0 and _force_tp > 0:
-            _fsl = _round_to_tick(_force_sl)
-            _ftp = _round_to_tick(_force_tp)
+            if _icici_mode:
+                _conv_sl, _conv_tp, _conv_reason = _icici_option_premium_levels(
+                    thesis_side=_icici_thesis_side,
+                    premium_entry=entry_ref,
+                    underlying_entry=_icici_underlying_entry,
+                    underlying_sl=float(_force_sl),
+                    underlying_tp=float(_force_tp),
+                    instrument=self._instrument,
+                )
+                if _conv_sl is None or _conv_tp is None:
+                    logger.info("ICICI options entry rejected: cannot convert NIFTY SL/TP to premium levels (%s)", _conv_reason)
+                    self._force_sl = None
+                    self._force_tp = None
+                    with self._lock:
+                        self._last_tp_gate_rejection = time.time()
+                    return
+                _fsl = _round_to_tick(_conv_sl)
+                _ftp = _round_to_tick(_conv_tp)
+                logger.info("ICICI premium SL/TP converted from NIFTY structure: %s", _conv_reason)
+            else:
+                _fsl = _round_to_tick(_force_sl)
+                _ftp = _round_to_tick(_force_tp)
             _dir_ok = False
             if side == "long" and _fsl < entry_ref and _ftp > entry_ref:
                 _dir_ok = True
@@ -6916,21 +7227,24 @@ class QuantStrategy:
         td = abs(entry_ref - tp_price)
         if sd < 1e-10: return
         rr = td / sd
-        _liq_entry_ref = entry_ref
-        _liq_preview_lev = self._effective_margin_risk_leverage(
-            _liq_entry_ref, sd, side=side, sl_price=sl_price) or QCfg.LEVERAGE()
-        _liq_ok, _liq_px, _liq_guard, _liq_reason = self._sl_liquidation_sanity(
-            side, _liq_entry_ref, sl_price, leverage_override=_liq_preview_lev)
-        if not _liq_ok:
-            logger.warning(
-                f"Entry rejected by liquidation guard: {side.upper()} "
-                f"entry=${_liq_entry_ref:,.1f} SL=${sl_price:,.1f} lev={_liq_preview_lev:.0f}x | {_liq_reason}")
-            with self._lock:
-                self._last_tp_gate_rejection = time.time()
-            return
-        logger.info(
-            f"Liquidation guard OK: est_liq=${_liq_px:,.1f} lev={_liq_preview_lev:.0f}x "
-            f"guard=${_liq_guard:,.1f} SL=${sl_price:,.1f}")
+        if not _icici_mode:
+            _liq_entry_ref = entry_ref
+            _liq_preview_lev = self._effective_margin_risk_leverage(
+                _liq_entry_ref, sd, side=side, sl_price=sl_price) or QCfg.LEVERAGE()
+            _liq_ok, _liq_px, _liq_guard, _liq_reason = self._sl_liquidation_sanity(
+                side, _liq_entry_ref, sl_price, leverage_override=_liq_preview_lev)
+            if not _liq_ok:
+                logger.warning(
+                    f"Entry rejected by liquidation guard: {side.upper()} "
+                    f"entry=${_liq_entry_ref:,.1f} SL=${sl_price:,.1f} lev={_liq_preview_lev:.0f}x | {_liq_reason}")
+                with self._lock:
+                    self._last_tp_gate_rejection = time.time()
+                return
+            logger.info(
+                f"Liquidation guard OK: est_liq=${_liq_px:,.1f} lev={_liq_preview_lev:.0f}x "
+                f"guard=${_liq_guard:,.1f} SL=${sl_price:,.1f}")
+        else:
+            logger.info("ICICI long-premium option: liquidation guard skipped; paid premium is the maximum loss envelope")
 
         # ── FIX Bug-B STEP 2: Size using actual SL distance ──────────────────────
         # Now that sl_price is known, size from dollar risk / actual SL distance.
@@ -6996,15 +7310,16 @@ class QuantStrategy:
             return
 
         _actual_entry_lev = float(getattr(self, "_active_effective_leverage", QCfg.LEVERAGE()) or QCfg.LEVERAGE())
-        _liq_ok, _liq_px, _liq_guard, _liq_reason = self._sl_liquidation_sanity(
-            side, entry_ref, sl_price, leverage_override=_actual_entry_lev)
-        if not _liq_ok:
-            logger.warning(
-                f"Entry rejected by actual-leverage liquidation guard: {side.upper()} "
-                f"entry=${entry_ref:,.1f} SL=${sl_price:,.1f} lev={_actual_entry_lev:.0f}x | {_liq_reason}")
-            with self._lock:
-                self._last_tp_gate_rejection = time.time()
-            return
+        if not _icici_mode:
+            _liq_ok, _liq_px, _liq_guard, _liq_reason = self._sl_liquidation_sanity(
+                side, entry_ref, sl_price, leverage_override=_actual_entry_lev)
+            if not _liq_ok:
+                logger.warning(
+                    f"Entry rejected by actual-leverage liquidation guard: {side.upper()} "
+                    f"entry=${entry_ref:,.1f} SL=${sl_price:,.1f} lev={_actual_entry_lev:.0f}x | {_liq_reason}")
+                with self._lock:
+                    self._last_tp_gate_rejection = time.time()
+                return
 
         # Always assert the leverage used by the sizing model before sending a
         # leveraged bracket.  Previous builds only called set_leverage() when
@@ -9321,6 +9636,14 @@ class QuantStrategy:
         min_qty = max(float(QCfg.MIN_QTY()), step)
         max_qty = max(min_qty, float(QCfg.MAX_QTY()))
         leverage = max(float(QCfg.LEVERAGE()), 1.0)
+        _inst_for_sizing = getattr(self, "_instrument", None)
+        is_icici_option = _is_icici_option_instrument(_inst_for_sizing) or _is_icici_underlying_chain_instrument(_inst_for_sizing)
+        if is_icici_option:
+            lot = max(1.0, _icici_runtime_lot_size(_inst_for_sizing))
+            step = max(step, lot)
+            min_qty = max(min_qty, lot)
+            max_qty = max(min_qty, float(_cfg("ICICI_OPTION_MAX_QTY", 1000000.0)))
+            leverage = 1.0
 
         # ── Tier multiplier ───────────────────────────────────────────────────
         _tier_base = {"S": 1.00, "A": 0.80, "B": 0.65}.get(ict_tier, 0.50)

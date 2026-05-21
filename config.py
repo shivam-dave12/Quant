@@ -23,11 +23,16 @@ DELTA_SECRET_KEY          = os.getenv("DELTA_SECRET_KEY", "")
 DELTA_TESTNET             = os.getenv("DELTA_TESTNET", "false").lower() == "true"
 COINSWITCH_API_KEY        = os.getenv("COINSWITCH_API_KEY",    "")
 COINSWITCH_SECRET_KEY     = os.getenv("COINSWITCH_SECRET_KEY", "")
+BREEZE_API_KEY            = os.getenv("BREEZE_API_KEY", os.getenv("ICICI_API_KEY", ""))
+BREEZE_SECRET_KEY         = os.getenv("BREEZE_SECRET_KEY", os.getenv("ICICI_SECRET_KEY", ""))
+ICICI_CLIENT_ID           = os.getenv("ICICI_CLIENT_ID", "")
+ICICI_PASSWORD            = os.getenv("ICICI_PASSWORD", "")
+ICICI_ENABLED             = os.getenv("ICICI_ENABLED", "true" if BREEZE_API_KEY else "false").lower() in ("1", "true", "yes", "on")
 TELEGRAM_BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID          = os.getenv("TELEGRAM_CHAT_ID",   "")
 
-if not DELTA_API_KEY and not COINSWITCH_API_KEY:
-    raise ValueError("No exchange credentials in .env. Set DELTA_API_KEY or COINSWITCH_API_KEY.")
+if not DELTA_API_KEY and not COINSWITCH_API_KEY and not BREEZE_API_KEY:
+    raise ValueError("No exchange credentials in .env. Set DELTA_API_KEY, COINSWITCH_API_KEY, or BREEZE_API_KEY.")
 
 # ── Symbol / Leverage ─────────────────────────────────────────────────────────
 SYMBOL                   = "BTCUSDT"
@@ -89,6 +94,7 @@ POST_EXIT_IMPAIRMENT_SIZE_MULT     = 0.40
 TICK_SIZE                        = 0.5 if EXECUTION_EXCHANGE == "delta" else 0.1
 TICK_SIZE_DELTA                  = 0.5
 TICK_SIZE_COINSWITCH             = 0.1
+TICK_SIZE_ICICI                  = 0.05
 LIMIT_ORDER_OFFSET_TICKS         = 3
 ORDER_TIMEOUT_SECONDS            = 600
 MAX_ORDER_RETRIES                = 2
@@ -186,6 +192,8 @@ def get_tick_size(exchange: str | None = None) -> float:
         return float(TICK_SIZE_DELTA)
     if ex == "coinswitch":
         return float(TICK_SIZE_COINSWITCH)
+    if ex == "icici":
+        return float(TICK_SIZE_ICICI)
     return float(TICK_SIZE)
 
 
@@ -576,6 +584,65 @@ STOCK_DESK_TRADING_ENABLED = False
 SUSPENDED_TRADING_DESKS = ("STOCKS",)
 SUSPENDED_ASSET_CLASSES = ("equity", "index")
 
+# ICICI / Indian index options desk. Only long premium options are routed:
+# bullish NIFTY thesis -> buy CE, bearish NIFTY thesis -> buy PE.
+ICICI_LONG_PREMIUM_ONLY = True
+ICICI_OPTIONS_ONLY = True
+ICICI_DISCOVERY_ENABLED = ICICI_ENABLED
+ICICI_OPTIONS_RUNTIME_ENABLED = ICICI_ENABLED
+ICICI_INDEX_OPTIONS_FROM_CONFIG_ONLY = True
+ICICI_INDEX_UNDERLYINGS = os.getenv("ICICI_INDEX_UNDERLYINGS", "NIFTY")
+ICICI_INDEX_BREEZE_STOCK_CODE_BY_UNDERLYING = {"NIFTY": "NIFTY"}
+ICICI_API_SESSION_PATH = os.getenv("ICICI_API_SESSION_PATH", "data/icici_api_session.txt")
+BREEZE_API_SESSION = os.getenv("BREEZE_API_SESSION", os.getenv("ICICI_API_SESSION", ""))
+BREEZE_SESSION_TOKEN = os.getenv("BREEZE_SESSION_TOKEN", "")
+ICICI_SESSION_CACHE_PATH = os.getenv("ICICI_SESSION_CACHE_PATH", "data/icici_breeze_session.json")
+ICICI_SESSION_TTL_SEC = 6 * 60 * 60
+ICICI_TOKEN_GENERATOR_HEADLESS = os.getenv("ICICI_TOKEN_GENERATOR_HEADLESS", "true").lower() == "true"
+ICICI_DEBUG_DIR = os.getenv("ICICI_DEBUG_DIR", "data/icici_debug")
+ICICI_MARKET_SESSION_GUARD_ENABLED = True
+ICICI_MARKET_OPEN_TIME = "09:15"
+ICICI_MARKET_CLOSE_TIME = "15:30"
+ICICI_MARKET_HOLIDAYS = tuple(x.strip() for x in os.getenv("ICICI_MARKET_HOLIDAYS", "").split(",") if x.strip())
+ICICI_BREEZE_THROTTLE_ENABLED = True
+ICICI_BREEZE_MIN_CALL_GAP_SEC = 0.35
+ICICI_SECURITY_MASTER_CACHE_PATH = os.getenv("ICICI_SECURITY_MASTER_CACHE_PATH", "data/icici_security_master.zip")
+ICICI_SECURITY_MASTER_URL = os.getenv("ICICI_SECURITY_MASTER_URL", "http://directlink.icicidirect.com/NewSecurityMaster/SecurityMaster.zip")
+ICICI_ALLOW_CLOSED_MARKET_HISTORICAL_WARMUP = True
+ICICI_ALLOW_CLOSED_MARKET_WARMUP = False
+ICICI_CLOSED_MARKET_QUOTE_PROBE = False
+ICICI_HISTORICAL_V2_FALLBACK = True
+ICICI_INDEX_STREAM_ENABLED = os.getenv("ICICI_INDEX_STREAM_ENABLED", "false").lower() == "true"
+ICICI_INDEX_WEBSOCKET_REQUIRED = False
+ICICI_INDEX_STREAM_CHANNELS = "1MIN,5MIN"
+ICICI_INDEX_STREAM_SCRIPT_CODES = {}
+ICICI_OPTION_TICK_SIZE = 0.05
+ICICI_OPTION_DEFAULT_LOT_SIZE = 1.0
+ICICI_OPTION_MIN_DTE = 1.0
+ICICI_OPTION_MAX_DTE = 21.0
+ICICI_INDEX_OPTION_TARGET_ABS_DELTA = 0.45
+ICICI_STOCK_OPTION_TARGET_ABS_DELTA = 0.50
+ICICI_OPTION_DELTA_BAND = 0.22
+ICICI_OPTION_MAX_THETA_TO_PREMIUM = 0.08
+ICICI_OPTION_IV_STRESS_PRIOR = 0.24
+INDIA_RISK_FREE_RATE = 0.065
+ICICI_OPTION_MAX_FUNDS_FRACTION_PER_TRADE = 0.42
+ICICI_OPTION_MIN_CASH_BUFFER_INR = 0.0
+ICICI_OPTION_MIN_READY_1M_BARS = 20
+ICICI_UNDERLYING_MIN_READY_1M_BARS = 20
+ICICI_OPTION_QUOTE_POLL_SEC = 2.0
+ICICI_UNDERLYING_REST_REFRESH_SEC = 30.0
+ICICI_OPTION_SLTP_DELTA_MULT = 1.00
+ICICI_OPTION_MIN_PREMIUM_RISK_PCT = 0.14
+ICICI_OPTION_MAX_PREMIUM_RISK_PCT = 0.58
+ICICI_OPTION_MIN_TP_PREMIUM_PCT = 0.18
+ICICI_OPTION_PREMIUM_TP_CONVEXITY_BONUS = 0.08
+INDIAN_NO_FRESH_ENTRY_AFTER_CLOSE_BUFFER_MIN = 25
+UNIVERSE_INCLUDE_EXCHANGES = os.getenv(
+    "UNIVERSE_INCLUDE_EXCHANGES",
+    "delta,coinswitch,icici" if ICICI_ENABLED else "delta,coinswitch",
+)
+
 # Portfolio slots: the bot may hold multiple contracts at once, but each
 # contract gets only one ENTERING/ACTIVE/EXITING slot.  Sizing is not divided
 # into fixed equal buckets.  Each candidate sees live free cash from the
@@ -594,6 +661,7 @@ PORTFOLIO_MIN_LOT_MAX_RISK_MULT = 1.15
 # if neither exchange lists them, they remain unavailable and are not traded.
 MULTI_ASSET_REQUESTS = [
     {"asset_id": "BTC", "display_name": "Bitcoin", "asset_class": "crypto", "aliases": ["BTCUSD", "BTCUSDT", "BTC/USDT", "XBTUSD"], "priority": 0},
+    {"asset_id": "NIFTY", "display_name": "NIFTY 50 index options", "asset_class": "option", "aliases": ["NIFTY", "NIFTY50", "CNXNIFTY"], "priority": 5},
 
     # Commodity exposure available on Delta is tokenised/RWA futures, not physical spot futures.
     {"asset_id": "OIL", "display_name": "Crude Oil / WTI", "asset_class": "commodity", "aliases": ["OIL", "WTI", "CL", "USOIL", "CRUDE", "CRUDEOIL", "OILUSD", "OILUSDT", "WTIUSDT"], "priority": 10},
@@ -654,6 +722,28 @@ POLICY_EQUITY_MAX_RR = 5.0
 POLICY_EQUITY_MAX_HOLD_SEC = 5400
 POLICY_EQUITY_COOLDOWN_SEC = 180
 POLICY_EQUITY_SL_BUFFER_ATR = 0.55
+
+POLICY_OPTION_RISK_MULT = 0.85
+POLICY_OPTION_MARGIN_PCT = 0.42
+POLICY_OPTION_MIN_MARGIN_USD = 0.0
+POLICY_OPTION_TICK_EVAL_SEC = 0.50
+POLICY_OPTION_LOOP_INTERVAL_SEC = 0.50
+POLICY_OPTION_MIN_1M_BARS = 45
+POLICY_OPTION_MIN_5M_BARS = 35
+POLICY_OPTION_MIN_RR = 1.60
+POLICY_OPTION_MAX_RR = 4.00
+POLICY_OPTION_MAX_HOLD_SEC = 2700
+POLICY_OPTION_COOLDOWN_SEC = 120
+POLICY_OPTION_LOSS_LOCKOUT_SEC = 1200
+POLICY_OPTION_SL_BUFFER_ATR = 0.75
+POLICY_OPTION_ATR_MIN_PCTILE = 0.02
+POLICY_OPTION_ATR_MAX_PCTILE = 0.995
+POLICY_OPTION_SLIPPAGE_TOL = 0.0030
+POLICY_OPTION_TRAIL_MIN_MOVE_ATR = 0.10
+POLICY_OPTION_OB_DEPTH_LEVELS = 3
+POLICY_OPTION_TICK_AGG_WINDOW_SEC = 30.0
+POLICY_OPTION_VWAP_WINDOW = 35
+POLICY_OPTION_CVD_WINDOW = 18
 
 # Desk model: the alpha stack remains the same everywhere
 # (ICT FVG + Quant). Desks only change thresholds, sizing and exit parameters.
@@ -764,6 +854,40 @@ TRADING_DESKS = {
             # session and wait for a fresh market window.  Suspended desks keep
             # the policy for future re-enable without sharing BTC state.
             "max_session_losses": 1,
+        },
+    },
+    "OPTIONS": {
+        "enabled": ICICI_OPTIONS_RUNTIME_ENABLED,
+        "display_name": "NIFTY Options Desk",
+        "strategy": STRATEGY_CORE_NAME,
+        "asset_ids": ("NIFTY",),
+        "asset_classes": ("option",),
+        "risk_multiplier": POLICY_OPTION_RISK_MULT,
+        "margin_pct": POLICY_OPTION_MARGIN_PCT,
+        "tick_eval_sec": POLICY_OPTION_TICK_EVAL_SEC,
+        "loop_interval_sec": POLICY_OPTION_LOOP_INTERVAL_SEC,
+        "min_1m_bars": POLICY_OPTION_MIN_1M_BARS,
+        "min_5m_bars": POLICY_OPTION_MIN_5M_BARS,
+        "min_rr": POLICY_OPTION_MIN_RR,
+        "max_rr": POLICY_OPTION_MAX_RR,
+        "max_hold_sec": POLICY_OPTION_MAX_HOLD_SEC,
+        "cooldown_sec": POLICY_OPTION_COOLDOWN_SEC,
+        "sl_buffer_atr": POLICY_OPTION_SL_BUFFER_ATR,
+        "entry": {
+            "confirm_ticks": 2,
+            "fvg_proximity_atr": 0.55,
+            "require_ob_or_fvg": ICT_REQUIRE_OB_OR_FVG,
+            "min_pool_significance": 1.25,
+            "min_sweep_quality": 0.24,
+            "reversal_sl_buffer_atr": 0.38,
+            "continuation_sl_buffer_atr": 0.45,
+        },
+        "exit": {
+            "tp_min_rr_reversion": 1.80,
+            "tp_min_rr_trend": 2.35,
+        },
+        "conviction": {
+            "max_session_losses": 2,
         },
     },
 }

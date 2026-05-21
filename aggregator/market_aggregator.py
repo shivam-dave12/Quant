@@ -107,10 +107,12 @@ class MarketAggregator:
         primary_dm,    # CoinSwitchDataManager | DeltaDataManager
         secondary_dm,  # DeltaDataManager | CoinSwitchDataManager | None
         instrument=None,
+        analysis_dm=None,
     ) -> None:
         self.instrument = instrument
         self._primary   = primary_dm
         self._secondary = secondary_dm
+        self._analysis  = analysis_dm
 
         self._lock = threading.RLock()
 
@@ -136,7 +138,8 @@ class MarketAggregator:
             f"MarketAggregator initialised "
             f"[{getattr(instrument, 'asset_id', 'legacy')}] "
             f"(primary={type(primary_dm).__name__} "
-            f"secondary={'none' if secondary_dm is None else type(secondary_dm).__name__})"
+            f"secondary={'none' if secondary_dm is None else type(secondary_dm).__name__} "
+            f"analysis={'none' if analysis_dm is None else type(analysis_dm).__name__})"
         )
 
     # ── Internal: secondary trade tap ────────────────────────────────────────
@@ -216,10 +219,22 @@ class MarketAggregator:
                 logger.warning(f"Secondary DM start failed (non-fatal): {e}")
                 secondary_ok[0] = False
 
+        analysis_ok = [True]
+
+        def start_analysis():
+            if self._analysis is None:
+                return
+            try:
+                analysis_ok[0] = self._analysis.start()
+            except Exception as e:
+                logger.warning(f"Analysis DM start failed (non-fatal): {e}")
+                analysis_ok[0] = False
+
         t1 = threading.Thread(target=start_primary,   daemon=True)
         t2 = threading.Thread(target=start_secondary, daemon=True)
-        t1.start(); t2.start()
-        t1.join(); t2.join()
+        t3 = threading.Thread(target=start_analysis,  daemon=True)
+        t1.start(); t2.start(); t3.start()
+        t1.join(); t2.join(); t3.join()
 
         if not primary_ok[0]:
             logger.error("❌ Primary DM failed to start — cannot trade")
@@ -235,10 +250,18 @@ class MarketAggregator:
             self._secondary_alive = True
             logger.info("✅ Both exchanges live — dual-feed aggregation active")
 
+        if self._analysis and not analysis_ok[0]:
+            logger.warning("Analysis DM unavailable; primary candles will be used for structure")
+
         return True
 
     def stop(self) -> None:
         self._primary.stop()
+        if self._analysis:
+            try:
+                self._analysis.stop()
+            except Exception:
+                pass
         if self._secondary:
             try:
                 self._secondary.stop()
@@ -247,6 +270,11 @@ class MarketAggregator:
 
     def restart_streams(self) -> bool:
         ok = self._primary.restart_streams()
+        if self._analysis:
+            try:
+                self._analysis.restart_streams()
+            except Exception:
+                pass
         if self._secondary:
             try:
                 self._secondary.restart_streams()
@@ -264,11 +292,21 @@ class MarketAggregator:
 
         # Fast path — primary is already ready
         if self._primary.is_ready:
+            if self._analysis is not None:
+                try:
+                    self._analysis.wait_until_ready(min(timeout_sec, 30.0))
+                except Exception:
+                    pass
             return True
 
         # Wait for primary
         ready = self._primary.wait_until_ready(timeout_sec)
         if ready:
+            if self._analysis is not None:
+                try:
+                    self._analysis.wait_until_ready(min(timeout_sec, 30.0))
+                except Exception:
+                    pass
             return True
 
         # Primary timed out — check if secondary can take over
@@ -322,18 +360,41 @@ class MarketAggregator:
     def register_strategy(self, strategy) -> None:
         self._strategy_ref = strategy
         self._primary.register_strategy(strategy)
+        if self._analysis is not None:
+            try:
+                self._analysis.register_strategy(strategy)
+            except Exception:
+                pass
         # Secondary does NOT register strategy — we don't want double
         # on_realtime_trade calls.  The tap above handles secondary trades.
 
     # ── Candles — primary exchange only ──────────────────────────────────────
 
     def get_candles(self, timeframe: str = "5m", limit: int = 100) -> List[Dict]:
+        if self._analysis is not None:
+            try:
+                rows = self._analysis.get_candles(timeframe, limit)
+                if rows:
+                    return rows
+            except Exception:
+                pass
+        return self._primary.get_candles(timeframe, limit)
+
+    def get_execution_candles(self, timeframe: str = "5m", limit: int = 100) -> List[Dict]:
         return self._primary.get_candles(timeframe, limit)
 
     # ── Price — weighted average (display only) ────────────────────────────
 
     def get_last_price(self) -> float:
-        return self._primary.get_last_price()
+        price = self._primary.get_last_price()
+        if price > 0:
+            return price
+        if self._analysis is not None:
+            try:
+                return float(self._analysis.get_last_price() or 0.0)
+            except Exception:
+                pass
+        return price
 
     def get_consensus_price(self) -> float:
         """Weighted cross-venue price for display/diagnostics only."""
@@ -357,6 +418,7 @@ class MarketAggregator:
         information remains usable but must be treated as single-venue evidence.
         """
         primary_ready = bool(getattr(self._primary, "is_ready", False))
+        analysis_ready = bool(self._analysis is not None and getattr(self._analysis, "is_ready", False))
         secondary_configured = self._secondary is not None
         secondary_ready = bool(
             secondary_configured and self._secondary_alive
@@ -366,12 +428,14 @@ class MarketAggregator:
         microstructure_weight = 1.0 if secondary_ready else 0.62
         return {
             "primary_ready": primary_ready,
+            "analysis_ready": analysis_ready,
             "secondary_configured": secondary_configured,
             "secondary_alive": secondary_ready,
             "sources": sources,
             "microstructure_weight": microstructure_weight,
-            "mode": "dual" if secondary_ready else "single",
+            "mode": "analysis_underlying" if analysis_ready else ("dual" if secondary_ready else "single"),
             "note": (
+                "underlying-analysis + executable option premium" if analysis_ready else
                 "dual-feed microstructure" if secondary_ready
                 else "single-feed microstructure; posterior should discount CVD/OB"
             ),
@@ -382,7 +446,26 @@ class MarketAggregator:
         return self.get_feed_reliability()
 
     def is_price_fresh(self, max_stale_seconds: float = 90.0) -> bool:
-        return self._primary.is_price_fresh(max_stale_seconds)
+        primary_fresh = self._primary.is_price_fresh(max_stale_seconds)
+        if primary_fresh:
+            return True
+        if self._analysis is not None:
+            try:
+                return bool(self._analysis.is_price_fresh(max_stale_seconds))
+            except Exception:
+                pass
+        return False
+
+    def get_last_update(self) -> float:
+        vals = []
+        for dm in (self._primary, self._secondary, self._analysis):
+            if dm is None:
+                continue
+            try:
+                vals.append(float(dm.get_last_update() or 0.0))
+            except Exception:
+                pass
+        return max(vals) if vals else 0.0
 
     # ── Orderbook — fused from both exchanges ─────────────────────────────────
 

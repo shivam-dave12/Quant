@@ -43,7 +43,7 @@ import time
 from collections import deque
 from datetime import datetime
 from enum import Enum
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
@@ -102,6 +102,7 @@ class _RateLimiter:
 # Global limiters — one per exchange (shared across all OrderManager instances)
 _CS_LIMITER    = _RateLimiter(min_interval_sec=3.0)
 _DELTA_LIMITER = _RateLimiter(min_interval_sec=0.25)
+_ICICI_LIMITER = _RateLimiter(min_interval_sec=0.75)
 
 # Also keep a module-level alias for compatibility imports (quant_strategy does
 # `from execution.order_manager import GlobalRateLimiter`)
@@ -857,6 +858,282 @@ class _DeltaAdapter:
 
 # ── Main OrderManager ─────────────────────────────────────────────────────────
 
+class _ICICIAdapter:
+    """Long-premium ICICI options adapter.
+
+    Opening orders are always buy-to-open limit orders. Exits are sell-to-close
+    limit orders. No market entry, no option writing, no leverage.
+    """
+
+    def __init__(self, api, exchange_instrument=None) -> None:
+        self.api = api
+        self.limiter = _ICICI_LIMITER
+        self.exchange_instrument = exchange_instrument
+        self.symbol = (exchange_instrument.symbol if exchange_instrument is not None else "")
+        self.display_symbol = (exchange_instrument.display_symbol if exchange_instrument is not None else self.symbol)
+        self.tick_size = float(getattr(exchange_instrument, "tick_size", 0.05) or 0.05) if exchange_instrument is not None else 0.05
+        self.lot_step = float(getattr(exchange_instrument, "lot_step", 1.0) or 1.0) if exchange_instrument is not None else 1.0
+        self.min_qty = float(getattr(exchange_instrument, "min_qty", 1.0) or 1.0) if exchange_instrument is not None else 1.0
+        self.max_qty = float(getattr(exchange_instrument, "max_qty", 0.0) or 0.0) if exchange_instrument is not None else 0.0
+        self.raw = getattr(exchange_instrument, "raw", {}) or {}
+
+    @staticmethod
+    def _num(value: Any, default: float = 0.0) -> float:
+        try:
+            if value is None:
+                return default
+            if isinstance(value, str):
+                value = value.strip().replace(",", "")
+                if not value:
+                    return default
+            return float(value)
+        except Exception:
+            return default
+
+    @staticmethod
+    def _success_payload(resp: Any) -> Dict[str, Any]:
+        data = resp.get("Success") if isinstance(resp, dict) else resp
+        if isinstance(data, list):
+            data = data[0] if data else {}
+        return data if isinstance(data, dict) else {}
+
+    def _active_raw(self) -> Dict[str, Any]:
+        selected = self.raw.get("selected_option_contract")
+        if isinstance(selected, dict) and isinstance(selected.get("raw"), dict):
+            merged = dict(self.raw)
+            merged.update(selected.get("raw") or {})
+            return merged
+        return self.raw
+
+    def _lot_size(self) -> float:
+        raw = self._active_raw()
+        for key in ("runtime_lot_size", "LotSize", "lot_size", "MinimumLotQty", "min_qty"):
+            val = self._num(raw.get(key), 0.0)
+            if val > 0:
+                return val
+        return max(1.0, self.min_qty)
+
+    def _order_body(self, side: str, order_type: str, quantity: float,
+                    price=None, trigger_price=None, reduce_only: bool = False,
+                    **kwargs) -> Dict:
+        order_type_u = str(order_type or "").upper()
+        stop_order_type = str(kwargs.get("stop_order_type") or "").lower()
+        if "MARKET" in order_type_u and not reduce_only:
+            raise RuntimeError("ICICI options guard: market entries are disabled; use limit orders")
+        raw = self._active_raw()
+        action = "sell" if reduce_only else "buy"
+        px = price if price is not None else trigger_price
+        if (px is None or float(px or 0.0) <= 0) and reduce_only:
+            px = raw.get("selected_entry_premium") or raw.get("ltp") or raw.get("last_price") or raw.get("close")
+        if px is None or float(px or 0.0) <= 0:
+            raise RuntimeError("ICICI options guard: limit price is required")
+        lot = int(max(1, round(self._lot_size())))
+        lots = max(1, int(round(float(quantity or 0.0) / max(lot, 1))))
+        qty = int(lots * lot)
+        body = {
+            "stock_code": str(raw.get("stock_code") or raw.get("ShortName") or "").upper(),
+            "exchange_code": str(raw.get("exchange_code") or "NFO").upper(),
+            "product": "options",
+            "action": action,
+            "order_type": "limit",
+            "quantity": qty,
+            "price": str(px),
+            "validity": "day",
+            "expiry_date": self.api._normalise_expiry(raw.get("expiry_date") or raw.get("ExpiryDate") or ""),
+            "right": self.api._normalise_right(raw.get("right") or raw.get("OptionType") or ""),
+            "strike_price": str(raw.get("strike_price") or raw.get("StrikePrice") or ""),
+        }
+        if (order_type_u.startswith("STOP") or stop_order_type == "stop_loss_order") and trigger_price is not None:
+            body["stoploss"] = str(trigger_price)
+        return {k: v for k, v in body.items() if v not in (None, "")}
+
+    def extract_order_id(self, resp: Dict) -> Optional[str]:
+        if not isinstance(resp, dict):
+            return None
+        data = resp.get("Success") or resp.get("success") or resp.get("data") or resp.get("result") or resp
+        if isinstance(data, list) and data:
+            data = data[0]
+        if isinstance(data, dict):
+            oid = data.get("order_id") or data.get("OrderId") or data.get("orderId") or data.get("id")
+            return str(oid) if oid else None
+        if isinstance(data, str) and data.strip():
+            return data.strip()
+        return None
+
+    def extract_status(self, order_data: Dict) -> str:
+        raw = str(order_data.get("status") or order_data.get("Status") or order_data.get("order_status") or "").upper()
+        if raw in {"EXECUTED", "FILLED", "COMPLETE", "COMPLETED"}:
+            return "FILLED"
+        if raw in {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}:
+            return "CANCELLED"
+        if raw in {"PARTIALLY_FILLED", "PARTIAL"}:
+            return "PARTIAL_FILL"
+        return "PENDING" if raw else "UNKNOWN"
+
+    def extract_fill_price(self, order_data: Dict) -> Optional[float]:
+        for f in ("average_price", "avg_price", "price", "execution_price"):
+            p = self._num(order_data.get(f), 0.0)
+            if p > 0:
+                return p
+        return None
+
+    def extract_filled_qty(self, order_data: Dict) -> float:
+        for f in ("filled_quantity", "executed_quantity", "quantity"):
+            q = self._num(order_data.get(f), 0.0)
+            if q > 0:
+                return q
+        return 0.0
+
+    def place_order(self, side: str, order_type: str, quantity: float,
+                    price: Optional[float] = None,
+                    trigger_price: Optional[float] = None,
+                    reduce_only: bool = False,
+                    **kwargs) -> Optional[Dict]:
+        self.limiter.wait()
+        try:
+            body = self._order_body(side, order_type, quantity, price=price, trigger_price=trigger_price, reduce_only=reduce_only, **kwargs)
+            resp = self.api.place_order(**body)
+            oid = self.extract_order_id(resp)
+            if not oid:
+                return {"_raw": resp, "_sc": 0, "_error": True}
+            return {"order_id": oid, "status": "PENDING", "quantity": float(body.get("quantity") or quantity), "price": float(body.get("price") or 0.0), "_raw": resp}
+        except Exception as exc:
+            return {"_raw": {"error": str(exc)}, "_sc": 0, "_error": True}
+
+    def cancel_order(self, order_id: str) -> Dict:
+        self.limiter.wait()
+        raw = self._active_raw()
+        try:
+            return self.api.cancel_order(order_id=str(order_id), exchange_code=str(raw.get("exchange_code") or "NFO").upper()) or {}
+        except TypeError:
+            return self.api.cancel_order(order_id=str(order_id)) or {}
+
+    def get_order(self, order_id: str) -> Optional[Dict]:
+        getter = getattr(self.api, "get_order", None) or getattr(self.api, "get_order_detail", None)
+        if not callable(getter):
+            return {"order_id": str(order_id), "status": "PENDING"}
+        self.limiter.wait()
+        raw = self._active_raw()
+        try:
+            resp = getter(order_id=str(order_id), exchange_code=str(raw.get("exchange_code") or "NFO").upper())
+        except TypeError:
+            try:
+                resp = getter(str(order_id))
+            except Exception:
+                return {"order_id": str(order_id), "status": "PENDING"}
+        except Exception:
+            return {"order_id": str(order_id), "status": "PENDING"}
+        data = self._success_payload(resp)
+        if data:
+            data.setdefault("order_id", str(order_id))
+            return data
+        return {"order_id": str(order_id), "status": "PENDING"}
+
+    def get_open_orders(self, symbol: str) -> Optional[list]:
+        return []
+
+    def get_positions(self, symbol: str) -> Optional[Dict]:
+        try:
+            return self.api.get_portfolio_positions()
+        except Exception:
+            return None
+
+    def normalise_position(self, raw) -> Optional[Dict]:
+        rows = raw.get("Success") if isinstance(raw, dict) else raw
+        if isinstance(rows, dict):
+            rows = rows.get("positions") or rows.get("data") or [rows]
+        positions = rows if isinstance(rows, list) else []
+        active = self._active_raw()
+        strike = str(active.get("strike_price") or "").strip().lower()
+        right = str(active.get("right") or active.get("option_type") or "").strip().lower()
+        expiry = str(active.get("expiry_date") or "").strip().lower()
+        for pos in positions:
+            if not isinstance(pos, dict):
+                continue
+            text = " ".join(str(v) for v in pos.values()).lower()
+            if strike and strike not in text:
+                continue
+            if right and right not in text and right[:1] not in text:
+                continue
+            if expiry and expiry[:10] not in text:
+                continue
+            qty = abs(self._num(pos.get("quantity") or pos.get("qty") or pos.get("open_quantity"), 0.0))
+            entry = self._num(pos.get("average_price") or pos.get("avg_price") or pos.get("entry_price"), 0.0)
+            upnl = self._num(pos.get("unrealized_pnl") or pos.get("pnl"), 0.0)
+            if qty > 0:
+                return {"side": "LONG", "size": qty, "entry_price": entry, "unrealized_pnl": upnl, "raw": pos}
+        return {"side": None, "size": 0.0, "entry_price": 0.0, "unrealized_pnl": 0.0}
+
+    def _parse_fno_funds(self, resp: Dict[str, Any]) -> Dict[str, Any]:
+        data = self._success_payload(resp)
+        allocated = self._num(data.get("allocated_fno", data.get("allocated_FNO", data.get("allocated_derivatives"))))
+        blocked = self._num(data.get("block_by_trade_fno", data.get("blocked_fno", data.get("block_by_trade_derivatives"))))
+        unallocated = self._num(data.get("unallocated_balance"))
+        bank_total = self._num(data.get("total_bank_balance"))
+        available = max(0.0, allocated - max(0.0, blocked))
+        return {"allocated": allocated, "blocked": max(0.0, blocked), "available": available, "unallocated": max(0.0, unallocated), "bank_total": max(0.0, bank_total), "source": "funds.allocated_fno_minus_block_by_trade_fno", "raw": resp}
+
+    def _parse_nfo_margin(self, resp: Dict[str, Any]) -> Dict[str, Any]:
+        data = self._success_payload(resp)
+        cash_limit = self._num(data.get("cash_limit"))
+        amount_allocated = self._num(data.get("amount_allocated"))
+        blocked = self._num(data.get("block_by_trade"))
+        base = cash_limit if cash_limit > 0 else amount_allocated
+        available = max(0.0, base - max(0.0, blocked))
+        return {"cash_limit": max(0.0, cash_limit), "amount_allocated": max(0.0, amount_allocated), "blocked": max(0.0, blocked), "available": available, "source": "margin.NFO.cash_limit_minus_block_by_trade" if cash_limit > 0 else "margin.NFO.amount_allocated_minus_block_by_trade", "raw": resp}
+
+    def get_balance(self) -> Dict:
+        funds_resp: Dict[str, Any] = {}
+        margin_resp: Dict[str, Any] = {}
+        errors = []
+        try:
+            self.limiter.wait()
+            funds_resp = self.api.get_funds()
+        except Exception as exc:
+            errors.append(f"funds: {exc}")
+        fno = self._parse_fno_funds(funds_resp) if funds_resp else {"allocated": 0.0, "blocked": 0.0, "available": 0.0, "unallocated": 0.0, "bank_total": 0.0, "source": "funds.unavailable", "raw": funds_resp}
+        try:
+            self.limiter.wait()
+            margin_resp = self.api.get_margin(exchange_code="NFO")
+        except Exception as exc:
+            errors.append(f"margin.NFO: {exc}")
+        margin = self._parse_nfo_margin(margin_resp) if margin_resp else {"cash_limit": 0.0, "amount_allocated": 0.0, "blocked": 0.0, "available": 0.0, "source": "margin.NFO.unavailable", "raw": margin_resp}
+        if fno["available"] > 0 or fno["allocated"] > 0:
+            available, locked, total, source = fno["available"], fno["blocked"], fno["allocated"], fno["source"]
+        elif margin["available"] > 0:
+            available, locked, total, source = margin["available"], margin["blocked"], max(margin["cash_limit"], margin["amount_allocated"], margin["available"] + margin["blocked"]), margin["source"]
+        else:
+            available, locked, total, source = 0.0, max(fno["blocked"], margin["blocked"]), max(fno["allocated"], margin["cash_limit"], margin["amount_allocated"]), "zero_fno_allocation_or_unavailable"
+        out = {
+            "available": max(0.0, available),
+            "available_raw": max(0.0, available),
+            "locked": max(0.0, locked),
+            "total": max(0.0, total),
+            "currency": "INR",
+            "segment": "FNO",
+            "source": source,
+            "fno_allocated": fno["allocated"],
+            "fno_blocked": fno["blocked"],
+            "fno_available": fno["available"],
+            "unallocated_balance": fno["unallocated"],
+            "bank_total": fno["bank_total"],
+            "nfo_cash_limit": margin["cash_limit"],
+            "nfo_amount_allocated": margin["amount_allocated"],
+            "nfo_blocked": margin["blocked"],
+            "nfo_available": margin["available"],
+            "raw": {"funds": funds_resp, "margin_nfo": margin_resp},
+        }
+        if errors:
+            out["warning"] = "; ".join(errors)
+            if not funds_resp and not margin_resp:
+                out["error"] = out["warning"]
+        logger.info("ICICI F&O balance source=%s available=%.2f allocated=%.2f blocked=%.2f nfo_cash_limit=%.2f unallocated=%.2f", out["source"], out["available"], out["fno_allocated"], out["fno_blocked"], out["nfo_cash_limit"], out["unallocated_balance"])
+        return out
+
+    def set_leverage(self, leverage: int, product_id: Optional[int] = None) -> Dict:
+        return {"success": True, "leverage": 1, "message": "ICICI long-premium options are fully funded; leverage is not applicable"}
+
+
 class OrderManager:
     """
     Exchange-agnostic order manager.
@@ -880,6 +1157,8 @@ class OrderManager:
                 exchange_instrument = None
         if exch == "delta":
             self._adapter = _DeltaAdapter(api, exchange_instrument=exchange_instrument)
+        elif exch == "icici":
+            self._adapter = _ICICIAdapter(api, exchange_instrument=exchange_instrument)
         else:
             self._adapter = _CoinSwitchAdapter(api, exchange_instrument=exchange_instrument)
 
