@@ -633,7 +633,18 @@ BREEZE_API_SESSION = os.getenv("BREEZE_API_SESSION", os.getenv("ICICI_API_SESSIO
 BREEZE_SESSION_TOKEN = os.getenv("BREEZE_SESSION_TOKEN", "")
 ICICI_SESSION_CACHE_PATH = os.getenv("ICICI_SESSION_CACHE_PATH", "data/icici_breeze_session.json")
 ICICI_SESSION_TTL_SEC = 6 * 60 * 60
+ICICI_SESSION_EXPIRES_DAILY = True
+ICICI_SESSION_TIMEZONE_OFFSET_MIN = 330
+# Telegram /start must generate/validate the Breeze session before ICICI
+# data managers touch protected Breeze endpoints. API_Session/SessionToken
+# are runtime artifacts, not .env requirements.
+ICICI_BREEZE_PREFLIGHT_ON_STARTUP = True
+ICICI_AUTO_TOKEN_GENERATOR_ON_STARTUP = True
+ICICI_AUTH_REQUIRED_FOR_DETAILS = True
 ICICI_TOKEN_GENERATOR_HEADLESS = os.getenv("ICICI_TOKEN_GENERATOR_HEADLESS", "true").lower() == "true"
+ICICI_PLAYWRIGHT_AUTO_INSTALL = True
+ICICI_OTP_WAIT_SEC = 180.0
+ICICI_STARTUP_TOKEN_WAIT_SEC = 300.0
 ICICI_DEBUG_DIR = os.getenv("ICICI_DEBUG_DIR", "data/icici_debug")
 ICICI_MARKET_SESSION_GUARD_ENABLED = True
 ICICI_MARKET_OPEN_TIME = "09:15"

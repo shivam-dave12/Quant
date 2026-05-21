@@ -143,3 +143,58 @@ def test_icici_configured_nifty_discovery_is_auth_independent():
     assert icici_inst.raw["breeze_stock_code"] == "NIFTY"
     assert icici_inst.raw["exchange_code"] == "NFO"
     assert icici_inst.raw["underlying_exchange_code"] == "NSE"
+
+
+
+def test_telegram_start_preflights_icici_token_before_bot_start(monkeypatch, tmp_path):
+    import sys
+    import types
+    from exchanges.icici.breeze_auth import BreezeSession
+    import telegram.controller as ctl
+
+    calls = []
+
+    class FakeSvc:
+        def require_configured(self, *, for_login=False):
+            calls.append(("require", for_login))
+        def get_session(self, force_refresh=False, otp_getter=None, otp_code=None):
+            calls.append(("get", force_refresh))
+            raise RuntimeError("missing session")
+        def refresh(self, *, otp_getter=None, otp_code=None):
+            calls.append(("refresh", otp_getter is not None))
+            assert otp_getter is not None
+            return BreezeSession("api-session", "session-token", 1.0, {})
+        def session_status(self, session=None):
+            return {"same_trading_day": True, "reason": "ok", "valid": True}
+
+    fake_mod = types.SimpleNamespace(BreezeTokenService=FakeSvc)
+    monkeypatch.setitem(sys.modules, "exchanges.icici.breeze_auth", fake_mod)
+    monkeypatch.setattr(ctl.config, "ICICI_OPTIONS_RUNTIME_ENABLED", True, raising=False)
+    monkeypatch.setattr(ctl.config, "ICICI_AUTO_TOKEN_GENERATOR_ON_STARTUP", True, raising=False)
+    monkeypatch.setattr(ctl.config, "ICICI_BREEZE_PREFLIGHT_ON_STARTUP", True, raising=False)
+    monkeypatch.setattr(ctl.config, "ICICI_AUTH_REQUIRED_FOR_DETAILS", True, raising=False)
+
+    c = ctl.TelegramBotController.__new__(ctl.TelegramBotController)
+    c._icici_otp_cv = __import__("threading").Condition()
+    c._icici_pending_otp = ""
+    c._icici_waiting_for_otp = False
+    c._icici_refresh_thread = None
+    sent = []
+    c.send_message = lambda msg, parse_mode="HTML": sent.append(msg) or True
+    c._icici_otp_getter = lambda: "123456"
+
+    c._ensure_icici_session_before_bot_start()
+
+    assert ("refresh", True) in calls
+    assert any("token ready before scanner start" in m for m in sent)
+
+
+def test_telegram_plain_six_digit_otp_is_consumed_when_waiting(monkeypatch):
+    import telegram.controller as ctl
+    c = ctl.TelegramBotController.__new__(ctl.TelegramBotController)
+    c._icici_otp_cv = __import__("threading").Condition()
+    c._icici_pending_otp = ""
+    c._icici_waiting_for_otp = True
+    out = ctl.TelegramBotController.handle_command(c, "123456")
+    assert "OTP received" in out
+    assert c._icici_pending_otp == "123456"

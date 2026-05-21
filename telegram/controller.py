@@ -30,7 +30,7 @@ import threading
 import requests
 import html as _html
 from typing import Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import sys
 
 import sys, os as _os; sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
@@ -391,6 +391,12 @@ class TelegramBotController:
         global bot_instance, bot_thread, bot_running
         cmd, args = self._normalize_command(raw_text)
         try:
+            if cmd and not str(cmd).startswith("/"):
+                maybe_otp = re.sub(r"\D", "", str(cmd or ""))
+                with self._icici_otp_cv:
+                    waiting_for_icici_otp = bool(self._icici_waiting_for_otp)
+                if waiting_for_icici_otp and len(maybe_otp) == 6:
+                    return self._cmd_icici_otp(maybe_otp)
             if   cmd in ("/help", "/commands"): return self._cmd_help()
             elif cmd == "/start":               return self._cmd_start()
             elif cmd == "/stop":                return self._cmd_stop()
@@ -526,13 +532,14 @@ class TelegramBotController:
 
     def _cmd_icici_otp(self, args: str) -> str:
         otp = re.sub(r"\D", "", str(args or ""))
-        if len(otp) < 4:
+        if len(otp) != 6:
             return "Send the OTP like: <code>/icici_otp 123456</code>"
         with self._icici_otp_cv:
+            waiting = bool(self._icici_waiting_for_otp)
             self._icici_pending_otp = otp
             self._icici_waiting_for_otp = False
             self._icici_otp_cv.notify_all()
-        return "ICICI OTP received. Continuing Breeze session refresh."
+        return "ICICI OTP received. Continuing Breeze session refresh." if waiting else "ICICI OTP captured. Waiting token generator will consume it if login is pending."
 
     # /help
     # ================================================================
@@ -2462,6 +2469,114 @@ class TelegramBotController:
         return "\n".join(lines)
 
     # ================================================================
+    # ICICI Breeze auth preflight before data managers start
+    # ================================================================
+
+    def _icici_otp_timeout_sec(self) -> float:
+        return max(45.0, float(getattr(config, "ICICI_OTP_WAIT_SEC", 180.0) or 180.0))
+
+    def _clear_icici_pending_otp(self) -> None:
+        with self._icici_otp_cv:
+            self._icici_pending_otp = ""
+            self._icici_waiting_for_otp = False
+
+    def _icici_auth_tz(self) -> timezone:
+        offset_min = int(getattr(config, "ICICI_SESSION_TIMEZONE_OFFSET_MIN", 330) or 330)
+        return timezone(timedelta(minutes=offset_min))
+
+    def _icici_auth_now(self) -> datetime:
+        return datetime.now(self._icici_auth_tz())
+
+    def _format_icici_session_ok(self, session) -> str:
+        try:
+            status = session.masked()
+            session_token = status.get("session_token", "***")
+        except Exception:
+            session_token = "***"
+        try:
+            from exchanges.icici.breeze_auth import BreezeTokenService
+            svc = BreezeTokenService()
+            st = svc.session_status(session)
+            day = "same-day" if st.get("same_trading_day") else "stale-day"
+        except Exception:
+            day = "unknown"
+        try:
+            age = int(session.age_sec())
+        except Exception:
+            age = 0
+        return (
+            "✅ <b>ICICI Breeze token ready before scanner start</b>\n"
+            f"Session age: <code>{age}s</code>\n"
+            f"Trading day: <code>{_esc(day)}</code>\n"
+            f"SessionToken: <code>{_esc(session_token)}</code>"
+        )
+
+    def _should_auto_icici_token_on_start(self) -> bool:
+        if not bool(getattr(config, "ICICI_AUTO_TOKEN_GENERATOR_ON_STARTUP", True)):
+            return False
+        return bool(
+            getattr(config, "ICICI_OPTIONS_RUNTIME_ENABLED", False)
+            or getattr(config, "ICICI_ENABLED", False)
+            or getattr(config, "ICICI_BREEZE_PREFLIGHT_ON_STARTUP", True)
+        )
+
+    def _ensure_icici_session_before_bot_start(self) -> None:
+        """Generate/validate Breeze token before ICICI DMs touch protected endpoints.
+
+        This is intentionally in Telegram /start rather than the data manager:
+        the controller owns the OTP conversation, while data managers must stay
+        deterministic and never block mid-start waiting for operator input.
+        """
+        if not self._should_auto_icici_token_on_start():
+            return
+        try:
+            if self._icici_refresh_thread is not None and self._icici_refresh_thread.is_alive():
+                wait_sec = max(
+                    self._icici_otp_timeout_sec() + 60.0,
+                    float(getattr(config, "ICICI_STARTUP_TOKEN_WAIT_SEC", 300.0) or 300.0),
+                )
+                self.send_message(
+                    "🔐 <b>ICICI Breeze token refresh already running</b>\n"
+                    "Startup will wait for the active renewal instead of launching a second login."
+                )
+                self._icici_refresh_thread.join(timeout=wait_sec)
+                if self._icici_refresh_thread.is_alive():
+                    raise RuntimeError("ICICI token refresh did not complete before startup wait timeout")
+
+            from exchanges.icici.breeze_auth import BreezeTokenService
+            svc = BreezeTokenService()
+            svc.require_configured(for_login=False)
+
+            # Fast path: valid same-day cached session, current API_Session file,
+            # or an explicit emergency SessionToken override. No .env session is
+            # required for the normal path.
+            try:
+                session = svc.get_session(force_refresh=False)
+                self.send_message(self._format_icici_session_ok(session))
+                return
+            except Exception as first_exc:
+                logger.info("ICICI Breeze session not ready; launching Telegram OTP login before scanner start: %s", first_exc)
+
+            svc.require_configured(for_login=True)
+            self._clear_icici_pending_otp()
+            self.send_message(
+                "🔐 <b>ICICI Breeze login required before NIFTY analysis starts</b>\n"
+                "No valid same-day Breeze session was found. I am launching the token generator now; "
+                "send only the OTP when requested."
+            )
+            session = svc.refresh(otp_getter=self._icici_otp_getter)
+            self.send_message(self._format_icici_session_ok(session))
+        except Exception as exc:
+            msg = f"ICICI Breeze startup token generation failed: {exc}"
+            logger.error(msg, exc_info=True)
+            if bool(getattr(config, "ICICI_AUTH_REQUIRED_FOR_DETAILS", True)):
+                raise RuntimeError(msg) from exc
+            self.send_message(
+                "⚠️ ICICI auth unavailable; continuing without authenticated ICICI data.\n"
+                f"Reason: <code>{_esc(exc)}</code>"
+            )
+
+    # ================================================================
     # BOT THREAD
     # ================================================================
 
@@ -2479,6 +2594,7 @@ class TelegramBotController:
             # without this, multi-asset Telegram starts used controller-only logs.
             import main as _main_logging_bootstrap  # noqa: F401
             import config as _cfg
+            self._ensure_icici_session_before_bot_start()
             if bool(getattr(_cfg, "MULTI_ASSET_ENABLED", True)):
                 from orchestration.multi_asset_bot import MultiAssetQuantBot
                 logger.info("Telegram /start selected MultiAssetQuantBot (MULTI_ASSET_ENABLED=True)")
