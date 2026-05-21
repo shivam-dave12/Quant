@@ -190,9 +190,9 @@ class MultiAssetQuantBot:
     def format_assets_report(self) -> str:
         def esc(x):
             return str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        lines = ["📡 <b>MULTI-ASSET SCANNER</b>", ""]
-        lines.append(f"Reserved slots: {self.guard.count_open(self.contexts)}/{self.guard.max_open_positions}")
-        lines.append(f"Budget mode: {esc(self.guard.budget_mode)} · one contract slot max: {self.guard.max_per_contract}")
+        lines = ["📡 <b>Portfolio Scanner Map</b>", "━━━━━━━━━━━━━━━━━━━━"]
+        lines.append(f"🧩 Slots: <code>{self.guard.count_open(self.contexts)}/{self.guard.max_open_positions}</code>")
+        lines.append(f"💼 Budget: <code>{esc(self.guard.budget_mode)}</code> · one-contract cap <code>{self.guard.max_per_contract}</code>")
         for ctx in self.contexts:
             inst = ctx.instrument
             try:
@@ -221,11 +221,17 @@ class MultiAssetQuantBot:
                     pnl_txt = f" · uPnL={self._fmt_money(m.get('upnl', 0.0))} live={self._fmt_money(m.get('lifecycle_pnl', m.get('upnl', 0.0)))}"
                 except Exception:
                     pnl_txt = ""
-            lines.append(f"• <b>{esc(inst.asset_id)}</b> primary={esc(inst.primary_exchange.value.upper())} {esc(inst.display_symbol)} [{esc(venues)}] — {esc(state)} @ {px:,.4f} · {esc(budget_txt)}{lev_txt} · {esc(pol_txt)}{pnl_txt}")
+            status_icon = "🟢" if state in ("READY", "SCANNING") else ("🔵" if pos else "🟠")
+            lines.append(
+                f"{status_icon} <b>{esc(inst.asset_id)}</b>  <code>{esc(inst.primary_exchange.value.upper())}:{esc(inst.display_symbol)}</code>\n"
+                f"   <code>{esc(state):<11} px {px:,.4f} · {esc(budget_txt)}{lev_txt}</code>\n"
+                f"   <code>{esc(venues)}</code>\n"
+                f"   <i>{esc(pol_txt)}{pnl_txt}</i>"
+            )
         if self.discovery_report and self.discovery_report.unavailable:
-            lines.append("\n<b>Unavailable:</b>")
+            lines.append("\n⚪ <b>Unavailable</b>")
             for aid, reason in self.discovery_report.unavailable.items():
-                lines.append(f"⚪ {esc(aid)} — {esc(reason)}")
+                lines.append(f"• {esc(aid)} — {esc(reason)}")
         return "\n".join(lines)
 
 
@@ -840,26 +846,29 @@ class MultiAssetQuantBot:
         return True
 
     def _startup_message(self) -> str:
-        lines = ["🏛 <b>PORTFOLIO COMMAND CENTER ONLINE</b>", ""]
-        lines.append("<b>Execution universe — asset-scoped strategy desks:</b>")
+        lines = ["🏛 <b>Portfolio Command Center Online</b>", "━━━━━━━━━━━━━━━━━━━━"]
+        lines.append("🧠 <b>Execution Universe</b>")
         for ctx in self.contexts:
             inst = ctx.instrument
             venues = ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items())
             lev = self._instrument_leverage(inst)
             pol = active_policy(inst)
             cadence = getattr(pol, "loop_interval_sec", getattr(pol, "tick_eval_sec", 0.0))
-            lines.append(f"• <b>{inst.asset_id}</b> — {inst.primary_exchange.value.upper()}:{inst.display_symbol} | venues {venues} | lev {lev}x | {pol.asset_class} | risk×{pol.risk_multiplier:.2f} | margin {pol.margin_pct:.0%} | cadence {float(cadence):.2f}s")
-        lines.append("")
+            lines.append(
+                f"🟢 <b>{inst.asset_id}</b>  <code>{inst.primary_exchange.value.upper()}:{inst.display_symbol}</code>\n"
+                f"   <code>lev {lev}x · risk×{pol.risk_multiplier:.2f} · margin {pol.margin_pct:.0%} · cadence {float(cadence):.2f}s</code>\n"
+                f"   <code>{venues}</code>"
+            )
         if not bool(getattr(config, "STOCK_DESK_TRADING_ENABLED", True)):
-            lines.append("⏸ <b>STOCK DESK SUSPENDED</b> — equity/index contexts are not created and cannot route orders.")
-            lines.append("")
-        lines.append("<b>Portfolio rules:</b>")
-        lines.append(f"• Multiple simultaneous contracts allowed: {self.guard.max_open_positions} portfolio slots")
-        lines.append(f"• One live/entering/exit slot per contract: max {self.guard.max_per_contract}")
-        lines.append(f"• Balance allocation: {self.guard.budget_mode}; cash uses live available funds, risk base is {self.guard.risk_budget_mode}; sizing uses per-instrument policy, not BTC defaults")
-        lines.append("• Live exchange products only; no synthetic symbols. Stock/equity/index desk is suspended and excluded before discovery.")
-        lines.append("• Alpha remains posterior/EV based; PortfolioManager only controls exposure mechanics")
-        lines.append("• Cross-asset overlay active for BTC/GOLD/SILVER: correlation, relative value, TP reach and cluster risk drive sizing/TP; unsponsored opposite metal-pair exposure is blocked as portfolio-risk, not as a retail signal filter")
+            lines.append("\n⏸ <b>Stock desk suspended</b> — equity/index contexts are not created and cannot route orders.")
+        lines.extend([
+            "\n🛡️ <b>Portfolio Rules</b>",
+            f"• Slots: <code>{self.guard.max_open_positions}</code> portfolio positions, <code>{self.guard.max_per_contract}</code> per contract",
+            f"• Balance allocation: <code>{self.guard.budget_mode}</code>; risk base <code>{self.guard.risk_budget_mode}</code>",
+            "• Live exchange products only; no synthetic executable symbols",
+            "• Alpha: posterior/EV first; portfolio manager controls exposure mechanics",
+            "• Cross-asset overlay: correlation, relative value, TP reach and cluster-risk sizing",
+        ])
         return "\n".join(lines)
 
     def _update_cross_asset_overlay(self) -> None:

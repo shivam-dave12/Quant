@@ -229,16 +229,25 @@ class DiscoveryReport:
     def telegram_html(self) -> str:
         def esc(x):
             return str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        parts = ["📡 <b>MULTI-ASSET LIVE CATALOG DISCOVERY</b>"]
-        parts.append("Raw products: " + esc(", ".join(f"{k}={v}" for k, v in self.raw_counts.items())))
+        parts = [
+            "📡 <b>Live Catalog Discovery</b>",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "🧾 Raw products: <code>" + esc(", ".join(f"{k}={v}" for k, v in self.raw_counts.items())) + "</code>",
+        ]
         if self.matched:
-            parts.append("\n<b>Activated:</b>")
+            parts.append("\n✅ <b>Activated Desks</b>")
             for inst in self.matched:
-                parts.append(f"✅ <b>{esc(inst.asset_id)}</b> — primary {esc(inst.primary_exchange.value.upper())} / {esc(inst.display_symbol)}")
+                venues = ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items())
+                parts.append(
+                    f"• <b>{esc(inst.asset_id)}</b>  <code>{esc(inst.primary_exchange.value.upper())}:{esc(inst.display_symbol)}</code>  "
+                    f"<i>{esc(getattr(inst.asset_class, 'value', str(inst.asset_class)).upper())}</i>"
+                )
+                if venues:
+                    parts.append(f"  <code>{esc(venues)}</code>")
         if self.unavailable:
-            parts.append("\n<b>Unavailable / skipped:</b>")
+            parts.append("\n⚪ <b>Unavailable / Skipped</b>")
             for aid, reason in self.unavailable.items():
-                parts.append(f"⚪ <b>{esc(aid)}</b> — {esc(reason)}")
+                parts.append(f"• <b>{esc(aid)}</b> — {esc(reason)}")
         return "\n".join(parts)
 
 

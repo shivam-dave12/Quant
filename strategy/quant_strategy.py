@@ -7944,6 +7944,10 @@ class QuantStrategy:
             expected_value=getattr(_best_t, 'full_position_utility', getattr(_best_t, 'utility', 0.0)) if _best_t is not None else 0.0,
             target_realism=getattr(_best_t, 'probability', 0.0) if _best_t is not None else 0.0,
             fee_line=_fee_line,
+            entry_leverage=_entry_leverage,
+            risk_usd=dollar_risk,
+            margin_risk_pct=getattr(self, '_active_margin_risk_pct', 0.0),
+            order_id=str(entry_data.get("order_id") or ""),
         )
         _entry_msg += (
             f"\n<code>RISK ${dollar_risk:.2f}   FEE {_fee_line}</code>"

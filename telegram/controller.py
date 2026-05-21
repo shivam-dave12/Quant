@@ -153,6 +153,9 @@ def _redact_telegram_token(value) -> str:
 bot_instance = None
 bot_thread   = None
 bot_running  = False
+bot_starting = False
+bot_last_start_error = ""
+bot_state_lock = threading.RLock()
 
 
 class TelegramBotController:
@@ -453,15 +456,18 @@ class TelegramBotController:
     # ================================================================
 
     def _icici_otp_getter(self) -> str:
+        timeout_sec = self._icici_otp_timeout_sec()
         with self._icici_otp_cv:
             self._icici_waiting_for_otp = True
             self._icici_pending_otp = ""
         self.send_message(
-            "<b>ICICI Breeze OTP required</b>\n"
-            "Send <code>/icici_otp 123456</code> within 180 seconds.",
+            "🔐 <b>ICICI Breeze OTP Required</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"⏳ Window: <code>{timeout_sec:.0f}s</code>\n"
+            "📲 Reply with <code>/icici_otp 123456</code> or just the six-digit OTP.",
             parse_mode="HTML",
         )
-        deadline = time.time() + 180.0
+        deadline = time.time() + timeout_sec
         with self._icici_otp_cv:
             while not self._icici_pending_otp and time.time() < deadline:
                 self._icici_otp_cv.wait(timeout=max(0.5, min(5.0, deadline - time.time())))
@@ -483,40 +489,49 @@ class TelegramBotController:
             reason = str(status.get("reason") or "")
             age = status.get("age_sec")
             age_txt = "n/a" if age is None else f"{float(age):.0f}s"
+            state_icon = "🟢" if valid else "🟠"
             return (
-                "<b>ICICI Breeze Session</b>\n"
-                f"Configured: <code>{configured}</code>\n"
-                f"Valid: <code>{valid}</code> ({_esc(reason)})\n"
-                f"Age: <code>{_esc(age_txt)}</code>\n"
-                f"Same trading day: <code>{bool(status.get('same_trading_day'))}</code>\n"
-                f"Operator-free refresh: <code>{refreshable}</code>\n"
-                f"Created: <code>{_esc(status.get('created_local') or '')}</code>\n"
-                f"Now: <code>{_esc(status.get('now_local') or '')}</code>"
+                f"{state_icon} <b>ICICI Breeze Desk</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"🧩 Configured: <code>{configured}</code>\n"
+                f"🔑 Session valid: <code>{valid}</code>  <i>{_esc(reason)}</i>\n"
+                f"⏱ Age: <code>{_esc(age_txt)}</code>\n"
+                f"📅 Same trading day: <code>{bool(status.get('same_trading_day'))}</code>\n"
+                f"🔄 Operator-free refresh: <code>{refreshable}</code>\n"
+                f"🕘 Created: <code>{_esc(status.get('created_local') or '')}</code>\n"
+                f"🕒 Now: <code>{_esc(status.get('now_local') or '')}</code>"
             )
         except Exception as e:
-            return f"ICICI status error: {_esc(e)}"
+            return f"⚠️ <b>ICICI status error</b>\n<code>{_esc(e)}</code>"
 
     def _cmd_icici_token(self) -> str:
         if self._icici_refresh_thread is not None and self._icici_refresh_thread.is_alive():
             return (
-                "ICICI token refresh is already running.\n"
+                "🔄 <b>ICICI token refresh already running</b>\n"
                 "If it is waiting for OTP, send <code>/icici_otp 123456</code>."
             )
 
         def _worker():
             try:
                 from exchanges.icici.breeze_auth import BreezeTokenService
+                from exchanges.icici.token_generator import assert_playwright_chromium_runtime_ready
                 svc = BreezeTokenService()
+                svc.require_configured(for_login=True)
+                assert_playwright_chromium_runtime_ready(
+                    auto_install=bool(getattr(config, "ICICI_PLAYWRIGHT_AUTO_INSTALL", True)),
+                    headless=bool(getattr(config, "ICICI_TOKEN_GENERATOR_HEADLESS", True)),
+                )
                 session = svc.get_session(force_refresh=True, otp_getter=self._icici_otp_getter)
                 status = svc.session_status(session)
                 self._icici_refresh_result = (
-                    "<b>ICICI Breeze session refreshed</b>\n"
-                    f"Valid: <code>{bool(status.get('valid'))}</code>\n"
-                    f"Reason: <code>{_esc(status.get('reason') or '')}</code>\n"
-                    f"Created: <code>{_esc(status.get('created_local') or '')}</code>"
+                    "✅ <b>ICICI Breeze Session Refreshed</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🔑 Valid: <code>{bool(status.get('valid'))}</code>\n"
+                    f"🧾 Reason: <code>{_esc(status.get('reason') or '')}</code>\n"
+                    f"🕘 Created: <code>{_esc(status.get('created_local') or '')}</code>"
                 )
             except Exception as e:
-                self._icici_refresh_result = f"<b>ICICI Breeze refresh failed</b>\n<code>{_esc(e)}</code>"
+                self._icici_refresh_result = f"❌ <b>ICICI Breeze Refresh Failed</b>\n<code>{_esc(e)}</code>"
             try:
                 self.send_message(self._icici_refresh_result, parse_mode="HTML")
             except Exception:
@@ -526,8 +541,8 @@ class TelegramBotController:
         self._icici_refresh_thread = threading.Thread(target=_worker, name="icici-token-refresh", daemon=True)
         self._icici_refresh_thread.start()
         return (
-            "ICICI Breeze token refresh started.\n"
-            "If ICICI asks for OTP, I will prompt here. Then send <code>/icici_otp 123456</code>."
+            "🚀 <b>ICICI Breeze token refresh started</b>\n"
+            "🧪 Chromium preflight runs first. If ICICI asks for OTP, I will prompt here."
         )
 
     def _cmd_icici_otp(self, args: str) -> str:
@@ -1029,8 +1044,15 @@ class TelegramBotController:
     # ================================================================
 
     def _cmd_status(self) -> str:
-        global bot_instance, bot_running
+        global bot_instance, bot_running, bot_starting, bot_last_start_error
         if not bot_running or not bot_instance:
+            if bot_starting:
+                return (
+                    "⏳ <b>Bot booting</b>\n"
+                    "Pipeline: <code>auth → preflight → universe → data warmup → scanner</code>"
+                )
+            if bot_last_start_error:
+                return f"❌ <b>Bot not running</b>\nLast startup error: <code>{_esc(bot_last_start_error)}</code>"
             return "Bot not running. Use /start"
         try:
             strat = bot_instance.strategy
@@ -2505,10 +2527,23 @@ class TelegramBotController:
         except Exception:
             age = 0
         return (
-            "✅ <b>ICICI Breeze token ready before scanner start</b>\n"
-            f"Session age: <code>{age}s</code>\n"
-            f"Trading day: <code>{_esc(day)}</code>\n"
-            f"SessionToken: <code>{_esc(session_token)}</code>"
+            "✅ <b>ICICI Breeze Ready</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔑 Session age: <code>{age}s</code>\n"
+            f"📅 Trading day: <code>{_esc(day)}</code>\n"
+            f"🧷 SessionToken: <code>{_esc(session_token)}</code>\n"
+            "🟢 NIFTY options scanner may start."
+        )
+
+    def _format_icici_preflight_ok(self, details: dict) -> str:
+        browser_path = str((details or {}).get("browser_path") or "")
+        runtime_path = str((details or {}).get("playwright_browsers_path") or "")
+        return (
+            "🧪 <b>ICICI Browser Preflight Passed</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🌐 Chromium: <code>{_esc(browser_path[-72:] or 'ready')}</code>\n"
+            f"📦 Runtime: <code>{_esc(runtime_path[-72:] or 'ready')}</code>\n"
+            "🔐 Safe to request Breeze OTP."
         )
 
     def _should_auto_icici_token_on_start(self) -> bool:
@@ -2559,10 +2594,17 @@ class TelegramBotController:
 
             svc.require_configured(for_login=True)
             self._clear_icici_pending_otp()
+            from exchanges.icici.token_generator import assert_playwright_chromium_runtime_ready
+            preflight = assert_playwright_chromium_runtime_ready(
+                auto_install=bool(getattr(config, "ICICI_PLAYWRIGHT_AUTO_INSTALL", True)),
+                headless=bool(getattr(config, "ICICI_TOKEN_GENERATOR_HEADLESS", True)),
+            )
+            self.send_message(self._format_icici_preflight_ok(preflight))
             self.send_message(
-                "🔐 <b>ICICI Breeze login required before NIFTY analysis starts</b>\n"
-                "No valid same-day Breeze session was found. I am launching the token generator now; "
-                "send only the OTP when requested."
+                "🔐 <b>ICICI Breeze Login Required</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "📉 NIFTY chart analysis is paused until the same-day Breeze session is ready.\n"
+                "📲 I am launching the token generator now; send only the OTP when requested."
             )
             session = svc.refresh(otp_getter=self._icici_otp_getter)
             self.send_message(self._format_icici_session_ok(session))
@@ -2572,7 +2614,7 @@ class TelegramBotController:
             if bool(getattr(config, "ICICI_AUTH_REQUIRED_FOR_DETAILS", True)):
                 raise RuntimeError(msg) from exc
             self.send_message(
-                "⚠️ ICICI auth unavailable; continuing without authenticated ICICI data.\n"
+                "⚠️ <b>ICICI auth unavailable</b>; continuing without authenticated ICICI data.\n"
                 f"Reason: <code>{_esc(exc)}</code>"
             )
 
@@ -2581,9 +2623,12 @@ class TelegramBotController:
     # ================================================================
 
     def _run_bot_thread(self):
-        global bot_instance, bot_running
+        global bot_instance, bot_running, bot_starting, bot_last_start_error
+        with bot_state_lock:
+            bot_starting = True
+            bot_running = False
+            bot_last_start_error = ""
         try:
-            bot_running = True
             import sys, os as _os
             _root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
             if _root not in sys.path:
@@ -2604,25 +2649,48 @@ class TelegramBotController:
                 logger.info("Telegram /start selected single-symbol QuantBot (MULTI_ASSET_ENABLED=False)")
                 bot_instance = QuantBot()
             if not bot_instance.initialize():
-                self.send_message("❌ Bot init failed. Check logs.")
-                bot_running = False
+                bot_last_start_error = "Bot init failed"
+                self.send_message("❌ <b>Bot init failed</b>\nCheck logs before retrying.")
                 return
             if not bot_instance.start():
-                self.send_message("❌ Bot start failed. Check logs.")
-                bot_running = False
+                bot_last_start_error = "Bot start failed"
+                self.send_message("❌ <b>Bot start failed</b>\nCheck logs before retrying.")
                 return
+            with bot_state_lock:
+                bot_running = True
+                bot_starting = False
+            self.send_message(
+                "✅ <b>Production Scanner Live</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "🧠 Strategy desks initialized\n"
+                "📡 Data managers ready\n"
+                "🛡️ Risk/execution wiring online\n"
+                "📊 Use /status or /assets for live telemetry."
+            )
             bot_instance.run()
         except Exception as e:
+            bot_last_start_error = str(e)
             logger.error(f"Bot crashed: {e}", exc_info=True)
-            self.send_message(f"❌ Bot crashed: {e}")
+            self.send_message(f"❌ <b>Bot crashed</b>\n<code>{_esc(e)}</code>")
         finally:
-            bot_running = False
+            with bot_state_lock:
+                bot_running = False
+                bot_starting = False
             logger.info("Bot thread finished")
 
     def _cmd_start(self) -> str:
-        global bot_instance, bot_thread, bot_running
-        if bot_running and bot_thread and bot_thread.is_alive():
-            return "Bot already running."
+        global bot_instance, bot_thread, bot_running, bot_starting, bot_last_start_error
+        with bot_state_lock:
+            thread_alive = bool(bot_thread and bot_thread.is_alive())
+            if bot_running and thread_alive:
+                return "🟢 <b>Bot already running.</b>"
+            if bot_starting and thread_alive:
+                return (
+                    "⏳ <b>Startup already in progress</b>\n"
+                    "Current boot path: <code>ICICI auth → browser preflight → universe → data warmup → scanner</code>"
+                )
+            bot_starting = True
+            bot_last_start_error = ""
         logger.info("Starting bot from Telegram...")
         # Keep the trading runtime non-daemon so the process cannot silently
         # drop live risk if the controller loop is interrupted. /stop is the
@@ -2631,18 +2699,30 @@ class TelegramBotController:
         bot_thread.start()
         time.sleep(2.0)
         if bot_thread.is_alive():
-            return "⏳ Starting bot... Check /status in 30s."
-        return "❌ Start failed. Check logs."
+            return (
+                "🚀 <b>Boot sequence started</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "🔐 ICICI Breeze/session readiness\n"
+                "🧪 Chromium runtime preflight\n"
+                "📡 Live universe + data warmup\n"
+                "🛡️ Risk/execution wiring\n"
+                "Use /status in 30s."
+            )
+        err = _esc(bot_last_start_error or "Check logs.")
+        return f"❌ <b>Start failed</b>\n<code>{err}</code>"
 
     def _cmd_stop(self) -> str:
-        global bot_instance, bot_running
+        global bot_instance, bot_running, bot_starting
         if not bot_running or not bot_instance:
+            if bot_starting:
+                return "⏳ Startup is still in progress; wait for the ready/failure alert before stopping."
             return "Bot not running."
         logger.info("Stopping bot from Telegram...")
-        bot_running = False
+        with bot_state_lock:
+            bot_running = False
         if bot_instance:
             bot_instance.stop()
-        return "🛑 Bot stopped."
+        return "🛑 <b>Bot stopped.</b>"
 
     # ================================================================
     # MAIN LOOP
@@ -2653,8 +2733,11 @@ class TelegramBotController:
         self.clear_old_messages()
         self.set_my_commands()
         self.send_message(
-            "⚡ <b>Liquidity-First Quant Bot Controller Ready</b>\n"
-            "Execution: " + getattr(config, "EXECUTION_EXCHANGE", "?").upper() + "\n\n"
+            "⚡ <b>Institutional Quant Controller Ready</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "🏦 Execution: <code>" + getattr(config, "EXECUTION_EXCHANGE", "?").upper() + "</code>\n"
+            "🔐 ICICI startup auth preflight: <code>" + str(bool(getattr(config, "ICICI_BREEZE_PREFLIGHT_ON_STARTUP", True))) + "</code>\n"
+            "🧪 Playwright runtime preflight: <code>enabled</code>\n\n"
             + self._cmd_help())
         logger.info("Telegram controller started")
 

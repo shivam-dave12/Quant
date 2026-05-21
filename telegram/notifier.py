@@ -1179,6 +1179,62 @@ def _tg_freeform(value: Any, digits: int = 2) -> str:
         return _esc(str(value))
 
 
+def _tg_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _tg_venue_price(value: Any, venue: str = "") -> str:
+    if value is None:
+        return "—"
+    cur = "₹" if "icici" in str(venue or "").lower() else "$"
+    digits = 2 if cur == "₹" else 1
+    try:
+        return f"{cur}{float(value):,.{digits}f}"
+    except Exception:
+        return _esc(str(value))
+
+
+def _tg_signed_money(value: Any, venue: str = "") -> str:
+    cur = "₹" if "icici" in str(venue or "").lower() else "$"
+    try:
+        v = float(value or 0.0)
+        sign = "+" if v >= 0 else "−"
+        return f"{sign}{cur}{abs(v):,.2f}"
+    except Exception:
+        return _esc(str(value))
+
+
+def _tg_selected_option_contract(inst=None, kw: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    kw = kw or {}
+    for key in ("selected_option_contract", "option_contract", "contract"):
+        val = kw.get(key)
+        if isinstance(val, dict):
+            return val
+    try:
+        raw = getattr(getattr(inst, "primary", None), "raw", {}) or {}
+    except Exception:
+        raw = {}
+    if isinstance(raw, dict):
+        selected = raw.get("selected_option_contract")
+        if isinstance(selected, dict):
+            return selected
+        if any(raw.get(k) for k in ("right", "option_type", "strike_price", "expiry_date", "TradingSymbol")):
+            return raw
+    return {}
+
+
+def _tg_instrument_identity(inst=None, kw: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    kw = kw or {}
+    asset = str(kw.get("asset", getattr(inst, "asset_id", "") if inst is not None else "") or "ASSET").upper()
+    symbol = str(kw.get("symbol", getattr(inst, "display_symbol", "") if inst is not None else "") or "-")
+    venue = str(kw.get("venue", getattr(getattr(inst, "primary_exchange", None), "value", "") if inst is not None else "") or "-").upper()
+    asset_class = str(getattr(getattr(inst, "asset_class", ""), "value", getattr(inst, "asset_class", "")) if inst is not None else kw.get("asset_class", "")).upper()
+    return {"asset": asset, "symbol": symbol, "venue": venue, "asset_class": asset_class or "-"}
+
+
 def format_entry_alert(
     side:        str,
     entry:       float,
@@ -1195,47 +1251,83 @@ def format_entry_alert(
     flow_conv:   float = 0.0,
     **_kw: Any,
 ) -> str:
-    """Institutional entry ticket: execution, risk, decision audit and exact-fee status."""
+    """Institutional entry ticket: execution, option vehicle, risk and decision audit."""
     side_u = str(side or "").upper()
+    inst = _kw.get("instrument") or _tg_current_instrument()
+    ident = _tg_instrument_identity(inst, _kw)
+    venue = ident["venue"]
+    option = _tg_selected_option_contract(inst, _kw)
+    is_icici = "ICICI" in venue
+    if is_icici and side_u == "SHORT":
+        ticket_side = "BUY PUT"
+    elif is_icici and side_u == "LONG":
+        ticket_side = "BUY CALL"
+    else:
+        ticket_side = side_u
     head_emoji = "🟢" if side_u == "LONG" else "🔴"
-    arr = _arrow(side)
-    flow_glyph = "▲" if flow_conv > 0.05 else ("▼" if flow_conv < -0.05 else "·")
-
+    flow_glyph = "▲" if flow_conv > 0.05 else ("▼" if flow_conv < -0.05 else "•")
     size_mult = _kw.get("size_mult", _kw.get("institutional_size_mult", None))
     posterior = _kw.get("posterior", _kw.get("probability", None))
     ev = _kw.get("expected_value", _kw.get("ev", None))
     target_realism = _kw.get("target_realism", None)
-    fee_line = str(_kw.get("fee_line", "Delta fee pending exact commission") or "Delta fee pending exact commission")
-    inst = _kw.get("instrument") or _tg_current_instrument()
-    asset = str(_kw.get("asset", getattr(inst, "asset_id", "") if inst is not None else "") or "").upper()
-    symbol = str(_kw.get("symbol", getattr(inst, "display_symbol", "") if inst is not None else "") or "")
-    venue = str(_kw.get("venue", getattr(getattr(inst, "primary_exchange", None), "value", "") if inst is not None else "") or "")
-    inst_line = " · ".join(x for x in [asset, f"{venue}:{symbol}" if venue or symbol else "", str(mode or "").upper(), f"TIER {tier}" if tier else ""] if x)
+    fee_line = str(_kw.get("fee_line", "fee model pending exact commission") or "fee model pending exact commission")
+    entry_leverage = _kw.get("entry_leverage", _kw.get("actual_leverage", _kw.get("leverage", None)))
+    risk_usd = _kw.get("risk_usd", _kw.get("dollar_risk", None))
+    margin_risk_pct = _kw.get("margin_risk_pct", _kw.get("active_margin_risk_pct", None))
+    margin_used = _kw.get("margin_used", None)
+    order_id = str(_kw.get("order_id", "") or "")
 
     rows = [
-        f"{head_emoji} <b>INSTITUTIONAL ENTRY · {_esc(side_u)}</b>  <code>{_fmt_price(entry)}</code>",
-        f"<code>{_esc(inst_line or (str(mode or '').upper() + ' · ' + str(tier or '-')))}</code>",
-        "<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>",
-        "🎯 <b>Execution</b>",
-        f"<code>ENTRY {_fmt_price(entry):>12}   QTY {float(qty or 0.0):>12.6f}</code>",
-        f"<code>SL    {_fmt_price(sl):>12}   {float(sl_atr or 0.0):>6.2f} ATR</code>",
-        f"<code>TP    {_fmt_price(tp):>12}   {float(tp_atr or 0.0):>6.2f} ATR   R:R 1:{float(rr or 0.0):.2f}</code>",
-        f"<code>FLOW  {_esc(flow_glyph):>12}   {float(flow_conv or 0.0):+8.2f}</code>",
+        f"{head_emoji} <b>ENTRY TICKET · {_esc(ticket_side)}</b>",
+        f"🏦 <code>{_esc(venue)}:{_esc(ident['symbol'])}</code>  <b>{_esc(ident['asset'])}</b>  <i>{_esc(ident['asset_class'])}</i>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "🎯 <b>Trade Plan</b>",
+        f"<code>ENTRY {_tg_venue_price(entry, venue):>13}   QTY {float(qty or 0.0):>12.6f}</code>",
+        f"<code>SL    {_tg_venue_price(sl, venue):>13}   {float(sl_atr or 0.0):>6.2f} ATR</code>",
+        f"<code>TP    {_tg_venue_price(tp, venue):>13}   {float(tp_atr or 0.0):>6.2f} ATR   R:R 1:{float(rr or 0.0):.2f}</code>",
+        f"<code>FLOW  {flow_glyph:>13}   {float(flow_conv or 0.0):+8.2f}</code>",
     ]
+    if option:
+        opt_symbol = option.get("selected_symbol") or option.get("TradingSymbol") or option.get("trading_symbol") or option.get("symbol") or ident["symbol"]
+        opt_right = option.get("right") or option.get("option_type") or option.get("OptionType") or ("call" if side_u == "LONG" else "put")
+        opt_strike = option.get("strike") or option.get("strike_price") or option.get("StrikePrice") or "-"
+        opt_expiry = option.get("expiry") or option.get("expiry_date") or option.get("ExpiryDate") or "-"
+        opt_delta = option.get("delta", None)
+        opt_theta = option.get("theta", None)
+        opt_lot = option.get("runtime_lot_size") or option.get("LotSize") or option.get("lot_size") or "-"
+        opt_cost = option.get("selected_contract_cost") or option.get("contract_cost") or None
+        rows.extend([
+            "🎟️ <b>Option Vehicle</b>",
+            f"<code>{_esc(opt_symbol)} · {_esc(str(opt_right).upper())} · {opt_strike} · exp {_esc(opt_expiry)}</code>",
+            f"<code>LOT {_esc(opt_lot):>8}   COST {_tg_venue_price(opt_cost, venue):>13}   Δ {_tg_freeform(opt_delta, 2):>7}   Θ {_tg_freeform(opt_theta, 3):>8}</code>",
+        ])
+    rows.append("🛡️ <b>Risk &amp; Sizing</b>")
+    risk_bits = []
+    if entry_leverage is not None:
+        risk_bits.append(f"LEV {_tg_freeform(entry_leverage, 0)}x")
+    if margin_used is not None:
+        risk_bits.append(f"MARGIN {_tg_venue_price(margin_used, venue)}")
+    if risk_usd is not None:
+        risk_bits.append(f"RISK {_tg_venue_price(risk_usd, venue)}")
+    if margin_risk_pct is not None:
+        risk_bits.append(f"MARGIN-RISK {_tg_float(margin_risk_pct) * 100.0:.2f}%")
+    rows.append(f"<code>{_esc('   '.join(risk_bits) if risk_bits else 'risk telemetry pending')}</code>")
     if size_mult is not None or posterior is not None or ev is not None or target_realism is not None:
         rows.extend([
-            "🧮 <b>Decision Audit</b>",
+            "🧠 <b>Decision Stack</b>",
             f"<code>SIZE {_tg_freeform(size_mult if size_mult is not None else 1.0, 2):>10}x   P(edge) {_tg_freeform(posterior, 2):>10}</code>",
             f"<code>EV   {_tg_freeform(ev, 3):>10}    TARGET {_tg_freeform(target_realism, 2):>10}</code>",
         ])
     rows.extend([
-        "💸 <b>Fee Wiring</b>",
+        "💸 <b>Cost Model</b>",
         f"<code>{_esc(fee_line)}</code>",
     ])
+    if order_id:
+        rows.append(f"🧾 <code>ORDER {_esc(order_id[:18])}</code>")
     if session:
         rows.append(f"🕒 <code>SESSION {_esc(str(session).upper())}</code>")
     if reason:
-        rows.append(f"<i>{_esc(str(reason)[:180])}</i>")
+        rows.append(f"📌 <i>{_esc(str(reason)[:180])}</i>")
     return "\n".join(rows)
 
 
@@ -1268,9 +1360,11 @@ def format_exit_alert(
         pts_realised = (float(exit_price or 0.0) - float(entry or 0.0)) if side_u == "LONG" else (float(entry or 0.0) - float(exit_price or 0.0))
 
     inst = _kw.get("instrument") or _tg_current_instrument()
-    asset = getattr(inst, "asset_id", _kw.get("asset", "ASSET")) if inst is not None else _kw.get("asset", "ASSET")
-    symbol = getattr(inst, "display_symbol", _kw.get("symbol", "-")) if inst is not None else _kw.get("symbol", "-")
-    venue = getattr(getattr(inst, "primary_exchange", None), "value", _kw.get("venue", "")) if inst is not None else _kw.get("venue", "")
+    ident = _tg_instrument_identity(inst, _kw)
+    asset = ident["asset"]
+    symbol = ident["symbol"]
+    venue = ident["venue"]
+    option = _tg_selected_option_contract(inst, _kw)
 
     gross = float(_kw.get("gross", 0.0) or 0.0)
     planned_rr = _kw.get("planned_rr", None)
@@ -1289,25 +1383,34 @@ def format_exit_alert(
     residual_net = _kw.get("residual_net", None)
 
     rows = [
-        f"{head_icon} <b>INSTITUTIONAL EXIT · {outcome}</b>  <code>{_esc(str(asset))}</code>",
-        f"<code>{_esc(str(venue).upper())}:{_esc(str(symbol))}</code> · {_esc(reason_label)}",
-        "<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>",
-        f"💰 <b>NET {_fpnl(float(pnl or 0.0))}</b>   <code>R {float(r_realised or 0.0):+6.2f}   MFE {float(mfe_r or 0.0):5.2f}</code>",
-        f"<code>{_esc(side_u):<5} {_fmt_price(entry):>12} → {_fmt_price(exit_price):>12}   pts {pts_realised:+.2f}</code>",
-        f"<code>GROSS {_fpnl(gross):>12}   FEES ${float(fees or 0.0):,.4f}   {fee_badge}</code>",
+        f"{head_icon} <b>EXIT TICKET · {outcome}</b>  <code>{_esc(str(asset))}</code>",
+        f"🏦 <code>{_esc(str(venue).upper())}:{_esc(str(symbol))}</code>  🎬 {_esc(reason_label)}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"💰 <b>NET {_tg_signed_money(pnl, venue)}</b>   <code>R {float(r_realised or 0.0):+6.2f}   MFE {float(mfe_r or 0.0):5.2f}</code>",
+        f"<code>{_esc(side_u):<5} {_tg_venue_price(entry, venue):>13} → {_tg_venue_price(exit_price, venue):>13}   pts {pts_realised:+.2f}</code>",
+        f"<code>GROSS {_tg_signed_money(gross, venue):>13}   FEES {_tg_venue_price(fees, venue):>13}   {fee_badge}</code>",
         f"<code>QTY   life {float(qty or 0.0):>9.6f}   left {residual_qty:>9.6f}</code>",
         f"<code>HOLD  {float(hold_min or 0.0):>7.1f}m   partial {partial_qty:>9.6f}</code>",
     ]
+    if option:
+        opt_symbol = option.get("selected_symbol") or option.get("TradingSymbol") or option.get("trading_symbol") or option.get("symbol") or symbol
+        opt_right = option.get("right") or option.get("option_type") or option.get("OptionType") or "-"
+        opt_strike = option.get("strike") or option.get("strike_price") or option.get("StrikePrice") or "-"
+        opt_expiry = option.get("expiry") or option.get("expiry_date") or option.get("ExpiryDate") or "-"
+        rows.extend([
+            "🎟️ <b>Option Vehicle</b>",
+            f"<code>{_esc(opt_symbol)} · {_esc(str(opt_right).upper())} · {opt_strike} · exp {_esc(opt_expiry)}</code>",
+        ])
     if partial_qty > 0 or abs(ladder_net) > 1e-12 or abs(ladder_gross) > 1e-12 or abs(ladder_fees) > 1e-12:
         rows.extend([
             "🎯 <b>Scale-Out Ledger</b>",
-            f"<code>LADDER net {_fpnl(ladder_net):>12}   gross {_fpnl(ladder_gross):>12}</code>",
-            f"<code>LADDER fees ${ladder_fees:>10,.4f}   residual {_fpnl(float(residual_net or 0.0)):>12}</code>",
+            f"<code>LADDER net {_tg_signed_money(ladder_net, venue):>13}   gross {_tg_signed_money(ladder_gross, venue):>13}</code>",
+            f"<code>LADDER fees {_tg_venue_price(ladder_fees, venue):>13}   residual {_tg_signed_money(float(residual_net or 0.0), venue):>13}</code>",
         ])
     if planned_rr is not None:
         rows.append(f"<code>PLAN  R:R 1:{float(planned_rr or 0.0):.2f}</code>")
     if margin_pct is not None or margin_used is not None:
-        rows.append(f"<code>MARGIN {_tg_freeform(margin_used, 2):>10}   ROI {_tg_freeform(margin_pct, 2):>8}%</code>")
+        rows.append(f"<code>MARGIN {_tg_venue_price(margin_used, venue):>13}   ROI {_tg_freeform(margin_pct, 2):>8}%</code>")
     if fee_source:
         rows.append(f"💸 <code>{_esc(fee_source)}</code>")
     rows.append(f"🧷 <i>{_esc(exit_model[:140])}</i>")
@@ -1339,18 +1442,19 @@ def format_partial_exit_alert(
     role_u = str(role or "TP").upper()
     status_u = str(status or "FILLED").upper()
     inst = _kw.get("instrument") or _tg_current_instrument()
-    asset = getattr(inst, "asset_id", _kw.get("asset", "ASSET")) if inst is not None else _kw.get("asset", "ASSET")
-    symbol = getattr(inst, "display_symbol", _kw.get("symbol", "-")) if inst is not None else _kw.get("symbol", "-")
-    venue = getattr(getattr(inst, "primary_exchange", None), "value", _kw.get("venue", "")) if inst is not None else _kw.get("venue", "")
+    ident = _tg_instrument_identity(inst, _kw)
+    asset = ident["asset"]
+    symbol = ident["symbol"]
+    venue = ident["venue"]
     rows = [
         f"🎯 <b>TP LADDER SCALE-OUT · {_esc(role_u)}</b>  <code>{_esc(str(asset))}</code>",
-        f"<code>{_esc(str(venue).upper())}:{_esc(str(symbol))}</code> · {_esc(side_u)} · {_esc(status_u)}",
-        "<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>",
-        f"{badge} <b>NET {_fpnl(float(net or 0.0))}</b>   <code>CUM {_fpnl(float(cumulative_net or 0.0)):>12}</code>",
-        f"<code>FILL  {_fmt_price(fill_price):>12}   CLOSED {float(qty_closed or 0.0):>10.6f}</code>",
-        f"<code>LEFT  {float(qty_remaining or 0.0):>12.6f}   FINAL {_fmt_price(final_tp):>12}</code>",
-        f"<code>GROSS {_fpnl(float(gross or 0.0)):>12}   FEES ${float(fees or 0.0):,.4f}   {fee_badge}</code>",
-        f"🛡️ <code>SL FIXED {_fmt_price(sl):>12}   native bracket remains authority</code>",
+        f"🏦 <code>{_esc(str(venue).upper())}:{_esc(str(symbol))}</code>  {_esc(side_u)} · {_esc(status_u)}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"{badge} <b>NET {_tg_signed_money(net, venue)}</b>   <code>CUM {_tg_signed_money(cumulative_net, venue):>13}</code>",
+        f"<code>FILL  {_tg_venue_price(fill_price, venue):>13}   CLOSED {float(qty_closed or 0.0):>10.6f}</code>",
+        f"<code>LEFT  {float(qty_remaining or 0.0):>12.6f}   FINAL {_tg_venue_price(final_tp, venue):>13}</code>",
+        f"<code>GROSS {_tg_signed_money(gross, venue):>13}   FEES {_tg_venue_price(fees, venue):>13}   {fee_badge}</code>",
+        f"🛡️ <code>SL FIXED {_tg_venue_price(sl, venue):>13}   native bracket remains authority</code>",
     ]
     return "\n".join(rows)
 
@@ -2039,4 +2143,3 @@ def format_log_alert(level: str, logger_name: str, message: str) -> str:
         f"<pre>{_esc(clean[:1800])}</pre>",
     ]
     return _tg_limit(lines, max_chars=2200)
-

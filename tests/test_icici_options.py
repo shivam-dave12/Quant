@@ -169,6 +169,12 @@ def test_telegram_start_preflights_icici_token_before_bot_start(monkeypatch, tmp
 
     fake_mod = types.SimpleNamespace(BreezeTokenService=FakeSvc)
     monkeypatch.setitem(sys.modules, "exchanges.icici.breeze_auth", fake_mod)
+    import exchanges.icici.token_generator as token_generator
+    monkeypatch.setattr(
+        token_generator,
+        "assert_playwright_chromium_runtime_ready",
+        lambda **kw: calls.append(("preflight", kw)) or {"browser_path": "chromium", "playwright_browsers_path": "cache"},
+    )
     monkeypatch.setattr(ctl.config, "ICICI_OPTIONS_RUNTIME_ENABLED", True, raising=False)
     monkeypatch.setattr(ctl.config, "ICICI_AUTO_TOKEN_GENERATOR_ON_STARTUP", True, raising=False)
     monkeypatch.setattr(ctl.config, "ICICI_BREEZE_PREFLIGHT_ON_STARTUP", True, raising=False)
@@ -185,8 +191,9 @@ def test_telegram_start_preflights_icici_token_before_bot_start(monkeypatch, tmp
 
     c._ensure_icici_session_before_bot_start()
 
+    assert next(i for i, c in enumerate(calls) if c[0] == "preflight") < next(i for i, c in enumerate(calls) if c[0] == "refresh")
     assert ("refresh", True) in calls
-    assert any("token ready before scanner start" in m for m in sent)
+    assert any("ICICI Breeze Ready" in m for m in sent)
 
 
 def test_telegram_plain_six_digit_otp_is_consumed_when_waiting(monkeypatch):
@@ -198,3 +205,50 @@ def test_telegram_plain_six_digit_otp_is_consumed_when_waiting(monkeypatch):
     out = ctl.TelegramBotController.handle_command(c, "123456")
     assert "OTP received" in out
     assert c._icici_pending_otp == "123456"
+
+
+def test_playwright_preflight_extracts_missing_linux_libraries():
+    from exchanges.icici.token_generator import _extract_missing_shared_libraries
+
+    msg = """
+    Host system is missing dependencies to run browsers.
+    Missing libraries:
+        libnss3.so
+        libatk-1.0.so.0
+    chromium: error while loading shared libraries: libxkbcommon.so.0: cannot open shared object file
+    libgbm.so.1 => not found
+    """
+    assert _extract_missing_shared_libraries(msg) == [
+        "libatk-1.0.so.0",
+        "libgbm.so.1",
+        "libnss3.so",
+        "libxkbcommon.so.0",
+    ]
+
+
+def test_entry_alert_renders_icici_option_vehicle():
+    from telegram.notifier import format_entry_alert
+
+    inst = _nifty_inst(_chain())
+    choice = select_contract_for_thesis(inst, "long", underlying_spot=23100, available_funds=10_000)
+    apply_contract_choice(inst, choice)
+    msg = format_entry_alert(
+        side="long",
+        entry=72.0,
+        sl=54.0,
+        tp=112.0,
+        qty=50,
+        mode="reversion",
+        tier="A",
+        sl_atr=1.2,
+        tp_atr=2.5,
+        rr=2.2,
+        instrument=inst,
+        entry_leverage=1,
+        risk_usd=900,
+        margin_risk_pct=0.12,
+    )
+    assert "ENTRY TICKET" in msg
+    assert "Option Vehicle" in msg
+    assert "BUY CALL" in msg
+    assert "NIFTY30JUN30CE23200" in msg

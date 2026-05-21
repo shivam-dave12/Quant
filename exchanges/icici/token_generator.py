@@ -122,7 +122,7 @@ def _ensure_playwright_runtime_path() -> Path:
     raise RuntimeError(f"No writable Playwright browser path available; last error: {last_exc}")
 
 
-def _install_playwright_chromium() -> None:
+def _install_playwright_chromium(*, auto_install: bool | None = None) -> None:
     """Download the Playwright Chromium browser for the current runtime user.
 
     This intentionally installs only Chromium, not the full browser bundle.  In
@@ -131,7 +131,9 @@ def _install_playwright_chromium() -> None:
     often not enough.  This helper lets live startup self-heal the exact failure
     shown in the runtime log: package installed, browser binary missing.
     """
-    if not _env_bool("ICICI_PLAYWRIGHT_AUTO_INSTALL", True):
+    if auto_install is None:
+        auto_install = _env_bool("ICICI_PLAYWRIGHT_AUTO_INSTALL", True)
+    if not auto_install:
         raise RuntimeError(
             "Playwright Chromium browser is missing and ICICI_PLAYWRIGHT_AUTO_INSTALL=False. "
             "Run: python -m playwright install chromium"
@@ -152,6 +154,130 @@ def _install_playwright_chromium() -> None:
             + "\nRun manually inside the same container/user: python -m playwright install chromium"
         )
     log.info("ICICI Playwright Chromium browser installed for current runtime user")
+
+
+def _extract_missing_shared_libraries(text: str) -> list[str]:
+    """Extract Linux shared-library names from Playwright/ldd diagnostics."""
+    libs: set[str] = set()
+    body = str(text or "")
+    for line in body.splitlines():
+        stripped = line.strip().strip("║").strip()
+        if re.fullmatch(r"lib[A-Za-z0-9_.+\-]+\.so(?:\.[0-9]+)*", stripped):
+            libs.add(stripped)
+        m = re.search(r"error while loading shared libraries:\s*([A-Za-z0-9_.+\-]+)", stripped)
+        if m:
+            libs.add(m.group(1))
+        m = re.search(r"\b([A-Za-z0-9_.+\-]+\.so(?:\.[0-9]+)*)\b\s*=>\s*not found\b", stripped)
+        if m:
+            libs.add(m.group(1))
+        if "missing" in stripped.lower() or "not found" in stripped.lower():
+            for lib in re.findall(r"\b(lib[A-Za-z0-9_.+\-]+\.so(?:\.[0-9]+)*)\b", stripped):
+                libs.add(lib)
+    return sorted(libs)
+
+
+def _chromium_ldd_output(browser_type) -> str:
+    if platform.system() != "Linux":
+        return ""
+    try:
+        exe = str(getattr(browser_type, "executable_path", "") or "")
+        if not exe or not Path(exe).exists():
+            return ""
+        proc = subprocess.run(
+            ["ldd", exe],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=15,
+        )
+        return proc.stdout or ""
+    except Exception as exc:
+        return f"ldd diagnostic unavailable: {exc}"
+
+
+def _playwright_dependency_error(exc: BaseException, ldd_output: str = "") -> RuntimeError:
+    combined = "\n".join(x for x in (str(exc), ldd_output) if x)
+    missing = _extract_missing_shared_libraries(combined)
+    missing_txt = ", ".join(missing) if missing else "not listed by Playwright"
+    return RuntimeError(
+        "ICICI Playwright Chromium runtime is not ready. "
+        "The Python package/browser may be installed, but Chromium cannot launch in this container/user.\n"
+        f"Missing shared libraries: {missing_txt}\n"
+        "Fix the Docker image/runtime with Playwright system dependencies "
+        "(for example: python -m playwright install-deps chromium, or equivalent apt packages), "
+        "then rebuild and restart the bot."
+    )
+
+
+def _looks_like_missing_system_deps(exc: BaseException, ldd_output: str = "") -> bool:
+    text = "\n".join(x for x in (str(exc), ldd_output) if x).lower()
+    return (
+        "host system is missing dependencies" in text
+        or "error while loading shared libraries" in text
+        or "cannot open shared object file" in text
+        or bool(_extract_missing_shared_libraries(text))
+    )
+
+
+def assert_playwright_chromium_runtime_ready(
+    *,
+    auto_install: bool | None = None,
+    headless: bool = True,
+) -> dict:
+    """Launch and close Chromium before OTP so startup fails before operator input.
+
+    This is a runtime preflight, not a Docker installer.  It catches the two
+    production failures that otherwise show up late in Telegram: browser binary
+    missing for the current user, and Linux shared libraries missing even though
+    the browser package exists.
+    """
+    if auto_install is None:
+        auto_install = _env_bool("ICICI_PLAYWRIGHT_AUTO_INSTALL", True)
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError("Playwright is required: pip install playwright && python -m playwright install chromium") from exc
+
+    runtime_path = _ensure_playwright_runtime_path()
+    with sync_playwright() as pw:
+        ldd_output = _chromium_ldd_output(pw.chromium)
+        browser = None
+        try:
+            browser = pw.chromium.launch(
+                headless=headless,
+                args=launch_args() if headless else ["--disable-gpu"],
+            )
+        except Exception as exc:
+            if _looks_like_missing_playwright_browser(exc):
+                _install_playwright_chromium(auto_install=auto_install)
+                try:
+                    browser = pw.chromium.launch(
+                        headless=headless,
+                        args=launch_args() if headless else ["--disable-gpu"],
+                    )
+                except Exception as retry_exc:
+                    retry_ldd = _chromium_ldd_output(pw.chromium) or ldd_output
+                    if _looks_like_missing_system_deps(retry_exc, retry_ldd):
+                        raise _playwright_dependency_error(retry_exc, retry_ldd) from retry_exc
+                    raise RuntimeError(f"ICICI Playwright Chromium preflight failed after browser install: {retry_exc}") from retry_exc
+            elif _looks_like_missing_system_deps(exc, ldd_output):
+                raise _playwright_dependency_error(exc, ldd_output) from exc
+            else:
+                raise RuntimeError(f"ICICI Playwright Chromium preflight failed: {exc}") from exc
+        finally:
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+
+        exe = str(getattr(pw.chromium, "executable_path", "") or "")
+        return {
+            "browser_path": exe,
+            "playwright_browsers_path": str(runtime_path),
+            "headless": bool(headless),
+            "missing_libraries": _extract_missing_shared_libraries(ldd_output),
+        }
 
 def launch_args() -> list[str]:
     if platform.system() == "Linux":
@@ -273,12 +399,21 @@ def generate_api_session(
     debug_path = Path(debug_dir)
     _ensure_playwright_runtime_path()
     with sync_playwright() as pw:
+        ldd_output = _chromium_ldd_output(pw.chromium)
         try:
             browser = pw.chromium.launch(headless=headless, args=launch_args() if headless else ["--disable-gpu"])
         except Exception as exc:
             if _looks_like_missing_playwright_browser(exc):
                 _install_playwright_chromium()
-                browser = pw.chromium.launch(headless=headless, args=launch_args() if headless else ["--disable-gpu"])
+                try:
+                    browser = pw.chromium.launch(headless=headless, args=launch_args() if headless else ["--disable-gpu"])
+                except Exception as retry_exc:
+                    retry_ldd = _chromium_ldd_output(pw.chromium) or ldd_output
+                    if _looks_like_missing_system_deps(retry_exc, retry_ldd):
+                        raise _playwright_dependency_error(retry_exc, retry_ldd) from retry_exc
+                    raise
+            elif _looks_like_missing_system_deps(exc, ldd_output):
+                raise _playwright_dependency_error(exc, ldd_output) from exc
             else:
                 raise
         context = browser.new_context(
