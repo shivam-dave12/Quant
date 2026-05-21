@@ -87,8 +87,7 @@ class ICICIOptionDataManager:
             if not isinstance(row, dict):
                 continue
             candidate = dict(row)
-            candidate.setdefault("stock_code", stock_code)
-            candidate.setdefault("underlying", underlying or stock_code)
+            candidate.setdefault("stock_code", underlying or stock_code)
             candidate.setdefault("exchange_code", exchange_code)
             candidate.setdefault("product_type", "options")
             candidates.append(candidate)

@@ -86,9 +86,10 @@ def _icici_breeze_code(underlying: str) -> str:
         for k, v in raw.items():
             if normalise_symbol(str(k)) == key and normalise_symbol(str(v)):
                 return normalise_symbol(str(v))
-    # Breeze uses stock_code=NIFTY for the Nifty 50 index and its NFO options;
-    # keep NIFTY50/CNXNIFTY as discovery aliases only, never as Breeze stock_code.
-    if key in {"NIFTY50", "CNXNIFTY", "NSENIFTY"}:
+    # ICICI Breeze uses stock_code="NIFTY" for the NIFTY 50 index and NFO
+    # option chain.  Keep operator-facing aliases accepted, but never send
+    # NIFTY50/CNXNIFTY as the Breeze stock_code.
+    if key in {"NIFTY50", "CNXNIFTY", "NIFTYINDEX"}:
         return "NIFTY"
     return key
 
@@ -378,14 +379,19 @@ class InstrumentRegistry:
         return out
 
     def load_icici(self, api, *, security_master_url: str | None = None) -> Dict[str, ExchangeInstrument]:
-        """Load ICICI index-option desk instruments.
+        """Load configured ICICI index-option desk instruments.
 
         v508 uses the underlying-first path for NIFTY: one desk instrument is
         discovered now, and the exact CE/PE strike/expiry is selected after the
         strategy produces a bullish/bearish NIFTY thesis.
+
+        This discovery stage is intentionally auth-free.  Breeze protected
+        endpoints are touched only when the ICICI data managers start, so NIFTY
+        must not disappear from the universe just because the runtime session
+        token has not been generated yet.
         """
         out: Dict[str, ExchangeInstrument] = {}
-        if api is None or not bool(_cfg("ICICI_ENABLED", False)):
+        if not bool(_cfg("ICICI_ENABLED", False)):
             self.icici = out
             return out
         underlyings = _csv_symbols(_cfg("ICICI_INDEX_UNDERLYINGS", "NIFTY"))
@@ -397,24 +403,26 @@ class InstrumentRegistry:
             return out
         for priority, underlying in enumerate(underlyings, 1):
             breeze_code = _icici_breeze_code(underlying)
-            display_underlying = "NIFTY" if breeze_code == "NIFTY" and normalise_symbol(underlying) in {"NIFTY", "NIFTY50", "CNXNIFTY", "NSENIFTY"} else underlying
-            raw = build_underlying_payload(display_underlying, "ICICI_INDEX_OPTIONS", [])
-            raw["underlying_display"] = display_underlying
+            raw = build_underlying_payload(breeze_code, "ICICI_INDEX_OPTIONS", [])
+            raw["underlying_display"] = underlying
+            raw["configured_underlying"] = underlying
             raw["breeze_stock_code"] = breeze_code
             raw["stock_code"] = breeze_code
             raw["underlying_stock_code"] = breeze_code
+            raw["underlying_exchange_code"] = "NSE"
+            raw["exchange_code"] = "NFO"
             raw["chain_source"] = "configured_index"
             raw["chain_candidates_deferred"] = True
             ei = ExchangeInstrument(
                 exchange=ExchangeName.ICICI,
                 symbol=breeze_code,
                 ws_symbol=breeze_code,
-                display_symbol=display_underlying,
-                asset_id=display_underlying,
+                display_symbol=breeze_code,
+                asset_id=breeze_code,
                 asset_class=AssetClass.OPTION,
                 product_id=None,
                 quote_asset="INR",
-                base_asset=display_underlying,
+                base_asset=breeze_code,
                 contract_type="option_chain",
                 status="active",
                 tick_size=float(_cfg("ICICI_OPTION_TICK_SIZE", 0.05)),
@@ -423,8 +431,12 @@ class InstrumentRegistry:
                 max_leverage=1.0,
                 raw={**raw, "configured_priority": priority},
             )
-            out[normalise_symbol(underlying)] = ei
-            out[normalise_symbol(breeze_code)] = ei
+            # Match both the operator-facing config alias (e.g. NIFTY50) and the
+            # real Breeze/NFO stock_code (NIFTY).  Both keys point to the same
+            # object, so raw_counts still reports one ICICI instrument.
+            for key in {normalise_symbol(underlying), normalise_symbol(breeze_code), "NIFTY50" if breeze_code == "NIFTY" else ""}:
+                if key:
+                    out[key] = ei
         self.icici = out
         logger.info("ICICI configured-index discovery active: underlyings=%s", ",".join(out.keys()) or "none")
         return out
