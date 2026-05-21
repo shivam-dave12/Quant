@@ -112,3 +112,34 @@ def test_icici_underlying_levels_convert_to_option_premium_levels():
     assert sl < 72.0 < tp
     assert (tp - 72.0) / (72.0 - sl) >= 1.6
     assert "delta=" in reason
+
+
+def test_icici_configured_nifty_discovery_is_auth_independent():
+    from execution.instrument_registry import InstrumentRegistry
+
+    reg = InstrumentRegistry(execution_preference="delta")
+    report = reg.discover(
+        delta_api=None,
+        coinswitch_api=None,
+        icici_api=None,
+        include_exchanges="icici",
+        requested=[{
+            "asset_id": "NIFTY",
+            "display_name": "NIFTY 50 index options",
+            "asset_class": "option",
+            "aliases": ["NIFTY50", "NIFTY", "CNXNIFTY"],
+            "priority": 1,
+        }],
+        max_active=5,
+        require_primary=False,
+    )
+    assert report.raw_counts["icici"] == 1
+    assert len(report.matched) == 1
+    inst = report.matched[0]
+    assert inst.asset_id == "NIFTY"
+    assert ExchangeName.ICICI in inst.by_exchange
+    icici_inst = inst.by_exchange[ExchangeName.ICICI]
+    assert icici_inst.symbol == "NIFTY"
+    assert icici_inst.raw["breeze_stock_code"] == "NIFTY"
+    assert icici_inst.raw["exchange_code"] == "NFO"
+    assert icici_inst.raw["underlying_exchange_code"] == "NSE"

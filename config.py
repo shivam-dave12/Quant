@@ -610,10 +610,16 @@ SUSPENDED_ASSET_CLASSES = ("equity", "index")
 # bullish NIFTY thesis -> buy CE, bearish NIFTY thesis -> buy PE.
 ICICI_LONG_PREMIUM_ONLY = True
 ICICI_OPTIONS_ONLY = True
-ICICI_DISCOVERY_ENABLED = ICICI_ENABLED
+# Discovery is config-backed and auth-independent, matching the working V83
+# ICICI desk design: NIFTY must enter the universe before Breeze session
+# generation. Protected Breeze endpoints are touched later by the ICICI runtime
+# data/execution adapters.
+ICICI_DISCOVERY_ENABLED = os.getenv("ICICI_DISCOVERY_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 ICICI_OPTIONS_RUNTIME_ENABLED = ICICI_ENABLED
 ICICI_INDEX_OPTIONS_FROM_CONFIG_ONLY = True
-ICICI_INDEX_UNDERLYINGS = os.getenv("ICICI_INDEX_UNDERLYINGS", "NIFTY")
+# Official Breeze stock_code for NIFTY 50 is NIFTY. Keep common aliases only in
+# the mapping layer; do not let .env override the institutional desk universe.
+ICICI_INDEX_UNDERLYINGS = "NIFTY"
 # Breeze's documented NIFTY 50 code is stock_code="NIFTY".  Accept common
 # aliases in config, but always route Breeze underlying/option-chain calls with
 # the ICICI stock_code expected by historicalcharts/OptionChain.
@@ -669,7 +675,7 @@ ICICI_OPTION_PREMIUM_TP_CONVEXITY_BONUS = 0.08
 INDIAN_NO_FRESH_ENTRY_AFTER_CLOSE_BUFFER_MIN = 25
 UNIVERSE_INCLUDE_EXCHANGES = os.getenv(
     "UNIVERSE_INCLUDE_EXCHANGES",
-    "delta,coinswitch,icici" if ICICI_ENABLED else "delta,coinswitch",
+    "delta,coinswitch,icici" if (ICICI_ENABLED or ICICI_DISCOVERY_ENABLED) else "delta,coinswitch",
 )
 
 # Portfolio slots: the bot may hold multiple contracts at once, but each

@@ -94,16 +94,30 @@ class MultiAssetQuantBot:
     def _build_api_clients(self):
         has_delta = bool(config.DELTA_API_KEY and config.DELTA_SECRET_KEY)
         has_cs = bool(config.COINSWITCH_API_KEY and config.COINSWITCH_SECRET_KEY)
-        has_icici = bool(
-            getattr(config, "ICICI_ENABLED", False)
-            and getattr(config, "BREEZE_API_KEY", "")
+
+        # V83 reference behaviour, adapted to v508:
+        # build the Breeze client for configured-index discovery even before the
+        # operator-generated API_Session exists. Constructor is auth-light; signed
+        # Breeze calls still happen only inside the ICICI data/execution adapters.
+        wants_icici_discovery = bool(getattr(config, "ICICI_DISCOVERY_ENABLED", False))
+        wants_icici_runtime = bool(getattr(config, "ICICI_OPTIONS_RUNTIME_ENABLED", False))
+        has_icici_runtime_keys = bool(
+            getattr(config, "BREEZE_API_KEY", "")
             and getattr(config, "BREEZE_SECRET_KEY", "")
-            and BreezeRestClient is not None
+        )
+        has_icici = bool(
+            BreezeRestClient is not None
+            and (wants_icici_discovery or (wants_icici_runtime and has_icici_runtime_keys))
         )
         delta_api = DeltaAPI(config.DELTA_API_KEY, config.DELTA_SECRET_KEY,
                              testnet=getattr(config, "DELTA_TESTNET", False)) if has_delta else None
         cs_api = CoinSwitchAPI(config.COINSWITCH_API_KEY, config.COINSWITCH_SECRET_KEY) if has_cs else None
         icici_api = BreezeRestClient() if has_icici else None
+        if wants_icici_runtime and not has_icici_runtime_keys:
+            logger.warning(
+                "ICICI runtime enabled but Breeze API key/secret are missing; "
+                "NIFTY discovery can continue, protected Breeze data/order calls will wait for credentials."
+            )
         return delta_api, cs_api, icici_api
 
 

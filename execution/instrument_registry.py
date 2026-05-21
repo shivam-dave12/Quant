@@ -391,7 +391,16 @@ class InstrumentRegistry:
         token has not been generated yet.
         """
         out: Dict[str, ExchangeInstrument] = {}
-        if not bool(_cfg("ICICI_ENABLED", False)):
+        config_only = bool(_cfg("ICICI_INDEX_OPTIONS_FROM_CONFIG_ONLY", True))
+        discovery_enabled = bool(_cfg("ICICI_DISCOVERY_ENABLED", False))
+        runtime_enabled = bool(_cfg("ICICI_ENABLED", False) or _cfg("ICICI_OPTIONS_RUNTIME_ENABLED", False))
+        if not (discovery_enabled or runtime_enabled):
+            self.icici = out
+            return out
+        # Configured-index discovery is intentionally auth-independent. This is
+        # the V83-compatible guardrail that prevents NIFTY from vanishing just
+        # because the Breeze API_Session has not been generated yet.
+        if api is None and not config_only:
             self.icici = out
             return out
         underlyings = _csv_symbols(_cfg("ICICI_INDEX_UNDERLYINGS", "NIFTY"))
