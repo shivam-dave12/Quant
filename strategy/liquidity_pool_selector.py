@@ -12,10 +12,10 @@ and adds the institutional features that were missing from both:
        candidate TP eat momentum on the way and reduce expected hit-rate.
     3. SESSION / KILLZONE BONUS — pools formed in the active killzone or
        previous session are statistically more likely to be revisited.
-    4. QUALITY-SCALED SL BUFFER — the SL ATR buffer scales INVERSELY with
-       protective-pool quality. A high-significance pool gets a thin buffer
-       (the pool itself is the protection); a low-quality pool gets a wider
-       buffer (we don't trust the pool to actually halt price, so we widen).
+    4. RAID-AWARE SL BUFFER — the SL ATR buffer scales WITH protective-pool
+       quality and same-side cluster width. A high-significance pool is where
+       stops concentrate, so SL must be beyond the full raid zone instead of
+       sitting tightly at the pool.
     5. EV (Expected Value) RANKING for TP — instead of "max significance"
        or "max raw R:R", we maximise:
                 EV  =  P(sweep) × R_distance × confluence × (1 - gauntlet_penalty)
@@ -142,11 +142,19 @@ _GAUNTLET_PENALTY_PER   = 0.18  # -18% per qualifying gauntlet pool
 _GAUNTLET_PENALTY_MAX   = 0.55  # but never wipe more than 55% of EV
 
 # SL pool selector tunables.
-_SL_BUFFER_BASE_ATR        = 0.18  # minimum buffer beyond pool price
-_SL_BUFFER_MAX_ATR         = 0.55  # ceiling on buffer
-_SL_BUFFER_QUALITY_SCALE   = 0.40  # inverse-scale: high quality → smaller buffer
-_SL_SEARCH_WINDOW_ATR      = 4.0   # max distance to look for a protective pool
-_SL_MIN_BEYOND_INVAL_ATR   = 0.05  # protective pool must be at least this far past invalidation
+#
+# Institutional stop placement must NOT park the exchange stop inside the
+# obvious liquidity pool.  A high-quality SSL/BSL pool represents a dense stop
+# cluster and therefore needs MORE clearance, not less.  The selector therefore
+# first finds the outer edge of the same-side stop cluster and then places SL
+# beyond that edge with a quality/cluster-scaled raid buffer.
+_SL_BUFFER_BASE_ATR        = 0.28  # minimum raid clearance beyond cluster edge
+_SL_BUFFER_MAX_ATR         = 1.35  # ceiling on raid clearance; aligns selector with final raid shield
+_SL_BUFFER_QUALITY_SCALE   = 0.42  # high quality => larger stop-raid buffer
+_SL_CLUSTER_SCAN_ATR       = 0.90  # same-side pools within this radius form one raid zone
+_SL_CLUSTER_DEPTH_SCALE    = 0.28  # extra buffer for wider raid zones
+_SL_SEARCH_WINDOW_ATR      = 5.5   # max distance to look for a protective cluster
+_SL_MIN_BEYOND_INVAL_ATR   = 0.05  # protective cluster must be past invalidation
 _SL_MIN_SIGNIFICANCE       = 1.5   # don't anchor SL to garbage pools
 
 # Killzones (UTC). London 07-10, NY 12-16. Bonus active during + previous KZ.
@@ -374,6 +382,133 @@ def _candidate_report_priority(r: PoolCandidateDiagnostic) -> float:
     proximity = 1.0 / (1.0 + max(r.distance_atr, 0.0) / 8.0)
 
     return 0.55 * p_fit + 0.30 * rr_fit + 0.15 * proximity
+
+
+def _status_is_live_for_stop(pool: Any) -> bool:
+    """A stop can use active liquidity only; archived pools are audit context."""
+    status = _pool_status(pool).upper()
+    return status not in ("SWEPT", "CONSUMED")
+
+
+def _tf_rank_value(tf: str) -> int:
+    return _TF_RANK.get(str(tf or "").lower(), 2)
+
+
+def _sl_quality_score(target: Any) -> Tuple[float, float, List[str]]:
+    """Return (raw_score, quality[0,1], audit notes) for a protective stop zone."""
+    pool = _safe(target, "pool", None)
+    sig = float(_safe(target, "significance", 0.0) or 0.0)
+    struct = _structural_bonus(pool)
+    fresh = _freshness_bonus(pool)
+    touch = _touch_penalty(pool)
+    tf_rank = _tf_rank_value(str(_safe(pool, "timeframe", "5m")))
+    htf = 1.0 + 0.05 * max(tf_rank - 2, 0)
+    score = sig * struct * fresh * touch * htf
+    quality = _clamp(score / 10.0, 0.0, 1.0)
+    notes = [f"score={score:.2f}", f"sig={sig:.1f}"]
+    if _safe(pool, "ob_aligned", False):
+        notes.append("OB-aligned")
+    if _safe(pool, "fvg_aligned", False):
+        notes.append("FVG-aligned")
+    touches = int(_safe(pool, "touches", 1) or 1)
+    if touches > 3:
+        notes.append(f"{touches} touches penalised")
+    return score, quality, notes
+
+
+def _same_side_stop_cluster(
+    pools: List[Any],
+    anchor: Any,
+    side: str,
+    entry: float,
+    atr: float,
+) -> Tuple[float, float, int, float, List[str]]:
+    """Return the outer edge of the same-side liquidity raid cluster.
+
+    For a long, the protective liquidity side is SSL below price and the outer
+    edge is the LOWEST clustered pool. For a short, it is BSL above price and
+    the outer edge is the HIGHEST clustered pool. This keeps SL behind the full
+    stop pocket instead of at a single visible pool.
+    """
+    a = max(float(atr or 0.0), 1e-9)
+    anchor_px = float(_safe(_safe(anchor, "pool", None), "price", 0.0) or 0.0)
+    if anchor_px <= 0.0:
+        return 0.0, 0.0, 0, 0.0, []
+    radius = max(_SL_CLUSTER_SCAN_ATR * a, 0.15 * abs(float(entry) - anchor_px))
+
+    # Build a contiguous raid pocket, not just a one-hop radius around the
+    # selected anchor.  Stop pools often form a ladder: A is close to B and B is
+    # close to C even when A and C are more than one scan-radius apart.  Treating
+    # only A/B as the cluster can park the stop before C, which is still inside
+    # the true liquidity pocket.
+    live_side: List[Tuple[Any, float]] = []
+    for t in pools:
+        try:
+            pool = _safe(t, "pool", None)
+            if not _status_is_live_for_stop(pool):
+                continue
+            px = float(_safe(pool, "price", 0.0) or 0.0)
+            if px <= 0.0:
+                continue
+            if side == "long" and px >= entry:
+                continue
+            if side == "short" and px <= entry:
+                continue
+            live_side.append((t, px))
+        except Exception:
+            continue
+
+    clustered: List[Any] = [anchor]
+    frontier = [anchor_px]
+    seen = {id(anchor)}
+    while frontier:
+        ref_px = frontier.pop()
+        for t, px in live_side:
+            if id(t) in seen:
+                continue
+            if abs(px - ref_px) <= radius:
+                clustered.append(t)
+                seen.add(id(t))
+                frontier.append(px)
+
+    if not clustered:
+        clustered = [anchor]
+
+    prices = [float(_safe(_safe(t, "pool", None), "price", anchor_px) or anchor_px) for t in clustered]
+    edge = min(prices) if side == "long" else max(prices)
+    width_atr = (max(prices) - min(prices)) / a if len(prices) > 1 else 0.0
+    cluster_score = 0.0
+    tfs = set()
+    for t in clustered:
+        sc, _, _ = _sl_quality_score(t)
+        cluster_score += max(sc, 0.0)
+        tfs.add(str(_safe(_safe(t, "pool", None), "timeframe", "")))
+    cluster_quality = _clamp((cluster_score / max(len(clustered), 1)) / 10.0, 0.0, 1.0)
+    notes = [
+        f"cluster_n={len(clustered)}",
+        f"cluster_edge={edge:.4f}",
+        f"cluster_width={width_atr:.2f}ATR",
+        f"tf_n={len([x for x in tfs if x])}",
+    ]
+    return edge, width_atr, len(clustered), cluster_quality, notes
+
+
+def _sl_raid_buffer_atr(quality: float, width_atr: float, cluster_n: int, max_buffer_atr: float) -> float:
+    """Quality/cluster-scaled clearance beyond the stop cluster edge."""
+    q = _clamp(float(quality or 0.0), 0.0, 1.0)
+    width = max(float(width_atr or 0.0), 0.0)
+    n_bonus = min(max(int(cluster_n or 1) - 1, 0) * 0.05, 0.25)
+    raw = (
+        _SL_BUFFER_BASE_ATR
+        + _SL_BUFFER_QUALITY_SCALE * q
+        + min(width * _SL_CLUSTER_DEPTH_SCALE, 0.45)
+        + n_bonus
+    )
+    return min(max(raw, _SL_BUFFER_BASE_ATR), _SL_BUFFER_MAX_ATR, max(float(max_buffer_atr), _SL_BUFFER_BASE_ATR))
+
+
+def _sl_from_cluster_edge(edge: float, side: str, atr: float, buffer_atr: float) -> float:
+    return float(edge) - float(buffer_atr) * float(atr) if side == "long" else float(edge) + float(buffer_atr) * float(atr)
 
 
 def _hour_utc(now: Optional[float]) -> int:
@@ -1240,89 +1375,89 @@ def score_sl_pool(
     min_risk:            float = 0.0,
 ) -> Optional[SLPoolPick]:
     """
-    Pick the best PROTECTIVE pool just past the structural invalidation
-    point, with a quality-scaled buffer.
+    Pick the best protective stop *zone*, not a single pool print.
 
-    Logic:
-        - Pool side = OPPOSING side of trade (longs invalidated by SSL pool
-          break; shorts invalidated by BSL pool break).
-        - Pool must lie BEYOND invalidation_price (or beyond entry by
-          _SL_MIN_BEYOND_INVAL_ATR if invalidation_price not provided).
-        - Within _SL_SEARCH_WINDOW_ATR of invalidation point.
-        - Score = significance × structural × htf_alignment × freshness
-                  × adjacency_bonus  −  touch_penalty
-        - SL = pool.price ∓ buffer, where buffer scales INVERSELY with quality.
-
-    Returns None if no protective pool qualifies — caller should fall back
-    to OB-based or ATR-based SL.
+    Long trades are invalidated by a raid through SSL below price; short trades
+    are invalidated by a raid through BSL above price.  The returned SL is
+    placed beyond the OUTER EDGE of the same-side liquidity cluster plus a
+    quality/cluster-scaled raid buffer.  This prevents the common failure mode
+    where a stop is parked directly at the liquidity that price is expected to
+    sweep.
     """
     if snap is None or atr <= 0:
         return None
 
-    # OPPOSING-side pools protect us. Long → SSL pool below us is the floor.
+    side = str(side or "").lower()
+    if side not in ("long", "short"):
+        return None
+
     if side == "long":
         opposing = list(_safe(snap, "ssl_pools", []) or [])
-        # Invalidation: by default, the lowest reasonable swing below entry.
         inv_price = invalidation_price if invalidation_price is not None else entry - 0.3 * atr
-        # Protective pools sit BELOW inv_price.
-        candidates = [t for t in opposing
-                      if _safe(t.pool, "price", 0.0) <= inv_price - _SL_MIN_BEYOND_INVAL_ATR * atr
-                      and (entry - _safe(t.pool, "price", 0.0)) <= _SL_SEARCH_WINDOW_ATR * atr]
+
+        def protects(t):
+            pool = _safe(t, "pool", None)
+            px = float(_safe(pool, "price", 0.0) or 0.0)
+            return (
+                _status_is_live_for_stop(pool)
+                and px <= inv_price - _SL_MIN_BEYOND_INVAL_ATR * atr
+                and (entry - px) <= _SL_SEARCH_WINDOW_ATR * atr
+            )
     else:
         opposing = list(_safe(snap, "bsl_pools", []) or [])
         inv_price = invalidation_price if invalidation_price is not None else entry + 0.3 * atr
-        candidates = [t for t in opposing
-                      if _safe(t.pool, "price", 0.0) >= inv_price + _SL_MIN_BEYOND_INVAL_ATR * atr
-                      and (_safe(t.pool, "price", 0.0) - entry) <= _SL_SEARCH_WINDOW_ATR * atr]
 
-    candidates = [t for t in candidates
-                  if _safe(t, "significance", 0.0) >= _SL_MIN_SIGNIFICANCE]
+        def protects(t):
+            pool = _safe(t, "pool", None)
+            px = float(_safe(pool, "price", 0.0) or 0.0)
+            return (
+                _status_is_live_for_stop(pool)
+                and px >= inv_price + _SL_MIN_BEYOND_INVAL_ATR * atr
+                and (px - entry) <= _SL_SEARCH_WINDOW_ATR * atr
+            )
+
+    candidates = [
+        t for t in opposing
+        if protects(t) and float(_safe(t, "significance", 0.0) or 0.0) >= _SL_MIN_SIGNIFICANCE
+    ]
     if not candidates:
         return None
 
     min_risk = max(0.0, float(min_risk or 0.0))
 
-    # Score each candidate.
-    scored: List[Tuple[float, Any, float, float, float]] = []
+    scored: List[Tuple[float, Any, float, float, float, List[str]]] = []
     for t in candidates:
-        sig = float(_safe(t, "significance", 0.0))
-        struct = _structural_bonus(t.pool)
-        fresh  = _freshness_bonus(t.pool)
-        touch  = _touch_penalty(t.pool)
-
-        # SL pools benefit from being ALIGNED with HTF on the OPPOSING side
-        # (i.e. for a LONG, an SSL pool aligned with bullish HTF means
-        # institutions defended that level). _htf_alignment_bonus already
-        # handles this — for a long-side trade looking at SSL pools, it
-        # returns 1.0 (no bonus) which is correct: we don't WANT bias here,
-        # we want raw structural strength. We therefore neutralise htf_m.
-        score = sig * struct * fresh * touch
-        quality = min(score / 10.0, 1.0)
-        buffer_atr = _SL_BUFFER_BASE_ATR + (1.0 - quality) * _SL_BUFFER_QUALITY_SCALE
-        buffer_atr = min(buffer_atr, _SL_BUFFER_MAX_ATR, max_buffer_atr)
-        pool_price = float(_safe(t.pool, "price", 0.0))
-        sl_price = (pool_price - buffer_atr * atr) if side == "long" else (pool_price + buffer_atr * atr)
-        if min_risk > 0.0 and abs(entry - sl_price) < min_risk:
+        try:
+            score, quality, notes = _sl_quality_score(t)
+            edge, width_atr, cluster_n, cluster_quality, cluster_notes = _same_side_stop_cluster(
+                opposing, t, side, entry, atr)
+            quality = max(quality, cluster_quality)
+            buffer_atr = _sl_raid_buffer_atr(quality, width_atr, cluster_n, max_buffer_atr)
+            sl_price = _sl_from_cluster_edge(edge, side, atr, buffer_atr)
+            risk = abs(float(entry) - float(sl_price))
+            if min_risk > 0.0 and risk < min_risk:
+                continue
+            # Prefer quality, but reward stops that clear the full cluster and
+            # are not microscopic.  This is a continuous score, not a fixed
+            # threshold; sizing/TP geometry will decide if the wider stop is
+            # affordable.
+            dist_atr = risk / max(float(atr), 1e-9)
+            structure_room = 1.0 - math.exp(-max(dist_atr, 0.0) / 1.80)
+            cluster_mult = 1.0 + min(width_atr * 0.18 + max(cluster_n - 1, 0) * 0.05, 0.55)
+            selection_score = score * max(0.35, structure_room) * cluster_mult
+            scored.append((selection_score, t, sl_price, buffer_atr, quality, notes + cluster_notes))
+        except Exception as e:
+            logger.debug("score_sl_pool: skipping protective target due to %s", e)
             continue
-        scored.append((score, t, sl_price, buffer_atr, quality))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     if not scored:
         return None
-    best_score, best_target, sl_price, buffer_atr, quality = scored[0]
 
-    # Quality on a [0, 1] scale: a score of ~10 is institutional-grade.
-
-    # Quality-scaled buffer:
-    #   high quality (1.0) → smallest buffer (BASE)
-    #   low quality (0.0)  → maximum buffer (BASE + scale × MAX)
-
-
-    reasons: List[str] = [f"score={best_score:.2f}", f"sig={float(_safe(best_target, 'significance', 0.0)):.1f}"]
-    if _safe(best_target.pool, "ob_aligned", False):
-        reasons.append("OB-aligned")
-    if int(_safe(best_target.pool, "touches", 1)) > 3:
-        reasons.append(f"{int(_safe(best_target.pool, 'touches', 1))} touches (penalised)")
+    best_score, best_target, sl_price, buffer_atr, quality, notes = scored[0]
+    reasons: List[str] = list(notes)
+    reasons.insert(0, f"selection={best_score:.2f}")
+    reasons.append("raid-zone shield")
 
     return SLPoolPick(
         target     = best_target,
@@ -1561,13 +1696,17 @@ def diagnose_sl_pool(
     limit: int = 8,
     min_risk: float = 0.0,
 ) -> PoolSelectionReport:
-    """Return an SL protective-pool audit table without relaxing SL rules."""
+    """Return an SL protective-cluster audit table without relaxing SL rules."""
+    side = str(side or "").lower()
     report = PoolSelectionReport(role="SL", side=side, entry=float(entry), atr=float(atr))
     if snap is None:
         report.summary = "no liquidity snapshot"
         return report
     if atr <= 0:
         report.summary = "ATR unavailable"
+        return report
+    if side not in ("long", "short"):
+        report.summary = "invalid side"
         return report
 
     min_risk = max(0.0, float(min_risk or 0.0))
@@ -1577,8 +1716,12 @@ def diagnose_sl_pool(
     if side == "long":
         pools = list(_safe(snap, "ssl_pools", []) or [])
         inv_price = invalidation_price if invalidation_price is not None else entry - 0.3 * atr
+
         def _protects(t):
-            px = float(_safe(t.pool, "price", 0.0))
+            pool = _safe(t, "pool", None)
+            px = float(_safe(pool, "price", 0.0) or 0.0)
+            if not _status_is_live_for_stop(pool):
+                return False, f"archived {_pool_status(pool).lower()} pool; not protective"
             if px > inv_price - _SL_MIN_BEYOND_INVAL_ATR * atr:
                 return False, "not beyond long invalidation"
             if (entry - px) > _SL_SEARCH_WINDOW_ATR * atr:
@@ -1587,8 +1730,12 @@ def diagnose_sl_pool(
     else:
         pools = list(_safe(snap, "bsl_pools", []) or [])
         inv_price = invalidation_price if invalidation_price is not None else entry + 0.3 * atr
+
         def _protects(t):
-            px = float(_safe(t.pool, "price", 0.0))
+            pool = _safe(t, "pool", None)
+            px = float(_safe(pool, "price", 0.0) or 0.0)
+            if not _status_is_live_for_stop(pool):
+                return False, f"archived {_pool_status(pool).lower()} pool; not protective"
             if px < inv_price + _SL_MIN_BEYOND_INVAL_ATR * atr:
                 return False, "not beyond short invalidation"
             if (px - entry) > _SL_SEARCH_WINDOW_ATR * atr:
@@ -1602,10 +1749,6 @@ def diagnose_sl_pool(
     for target in pools:
         row = _candidate_base("SL", side, target, entry, atr)
         try:
-            status = row.status.upper()
-            if status in ("SWEPT", "CONSUMED"):
-                row.reason = f"archived {status.lower()} pool; not protective"
-                rows.append(row); continue
             ok, why = _protects(target)
             if not ok:
                 row.reason = why
@@ -1614,26 +1757,26 @@ def diagnose_sl_pool(
                 row.reason = f"significance {row.significance:.1f} < {_SL_MIN_SIGNIFICANCE:.1f}"
                 rows.append(row); continue
 
-            sig = float(_safe(target, "significance", 0.0))
-            struct = _structural_bonus(target.pool)
-            fresh = _freshness_bonus(target.pool)
-            touch = _touch_penalty(target.pool)
-            score = sig * struct * fresh * touch
-            quality = min(score / 10.0, 1.0)
-            buffer_atr = _SL_BUFFER_BASE_ATR + (1.0 - quality) * _SL_BUFFER_QUALITY_SCALE
-            buffer_atr = min(buffer_atr, _SL_BUFFER_MAX_ATR, max_buffer_atr)
-            pool_price = float(_safe(target.pool, "price", 0.0))
-            row.sl_price = (pool_price - buffer_atr * atr) if side == "long" else (pool_price + buffer_atr * atr)
+            score, quality, notes = _sl_quality_score(target)
+            edge, width_atr, cluster_n, cluster_quality, cluster_notes = _same_side_stop_cluster(
+                pools, target, side, entry, atr)
+            quality = max(quality, cluster_quality)
+            buffer_atr = _sl_raid_buffer_atr(quality, width_atr, cluster_n, max_buffer_atr)
+            row.sl_price = _sl_from_cluster_edge(edge, side, atr, buffer_atr)
             row.buffer_atr = buffer_atr
             row.quality = quality
+            row.risk = abs(float(entry) - float(row.sl_price))
+            structure_room = 1.0 - math.exp(-max(row.risk / max(float(atr), 1e-9), 0.0) / 1.80)
+            cluster_mult = 1.0 + min(width_atr * 0.18 + max(cluster_n - 1, 0) * 0.05, 0.55)
             row.ev = score
-            if min_risk > 0.0 and abs(entry - row.sl_price) < min_risk:
-                row.reason = f"risk {abs(entry - row.sl_price):.1f}pts < required {min_risk:.1f}pts"
+            row.selection_ev = score * max(0.35, structure_room) * cluster_mult
+            row.notes = notes + cluster_notes + ["raid-zone shield"]
+            if min_risk > 0.0 and row.risk < min_risk:
+                row.reason = f"risk {row.risk:.1f}pts < required {min_risk:.1f}pts"
                 rows.append(row); continue
             row.eligible = True
-            row.reason = "eligible protective SL pool"
-            row.notes = [f"score={score:.2f}"]
-            candidates.append((score, row, target))
+            row.reason = "eligible protective stop cluster"
+            candidates.append((row.selection_ev, row, target))
             rows.append(row)
         except Exception as e:
             row.reason = f"diagnostic error: {e}"
@@ -1643,13 +1786,15 @@ def diagnose_sl_pool(
     if candidates:
         selected = candidates[0][1]
         selected.selected = True
-        selected.reason = "selected protective SL anchor"
+        selected.reason = "selected protective stop cluster"
         report.selected = selected
-        report.summary = (f"selected ${selected.sl_price:,.1f}; anchor ${selected.pool_price:,.1f}; "
-                          f"quality={selected.quality:.2f}; buffer={selected.buffer_atr:.2f}ATR")
+        report.summary = (
+            f"selected ${selected.sl_price:,.1f}; cluster edge ${selected.pool_price:,.1f}; "
+            f"quality={selected.quality:.2f}; raid_buffer={selected.buffer_atr:.2f}ATR"
+        )
     else:
         if rows:
-            report.summary = "no protective SL pool; best visible pool rejected: " + rows[0].reason
+            report.summary = "no protective SL cluster; best visible pool rejected: " + rows[0].reason
         else:
             report.summary = "no SL candidates found"
     report.candidates = _sort_report_candidates(rows, limit)

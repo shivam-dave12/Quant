@@ -1842,6 +1842,131 @@ class EntryEngine:
 
         return True, f"pool SL geometry ok expansion={expansion:.2f}x rr={pool_rr:.2f}"
 
+    @staticmethod
+    def _pool_live_for_stop(pool: Any) -> bool:
+        try:
+            status = getattr(pool, "status", "")
+            if hasattr(status, "value"):
+                status = status.value
+            return str(status or "").upper() not in ("SWEPT", "CONSUMED")
+        except Exception:
+            return True
+
+    @staticmethod
+    def _pool_price(pool: Any) -> float:
+        try:
+            return float(getattr(pool, "price", 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _pool_tf_rank(pool: Any) -> int:
+        try:
+            tf = str(getattr(pool, "timeframe", "5m") or "5m").lower()
+            return {"1m": 1, "2m": 1, "3m": 1, "5m": 2, "15m": 3, "30m": 3,
+                    "1h": 4, "2h": 4, "4h": 5, "1d": 6}.get(tf, 2)
+        except Exception:
+            return 2
+
+    def _stop_raid_boundary_candidate(
+        self,
+        snap,
+        side: str,
+        price: float,
+        atr: float,
+        invalidation_price: float,
+    ) -> tuple:
+        """Return a stop beyond the entire nearby same-side liquidity pocket.
+
+        This is the final guard against the bad behaviour the live logs showed:
+        SL is technically protective but parked on/inside the liquidity that ICT
+        expects price to raid.  The boundary is built from all live SSL pools
+        near long invalidation or all live BSL pools near short invalidation.
+        """
+        if snap is None or atr <= 0 or price <= 0:
+            return None, "no liquidity snapshot", 0.0
+        side = str(side or "").lower()
+        if side not in ("long", "short"):
+            return None, "invalid side", 0.0
+        inv = float(invalidation_price or 0.0)
+        if inv <= 0.0:
+            inv = price - 0.50 * atr if side == "long" else price + 0.50 * atr
+
+        pools = list(getattr(snap, "ssl_pools", []) or []) if side == "long" else list(getattr(snap, "bsl_pools", []) or [])
+        if not pools:
+            return None, "no same-side liquidity pools", 0.0
+
+        # Search around the invalidation side, not all the way through the book.
+        # It scales with current entry-to-invalidation gap so delayed entries do
+        # not accidentally ignore a wider raid pocket.
+        entry_to_inv = abs(float(price) - inv)
+        search_room = max(2.25 * atr, min(6.00 * atr, entry_to_inv + 2.25 * atr))
+        include_limit = inv + 0.75 * atr if side == "long" else inv - 0.75 * atr
+
+        cluster = []
+        for target in pools:
+            try:
+                pool = getattr(target, "pool", target)
+                if not self._pool_live_for_stop(pool):
+                    continue
+                px = self._pool_price(pool)
+                if px <= 0.0:
+                    continue
+                if side == "long":
+                    if px >= price:
+                        continue
+                    if px > include_limit:
+                        continue
+                    if (price - px) > search_room:
+                        continue
+                else:
+                    if px <= price:
+                        continue
+                    if px < include_limit:
+                        continue
+                    if (px - price) > search_room:
+                        continue
+                cluster.append(target)
+            except Exception:
+                continue
+
+        if not cluster:
+            return None, "no live liquidity inside raid boundary window", 0.0
+
+        prices = [self._pool_price(getattr(t, "pool", t)) for t in cluster]
+        boundary = min(prices) if side == "long" else max(prices)
+        width_atr = (max(prices) - min(prices)) / max(float(atr), 1e-9) if len(prices) > 1 else 0.0
+        max_sig = 0.0
+        sum_sig = 0.0
+        max_tf_rank = 1
+        for t in cluster:
+            pool = getattr(t, "pool", t)
+            try:
+                sig = float(getattr(t, "significance", getattr(pool, "significance", 0.0)) or 0.0)
+            except Exception:
+                sig = 0.0
+            max_sig = max(max_sig, sig)
+            sum_sig += max(sig, 0.0)
+            max_tf_rank = max(max_tf_rank, self._pool_tf_rank(pool))
+
+        q = max(0.0, min(1.0, max(max_sig, sum_sig / max(len(cluster), 1)) / 10.0))
+        regime = max(0.0, min(1.0, float(getattr(self, "_atr_pctile", 0.5) or 0.5)))
+        buffer_atr = (
+            0.42
+            + 0.24 * regime
+            + 0.24 * q
+            + min(width_atr * 0.18, 0.35)
+            + min(max(len(cluster) - 1, 0) * 0.04, 0.24)
+            + min(max(max_tf_rank - 2, 0) * 0.04, 0.16)
+        )
+        buffer_atr = max(0.45, min(1.35, buffer_atr))
+        raid_sl = boundary - buffer_atr * atr if side == "long" else boundary + buffer_atr * atr
+        reason = (
+            f"raid boundary {len(cluster)} pools edge=${boundary:.1f} "
+            f"width={width_atr:.2f}ATR q={q:.2f} buffer={buffer_atr:.2f}ATR"
+        )
+        return raid_sl, reason, q
+
     def _apply_institutional_sl_envelope(
         self,
         snap,
@@ -1909,6 +2034,38 @@ class EntryEngine:
                     logger.info(
                         "SL envelope %s: ignored protective pool $%.1f (%s)",
                         label, pool_sl, geometry_reason)
+
+        # Final raid-zone shield: if the proposed SL is still inside the same-side
+        # liquidity pocket, either widen it beyond the whole pocket or abstain.
+        # We do not keep the tighter stop because that makes our SL the liquidity.
+        raid_sl, raid_reason, raid_quality = self._stop_raid_boundary_candidate(
+            snap, side, price, atr, invalidation_price)
+        if raid_sl is not None and self._sl_is_protective(side, raid_sl, price):
+            raid_risk = abs(price - raid_sl)
+            if raid_risk > risk + max(atr * 0.05, 1e-9):
+                target_reward = self._dominant_institutional_tp_reward(snap, side, price, atr)
+                if raid_risk > max_risk:
+                    return None, (
+                        f"SL would sit inside liquidity raid zone; required {raid_reason} "
+                        f"but breaches liquidation room risk={raid_risk:.1f}pts max={max_risk:.1f}pts"
+                    )
+                accept_raid, raid_geometry = self._accepts_pool_stop_geometry(
+                    risk,
+                    raid_risk,
+                    target_reward,
+                    self._current_quant_posterior(),
+                    max(float(raid_quality or 0.0), float(getattr(pool_pick, "quality", 0.0) if pool_pick is not None else 0.0)),
+                )
+                if not accept_raid:
+                    return None, (
+                        f"SL would sit inside liquidity raid zone; required {raid_reason}; "
+                        f"{raid_geometry}"
+                    )
+                logger.info(
+                    "SL raid-zone shield %s: $%.1f -> $%.1f (%s; %s)",
+                    label, sl, raid_sl, raid_reason, raid_geometry)
+                sl = raid_sl
+                risk = raid_risk
 
         sl = self._push_sl_behind_pools(sl, side, price, atr)
         risk = abs(price - sl)
@@ -2769,35 +2926,52 @@ class EntryEngine:
         return sl
 
     def _push_sl_behind_pools(self, sl, side, price, atr):
-        """Push SL behind nearby liquidity pools.
+        """Push SL outside any nearby same-side liquidity pocket.
 
-        EE-6 FIX: cap the total push distance to _SL_PUSH_MAX_ATR from the
-        starting SL so a large `snap.bsl_pools` list with one outlier pool
-        far from price cannot shift SL to an unrealistic distance.
+        This is a secondary safety rail used by OB/fallback stop paths.  The
+        primary envelope now builds a raid-boundary stop, but any later stop
+        mutation must still avoid leaving the exchange stop at a visible SSL/BSL.
         """
         snap = self._last_liq_snapshot
-        if snap is None:
+        if snap is None or atr <= 0:
             return sl
-        _SL_PUSH_MAX_ATR = 3.0     # never push SL more than 3 ATR from original
-        sl_origin = sl
-        buf = 0.25 * atr
+        _SL_PUSH_MAX_ATR = 3.5
+        sl_origin = float(sl)
+        regime = max(0.0, min(1.0, float(getattr(self, "_atr_pctile", 0.5) or 0.5)))
+
+        def _buf_for(target) -> float:
+            pool = getattr(target, "pool", target)
+            try:
+                sig = float(getattr(target, "significance", getattr(pool, "significance", 0.0)) or 0.0)
+            except Exception:
+                sig = 0.0
+            q = max(0.0, min(1.0, sig / 10.0))
+            return max(0.32, min(0.95, 0.34 + 0.18 * regime + 0.22 * q)) * atr
+
         if side == "long":
-            for t in snap.ssl_pools:
-                if sl < t.pool.price < price:
-                    candidate = t.pool.price - buf
-                    # Cap: candidate must not be more than _SL_PUSH_MAX_ATR ATR
-                    # below the original SL.
+            for t in getattr(snap, "ssl_pools", []) or []:
+                pool = getattr(t, "pool", t)
+                if not self._pool_live_for_stop(pool):
+                    continue
+                px = self._pool_price(pool)
+                if sl < px < price:
+                    candidate = px - _buf_for(t)
                     if sl_origin - candidate > _SL_PUSH_MAX_ATR * atr:
                         continue
                     sl = min(sl, candidate)
         else:
-            for t in snap.bsl_pools:
-                if price < t.pool.price < sl:
-                    candidate = t.pool.price + buf
+            for t in getattr(snap, "bsl_pools", []) or []:
+                pool = getattr(t, "pool", t)
+                if not self._pool_live_for_stop(pool):
+                    continue
+                px = self._pool_price(pool)
+                if price < px < sl:
+                    candidate = px + _buf_for(t)
                     if candidate - sl_origin > _SL_PUSH_MAX_ATR * atr:
                         continue
                     sl = max(sl, candidate)
         return sl
+
 
     @staticmethod
     def _ict_summary(ict, side):

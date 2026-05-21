@@ -2990,3 +2990,144 @@ def test_tp_ladder_uses_selector_cost_when_live_bps_unavailable():
     assert all(l.cost_r >= 0.80 - 1e-9 for l in plan.legs), plan.as_dict()
     assert any("prop-desk net-edge filter" in n for n in plan.regime_notes), plan.regime_notes
 # ===== END test_prop_desk_tp_ladder_net_edge.py =====
+
+# ===== BEGIN test_institutional_sl_raid_zone.py =====
+
+def test_sl_selector_places_stop_beyond_outer_liquidity_cluster_edge():
+    from types import SimpleNamespace
+    from strategy.liquidity_pool_selector import score_sl_pool
+
+    def target(price, sig, tf="5m"):
+        return SimpleNamespace(
+            pool=SimpleNamespace(
+                price=float(price), status="DETECTED", timeframe=tf,
+                touches=2, ob_aligned=False, fvg_aligned=False,
+            ),
+            significance=float(sig),
+            distance_atr=abs(100.0 - float(price)),
+            tf_sources=[tf],
+        )
+
+    snap = SimpleNamespace(
+        ssl_pools=[
+            target(99.20, 5.0, "5m"),
+            target(98.80, 8.0, "15m"),
+            target(98.55, 7.0, "1h"),
+        ],
+        bsl_pools=[],
+    )
+
+    pick = score_sl_pool(
+        snap, side="long", entry=100.0, atr=1.0,
+        invalidation_price=99.35, max_buffer_atr=2.0,
+    )
+
+    assert pick is not None
+    assert pick.sl_price < 98.55 - 0.45  # below the whole SSL cluster, not at 99.20/98.80
+    assert "raid-zone shield" in " ".join(pick.reasons)
+
+
+def test_sl_envelope_abstains_when_raid_boundary_kills_payoff_geometry():
+    from types import SimpleNamespace
+    from strategy.entry_engine import EntryEngine
+
+    def target(price, sig):
+        return SimpleNamespace(
+            pool=SimpleNamespace(price=float(price), status="DETECTED", timeframe="15m"),
+            significance=float(sig),
+            distance_atr=abs(100.0 - float(price)),
+            tf_sources=["15m"],
+        )
+
+    engine = EntryEngine()
+    engine._last_liq_snapshot = SimpleNamespace(
+        ssl_pools=[target(99.10, 9.0), target(98.70, 8.0), target(98.45, 8.0)],
+        bsl_pools=[target(101.8, 5.0)],
+    )
+    engine._dominant_institutional_tp_reward = lambda *args, **kwargs: 1.0
+    engine._current_quant_posterior = lambda: 0.30
+    engine._sl_before_liquidation = lambda *args, **kwargs: True
+
+    sl, reason = engine._apply_institutional_sl_envelope(
+        engine._last_liq_snapshot,
+        side="long",
+        price=100.0,
+        atr=1.0,
+        structural_sl=99.0,
+        invalidation_price=99.2,
+        label="unit",
+    )
+
+    assert sl is None
+    assert "liquidity raid zone" in reason
+# ===== END test_institutional_sl_raid_zone.py =====
+
+
+def test_sl_selector_counts_full_cluster_width_when_outer_edge_is_selected():
+    from types import SimpleNamespace
+    from strategy.liquidity_pool_selector import score_sl_pool
+
+    def target(price, sig, tf="5m"):
+        return SimpleNamespace(
+            pool=SimpleNamespace(
+                price=float(price), status="DETECTED", timeframe=tf,
+                touches=2, ob_aligned=False, fvg_aligned=False,
+            ),
+            significance=float(sig),
+            distance_atr=abs(100.0 - float(price)),
+            tf_sources=[tf],
+        )
+
+    snap = SimpleNamespace(
+        ssl_pools=[
+            target(99.20, 5.0, "5m"),
+            target(98.80, 8.0, "15m"),
+            # Highest-quality target is the outer edge.  The selector must still
+            # count 99.20→98.40 as cluster width instead of logging 0.00ATR.
+            target(98.40, 10.0, "1h"),
+        ],
+        bsl_pools=[],
+    )
+
+    pick = score_sl_pool(snap, side="long", entry=100.0, atr=1.0,
+                         invalidation_price=99.35, max_buffer_atr=2.0)
+
+    assert pick is not None
+    reasons = " ".join(pick.reasons)
+    assert "cluster_n=3" in reasons
+    assert "cluster_width=0.80ATR" in reasons
+    assert pick.sl_price < 98.40 - 0.80
+
+
+def test_sl_selector_chains_adjacent_pools_into_one_raid_zone():
+    from types import SimpleNamespace
+    from strategy.liquidity_pool_selector import score_sl_pool
+
+    def target(price, sig, tf="5m"):
+        return SimpleNamespace(
+            pool=SimpleNamespace(
+                price=float(price), status="DETECTED", timeframe=tf,
+                touches=2, ob_aligned=False, fvg_aligned=False,
+            ),
+            significance=float(sig),
+            distance_atr=abs(100.0 - float(price)),
+            tf_sources=[tf],
+        )
+
+    snap = SimpleNamespace(
+        ssl_pools=[
+            target(99.20, 7.0, "5m"),
+            target(98.35, 7.0, "15m"),   # within 0.90ATR of 99.20
+            target(97.55, 9.0, "1h"),    # within 0.90ATR of 98.35, but not 99.20
+        ],
+        bsl_pools=[],
+    )
+
+    pick = score_sl_pool(snap, side="long", entry=100.0, atr=1.0,
+                         invalidation_price=99.35, max_buffer_atr=2.0)
+
+    assert pick is not None
+    reasons = " ".join(pick.reasons)
+    assert "cluster_n=3" in reasons
+    assert "cluster_edge=97.5500" in reasons
+    assert pick.sl_price < 97.55 - 0.80
