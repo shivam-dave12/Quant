@@ -86,6 +86,10 @@ def _icici_breeze_code(underlying: str) -> str:
         for k, v in raw.items():
             if normalise_symbol(str(k)) == key and normalise_symbol(str(v)):
                 return normalise_symbol(str(v))
+    # Breeze uses stock_code=NIFTY for the Nifty 50 index and its NFO options;
+    # keep NIFTY50/CNXNIFTY as discovery aliases only, never as Breeze stock_code.
+    if key in {"NIFTY50", "CNXNIFTY", "NSENIFTY"}:
+        return "NIFTY"
     return key
 
 
@@ -392,21 +396,25 @@ class InstrumentRegistry:
             self.icici = out
             return out
         for priority, underlying in enumerate(underlyings, 1):
-            raw = build_underlying_payload(underlying, "ICICI_INDEX_OPTIONS", [])
-            raw["underlying_display"] = underlying
-            raw["breeze_stock_code"] = _icici_breeze_code(underlying)
+            breeze_code = _icici_breeze_code(underlying)
+            display_underlying = "NIFTY" if breeze_code == "NIFTY" and normalise_symbol(underlying) in {"NIFTY", "NIFTY50", "CNXNIFTY", "NSENIFTY"} else underlying
+            raw = build_underlying_payload(display_underlying, "ICICI_INDEX_OPTIONS", [])
+            raw["underlying_display"] = display_underlying
+            raw["breeze_stock_code"] = breeze_code
+            raw["stock_code"] = breeze_code
+            raw["underlying_stock_code"] = breeze_code
             raw["chain_source"] = "configured_index"
             raw["chain_candidates_deferred"] = True
             ei = ExchangeInstrument(
                 exchange=ExchangeName.ICICI,
-                symbol=underlying,
-                ws_symbol=underlying,
-                display_symbol=underlying,
-                asset_id=underlying,
+                symbol=breeze_code,
+                ws_symbol=breeze_code,
+                display_symbol=display_underlying,
+                asset_id=display_underlying,
                 asset_class=AssetClass.OPTION,
                 product_id=None,
                 quote_asset="INR",
-                base_asset=underlying,
+                base_asset=display_underlying,
                 contract_type="option_chain",
                 status="active",
                 tick_size=float(_cfg("ICICI_OPTION_TICK_SIZE", 0.05)),
@@ -416,6 +424,7 @@ class InstrumentRegistry:
                 raw={**raw, "configured_priority": priority},
             )
             out[normalise_symbol(underlying)] = ei
+            out[normalise_symbol(breeze_code)] = ei
         self.icici = out
         logger.info("ICICI configured-index discovery active: underlyings=%s", ",".join(out.keys()) or "none")
         return out

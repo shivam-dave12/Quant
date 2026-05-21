@@ -17,17 +17,31 @@ load_dotenv()
 # ── Exchange routing ──────────────────────────────────────────────────────────
 EXECUTION_EXCHANGE = os.getenv("EXECUTION_EXCHANGE", "delta").lower()
 
+
+def _env_first(*names: str, default: str = "") -> str:
+    """Return the first non-empty environment variable.
+
+    Keeps .env exchange-only while accepting the common Breeze/ICICI naming
+    variants used across ICICI Direct docs, SDK examples and older bot builds.
+    """
+    for name in names:
+        value = os.getenv(name, "")
+        if str(value or "").strip():
+            return str(value).strip()
+    return default
+
+
 # ── Credentials ───────────────────────────────────────────────────────────────
-DELTA_API_KEY             = os.getenv("DELTA_API_KEY",    "")
-DELTA_SECRET_KEY          = os.getenv("DELTA_SECRET_KEY", "")
+DELTA_API_KEY             = _env_first("DELTA_API_KEY")
+DELTA_SECRET_KEY          = _env_first("DELTA_SECRET_KEY", "DELTA_API_SECRET")
 DELTA_TESTNET             = os.getenv("DELTA_TESTNET", "false").lower() == "true"
-COINSWITCH_API_KEY        = os.getenv("COINSWITCH_API_KEY",    "")
-COINSWITCH_SECRET_KEY     = os.getenv("COINSWITCH_SECRET_KEY", "")
-BREEZE_API_KEY            = os.getenv("BREEZE_API_KEY", os.getenv("ICICI_API_KEY", ""))
-BREEZE_SECRET_KEY         = os.getenv("BREEZE_SECRET_KEY", os.getenv("ICICI_SECRET_KEY", ""))
-ICICI_CLIENT_ID           = os.getenv("ICICI_CLIENT_ID", "")
-ICICI_PASSWORD            = os.getenv("ICICI_PASSWORD", "")
-ICICI_ENABLED             = os.getenv("ICICI_ENABLED", "true" if BREEZE_API_KEY else "false").lower() in ("1", "true", "yes", "on")
+COINSWITCH_API_KEY        = _env_first("COINSWITCH_API_KEY")
+COINSWITCH_SECRET_KEY     = _env_first("COINSWITCH_SECRET_KEY", "COINSWITCH_API_SECRET")
+BREEZE_API_KEY            = _env_first("BREEZE_API_KEY", "BREEZE_APP_KEY", "ICICI_API_KEY", "ICICI_APP_KEY")
+BREEZE_SECRET_KEY         = _env_first("BREEZE_SECRET_KEY", "BREEZE_API_SECRET", "BREEZE_APP_SECRET", "ICICI_SECRET_KEY", "ICICI_API_SECRET", "ICICI_APP_SECRET")
+ICICI_CLIENT_ID           = _env_first("ICICI_CLIENT_ID", "BREEZE_CLIENT_ID")
+ICICI_PASSWORD            = _env_first("ICICI_PASSWORD", "BREEZE_PASSWORD")
+ICICI_ENABLED             = os.getenv("ICICI_ENABLED", "true" if (BREEZE_API_KEY and BREEZE_SECRET_KEY) else "false").lower() in ("1", "true", "yes", "on")
 TELEGRAM_BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID          = os.getenv("TELEGRAM_CHAT_ID",   "")
 
@@ -592,7 +606,7 @@ ICICI_DISCOVERY_ENABLED = ICICI_ENABLED
 ICICI_OPTIONS_RUNTIME_ENABLED = ICICI_ENABLED
 ICICI_INDEX_OPTIONS_FROM_CONFIG_ONLY = True
 ICICI_INDEX_UNDERLYINGS = os.getenv("ICICI_INDEX_UNDERLYINGS", "NIFTY")
-ICICI_INDEX_BREEZE_STOCK_CODE_BY_UNDERLYING = {"NIFTY": "NIFTY"}
+ICICI_INDEX_BREEZE_STOCK_CODE_BY_UNDERLYING = {"NIFTY": "NIFTY", "NIFTY50": "NIFTY", "CNXNIFTY": "NIFTY"}
 ICICI_API_SESSION_PATH = os.getenv("ICICI_API_SESSION_PATH", "data/icici_api_session.txt")
 BREEZE_API_SESSION = os.getenv("BREEZE_API_SESSION", os.getenv("ICICI_API_SESSION", ""))
 BREEZE_SESSION_TOKEN = os.getenv("BREEZE_SESSION_TOKEN", "")

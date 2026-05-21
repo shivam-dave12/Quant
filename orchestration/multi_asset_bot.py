@@ -709,7 +709,7 @@ class MultiAssetQuantBot:
                 logger.info(line)
             if not self.discovery_report.matched:
                 logger.error("No confirmed tradable instruments found. Scanner will not start.")
-            return False
+                return False
 
             for inst in self.discovery_report.matched:
                 ctx = self._build_asset_context(inst, delta_api, cs_api, icici_api)
