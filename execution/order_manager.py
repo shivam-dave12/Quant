@@ -905,6 +905,51 @@ class _ICICIAdapter:
             return merged
         return self.raw
 
+    def _has_contract_identity(self, raw: Dict[str, Any]) -> bool:
+        if not isinstance(raw, dict):
+            return False
+        strike = self._num(raw.get("strike_price") or raw.get("StrikePrice") or raw.get("strike"), 0.0)
+        expiry = str(raw.get("expiry_date") or raw.get("ExpiryDate") or raw.get("expiry") or "").strip()
+        right = str(raw.get("right") or raw.get("option_type") or raw.get("OptionType") or "").strip().lower()
+        return bool(strike > 0 and expiry and right in {"call", "put", "ce", "pe", "c", "p"})
+
+    def _position_qty(self, row: Dict[str, Any]) -> float:
+        for key in ("quantity", "qty", "open_quantity", "open_qty", "net_quantity", "net_qty"):
+            qty = self._num(row.get(key), 0.0)
+            if abs(qty) > 0:
+                return abs(qty)
+        return 0.0
+
+    def _normalised_position_row(self, row: Dict[str, Any], *, source: str = "matched") -> Dict[str, Any]:
+        qty = self._position_qty(row)
+        entry = self._num(row.get("average_price") or row.get("avg_price") or row.get("entry_price"), 0.0)
+        upnl = self._num(row.get("unrealized_pnl") or row.get("unrealised_pnl") or row.get("pnl"), 0.0)
+        right = str(row.get("right") or row.get("option_type") or row.get("OptionType") or "").strip()
+        strike = str(row.get("strike_price") or row.get("StrikePrice") or row.get("strike") or "").strip()
+        expiry = str(row.get("expiry_date") or row.get("ExpiryDate") or row.get("expiry") or "").strip()
+        symbol = str(row.get("TradingSymbol") or row.get("trading_symbol") or row.get("symbol") or "").strip()
+        out = {
+            "side": "LONG" if qty > 0 else None,
+            "size": qty,
+            "entry_price": entry,
+            "unrealized_pnl": upnl,
+            "currency": "INR",
+            "raw": row,
+            "contract_identity_source": source,
+            "stock_code": row.get("stock_code") or row.get("StockCode"),
+            "exchange_code": row.get("exchange_code") or row.get("ExchangeCode"),
+            "right": right,
+            "strike_price": strike,
+            "expiry_date": expiry,
+            "TradingSymbol": symbol,
+        }
+        if source != "matched":
+            out["requires_contract_reconstruction"] = True
+        if not self._has_contract_identity(out):
+            out["unadoptable"] = True
+            out["reason"] = "missing_exact_icici_option_identity"
+        return out
+
     def _lot_size(self) -> float:
         raw = self._active_raw()
         for key in ("runtime_lot_size", "LotSize", "lot_size", "MinimumLotQty", "min_qty"):
@@ -1044,6 +1089,34 @@ class _ICICIAdapter:
             rows = rows.get("positions") or rows.get("data") or [rows]
         positions = rows if isinstance(rows, list) else []
         active = self._active_raw()
+        if not self._has_contract_identity(active):
+            open_positions = [
+                self._normalised_position_row(pos, source="broker_portfolio")
+                for pos in positions
+                if isinstance(pos, dict) and self._position_qty(pos) > 0
+            ]
+            if not open_positions:
+                return {"side": None, "size": 0.0, "entry_price": 0.0, "unrealized_pnl": 0.0, "currency": "INR"}
+            first = open_positions[0]
+            if len(open_positions) > 1:
+                first = dict(first)
+                first["multiple_broker_positions"] = True
+                first["external_positions"] = open_positions
+                first["size"] = sum(float(p.get("size", 0.0) or 0.0) for p in open_positions)
+                first["unrealized_pnl"] = sum(float(p.get("unrealized_pnl", 0.0) or 0.0) for p in open_positions)
+                first["unadoptable"] = True
+                first["reason"] = "multiple_icici_broker_positions_require_manual_selection"
+            logger.warning(
+                "ICICI broker position detected before a selected option vehicle exists: "
+                "symbol=%s right=%s strike=%s expiry=%s qty=%.8g adoptable=%s",
+                first.get("TradingSymbol") or "-",
+                first.get("right") or "-",
+                first.get("strike_price") or "-",
+                first.get("expiry_date") or "-",
+                float(first.get("size", 0.0) or 0.0),
+                not bool(first.get("unadoptable")),
+            )
+            return first
         strike = str(active.get("strike_price") or "").strip().lower()
         right = str(active.get("right") or active.get("option_type") or "").strip().lower()
         expiry = str(active.get("expiry_date") or "").strip().lower()
@@ -1061,8 +1134,37 @@ class _ICICIAdapter:
             entry = self._num(pos.get("average_price") or pos.get("avg_price") or pos.get("entry_price"), 0.0)
             upnl = self._num(pos.get("unrealized_pnl") or pos.get("pnl"), 0.0)
             if qty > 0:
-                return {"side": "LONG", "size": qty, "entry_price": entry, "unrealized_pnl": upnl, "raw": pos}
-        return {"side": None, "size": 0.0, "entry_price": 0.0, "unrealized_pnl": 0.0}
+                matched = self._normalised_position_row(pos, source="selected_contract_match")
+                matched["entry_price"] = entry
+                matched["unrealized_pnl"] = upnl
+                return matched
+        open_positions = [
+            self._normalised_position_row(pos, source="broker_portfolio_unmatched")
+            for pos in positions
+            if isinstance(pos, dict) and self._position_qty(pos) > 0
+        ]
+        if open_positions:
+            first = open_positions[0]
+            if len(open_positions) > 1:
+                first = dict(first)
+                first["multiple_broker_positions"] = True
+                first["external_positions"] = open_positions
+                first["size"] = sum(float(p.get("size", 0.0) or 0.0) for p in open_positions)
+                first["unrealized_pnl"] = sum(float(p.get("unrealized_pnl", 0.0) or 0.0) for p in open_positions)
+                first["unadoptable"] = True
+                first["reason"] = "multiple_icici_broker_positions_require_manual_selection"
+            logger.warning(
+                "ICICI broker position did not match selected contract; reporting actual broker vehicle "
+                "symbol=%s right=%s strike=%s expiry=%s qty=%.8g adoptable=%s",
+                first.get("TradingSymbol") or "-",
+                first.get("right") or "-",
+                first.get("strike_price") or "-",
+                first.get("expiry_date") or "-",
+                float(first.get("size", 0.0) or 0.0),
+                not bool(first.get("unadoptable")),
+            )
+            return first
+        return {"side": None, "size": 0.0, "entry_price": 0.0, "unrealized_pnl": 0.0, "currency": "INR"}
 
     def _parse_fno_funds(self, resp: Dict[str, Any]) -> Dict[str, Any]:
         data = self._success_payload(resp)

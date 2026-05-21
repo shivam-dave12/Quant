@@ -24,6 +24,7 @@ from typing import Any, Dict, List
 
 import config
 from .api import BreezeRestClient
+from .market_session import icici_market_session_state
 from .rate_limiter import breeze_throttle
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,15 @@ class ICICIUnderlyingDataManager:
 
     def start(self) -> bool:
         try:
+            session = icici_market_session_state()
+            if not session.is_open and bool(_cfg("ICICI_ANALYZE_ONLY_DURING_MARKET_SESSION", True)):
+                self.is_ready = False
+                logger.warning(
+                    "ICICI underlying chart dormant for %s: %s; no post-market NIFTY analysis",
+                    getattr(self.instrument, "asset_id", "?"),
+                    session.reason,
+                )
+                return False
             self.api.preflight_session()
             self._warmup()
             min_bars = int(_cfg("ICICI_UNDERLYING_MIN_READY_1M_BARS", 20))
@@ -386,6 +396,9 @@ class ICICIUnderlyingDataManager:
             return " ".join(f"{tf}={len(self._candles.get(tf, ())) }" for tf in ("1m", "5m", "15m", "1h", "4h", "1d"))
 
     def _maybe_refresh_live(self) -> None:
+        session = icici_market_session_state()
+        if not session.is_open and bool(_cfg("ICICI_ANALYZE_ONLY_DURING_MARKET_SESSION", True)):
+            return
         interval = float(_cfg("ICICI_UNDERLYING_REST_REFRESH_SEC", 30.0) or 0.0)
         if interval <= 0:
             return

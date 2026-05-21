@@ -660,6 +660,78 @@ def _icici_selected_premium(instrument: Any = None, fallback: float = 0.0) -> fl
     return float(fallback or 0.0)
 
 
+def _icici_contract_identity_ok(raw: Dict[str, Any]) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    strike = _icici_float(raw.get("strike_price") or raw.get("StrikePrice") or raw.get("strike"), 0.0)
+    expiry = str(raw.get("expiry_date") or raw.get("ExpiryDate") or raw.get("expiry") or "").strip()
+    right = _icici_option_right(raw)
+    return bool(strike > 0 and expiry and right in ("call", "put"))
+
+
+def _icici_contract_from_position(ex_pos: Any) -> Dict[str, Any]:
+    if not isinstance(ex_pos, dict):
+        return {}
+    merged: Dict[str, Any] = {}
+    raw = ex_pos.get("raw")
+    if isinstance(raw, dict):
+        merged.update(raw)
+    merged.update({k: v for k, v in ex_pos.items() if k != "raw"})
+    return merged
+
+
+def _icici_ensure_adoptable_contract(instrument: Any, ex_pos: Any) -> bool:
+    """Ensure ICICI recovery has an exact option vehicle before adoption."""
+    if _icici_contract_identity_ok(_icici_selected_contract_dict(instrument)):
+        return True
+    pos_contract = _icici_contract_from_position(ex_pos)
+    if not _icici_contract_identity_ok(pos_contract):
+        return False
+    raw = _icici_primary_raw(instrument)
+    if not isinstance(raw, dict):
+        return False
+    entry_px = _icici_float(
+        pos_contract.get("entry_price")
+        or pos_contract.get("average_price")
+        or pos_contract.get("avg_price")
+        or pos_contract.get("ltp")
+        or pos_contract.get("last_price"),
+        0.0,
+    )
+    selected = dict(pos_contract)
+    selected.setdefault("raw", dict(pos_contract))
+    if entry_px > 0:
+        selected.setdefault("selected_entry_premium", entry_px)
+    right = _icici_option_right(pos_contract)
+    raw["selected_option_contract"] = selected
+    raw["stock_code"] = pos_contract.get("stock_code") or pos_contract.get("StockCode") or raw.get("stock_code") or raw.get("underlying")
+    raw["exchange_code"] = pos_contract.get("exchange_code") or pos_contract.get("ExchangeCode") or raw.get("exchange_code") or "NFO"
+    raw["product_type"] = "options"
+    raw["right"] = "Call" if right == "call" else "Put"
+    raw["option_type"] = raw["right"]
+    raw["strike_price"] = str(pos_contract.get("strike_price") or pos_contract.get("StrikePrice") or pos_contract.get("strike") or "")
+    raw["expiry_date"] = str(pos_contract.get("expiry_date") or pos_contract.get("ExpiryDate") or pos_contract.get("expiry") or "")
+    raw["TradingSymbol"] = (
+        pos_contract.get("TradingSymbol")
+        or pos_contract.get("trading_symbol")
+        or pos_contract.get("selected_symbol")
+        or pos_contract.get("symbol")
+        or raw.get("TradingSymbol")
+    )
+    lot = _icici_float(
+        pos_contract.get("runtime_lot_size")
+        or pos_contract.get("LotSize")
+        or pos_contract.get("lot_size")
+        or raw.get("runtime_lot_size"),
+        0.0,
+    )
+    if lot > 0:
+        raw["runtime_lot_size"] = lot
+    if entry_px > 0:
+        raw["selected_entry_premium"] = entry_px
+    return _icici_contract_identity_ok(raw)
+
+
 def _icici_select_contract_for_thesis(
     instrument: Any,
     data_manager: Any,
@@ -3302,6 +3374,9 @@ class QuantStrategy:
         sizing and portfolio-pair exposure. It cannot create an entry; it may
         block only unsponsored cross-desk exposure conflicts.
         """
+        asset_id = str(getattr(self, "_asset_id", "") or "").upper()
+        if asset_id not in {"BTC", "GOLD", "SILVER"}:
+            state = None
         self._cross_asset_state = state
         try:
             if self._entry_engine is not None and hasattr(self._entry_engine, "set_cross_asset_state"):
@@ -3320,6 +3395,8 @@ class QuantStrategy:
             if state is None or not bool(getattr(state, "enabled", False)):
                 return
             asset = str(getattr(self, "_asset_id", "") or "")
+            if asset.upper() not in {"BTC", "GOLD", "SILVER"}:
+                return
             side = str(getattr(signal, "side", "") or "").lower()
             adj = state.adjustment_for(asset, side)
             if adj is None or not bool(getattr(adj, "enabled", False)):
@@ -7005,9 +7082,17 @@ class QuantStrategy:
                     self._last_tp_gate_rejection = time.time()
                 return
             side = "long"
-            price = float(data_manager.get_last_price() or 0.0)
+            price = _icici_selected_premium(self._instrument, fallback=0.0)
             if price <= max(QCfg.TICK_SIZE(), 1e-6):
-                price = _icici_selected_premium(self._instrument, fallback=0.0)
+                try:
+                    rows = list(data_manager.get_execution_candles("1m", 3) or [])
+                    for candle in reversed(rows):
+                        px = _icici_float(candle.get("c", candle.get("close")), 0.0)
+                        if px > max(QCfg.TICK_SIZE(), 1e-6):
+                            price = px
+                            break
+                except Exception:
+                    pass
             if price <= max(QCfg.TICK_SIZE(), 1e-6):
                 logger.info("ICICI options entry rejected: selected option premium is unavailable after contract selection")
                 with self._lock:
@@ -7111,6 +7196,11 @@ class QuantStrategy:
                 f"— falling back to live book. Signal may be from a prior tick."
             )
 
+        if _icici_mode:
+            limit_px = _round_to_tick(max(price, QCfg.TICK_SIZE()))
+            mt_reason = f"icici_option_limit_premium={limit_px:.2f}"
+            use_maker = True
+
         # Keep fee engine updated for diagnostics and TP gate
         if self._fee_engine is not None:
             try:
@@ -7123,7 +7213,7 @@ class QuantStrategy:
         # Bug #34 fix: for book-offset (non-OTE) entries, query the fee engine
         # to decide maker vs taker.  OTE-signal entries always remain maker
         # (they're limit orders by construction).
-        if not _sig_is_valid and self._fee_engine is not None and self._fee_engine.is_warmed_up():
+        if not _icici_mode and not _sig_is_valid and self._fee_engine is not None and self._fee_engine.is_warmed_up():
             try:
                 _urgency = 1.0 - min(1.0, signal_confidence)   # low confidence = more urgent
                 _fe_maker, _fe_lim, _fe_reason = self._fee_engine.decide_entry_type(
@@ -10525,10 +10615,72 @@ class QuantStrategy:
                     settle_sec,
                 )
                 return
+            _is_icici_reconcile = _icici_exchange_name(getattr(self, "_instrument", None)) == "icici"
+            if _is_icici_reconcile:
+                _session_open, _session_reason = _icici_market_session_open()
+                if not _session_open:
+                    self._last_unmanaged_external_position = dict(ex_pos)
+                    logger.critical(
+                        "ICICI reconcile found a broker position while NSE/NFO is closed (%s); "
+                        "refusing bot adoption/analysis. Manual broker review required.",
+                        _session_reason,
+                    )
+                    try:
+                        self._send_telegram(
+                            "🚨 <b>ICICI POSITION NOT ADOPTED</b>\n"
+                            "<b>NIFTY option desk is closed</b>\n"
+                            f"Reason: <code>{_session_reason}</code>\n"
+                            "The bot will not analyse or manage this after-hours position automatically. "
+                            "Manual broker review is required.",
+                            event_type="reconcile_guard",
+                        )
+                    except Exception:
+                        pass
+                    self._last_exit_time = time.time()
+                    return
+                if bool(ex_pos.get("unadoptable")):
+                    self._last_unmanaged_external_position = dict(ex_pos)
+                    logger.critical(
+                        "ICICI reconcile found broker position qty=%.8g entry=%.2f but Breeze did not provide "
+                        "exact strike/right/expiry; refusing adoption to avoid ghost position.",
+                        ex_size,
+                        float(ex_pos.get("entry_price", 0.0) or 0.0),
+                    )
+                    try:
+                        self._send_telegram(
+                            "🚨 <b>ICICI POSITION NOT ADOPTED</b>\n"
+                            "Broker position detected, but exact option identity is missing.\n"
+                            f"Qty: <code>{ex_size:.8g}</code> · Entry: <code>₹{float(ex_pos.get('entry_price', 0.0) or 0.0):,.2f}</code>\n"
+                            "Required fields: <code>strike/right/expiry</code>. No order will be sent.",
+                            event_type="reconcile_guard",
+                        )
+                    except Exception:
+                        pass
+                    self._last_exit_time = time.time()
+                    return
+                if not _icici_ensure_adoptable_contract(getattr(self, "_instrument", None), ex_pos):
+                    self._last_unmanaged_external_position = dict(ex_pos)
+                    logger.critical(
+                        "ICICI reconcile found a broker position but exact option contract metadata "
+                        "(strike/right/expiry) is missing; refusing adoption to avoid wrong-contract "
+                        "protection or failed flatten."
+                    )
+                    try:
+                        self._send_telegram(
+                            "🚨 <b>ICICI POSITION NOT ADOPTED</b>\n"
+                            "Exact option vehicle metadata is missing: <code>strike/right/expiry</code>.\n"
+                            "The bot will not guess the contract. Manual broker review is required.",
+                            event_type="reconcile_guard",
+                        )
+                    except Exception:
+                        pass
+                    self._last_exit_time = time.time()
+                    return
             ex_entry=float(ex_pos.get("entry_price",0.0)); ex_upnl=float(ex_pos.get("unrealized_pnl",0.0))
             # Guard: CoinSwitch sometimes returns entry_price=0 for a position that
             # has been filled but not yet fully settled in the position feed.
-            if ex_entry < 1.0:
+            _min_adopt_entry = max(QCfg.TICK_SIZE(), 1e-6) if _is_icici_reconcile else 1.0
+            if ex_entry < _min_adopt_entry:
                 logger.warning(
                     f"Reconcile: skipping adoption of {ex_side} size={ex_size} "
                     f"— entry_price={ex_entry:.2f} not yet settled on exchange")
@@ -10612,6 +10764,7 @@ class QuantStrategy:
                 entry_atr=_adopt_atr, entry_session=self._current_entry_session(),
                 tp_ladder_initial_qty=ex_size, tp_ladder_last_sync_qty=ex_size,
                 last_seen_price=ex_entry)
+            self._last_unmanaged_external_position = None
             self.current_sl_price=sl_p; self.current_tp_price=tp_p
             self._confirm_long=self._confirm_short=0
             # Reconcile adoption means the exchange is already carrying risk.
@@ -10625,8 +10778,13 @@ class QuantStrategy:
                 logger.debug(f"risk_manager.set_position_open(True) adoption error (non-fatal): {_rm_adopt_e}")
             # Reset duplicate guards for the newly adopted position
             self._exit_completed = False
-            logger.warning(f"⚡ RECONCILE: adopted {iside.upper()} @ ${ex_entry:,.2f}")
-            self._send_telegram(f"⚡ <b>POSITION ADOPTED</b>\nSide: {iside.upper()} | Size: {ex_size}\nEntry: ${ex_entry:,.2f} | uPnL: ${ex_upnl:+.2f}")
+            _adopt_cur = "₹" if _is_icici_reconcile else "$"
+            logger.warning(f"⚡ RECONCILE: adopted {iside.upper()} @ {_adopt_cur}{ex_entry:,.2f}")
+            self._send_telegram(
+                f"⚡ <b>POSITION ADOPTED</b>\n"
+                f"Side: {iside.upper()} | Size: {ex_size}\n"
+                f"Entry: {_adopt_cur}{ex_entry:,.2f} | uPnL: {_adopt_cur}{ex_upnl:+,.2f}"
+            )
 
             # ── TP-LADDER ADOPTION REPAIR ─────────────────────────────────────
             # If a native bracket fill/child-verification timed out but the

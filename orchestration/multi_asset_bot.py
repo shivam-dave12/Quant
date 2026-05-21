@@ -31,10 +31,12 @@ from exchanges.delta.data_manager import DeltaDataManager
 try:
     from exchanges.icici.api import BreezeRestClient
     from exchanges.icici.data_manager import ICICIOptionDataManager
+    from exchanges.icici.market_session import icici_market_session_state
     from exchanges.icici.underlying_data_manager import ICICIUnderlyingDataManager
 except Exception:  # pragma: no cover - ICICI is optional at runtime
     BreezeRestClient = None  # type: ignore
     ICICIOptionDataManager = None  # type: ignore
+    icici_market_session_state = None  # type: ignore
     ICICIUnderlyingDataManager = None  # type: ignore
 from risk.risk_manager import RiskManager
 from orchestration.portfolio_manager import PortfolioManager, PortfolioRiskManager
@@ -120,6 +122,35 @@ class MultiAssetQuantBot:
             )
         return delta_api, cs_api, icici_api
 
+    @staticmethod
+    def _is_icici_context(ctx: AssetContext) -> bool:
+        try:
+            inst = ctx.instrument
+            return inst.primary_exchange == ExchangeName.ICICI or ExchangeName.ICICI in inst.by_exchange
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_cross_asset_member(ctx: AssetContext) -> bool:
+        try:
+            aid = str(getattr(ctx.instrument, "asset_id", "") or "").upper()
+            return aid in {"BTC", "GOLD", "SILVER"}
+        except Exception:
+            return False
+
+    def _icici_market_open(self) -> tuple[bool, str]:
+        if not bool(getattr(config, "ICICI_ANALYZE_ONLY_DURING_MARKET_SESSION", True)):
+            return True, "ICICI session guard disabled"
+        if icici_market_session_state is None:
+            return False, "ICICI market session guard unavailable"
+        try:
+            state = icici_market_session_state()
+            return bool(state.is_open), str(state.reason or "")
+        except Exception as exc:
+            return False, f"ICICI market session check failed: {exc}"
+
+    def _cross_asset_contexts(self) -> List[AssetContext]:
+        return [c for c in self.contexts if c.ready and self._is_cross_asset_member(c)]
 
     def _instrument_leverage(self, inst: TradableInstrument) -> int:
         configured = max(1, int(getattr(config, "LEVERAGE", 1)))
@@ -199,13 +230,14 @@ class MultiAssetQuantBot:
                 px = ctx.data_manager.get_last_price()
             except Exception:
                 px = 0.0
+            cur = self._currency_for_instrument(inst)
             pos = ctx.strategy.get_position()
             state = ctx.phase_name if pos else ("READY" if ctx.ready else "NOT READY")
             try:
                 bal = ctx.risk_manager.get_available_balance() or {}
                 budget = float(bal.get("available", 0.0) or 0.0)
                 raw = float(bal.get("available_raw", budget) or budget)
-                budget_txt = f"slot=${budget:,.2f} raw=${raw:,.2f}"
+                budget_txt = f"slot={cur}{budget:,.2f} raw={cur}{raw:,.2f}"
             except Exception:
                 budget_txt = "slot=n/a"
             venues = ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items())
@@ -218,7 +250,10 @@ class MultiAssetQuantBot:
             if pos:
                 try:
                     m = self._ctx_position_metrics(ctx)
-                    pnl_txt = f" · uPnL={self._fmt_money(m.get('upnl', 0.0))} live={self._fmt_money(m.get('lifecycle_pnl', m.get('upnl', 0.0)))}"
+                    pnl_txt = (
+                        f" · uPnL={self._fmt_currency(m.get('upnl', 0.0), signed=True, currency=cur)} "
+                        f"live={self._fmt_currency(m.get('lifecycle_pnl', m.get('upnl', 0.0)), signed=True, currency=cur)}"
+                    )
                 except Exception:
                     pnl_txt = ""
             status_icon = "🟢" if state in ("READY", "SCANNING") else ("🔵" if pos else "🟠")
@@ -263,6 +298,28 @@ class MultiAssetQuantBot:
         except Exception:
             return "$0.00"
 
+    @staticmethod
+    def _currency_for_instrument(inst: TradableInstrument) -> str:
+        try:
+            quote = str(getattr(getattr(inst, "primary", None), "quote_asset", "") or "").upper()
+            ex = getattr(getattr(inst, "primary_exchange", None), "value", getattr(inst, "primary_exchange", ""))
+            if quote == "INR" or str(ex).lower() == "icici":
+                return "₹"
+        except Exception:
+            pass
+        return "$"
+
+    @classmethod
+    def _fmt_currency(cls, v: float, *, signed: bool = False, currency: str = "$", n: int = 2) -> str:
+        try:
+            f = float(v or 0.0)
+            sign = "+" if signed and f >= 0 else ""
+            if not signed:
+                sign = ""
+            return f"{sign}{currency}{f:,.{n}f}"
+        except Exception:
+            return f"{currency}+0.00" if signed else f"{currency}0.00"
+
     def _ctx_position_metrics(self, ctx: AssetContext) -> Dict[str, Any]:
         inst = ctx.instrument
         pos_snapshot = ctx.strategy.get_position()
@@ -275,6 +332,7 @@ class MultiAssetQuantBot:
         out: Dict[str, Any] = {
             "asset": inst.asset_id, "symbol": inst.display_symbol,
             "venue": inst.primary_exchange.value.upper(), "class": pol.asset_class,
+            "currency": self._currency_for_instrument(inst),
             "desk": pol.desk_id, "desk_name": pol.desk_name, "strategy": pol.strategy_key,
             "price": px, "position": pos_snapshot, "upnl": 0.0,
             "unrealised_pnl": 0.0, "unrealized_pnl": 0.0,
@@ -285,6 +343,25 @@ class MultiAssetQuantBot:
             "entry_leverage": 0.0, "leverage": 0.0, "margin_used": 0.0,
         }
         if not pos_snapshot:
+            ext = getattr(ctx.strategy, "_last_unmanaged_external_position", None)
+            if isinstance(ext, dict) and float(ext.get("size", 0.0) or 0.0) > 0:
+                out.update({
+                    "external_position": ext,
+                    "state": "EXTERNAL_UNADOPTED",
+                    "side": str(ext.get("side") or "LONG").upper(),
+                    "qty": float(ext.get("size", 0.0) or 0.0),
+                    "entry": float(ext.get("entry_price", 0.0) or 0.0),
+                    "upnl": float(ext.get("unrealized_pnl", 0.0) or 0.0),
+                    "unrealised_pnl": float(ext.get("unrealized_pnl", 0.0) or 0.0),
+                    "unrealized_pnl": float(ext.get("unrealized_pnl", 0.0) or 0.0),
+                    "currency": "₹",
+                    "contract_identity_source": ext.get("contract_identity_source", ""),
+                    "unadoptable_reason": ext.get("reason", ""),
+                    "option_symbol": ext.get("TradingSymbol") or ext.get("symbol") or "",
+                    "right": ext.get("right") or "",
+                    "strike": ext.get("strike_price") or "",
+                    "expiry": ext.get("expiry_date") or "",
+                })
             return out
 
         # get_position() returns a dict, while the strategy keeps the richer
@@ -581,10 +658,27 @@ class MultiAssetQuantBot:
         rows = [self._ctx_position_metrics(c) for c in self.contexts]
         lines = ["🏛 <b>INSTITUTIONAL POSITIONS</b>", "<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>"]
         open_rows = [r for r in rows if r.get("position")]
-        if not open_rows:
+        external_rows = [r for r in rows if r.get("external_position")]
+        if not open_rows and not external_rows:
             lines.append("No live positions. 🛰 Scanner Desks remain active.")
+        if external_rows:
+            lines.append("\n<b>🚨 Broker Positions Not Adopted</b>")
+            for r in external_rows:
+                cur = str(r.get("currency") or "₹")
+                vehicle = " ".join(str(x) for x in (r.get("option_symbol"), r.get("right"), r.get("strike"), r.get("expiry")) if x)
+                reason = str(r.get("unadoptable_reason") or r.get("contract_identity_source") or "external broker position")
+                lines.append(
+                    f"<code>{self._esc(r['asset']):<6} {self._esc(r['venue'])}:{self._esc(r['symbol'])} {self._esc(r['side']):<5} qty {float(r['qty']):.6f}</code>"
+                )
+                lines.append(
+                    f"<code>ENTRY {self._fmt_currency(r['entry'], currency=cur):>12}  UPNL {self._fmt_currency(r['upnl'], signed=True, currency=cur):>12}</code>"
+                )
+                if vehicle.strip():
+                    lines.append(f"<code>VEHICLE {self._esc(vehicle[:72])}</code>")
+                lines.append(f"<i>{self._esc(reason[:140])}; no order will be sent until adoption is exact.</i>")
         for r in open_rows:
             pol = r["policy"]
+            cur = str(r.get("currency") or "$")
             lines.append(
                 f"\n<b>{self._esc(r['asset'])}</b>  <code>{self._esc(r['venue'])}:{self._esc(r['symbol'])}</code> · {self._esc(pol.asset_class)}"
             )
@@ -592,16 +686,16 @@ class MultiAssetQuantBot:
                 f"<code>{self._esc(r['side']):<5} qty {float(r['qty']):.6f}   lev {float(r.get('entry_leverage', 0.0) or 0.0):.0f}x   R {float(r['r']):+.2f}   MFE {float(r['mfe_r']):.2f}   hold {float(r['hold_min']):.0f}m</code>"
             )
             lines.append(
-                f"<code>MARGIN {self._fmt_price(r.get('margin_used', 0.0)):>11}  policy cap {float(getattr(pol, 'leverage', 0.0) or 0.0):.0f}x</code>"
+                f"<code>MARGIN {self._fmt_currency(r.get('margin_used', 0.0), currency=cur):>11}  policy cap {float(getattr(pol, 'leverage', 0.0) or 0.0):.0f}x</code>"
             )
             lines.append(
-                f"<code>ENTRY {self._fmt_price(r['entry']):>12}  PX {self._fmt_price(r['price']):>12}  UPNL {self._fmt_money(r['upnl']):>11}</code>"
+                f"<code>ENTRY {self._fmt_currency(r['entry'], currency=cur):>12}  PX {self._fmt_currency(r['price'], currency=cur):>12}  UPNL {self._fmt_currency(r['upnl'], signed=True, currency=cur):>11}</code>"
             )
             lines.append(
-                f"<code>LIVE  {self._fmt_money(r.get('lifecycle_pnl', r['upnl'])):>12}  ladder {self._fmt_money(r.get('open_realized', 0.0)):>10}</code>"
+                f"<code>LIVE  {self._fmt_currency(r.get('lifecycle_pnl', r['upnl']), signed=True, currency=cur):>12}  ladder {self._fmt_currency(r.get('open_realized', 0.0), signed=True, currency=cur):>10}</code>"
             )
             lines.append(
-                f"<code>SL    {self._fmt_price(r['sl']):>12}  FINAL TP {self._fmt_price(r['tp']):>12}  LADDER</code>"
+                f"<code>SL    {self._fmt_currency(r['sl'], currency=cur):>12}  FINAL TP {self._fmt_currency(r['tp'], currency=cur):>12}  LADDER</code>"
             )
             if r.get("sl_id") or r.get("tp_id"):
                 lines.append(f"<code>BRKT  SL {str(r.get('sl_id') or '-')[:8]}…  TP {str(r.get('tp_id') or '-')[:8]}…</code>")
@@ -609,7 +703,8 @@ class MultiAssetQuantBot:
         for r in rows:
             if r.get("position"):
                 continue
-            lines.append(f"<code>{self._esc(r['asset']):<6} {self._esc(r['symbol']):<12} {self._esc(r['state']):<10} px {self._fmt_price(r['price'])}</code>")
+            cur = str(r.get("currency") or "$")
+            lines.append(f"<code>{self._esc(r['asset']):<6} {self._esc(r['symbol']):<12} {self._esc(r['state']):<10} px {self._fmt_currency(r['price'], currency=cur)}</code>")
         return "\n".join(lines)
 
     def format_portfolio_equity_report(self) -> str:
@@ -640,10 +735,16 @@ class MultiAssetQuantBot:
                 pos_tail = ""
                 lev_display = float(r.get("entry_leverage", 0.0) or pol.leverage or 0.0) if r.get("position") else float(pol.leverage or 0.0)
                 if r.get("position"):
-                    pos_tail = f" margin {self._fmt_price(r.get('margin_used', 0.0))} uPnL {self._fmt_money(r.get('upnl', 0.0))} live {self._fmt_money(r.get('lifecycle_pnl', r.get('upnl', 0.0)))}"
+                    cur = str(r.get("currency") or self._currency_for_instrument(ctx.instrument))
+                    pos_tail = (
+                        f" margin {self._fmt_currency(r.get('margin_used', 0.0), currency=cur)} "
+                        f"uPnL {self._fmt_currency(r.get('upnl', 0.0), signed=True, currency=cur)} "
+                        f"live {self._fmt_currency(r.get('lifecycle_pnl', r.get('upnl', 0.0)), signed=True, currency=cur)}"
+                    )
+                bal_cur = self._currency_for_instrument(ctx.instrument)
                 lines.append(
-                    f"<code>{self._esc(ctx.instrument.asset_id):<6} cash {self._fmt_price(float(bal.get('available',0) or 0)):>10} "
-                    f"riskbase {self._fmt_price(float(bal.get('risk_total',0) or 0)):>10} lev {lev_display:>2.0f}x margin {pol.margin_pct:.0%} risk×{pol.risk_multiplier:.2f}{self._esc(pos_tail)}</code>"
+                    f"<code>{self._esc(ctx.instrument.asset_id):<6} cash {self._fmt_currency(float(bal.get('available',0) or 0), currency=bal_cur):>10} "
+                    f"riskbase {self._fmt_currency(float(bal.get('risk_total',0) or 0), currency=bal_cur):>10} lev {lev_display:>2.0f}x margin {pol.margin_pct:.0%} risk×{pol.risk_multiplier:.2f}{self._esc(pos_tail)}</code>"
                 )
             except Exception:
                 continue
@@ -797,6 +898,16 @@ class MultiAssetQuantBot:
         inst = ctx.instrument
         try:
             with instrument_scope(inst):
+                if self._is_icici_context(ctx):
+                    session_open, session_reason = self._icici_market_open()
+                    if not session_open:
+                        ctx.ready = False
+                        logger.warning(
+                            "%s ICICI desk dormant: %s. No NIFTY analysis, entries, adoption, or cross-asset overlay outside NSE/NFO hours.",
+                            inst.asset_id,
+                            session_reason,
+                        )
+                        return False
                 logger.info("▶️ Starting %s [%s/%s] | %s", inst.asset_id, inst.primary_exchange.value, inst.display_symbol, self.guard.report_line(ctx))
                 target_lev = self._instrument_leverage(inst)
                 effective_lev = self._set_leverage_with_backoff(ctx, target_lev)
@@ -874,11 +985,11 @@ class MultiAssetQuantBot:
     def _update_cross_asset_overlay(self) -> None:
         """Refresh portfolio-level BTC/GOLD/SILVER context and push it into desks."""
         try:
-            state = self.cross_asset.update_from_contexts([c for c in self.contexts if c.ready])
+            state = self.cross_asset.update_from_contexts(self._cross_asset_contexts())
             for c in self.contexts:
                 try:
                     if hasattr(c.strategy, "set_cross_asset_state"):
-                        c.strategy.set_cross_asset_state(state)
+                        c.strategy.set_cross_asset_state(state if self._is_cross_asset_member(c) else None)
                 except Exception:
                     pass
             now = time.time()
@@ -898,6 +1009,15 @@ class MultiAssetQuantBot:
                 for ctx in list(self.contexts):
                     if not ctx.ready:
                         continue
+                    if self._is_icici_context(ctx):
+                        session_open, session_reason = self._icici_market_open()
+                        if not session_open:
+                            ctx.ready = False
+                            self._log_throttled_asset(
+                                ctx,
+                                f"ICICI market closed: {session_reason}; NIFTY desk dormant, no analysis/entries.",
+                            )
+                            continue
                     interval = self.guard.evaluation_interval(ctx)
                     if not ctx.has_position and ctx.last_tick_time > 0 and time.time() - ctx.last_tick_time < interval:
                         continue
@@ -961,7 +1081,7 @@ class MultiAssetQuantBot:
                 )
                 try:
                     ca = getattr(ctx.strategy, "_cross_asset_state", None)
-                    if ca is not None and getattr(ca, "enabled", False):
+                    if self._is_cross_asset_member(ctx) and ca is not None and getattr(ca, "enabled", False):
                         logger.info("ANALYSIS_CROSS_ASSET asset=%s | %s", inst.asset_id, ca.summary())
                 except Exception:
                     pass

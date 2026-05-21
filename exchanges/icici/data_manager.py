@@ -141,6 +141,14 @@ class ICICIOptionDataManager:
 
     def start(self) -> bool:
         try:
+            session = icici_market_session_state()
+            if not session.is_open and bool(_cfg("ICICI_ANALYZE_ONLY_DURING_MARKET_SESSION", True)):
+                self.is_ready = False
+                logger.warning(
+                    "ICICI option DM dormant: %s; NIFTY option analysis/trading disabled outside NSE/NFO hours",
+                    session.reason,
+                )
+                return False
             if self._is_chain_mode():
                 self.api.preflight_session()
                 # Underlying-desk mode: the executable option is deliberately
@@ -154,7 +162,6 @@ class ICICIOptionDataManager:
                     getattr(self.instrument, "asset_id", "?"),
                 )
                 return True
-            session = icici_market_session_state()
             if not session.is_open:
                 if bool(_cfg("ICICI_ALLOW_CLOSED_MARKET_HISTORICAL_WARMUP", True)):
                     self.warmup_closed_market(session.reason)

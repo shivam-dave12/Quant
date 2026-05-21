@@ -1,5 +1,6 @@
 import os
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 os.environ.setdefault("DELTA_API_KEY", "test")
@@ -11,7 +12,7 @@ from core.instruments import AssetClass, ExchangeName, ExchangeInstrument, Trada
 from agents.icici_chain_architect import build_underlying_payload, select_contract_for_thesis, apply_contract_choice
 from exchanges.icici.market_session import icici_market_session_state
 from execution.order_manager import OrderManager
-from strategy.quant_strategy import _icici_option_premium_levels
+from strategy.quant_strategy import _icici_ensure_adoptable_contract, _icici_option_premium_levels, _icici_selected_premium
 
 
 def _nifty_inst(chain):
@@ -98,6 +99,8 @@ def test_icici_underlying_levels_convert_to_option_premium_levels():
     choice = select_contract_for_thesis(inst, "long", underlying_spot=23100, available_funds=10_000)
     apply_contract_choice(inst, choice)
 
+    assert _icici_selected_premium(inst, fallback=0.0) == 72.0
+
     with instrument_scope(inst):
         sl, tp, reason = _icici_option_premium_levels(
             thesis_side="long",
@@ -112,6 +115,191 @@ def test_icici_underlying_levels_convert_to_option_premium_levels():
     assert sl < 72.0 < tp
     assert (tp - 72.0) / (72.0 - sl) >= 1.6
     assert "delta=" in reason
+
+
+def test_icici_data_managers_are_dormant_after_market_close(monkeypatch):
+    import exchanges.icici.data_manager as option_dm_mod
+    import exchanges.icici.underlying_data_manager as underlying_dm_mod
+
+    closed = SimpleNamespace(is_open=False, reason="market closed after 15:30 IST")
+    monkeypatch.setattr(option_dm_mod, "icici_market_session_state", lambda: closed)
+    monkeypatch.setattr(underlying_dm_mod, "icici_market_session_state", lambda: closed)
+    monkeypatch.setattr(option_dm_mod.config, "ICICI_ANALYZE_ONLY_DURING_MARKET_SESSION", True, raising=False)
+    monkeypatch.setattr(underlying_dm_mod.config, "ICICI_ANALYZE_ONLY_DURING_MARKET_SESSION", True, raising=False)
+
+    class API:
+        def preflight_session(self):
+            raise AssertionError("closed-market startup must not touch Breeze auth/data")
+
+    inst = _nifty_inst(_chain())
+    option_dm = option_dm_mod.ICICIOptionDataManager(instrument=inst, api=API())
+    underlying_dm = underlying_dm_mod.ICICIUnderlyingDataManager(instrument=inst, api=API())
+
+    assert not option_dm.start()
+    assert not option_dm.is_ready
+    assert not underlying_dm.start()
+    assert not underlying_dm.is_ready
+
+
+def test_nifty_is_excluded_from_cross_asset_overlay():
+    from orchestration.multi_asset_bot import MultiAssetQuantBot
+
+    def _inst(asset_id, exchange=ExchangeName.DELTA):
+        ei = ExchangeInstrument(
+            exchange=exchange,
+            symbol=f"{asset_id}USD",
+            ws_symbol=f"{asset_id}USD",
+            display_symbol=f"{asset_id}USD",
+            asset_id=asset_id,
+            asset_class=AssetClass.CRYPTO if asset_id == "BTC" else AssetClass.COMMODITY,
+            quote_asset="USD",
+            base_asset=asset_id,
+            contract_type="perpetual",
+            status="active",
+            tick_size=0.1,
+            lot_step=1.0,
+            min_qty=1.0,
+            max_leverage=50.0,
+        )
+        return TradableInstrument(asset_id, asset_id, ei.asset_class, exchange, {exchange: ei})
+
+    class FakeState:
+        enabled = True
+        def summary(self):
+            return "fake"
+
+    class FakeCrossAsset:
+        def __init__(self):
+            self.assets = []
+            self.state = FakeState()
+        def update_from_contexts(self, contexts):
+            self.assets = [c.instrument.asset_id for c in contexts]
+            return self.state
+
+    class FakeStrategy:
+        def __init__(self):
+            self.states = []
+        def set_cross_asset_state(self, state):
+            self.states.append(state)
+
+    btc_strategy = FakeStrategy()
+    nifty_strategy = FakeStrategy()
+    bot = MultiAssetQuantBot.__new__(MultiAssetQuantBot)
+    bot.contexts = [
+        SimpleNamespace(instrument=_inst("BTC"), ready=True, strategy=btc_strategy),
+        SimpleNamespace(instrument=_nifty_inst(_chain()), ready=True, strategy=nifty_strategy),
+    ]
+    bot.cross_asset = FakeCrossAsset()
+    bot._last_cross_asset_log = 10**12
+
+    bot._update_cross_asset_overlay()
+
+    assert bot.cross_asset.assets == ["BTC"]
+    assert btc_strategy.states[-1] is bot.cross_asset.state
+    assert nifty_strategy.states[-1] is None
+
+
+def test_icici_position_reconcile_requires_exact_option_identity():
+    from execution.order_manager import _ICICIAdapter
+
+    raw = build_underlying_payload("NIFTY", "ICICI_INDEX_OPTIONS", [])
+    exchange_inst = SimpleNamespace(
+        symbol="NIFTY",
+        display_symbol="NIFTY",
+        tick_size=0.05,
+        lot_step=1.0,
+        min_qty=1.0,
+        max_qty=0.0,
+        raw=raw,
+    )
+    adapter = _ICICIAdapter(api=SimpleNamespace(), exchange_instrument=exchange_inst)
+    expiry = (datetime.now(timezone.utc) + timedelta(days=10)).strftime("%Y-%m-%d")
+    broker_positions = {
+        "Success": [{
+            "stock_code": "NIFTY",
+            "exchange_code": "NFO",
+            "right": "Call",
+            "strike_price": "23200",
+            "expiry_date": expiry,
+            "quantity": 50,
+            "average_price": 72.0,
+        }]
+    }
+
+    detected = adapter.normalise_position(broker_positions)
+    assert detected["side"] == "LONG"
+    assert detected["size"] == 50
+    assert detected["requires_contract_reconstruction"] is True
+    assert not detected.get("unadoptable")
+    assert detected["currency"] == "INR"
+
+    raw.update({
+        "selected_option_contract": {"raw": dict(broker_positions["Success"][0])},
+        "right": "Call",
+        "strike_price": "23200",
+        "expiry_date": expiry,
+        "selected_entry_premium": 72.0,
+    })
+
+    adopted = adapter.normalise_position(broker_positions)
+    assert adopted["side"] == "LONG"
+    assert adopted["size"] == 50
+    assert adopted["contract_identity_source"] == "selected_contract_match"
+
+
+def test_icici_position_reconcile_reports_unadoptable_ghost_without_identity():
+    from execution.order_manager import _ICICIAdapter
+
+    raw = build_underlying_payload("NIFTY", "ICICI_INDEX_OPTIONS", [])
+    exchange_inst = SimpleNamespace(
+        symbol="NIFTY",
+        display_symbol="NIFTY",
+        tick_size=0.05,
+        lot_step=1.0,
+        min_qty=1.0,
+        max_qty=0.0,
+        raw=raw,
+    )
+    adapter = _ICICIAdapter(api=SimpleNamespace(), exchange_instrument=exchange_inst)
+    broker_positions = {
+        "Success": [{
+            "stock_code": "NIFTY",
+            "exchange_code": "NFO",
+            "quantity": 50,
+            "average_price": 72.0,
+        }]
+    }
+
+    detected = adapter.normalise_position(broker_positions)
+    assert detected["size"] == 50
+    assert detected["unadoptable"] is True
+    assert detected["reason"] == "missing_exact_icici_option_identity"
+
+
+def test_icici_reconcile_can_reconstruct_exact_option_vehicle():
+    inst = _nifty_inst(_chain())
+    expiry = inst.primary.raw["chain_candidates"][1]["expiry_date"]
+    ex_pos = {
+        "side": "LONG",
+        "size": 50,
+        "entry_price": 72.0,
+        "raw": {
+            "stock_code": "NIFTY",
+            "exchange_code": "NFO",
+            "right": "Call",
+            "strike_price": "23200",
+            "expiry_date": expiry,
+            "TradingSymbol": "NIFTY30JUN30CE23200",
+            "LotSize": 50,
+            "average_price": 72.0,
+        },
+    }
+
+    assert _icici_ensure_adoptable_contract(inst, ex_pos)
+    assert inst.primary.raw["product_type"] == "options"
+    assert inst.primary.raw["right"] == "Call"
+    assert inst.primary.raw["strike_price"] == "23200"
+    assert _icici_selected_premium(inst, fallback=0.0) == 72.0
 
 
 def test_icici_configured_nifty_discovery_is_auth_independent():
@@ -252,3 +440,34 @@ def test_entry_alert_renders_icici_option_vehicle():
     assert "Option Vehicle" in msg
     assert "BUY CALL" in msg
     assert "NIFTY30JUN30CE23200" in msg
+    assert "₹72.00" in msg
+    assert "₹112.00" in msg
+    assert "$" not in msg
+
+
+def test_periodic_report_renders_icici_values_in_inr():
+    from telegram.notifier import format_periodic_report
+
+    inst = _nifty_inst(_chain())
+    msg = format_periodic_report(
+        current_price=72.0,
+        balance=10_000,
+        daily_pnl=125.5,
+        total_pnl=250.0,
+        total_trades=2,
+        win_rate=50.0,
+        atr=8.5,
+        instrument=inst,
+        position={
+            "side": "LONG",
+            "entry_price": 70.0,
+            "sl_price": 55.0,
+            "tp_price": 110.0,
+            "quantity": 50,
+            "unrealized_pnl": 100.0,
+        },
+    )
+    assert "₹72.00" in msg
+    assert "₹10,000.00" in msg
+    assert "+₹125.50" in msg
+    assert "$" not in msg

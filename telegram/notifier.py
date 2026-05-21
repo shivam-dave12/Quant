@@ -412,7 +412,7 @@ def _tg_asset_header(inst=None, event_type: str = "", context: Optional[Dict[str
             except Exception: pass
         if state and state != "-": bits.append(f"state {state}")
         if price is not None:
-            try: bits.append(f"px {_tg_price(float(price))}")
+            try: bits.append(f"px {_tg_price(float(price), venue=primary_name)}")
             except Exception: pass
         if slots: bits.append(f"slots {slots}")
         line3 = "<code>" + _esc(" | ".join(bits)) + "</code>" if bits else ""
@@ -911,14 +911,37 @@ def _tag(text: Any, name: str) -> str:
     return f"<{name}>{_esc(text)}</{name}>"
 
 
+def _tg_currency_symbol(venue: str = "", inst: Any = None) -> str:
+    text = str(venue or "").lower()
+    if inst is not None:
+        try:
+            text += " " + str(getattr(getattr(inst, "primary_exchange", ""), "value", getattr(inst, "primary_exchange", ""))).lower()
+            text += " " + str(getattr(getattr(inst, "primary", None), "quote_asset", "")).lower()
+        except Exception:
+            pass
+    if "icici" in text or "inr" in text:
+        return "\u20b9"
+    return "$"
+
+
+def _tg_current_venue() -> str:
+    inst = _tg_current_instrument()
+    try:
+        return str(getattr(getattr(inst, "primary_exchange", ""), "value", getattr(inst, "primary_exchange", ""))).upper()
+    except Exception:
+        return ""
+
+
 # ======================================================================
 # UTILITY HELPERS
 # ======================================================================
 
-def _fmt_price(p: Optional[float]) -> str:
+def _fmt_price(p: Optional[float], venue: str = "") -> str:
     if p is None:
         return "—"
-    return f"${p:,.1f}"
+    cur = _tg_currency_symbol(venue or _tg_current_venue(), _tg_current_instrument())
+    digits = 2 if cur == "\u20b9" else 1
+    return f"{cur}{p:,.{digits}f}"
 
 
 # ======================================================================
@@ -1164,9 +1187,10 @@ def _fpts(v: float) -> str:
     return f"{sign}{abs(v):,.1f} pts"
 
 
-def _fpnl(v: float) -> str:
+def _fpnl(v: float, venue: str = "") -> str:
     sign = "+" if v >= 0 else "−"
-    return f"{sign}${abs(v):,.2f}"
+    cur = _tg_currency_symbol(venue or _tg_current_venue(), _tg_current_instrument())
+    return f"{sign}{cur}{abs(v):,.2f}"
 
 
 def _tg_freeform(value: Any, digits: int = 2) -> str:
@@ -1189,8 +1213,8 @@ def _tg_float(value: Any, default: float = 0.0) -> float:
 def _tg_venue_price(value: Any, venue: str = "") -> str:
     if value is None:
         return "—"
-    cur = "₹" if "icici" in str(venue or "").lower() else "$"
-    digits = 2 if cur == "₹" else 1
+    cur = _tg_currency_symbol(venue, _tg_current_instrument())
+    digits = 2 if cur == "\u20b9" else 1
     try:
         return f"{cur}{float(value):,.{digits}f}"
     except Exception:
@@ -1198,7 +1222,7 @@ def _tg_venue_price(value: Any, venue: str = "") -> str:
 
 
 def _tg_signed_money(value: Any, venue: str = "") -> str:
-    cur = "₹" if "icici" in str(venue or "").lower() else "$"
+    cur = _tg_currency_symbol(venue, _tg_current_instrument())
     try:
         v = float(value or 0.0)
         sign = "+" if v >= 0 else "−"
@@ -1637,11 +1661,13 @@ def format_status_card(
 _TG_RULE = "<code>" + ("\u2500" * 34) + "</code>"
 
 
-def _tg_price(value: Any, digits: int = 2) -> str:
+def _tg_price(value: Any, digits: int = 2, venue: str = "") -> str:
     try:
         if value is None:
             return "-"
-        return f"${float(value):,.{digits}f}"
+        cur = _tg_currency_symbol(venue or _tg_current_venue(), _tg_current_instrument())
+        out_digits = 2 if cur == "\u20b9" else digits
+        return f"{cur}{float(value):,.{out_digits}f}"
     except Exception:
         return "-"
 
@@ -1653,13 +1679,15 @@ def _tg_num(value: Any, digits: int = 2) -> str:
         return "-"
 
 
-def _tg_pnl(value: Any) -> str:
+def _tg_pnl(value: Any, venue: str = "") -> str:
     try:
         v = float(value)
         sign = "+" if v >= 0 else "-"
-        return f"{sign}${abs(v):,.2f}"
+        cur = _tg_currency_symbol(venue or _tg_current_venue(), _tg_current_instrument())
+        return f"{sign}{cur}{abs(v):,.2f}"
     except Exception:
-        return "$0.00"
+        cur = _tg_currency_symbol(venue or _tg_current_venue(), _tg_current_instrument())
+        return f"{cur}0.00"
 
 
 def _tg_bar(value: float, width: int = 12) -> str:
@@ -1778,13 +1806,14 @@ def format_periodic_report(
     _inst = _kw.get("instrument", None) or _tg_current_instrument()
     _asset = getattr(_inst, "asset_id", "BTC") if _inst is not None else "BTC"
     _symbol = getattr(_inst, "display_symbol", _asset) if _inst is not None else _asset
+    _venue = str(getattr(getattr(_inst, "primary_exchange", ""), "value", getattr(_inst, "primary_exchange", ""))).upper() if _inst is not None else ""
     lines = [
         f"\U0001f4ca <b>INSTITUTIONAL STATUS</b>  <code>{_esc(now_ist)}</code>",
         _TG_RULE,
-        f"<code>{_esc(str(_asset)):<7} {_tg_price(current_price):>14}   ATR {_tg_num(atr, 1):>7}</code>",
+        f"<code>{_esc(str(_asset)):<7} {_tg_price(current_price, venue=_venue):>14}   ATR {_tg_num(atr, 1):>7}</code>",
         f"<code>SYMBOL  {_esc(str(_symbol)):<14}</code>",
-        f"<code>BAL     {_tg_price(balance):>14}   TRD {int(total_trades):>4}   WR {float(win_rate or 0):>5.1f}%</code>",
-        f"{pnl_icon} <code>DAY     {_tg_pnl(daily_pnl):>14}   ALL {_tg_pnl(total_pnl):>14}</code>",
+        f"<code>BAL     {_tg_price(balance, venue=_venue):>14}   TRD {int(total_trades):>4}   WR {float(win_rate or 0):>5.1f}%</code>",
+        f"{pnl_icon} <code>DAY     {_tg_pnl(daily_pnl, venue=_venue):>14}   ALL {_tg_pnl(total_pnl, venue=_venue):>14}</code>",
         f"<code>STATE   {_esc((bot_state or 'SCANNING').upper()):<14} {_esc((session or '-').upper()):<10} {kz}</code>",
         _tg_section("\U0001f3db", "Market Context"),
         f"<code>AMD     {_esc(amd_phase or '-'):<16} bias {_esc(amd_bias or '-')}</code>",
@@ -1819,7 +1848,7 @@ def format_periodic_report(
         winner = "REVERSAL" if rev > cont + 15 else ("CONTINUATION" if cont > rev + 15 else "CONTESTED")
         lines += [
             _tg_section("\U0001f30a", "Sweep Read"),
-            f"<code>POOL    {_esc(sweep_analysis.get('sweep_side', '-')):<8} @ {_tg_price(sweep_analysis.get('sweep_price', 0.0)):>13}</code>",
+            f"<code>POOL    {_esc(sweep_analysis.get('sweep_side', '-')):<8} @ {_tg_price(sweep_analysis.get('sweep_price', 0.0), venue=_venue):>13}</code>",
             f"<code>SCORE   REV {rev:>5.1f}   CONT {cont:>5.1f}   {winner}</code>",
         ]
 
@@ -1869,10 +1898,10 @@ def format_periodic_report(
         lines += [
             _tg_section("\U0001f512", "Active Position"),
             f"<code>SIDE    {_esc(side):<8} qty {qty:.6f}   R {r_now:+.2f}</code>",
-            f"<code>ENTRY   {_tg_price(entry):>14}   UPNL {_tg_pnl(upnl):>14}</code>",
-            f"<code>LIVE    {_tg_pnl(lifecycle_open):>14}   ladder {_tg_pnl(realised_ladder):>12}</code>",
-            f"<code>LEV     {entry_lev:>6.0f}x       margin {_tg_price(margin_used):>14}</code>" if entry_lev > 0 else "<code>LEV     -            margin              -</code>",
-            f"<code>SL      {_tg_price(sl):>14}   TP {_tg_price(tp):>14}   RR 1:{rr:.2f}</code>",
+            f"<code>ENTRY   {_tg_price(entry, venue=_venue):>14}   UPNL {_tg_pnl(upnl, venue=_venue):>14}</code>",
+            f"<code>LIVE    {_tg_pnl(lifecycle_open, venue=_venue):>14}   ladder {_tg_pnl(realised_ladder, venue=_venue):>12}</code>",
+            f"<code>LEV     {entry_lev:>6.0f}x       margin {_tg_price(margin_used, venue=_venue):>14}</code>" if entry_lev > 0 else "<code>LEV     -            margin              -</code>",
+            f"<code>SL      {_tg_price(sl, venue=_venue):>14}   TP {_tg_price(tp, venue=_venue):>14}   RR 1:{rr:.2f}</code>",
         ]
         # Fixed-SL TP-ladder policy: no break-even lock line is rendered.
 

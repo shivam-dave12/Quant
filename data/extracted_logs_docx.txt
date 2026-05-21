@@ -1,0 +1,500 @@
+2026-05-21 16:08:09,954 - __main__ - INFO - 🛡 Telegram-only shutdown guard active for telegram-controller | guarded=SIGTERM,SIGINT,SIGHUP,SIGQUIT | pid=1 ppid=0 parent='?'
+2026-05-21 16:08:09,955 - __main__ - INFO - TelegramBotController (liquidity-first) initialized
+2026-05-21 16:08:11,308 - __main__ - INFO - Telegram commands registered
+2026-05-21 16:08:11,589 - __main__ - INFO - Telegram controller started
+[ec2-user@ip-172-31-29-99 ~]$ log
+Error: no container with name or ID "quant" found: no such container
+[ec2-user@ip-172-31-29-99 ~]$ log
+2026-05-21 16:08:30,657 - __main__ - INFO - 🛡 Telegram-only shutdown guard active for telegram-controller | guarded=SIGTERM,SIGINT,SIGHUP,SIGQUIT | pid=2 ppid=1 parent='/run/podman-init -- python telegram/controller.py'
+2026-05-21 16:08:30,657 - __main__ - INFO - TelegramBotController (liquidity-first) initialized
+2026-05-21 16:08:32,001 - __main__ - INFO - Telegram commands registered
+2026-05-21 16:08:32,279 - __main__ - INFO - Telegram controller started
+2026-05-21 16:08:41,787 - __main__ - INFO - Received: /start
+2026-05-21 16:08:41,787 - __main__ - INFO - Starting bot from Telegram...
+16:08:42.283 | INFO | ✉ TELEGRAM     | ICICI Breeze session not ready; launching Telegram OTP login before scanner start: ICICI Breeze API_Session is missing. Run the token generator first, then set BREEZE_API_SESSION/ICICI_API_SESSION or write it to data/icici_api_session.txt. Protected Breeze endpoints cannot be used before CustomerDetails session generation.
+16:09:28.211 | INFO | ▶ RUNTIME      | Received: 128076
+16:09:30.830 | INFO | ✉ TELEGRAM     | Telegram /start selected MultiAssetQuantBot (MULTI_ASSET_ENABLED=True)
+16:09:30.831 | INFO | • SYSTEM       | ============================================================================================
+16:09:30.831 | INFO | • SYSTEM       | ⚡ MULTI-ASSET INSTITUTIONAL LIQUIDITY SCANNER
+16:09:30.831 | INFO | • SYSTEM       |    Live exchange catalogs only — stock desk suspended; no synthetic feeds
+16:09:30.832 | INFO | • SYSTEM       | ============================================================================================
+16:09:30.832 | INFO | 📡 MARKET-DATA  | DeltaAPI initialized — endpoint: https://api.india.delta.exchange (testnet=False)
+16:09:30.840 | WARN | • SYSTEM       | ⏸ STOCK DESK SUSPENDED — excluded from trading universe before discovery: SPX_INDEX, SPY, QQQ, AAPL, MSFT, NVDA, TSLA, AMZN, META, COIN, CRCL, GOOGL
+16:09:34.234 | INFO | ⚙ EXECUTION    | ICICI configured-index discovery active: underlyings=NIFTY,NIFTY50
+16:09:34.237 | INFO | • SYSTEM       | 📡 MULTI-ASSET LIVE CATALOG DISCOVERY
+16:09:34.237 | INFO | • SYSTEM       |    raw products: delta=191, coinswitch=0, icici=1
+16:09:34.237 | INFO | • SYSTEM       |    activated:
+16:09:34.237 | INFO | • SYSTEM       |      ✅ BTC      primary=delta      delta:BTCUSD
+16:09:34.238 | INFO | • SYSTEM       |      ✅ NIFTY    primary=icici      icici:NIFTY
+16:09:34.238 | INFO | • SYSTEM       |      ✅ GOLD     primary=delta      delta:PAXGUSD
+16:09:34.238 | INFO | • SYSTEM       |      ✅ SILVER   primary=delta      delta:SLVONUSD
+16:09:34.238 | INFO | • SYSTEM       |    unavailable / skipped:
+16:09:34.238 | INFO | • SYSTEM       |      ⚪ OIL      not present in live Delta/CoinSwitch/ICICI catalog; not traded
+16:09:34.239 | INFO | ⚙ EXECUTION    | ✅ OrderManager initialised (exchange=delta, symbol=BTCUSD)
+16:09:34.240 | INFO | ⚙ EXECUTION    | ✅ ExecutionRouter active exchange: delta
+16:09:34.240 | INFO | 📡 MARKET-DATA  | DeltaAPI initialized — endpoint: https://api.india.delta.exchange (testnet=False)
+16:09:34.240 | INFO | 📡 MARKET-DATA  | DeltaDataManager initialised (BTCUSD)
+16:09:34.240 | INFO | 📡 MARKET-DATA  | MarketAggregator initialised [BTC] (primary=DeltaDataManager secondary=none analysis=none)
+16:09:34.241 | INFO | ⚖ RISK         | ✅ RiskManager initialized (liquidity-first mode)
+16:09:34.288 | INFO | • SYSTEM       | PostTradeAgent v2.0 initialised — institutional post-trade analysis active
+16:09:34.295 | INFO | 🧠 POSTERIOR    | ========================================================================
+16:09:34.295 | INFO | 🧠 POSTERIOR    | ⚡ QuantStrategy v10.0 — INSTITUTIONAL LIQUIDITY-FIRST
+16:09:34.296 | INFO | 🧠 POSTERIOR    | [BTC|DELTA:BTCUSD]    BTC | BTCUSD | venues=DELTA:BTCUSD | leverage=45x | 50% margin
+16:09:34.296 | INFO | ⚙ EXECUTION    |    Entry: ACTIVE (LiquidityMap -> QuantPosterior -> Risk/Execution)
+16:09:34.296 | INFO | 🧠 POSTERIOR    |    LiquidityMap: ACTIVE
+16:09:34.296 | INFO | 🧠 POSTERIOR    |    ICT Engine: ENABLED
+16:09:34.296 | INFO | 🧠 POSTERIOR    |    DirectionEngine: ACTIVE
+16:09:34.296 | INFO | 🧠 POSTERIOR    |    ConvictionModel: ADVISORY/SAFETY
+16:09:34.296 | INFO | 🧠 POSTERIOR    |    ExitModel: FIXED_SL + dynamic liquidity TP ladder
+16:09:34.296 | INFO | 🧠 POSTERIOR    |    PostTradeAgent: ACTIVE
+16:09:34.297 | INFO | 🧠 POSTERIOR    | ========================================================================
+16:09:34.297 | INFO | ⚙ EXECUTION    | ✅ OrderManager initialised (exchange=icici, symbol=NIFTY)
+16:09:34.297 | INFO | ⚙ EXECUTION    | ✅ ExecutionRouter active exchange: icici
+16:09:34.297 | INFO | 📡 MARKET-DATA  | ICICIOptionDataManager initialised [NIFTY]
+16:09:34.297 | INFO | 📡 MARKET-DATA  | ICICIUnderlyingDataManager initialised [NIFTY -> underlying=NIFTY]
+16:09:34.297 | INFO | 📡 MARKET-DATA  | MarketAggregator initialised [NIFTY] (primary=ICICIOptionDataManager secondary=none analysis=ICICIUnderlyingDataManager)
+16:09:34.298 | INFO | ⚖ RISK         | ✅ RiskManager initialized (liquidity-first mode)
+16:09:34.301 | INFO | • SYSTEM       | PostTradeAgent v2.0 initialised — institutional post-trade analysis active
+16:09:34.301 | INFO | 🧠 POSTERIOR    | ========================================================================
+16:09:34.301 | INFO | 🧠 POSTERIOR    | ⚡ QuantStrategy v10.0 — INSTITUTIONAL LIQUIDITY-FIRST
+16:09:34.302 | INFO | 🧠 POSTERIOR    | [NIFTY|ICICI:NIFTY]    NIFTY | NIFTY | venues=ICICI:NIFTY | leverage=1x | 42% margin
+16:09:34.302 | INFO | ⚙ EXECUTION    |    Entry: ACTIVE (LiquidityMap -> QuantPosterior -> Risk/Execution)
+16:09:34.302 | INFO | 🧠 POSTERIOR    |    LiquidityMap: ACTIVE
+16:09:34.302 | INFO | 🧠 POSTERIOR    |    ICT Engine: ENABLED
+16:09:34.302 | INFO | 🧠 POSTERIOR    |    DirectionEngine: ACTIVE
+16:09:34.302 | INFO | 🧠 POSTERIOR    |    ConvictionModel: ADVISORY/SAFETY
+16:09:34.302 | INFO | 🧠 POSTERIOR    |    ExitModel: FIXED_SL + dynamic liquidity TP ladder
+16:09:34.303 | INFO | 🧠 POSTERIOR    |    PostTradeAgent: ACTIVE
+16:09:34.303 | INFO | 🧠 POSTERIOR    | ========================================================================
+16:09:34.303 | INFO | ⚙ EXECUTION    | ✅ OrderManager initialised (exchange=delta, symbol=PAXGUSD)
+16:09:34.303 | INFO | ⚙ EXECUTION    | ✅ ExecutionRouter active exchange: delta
+16:09:34.303 | INFO | 📡 MARKET-DATA  | DeltaAPI initialized — endpoint: https://api.india.delta.exchange (testnet=False)
+16:09:34.303 | INFO | 📡 MARKET-DATA  | DeltaDataManager initialised (PAXGUSD)
+16:09:34.303 | INFO | 📡 MARKET-DATA  | MarketAggregator initialised [GOLD] (primary=DeltaDataManager secondary=none analysis=none)
+16:09:34.304 | INFO | ⚖ RISK         | ✅ RiskManager initialized (liquidity-first mode)
+16:09:34.304 | INFO | • SYSTEM       | PostTradeAgent v2.0 initialised — institutional post-trade analysis active
+16:09:34.305 | INFO | 🧠 POSTERIOR    | ========================================================================
+16:09:34.305 | INFO | 🧠 POSTERIOR    | ⚡ QuantStrategy v10.0 — INSTITUTIONAL LIQUIDITY-FIRST
+16:09:34.305 | INFO | 🧠 POSTERIOR    | [GOLD|DELTA:PAXGUSD]    GOLD | PAXGUSD | venues=DELTA:PAXGUSD | leverage=25x | 36% margin
+16:09:34.305 | INFO | ⚙ EXECUTION    |    Entry: ACTIVE (LiquidityMap -> QuantPosterior -> Risk/Execution)
+16:09:34.305 | INFO | 🧠 POSTERIOR    |    LiquidityMap: ACTIVE
+16:09:34.305 | INFO | 🧠 POSTERIOR    |    ICT Engine: ENABLED
+16:09:34.305 | INFO | 🧠 POSTERIOR    |    DirectionEngine: ACTIVE
+16:09:34.306 | INFO | 🧠 POSTERIOR    |    ConvictionModel: ADVISORY/SAFETY
+16:09:34.306 | INFO | 🧠 POSTERIOR    |    ExitModel: FIXED_SL + dynamic liquidity TP ladder
+16:09:34.306 | INFO | 🧠 POSTERIOR    |    PostTradeAgent: ACTIVE
+16:09:34.306 | INFO | 🧠 POSTERIOR    | ========================================================================
+16:09:34.306 | INFO | ⚙ EXECUTION    | ✅ OrderManager initialised (exchange=delta, symbol=SLVONUSD)
+16:09:34.306 | INFO | ⚙ EXECUTION    | ✅ ExecutionRouter active exchange: delta
+16:09:34.306 | INFO | 📡 MARKET-DATA  | DeltaAPI initialized — endpoint: https://api.india.delta.exchange (testnet=False)
+16:09:34.307 | INFO | 📡 MARKET-DATA  | DeltaDataManager initialised (SLVONUSD)
+16:09:34.307 | INFO | 📡 MARKET-DATA  | MarketAggregator initialised [SILVER] (primary=DeltaDataManager secondary=none analysis=none)
+16:09:34.307 | INFO | ⚖ RISK         | ✅ RiskManager initialized (liquidity-first mode)
+16:09:34.308 | INFO | • SYSTEM       | PostTradeAgent v2.0 initialised — institutional post-trade analysis active
+16:09:34.308 | INFO | 🧠 POSTERIOR    | ========================================================================
+16:09:34.308 | INFO | 🧠 POSTERIOR    | ⚡ QuantStrategy v10.0 — INSTITUTIONAL LIQUIDITY-FIRST
+16:09:34.309 | INFO | 🧠 POSTERIOR    | [SILVER|DELTA:SLVONUSD]    SILVER | SLVONUSD | venues=DELTA:SLVONUSD | leverage=25x | 36% margin
+16:09:34.309 | INFO | ⚙ EXECUTION    |    Entry: ACTIVE (LiquidityMap -> QuantPosterior -> Risk/Execution)
+16:09:34.309 | INFO | 🧠 POSTERIOR    |    LiquidityMap: ACTIVE
+16:09:34.309 | INFO | 🧠 POSTERIOR    |    ICT Engine: ENABLED
+16:09:34.309 | INFO | 🧠 POSTERIOR    |    DirectionEngine: ACTIVE
+16:09:34.309 | INFO | 🧠 POSTERIOR    |    ConvictionModel: ADVISORY/SAFETY
+16:09:34.309 | INFO | 🧠 POSTERIOR    |    ExitModel: FIXED_SL + dynamic liquidity TP ladder
+16:09:34.309 | INFO | 🧠 POSTERIOR    |    PostTradeAgent: ACTIVE
+16:09:34.309 | INFO | 🧠 POSTERIOR    | ========================================================================
+16:09:34.309 | INFO | • SYSTEM       | ✅ Built 4 isolated strategy contexts
+16:09:34.311 | INFO | ⚖ RISK         | [BTC|DELTA:BTCUSD] ▶️ Starting BTC [delta/BTCUSD] | policy=crypto lev=45x margin=50% risk_mult=1.00 loop=0.25s
+16:09:34.311 | INFO | ⚖ RISK         | [NIFTY|ICICI:NIFTY] ▶️ Starting NIFTY [icici/NIFTY] | policy=option lev=1x margin=42% risk_mult=0.85 loop=0.50s
+16:09:34.312 | INFO | ⚖ RISK         | [GOLD|DELTA:PAXGUSD] ▶️ Starting GOLD [delta/PAXGUSD] | policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:09:34.315 | INFO | • SYSTEM       | [NIFTY|ICICI:NIFTY] NIFTY leverage target=1x effective=1x (cap=1x)
+16:09:34.318 | INFO | ⚖ RISK         | [SILVER|DELTA:SLVONUSD] ▶️ Starting SILVER [delta/SLVONUSD] | policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:09:34.322 | INFO | 📡 MARKET-DATA  | ICICI option-chain DM ready in underlying-first mode [NIFTY]; contract will be selected post-thesis
+16:09:34.329 | INFO | 📡 MARKET-DATA  | [BTC|DELTA:BTCUSD] product_id resolved via ticker: BTCUSD → 27
+16:09:34.614 | INFO | 📡 MARKET-DATA  | [SILVER|DELTA:SLVONUSD] product_id resolved via ticker: SLVONUSD → 124058
+16:09:35.122 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] BTC leverage target=45x effective=45x
+16:09:35.155 | INFO | 📡 MARKET-DATA  | product_id resolved via ticker: BTCUSD → 27
+16:09:35.155 | INFO | 📡 MARKET-DATA  | Delta product_id for BTCUSD: 27
+16:09:35.155 | INFO | 📡 MARKET-DATA  | Delta DM[BTCUSD]: starting WebSocket...
+16:09:35.155 | INFO | 📡 MARKET-DATA  | DeltaWebSocket initialized — endpoint: wss://socket.india.delta.exchange (testnet=False)
+16:09:35.155 | INFO | 📡 MARKET-DATA  | 📊 Subscribed orderbook: BTCUSD
+16:09:35.156 | INFO | 📡 MARKET-DATA  | 💹 Subscribed trades: BTCUSD
+16:09:35.156 | INFO | 📡 MARKET-DATA  | 🕯️  Subscribed candlestick_1m: BTCUSD (key=1)
+16:09:35.156 | INFO | 📡 MARKET-DATA  | 🕯️  Subscribed candlestick_5m: BTCUSD (key=5)
+16:09:35.156 | INFO | 📡 MARKET-DATA  | 🕯️  Subscribed candlestick_15m: BTCUSD (key=15)
+16:09:35.156 | INFO | 📡 MARKET-DATA  | 🕯️  Subscribed candlestick_1h: BTCUSD (key=60)
+16:09:35.157 | INFO | 📡 MARKET-DATA  | 🕯️  Subscribed candlestick_4h: BTCUSD (key=240)
+16:09:35.157 | INFO | 📡 MARKET-DATA  | 🕯️  Subscribed candlestick_1d: BTCUSD (key=1440)
+16:09:35.157 | INFO | 📡 MARKET-DATA  | 🔐 Subscribed orders: BTCUSD
+16:09:35.448 | INFO | • SYSTEM       | [SILVER|DELTA:SLVONUSD] SILVER leverage target=25x effective=25x (cap=25x)
+16:09:35.479 | INFO | 📡 MARKET-DATA  | product_id resolved via ticker: SLVONUSD → 124058
+16:09:35.479 | INFO | 📡 MARKET-DATA  | Delta product_id for SLVONUSD: 124058
+16:09:35.479 | INFO | 📡 MARKET-DATA  | Delta DM[SLVONUSD]: starting WebSocket...
+16:09:35.479 | INFO | 📡 MARKET-DATA  | DeltaWebSocket initialized — endpoint: wss://socket.india.delta.exchange (testnet=False)
+16:09:35.480 | INFO | 📡 MARKET-DATA  | 📊 Subscribed orderbook: SLVONUSD
+16:09:35.480 | INFO | 📡 MARKET-DATA  | 💹 Subscribed trades: SLVONUSD
+16:09:35.480 | INFO | 📡 MARKET-DATA  | 🕯️  Subscribed candlestick_1m: SLVONUSD (key=1)
+16:09:35.480 | INFO | 📡 MARKET-DATA  | 🕯️  Subscribed candlestick_5m: SLVONUSD (key=5)
+16:09:35.480 | INFO | 📡 MARKET-DATA  | 🕯️  Subscribed candlestick_15m: SLVONUSD (key=15)
+16:09:35.481 | INFO | 📡 MARKET-DATA  | 🕯️  Subscribed candlestick_1h: SLVONUSD (key=60)
+16:09:35.481 | INFO | 📡 MARKET-DATA  | 🕯️  Subscribed candlestick_4h: SLVONUSD (key=240)
+16:09:35.481 | INFO | 📡 MARKET-DATA  | 🕯️  Subscribed candlestick_1d: SLVONUSD (key=1440)
+16:09:35.481 | INFO | 📡 MARKET-DATA  | 🔐 Subscribed orders: SLVONUSD
+16:09:35.564 | INFO | 📡 MARKET-DATA  | [GOLD|DELTA:PAXGUSD] product_id resolved via ticker: PAXGUSD → 123006
+16:09:35.990 | INFO | 📡 MARKET-DATA  | Websocket connected
+16:09:35.991 | INFO | 📡 MARKET-DATA  | ✅ DeltaWebSocket connected
+16:09:35.996 | INFO | 📡 MARKET-DATA  | ✅ Delta WS streams started for BTCUSD
+16:09:35.997 | INFO | 📡 MARKET-DATA  | Delta DM[BTCUSD]: starting REST warmup...
+16:09:36.246 | INFO | 📡 MARKET-DATA  | Websocket connected
+16:09:36.247 | INFO | 📡 MARKET-DATA  | ✅ DeltaWebSocket connected
+16:09:36.247 | INFO | 📡 MARKET-DATA  | ✅ Delta WS streams started for SLVONUSD
+16:09:36.248 | INFO | 📡 MARKET-DATA  | Delta DM[SLVONUSD]: starting REST warmup...
+16:09:36.265 | INFO | 📡 MARKET-DATA  | Delta warmup BTCUSD 1m: 199 candles
+16:09:36.308 | INFO | 📡 MARKET-DATA  | 🔄 Resubscribed 8 public channels
+16:09:36.309 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] GOLD leverage target=25x effective=25x (cap=25x)
+16:09:36.312 | INFO | 📡 MARKET-DATA  | ✅ DeltaWebSocket authenticated (private channels active)
+16:09:36.318 | INFO | 📡 MARKET-DATA  | 🔄 Resubscribed 3 private channels
+16:09:36.414 | INFO | 📡 MARKET-DATA  | product_id resolved via ticker: PAXGUSD → 123006
+16:09:36.424 | INFO | 📡 MARKET-DATA  | Delta product_id for PAXGUSD: 123006
+16:09:36.433 | INFO | 📡 MARKET-DATA  | Delta DM[PAXGUSD]: starting WebSocket...
+16:09:36.434 | INFO | 📡 MARKET-DATA  | DeltaWebSocket initialized — endpoint: wss://socket.india.delta.exchange (testnet=False)
+16:09:36.435 | INFO | 📡 MARKET-DATA  | 📊 Subscribed orderbook: PAXGUSD
+16:09:36.435 | INFO | 📡 MARKET-DATA  | 💹 Subscribed trades: PAXGUSD
+16:09:36.435 | INFO | 📡 MARKET-DATA  | 🕯️  Subscribed candlestick_1m: PAXGUSD (key=1)
+16:09:36.435 | INFO | 📡 MARKET-DATA  | 🕯️  Subscribed candlestick_5m: PAXGUSD (key=5)
+16:09:36.435 | INFO | 📡 MARKET-DATA  | 🕯️  Subscribed candlestick_15m: PAXGUSD (key=15)
+16:09:36.436 | INFO | 📡 MARKET-DATA  | 🕯️  Subscribed candlestick_1h: PAXGUSD (key=60)
+16:09:36.436 | INFO | 📡 MARKET-DATA  | 🕯️  Subscribed candlestick_4h: PAXGUSD (key=240)
+16:09:36.436 | INFO | 📡 MARKET-DATA  | 🕯️  Subscribed candlestick_1d: PAXGUSD (key=1440)
+16:09:36.436 | INFO | 📡 MARKET-DATA  | 🔐 Subscribed orders: PAXGUSD
+16:09:36.519 | INFO | 📡 MARKET-DATA  | Delta warmup SLVONUSD 1m: 199 candles
+16:09:36.548 | INFO | 📡 MARKET-DATA  | 🔄 Resubscribed 8 public channels
+16:09:36.549 | INFO | 📡 MARKET-DATA  | ✅ DeltaWebSocket authenticated (private channels active)
+16:09:36.549 | INFO | 📡 MARKET-DATA  | 🔄 Resubscribed 3 private channels
+16:09:36.787 | INFO | 📡 MARKET-DATA  | Delta warmup BTCUSD 5m: 200 candles
+16:09:37.036 | INFO | 📡 MARKET-DATA  | Delta warmup SLVONUSD 5m: 200 candles
+16:09:37.050 | INFO | 📡 MARKET-DATA  | 🔍 Orderbook raw sample — buy[0]=[{'depth': '125', 'limit_price': '67.97', 'size': 125}]  sell[0]=[{'depth': '198', 'limit_price': '68.07', 'size': 198}]
+16:09:37.321 | INFO | 📡 MARKET-DATA  | Delta warmup BTCUSD 15m: 200 candles
+16:09:37.443 | INFO | 📡 MARKET-DATA  | Websocket connected
+16:09:37.444 | INFO | 📡 MARKET-DATA  | ✅ DeltaWebSocket connected
+16:09:37.444 | INFO | 📡 MARKET-DATA  | ✅ Delta WS streams started for PAXGUSD
+16:09:37.444 | INFO | 📡 MARKET-DATA  | Delta DM[PAXGUSD]: starting REST warmup...
+16:09:37.601 | INFO | 📡 MARKET-DATA  | Delta warmup SLVONUSD 15m: 200 candles
+16:09:37.613 | INFO | 📡 MARKET-DATA  | 🔍 Orderbook raw sample — buy[0]=[{'depth': '162', 'limit_price': '77244.0', 'size': 162}]  sell[0]=[{'depth': '2184', 'limit_price': '77245.5', 'size': 2184}]
+16:09:37.713 | INFO | 📡 MARKET-DATA  | Delta warmup PAXGUSD 1m: 199 candles
+16:09:37.745 | INFO | 📡 MARKET-DATA  | 🔄 Resubscribed 8 public channels
+16:09:37.746 | INFO | 📡 MARKET-DATA  | ✅ DeltaWebSocket authenticated (private channels active)
+16:09:37.746 | INFO | 📡 MARKET-DATA  | 🔄 Resubscribed 3 private channels
+16:09:37.864 | INFO | 📡 MARKET-DATA  | Delta warmup BTCUSD 1h: 100 candles
+16:09:38.125 | INFO | 📡 MARKET-DATA  | Delta warmup SLVONUSD 1h: 100 candles
+16:09:38.234 | INFO | 📡 MARKET-DATA  | Delta warmup PAXGUSD 5m: 200 candles
+16:09:38.400 | INFO | 📡 MARKET-DATA  | Delta warmup BTCUSD 4h: 50 candles
+16:09:38.501 | INFO | 📡 MARKET-DATA  | 🔍 Orderbook raw sample — buy[0]=[{'depth': '69', 'limit_price': '4510.80', 'size': 69}]  sell[0]=[{'depth': '1177', 'limit_price': '4510.90', 'size': 1177}]
+16:09:38.600 | INFO | 📡 MARKET-DATA  | ICICI underlying chart ready for NIFTY: 1m=800 5m=617 15m=211 1h=288 4h=96 1d=120
+16:09:38.653 | INFO | 📡 MARKET-DATA  | Delta warmup SLVONUSD 4h: 50 candles
+16:09:39.381 | INFO | 📡 MARKET-DATA  | Delta warmup PAXGUSD 15m: 200 candles
+16:09:39.383 | INFO | 📡 MARKET-DATA  | Delta warmup BTCUSD 1d: 30 candles
+16:09:39.634 | INFO | 📡 MARKET-DATA  | ✅ Delta REST warmup complete for BTCUSD
+16:09:39.634 | INFO | 📡 MARKET-DATA  | Delta DM[BTCUSD] ready=True (1m=199 5m=200 15m=200 4h=50)
+16:09:39.635 | INFO | ⚖ RISK         | [BTC|DELTA:BTCUSD] ✅ BTC ready @ 77232.5000 | venues=delta:BTCUSD | policy=crypto lev=45x margin=50% risk_mult=1.00 loop=0.25s
+16:09:39.650 | INFO | 📡 MARKET-DATA  | Delta warmup SLVONUSD 1d: 30 candles
+16:09:39.900 | INFO | 📡 MARKET-DATA  | ✅ Delta REST warmup complete for SLVONUSD
+16:09:39.900 | INFO | 📡 MARKET-DATA  | Delta DM[SLVONUSD] ready=True (1m=199 5m=200 15m=200 4h=50)
+16:09:39.903 | INFO | ⚖ RISK         | [SILVER|DELTA:SLVONUSD] ✅ SILVER ready @ 68.1400 | venues=delta:SLVONUSD | policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:09:39.904 | INFO | 📡 MARKET-DATA  | Delta warmup PAXGUSD 1h: 100 candles
+16:09:40.467 | INFO | 📡 MARKET-DATA  | Delta warmup PAXGUSD 4h: 50 candles
+16:09:40.997 | INFO | 📡 MARKET-DATA  | Delta warmup PAXGUSD 1d: 30 candles
+16:09:41.247 | INFO | 📡 MARKET-DATA  | ✅ Delta REST warmup complete for PAXGUSD
+16:09:41.248 | INFO | 📡 MARKET-DATA  | Delta DM[PAXGUSD] ready=True (1m=199 5m=200 15m=200 4h=50)
+16:09:41.249 | INFO | ⚖ RISK         | [GOLD|DELTA:PAXGUSD] ✅ GOLD ready @ 4510.6000 | venues=delta:PAXGUSD | policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:09:41.460 | INFO | ⚖ RISK         | [NIFTY|ICICI:NIFTY] ✅ NIFTY ready @ 23654.7000 | venues=icici:NIFTY | policy=option lev=1x margin=42% risk_mult=0.85 loop=0.50s
+16:09:41.780 | INFO | • SYSTEM       | 📊 Multi-asset loop active
+16:09:41.782 | INFO | • SYSTEM       | 🌐 CROSS-ASSET | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:09:41.797 | INFO | 🧠 POSTERIOR    | [BTC|DELTA:BTCUSD] 🧭 DIR_TELEMETRY: hunt=BSL conf=0.20 delivery=bullish raw=+0.203 BSL=0.20 SSL=0.00 | BSL_HUNT (score=+0.203) | AMD=DISTRIBUTION(bullish,0.71) | HTF=+0.50 | DR=0.47 | flow=-0.20
+16:09:41.801 | INFO | 💧 LIQUIDITY    | [BTC|DELTA:BTCUSD] SWEEPS detected: 🎯 SWEEP [5m] SSL @$77,184->long q=0.72 wick=$77,173 vol=2.9x | 🎯 SWEEP [5m] SSL @$77,305->long q=1.00 wick=$77,173 vol=2.9x | 🎯 SWEEP [5m] SSL @$77,344->long q=1.00 wick=$77,173 vol=2.9x | 🎯 SWEEP [5m] SSL @$77,388->long q=1.00 wick=$77,173 vol=2.9x | 🎯 SWEEP [15m] BSL @$77,625->short q=0.78 wick=$77,652 vol=3.1x | 🎯 SWEEP [15m] BSL @$77,445->short q=0.94 wick=$77,652 vol=3.1x | 🎯 SWEEP [15m] BSL @$77,546->short q=0.94 wick=$77,652 vol=3.1x | 🎯 SWEEP [15m] SSL @$77,177->long q=0.70 wick=$77,145 vol=3.1x | +4 more
+16:09:41.806 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] 🎯 POST-SWEEP ENTERED [LIQ-MAP]: SSL $77,305.0 quality=1.00 wick=$77,173.0
+16:09:41.806 | INFO | 🧠 POSTERIOR    | [BTC|DELTA:BTCUSD] [THINK] State=POST_SWEEP | Flow=neutral(-0.15) | CVD=-0.38 | Target=short->$77,184(0.5ATR) | BSL=0.6ATR | SSL=0.5ATR | Struct=15m:ranging/4H:bullish | DR=EQ(50%)
+16:09:41.807 | INFO | ⚖ RISK         | [BTC|DELTA:BTCUSD] ANALYSIS_TICK asset=BTC primary=DELTA symbol=BTCUSD state=SCANNING price=77233.5000 eval_ms=24.2 slots=0/6 policy=crypto lev=45x margin=50% risk_mult=1.00 loop=0.25s
+16:09:41.807 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] ANALYSIS_CROSS_ASSET asset=BTC | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:09:41.807 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] BTC DELTA BTCUSD | price 77233.5000 | SCANNING | open=0/6
+16:09:41.818 | INFO | 🧠 POSTERIOR    | [NIFTY|ICICI:NIFTY] 🧭 DIR_TELEMETRY: hunt=BSL conf=0.23 delivery=bullish raw=+0.229 BSL=0.23 SSL=0.00 | BSL_HUNT (score=+0.229) | AMD=DISTRIBUTION(bullish,0.66) | HTF=+0.33 | DR=0.39 | flow=+0.00
+16:09:41.823 | INFO | 💧 LIQUIDITY    | [NIFTY|ICICI:NIFTY] SWEEPS detected: 🎯 SWEEP [1h] SSL @$23,641->long q=0.30 wick=$23,638 vol=0.0x | 🎯 SWEEP [4h] BSL @$23,839->short q=0.75 wick=$23,878 vol=0.0x
+16:09:41.828 | INFO | • SYSTEM       | [NIFTY|ICICI:NIFTY] 🎯 POST-SWEEP ENTERED [LIQ-MAP]: BSL $23,839.0 quality=0.75 wick=$23,878.3
+16:09:41.828 | INFO | 🧠 POSTERIOR    | [NIFTY|ICICI:NIFTY] [THINK] State=POST_SWEEP | Flow=neutral(+0.00) | CVD=+0.00 | Target=short->$23,639(0.9ATR) | BSL=0.3ATR | SSL=0.3ATR | Struct=15m:bullish/4H:ranging | DR=EQ(50%)
+16:09:41.829 | INFO | ⚖ RISK         | [NIFTY|ICICI:NIFTY] ANALYSIS_TICK asset=NIFTY primary=ICICI symbol=NIFTY state=SCANNING price=23654.7000 eval_ms=21.1 slots=0/6 policy=option lev=1x margin=42% risk_mult=0.85 loop=0.50s
+16:09:41.829 | INFO | • SYSTEM       | [NIFTY|ICICI:NIFTY] ANALYSIS_CROSS_ASSET asset=NIFTY | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:09:41.829 | INFO | • SYSTEM       | [NIFTY|ICICI:NIFTY] NIFTY ICICI NIFTY | price 23654.7000 | SCANNING | open=0/6
+16:09:41.838 | INFO | 🧠 POSTERIOR    | [GOLD|DELTA:PAXGUSD] 🧭 DIR_TELEMETRY: hunt=NEUTRAL conf=0.00 delivery= raw=-0.064 BSL=0.00 SSL=0.06 | low_confidence(composite=0.064<0.1)
+16:09:41.841 | INFO | 💧 LIQUIDITY    | [GOLD|DELTA:PAXGUSD] SWEEPS detected: 🎯 SWEEP [1m] SSL @$4,515->long q=0.48 wick=$4,514 vol=0.4x | 🎯 SWEEP [15m] SSL @$4,516->long q=0.78 wick=$4,511 vol=2.1x | 🎯 SWEEP [4h] SSL @$4,515->long q=0.59 wick=$4,512 vol=1.2x | 🎯 SWEEP [1d] SSL @$4,497->long q=0.91 wick=$4,462 vol=1.4x | 🎯 SWEEP [1d] SSL @$4,505->long q=0.91 wick=$4,462 vol=1.4x
+16:09:41.844 | INFO | 🧠 POSTERIOR    | [GOLD|DELTA:PAXGUSD] [THINK] State=POST_SWEEP | Flow=short(-0.30) | CVD=-0.60 | Target=long->$4,514(0.6ATR) | BSL=0.6ATR | SSL=0.5ATR | Struct=15m:ranging/4H:ranging | DR=EQ(50%)
+16:09:41.845 | INFO | ⚖ RISK         | [GOLD|DELTA:PAXGUSD] ANALYSIS_TICK asset=GOLD primary=DELTA symbol=PAXGUSD state=SCANNING price=4510.6000 eval_ms=14.8 slots=0/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:09:41.845 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] ANALYSIS_CROSS_ASSET asset=GOLD | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:09:41.845 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] GOLD DELTA PAXGUSD | price 4510.6000 | SCANNING | open=0/6
+16:09:41.852 | INFO | 🏛 STRUCTURE    | [SILVER|DELTA:SLVONUSD] 🔱 ICT BSL SWEPT @ $68 disp=True(0.65) age=582s → BEARISH BIAS
+16:09:41.854 | INFO | 🧠 POSTERIOR    | [SILVER|DELTA:SLVONUSD] 🧭 DIR_TELEMETRY: hunt=NEUTRAL conf=0.00 delivery= raw=+0.100 BSL=0.10 SSL=0.00 | low_confidence(composite=0.100<0.1)
+16:09:41.857 | INFO | 💧 LIQUIDITY    | [SILVER|DELTA:SLVONUSD] SWEEPS detected: 🎯 SWEEP [1m] SSL @$68->long q=0.50 wick=$68 vol=0.5x | 🎯 SWEEP [5m] SSL @$68->long q=0.39 wick=$68 vol=3.8x | 🎯 SWEEP [15m] BSL @$68->short q=0.78 wick=$69 vol=0.7x | 🎯 SWEEP [15m] BSL @$69->short q=0.62 wick=$69 vol=0.7x
+16:09:41.859 | INFO | 🏛 STRUCTURE    | [SILVER|DELTA:SLVONUSD] 🌊 DirectionEngine: POST-SWEEP STARTED | BSL @ $67.9 | price=$68.14 | quality=0.65
+16:09:41.860 | INFO | 🧠 POSTERIOR    | [SILVER|DELTA:SLVONUSD] [THINK] State=POST_SWEEP | Flow=short(-0.24) | CVD=-0.52 | Target=long->$69(2.3ATR) | BSL=0.1ATR | SSL=1.2ATR | Struct=15m:bullish/4H:bullish | DR=EQ(50%)
+16:09:41.861 | INFO | ⚖ RISK         | [SILVER|DELTA:SLVONUSD] ANALYSIS_TICK asset=SILVER primary=DELTA symbol=SLVONUSD state=SCANNING price=68.1400 eval_ms=15.1 slots=0/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:09:41.861 | INFO | • SYSTEM       | [SILVER|DELTA:SLVONUSD] ANALYSIS_CROSS_ASSET asset=SILVER | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:09:41.861 | INFO | • SYSTEM       | [SILVER|DELTA:SLVONUSD] SILVER DELTA SLVONUSD | price 68.1400 | SCANNING | open=0/6
+16:09:42.378 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] EntryEngine sweep locks invalidated (1) reason=regime_change
+16:09:42.380 | WARN | 🧠 POSTERIOR    | [NIFTY|ICICI:NIFTY] ⚡ RECONCILE: adopted LONG @ $1,792.08
+16:09:42.380 | CRIT | 🧠 POSTERIOR    | [NIFTY|ICICI:NIFTY] 💀 Adopted LONG has NO stop-loss on exchange — emergency-flattening to prevent unbounded loss.
+16:09:42.623 | CRIT | ⚙ EXECUTION    | [NIFTY|ICICI:NIFTY] 💀 EMERGENCY FLATTEN [adopted_unprotected] — closing LONG size=9.0 via MARKET SELL reduce_only=True
+16:09:42.623 | INFO | ⚙ EXECUTION    | [NIFTY|ICICI:NIFTY] MARKET SELL qty=9.0 reduce_only=True
+16:09:42.623 | ERRO | ⚙ EXECUTION    | [NIFTY|ICICI:NIFTY] place_order non-retryable failure: sc=0 raw={'error': 'ICICI options guard: limit price is required'}
+16:09:42.623 | CRIT | ⚙ EXECUTION    | [NIFTY|ICICI:NIFTY] 💀 Emergency flatten FAILED for adopted_unprotected — MANUAL INTERVENTION REQUIRED
+16:09:42.889 | INFO | 🧠 POSTERIOR    | [NIFTY|ICICI:NIFTY] 📝 POOL-GATE CONTINUE: next target $23,693 — TP stays at $0 (immutability policy) | conf=0.70 | AMD_DELIVERY_INTACT + FLOW_OK + NEXT_POOL @ $23,693 (2.0R potential)
+16:09:43.413 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] EntryEngine sweep locks invalidated (1) reason=regime_change
+16:09:43.415 | WARN | 🧠 POSTERIOR    | [SILVER|DELTA:SLVONUSD] ⚡ RECONCILE: adopted LONG @ $67.87
+16:09:43.416 | INFO | 💧 LIQUIDITY    | [SILVER|DELTA:SLVONUSD] 🎯 TP_LADDER PLAN [LONG] TP1@68.55 40% | TP2@68.96 23% | TP3@69.26 22% | FINAL@69.64 15% | notes=no internal liquidity: using Fibonacci path-monetisation fallback (3 legs); TP1 balanced: capped first exit at 21%; excess pushed deeper/final; terminal-runner reserve 15%: final TP kept executable after path monetisation; higher final TP 8.1ATR: path ladder monetises internal liquidity; solvency checkpoint TP1: worst-case +0.22R after original SL; residual-domination 0.13x
+16:09:43.416 | INFO | ⚙ EXECUTION    | [SILVER|DELTA:SLVONUSD] TP sell qty=0.7000000000000001 trigger=$68.55
+16:09:44.673 | INFO | ⚙ EXECUTION    | [SILVER|DELTA:SLVONUSD] ✅ TP: 1325570408 @ $68.55
+16:09:44.673 | INFO | 💧 LIQUIDITY    | [SILVER|DELTA:SLVONUSD] ✅ TP_LADDER TP1 placed reduce-only SELL qty=0.7 trigger=$68.55 oid=1325570408
+16:09:44.674 | INFO | ⚙ EXECUTION    | [SILVER|DELTA:SLVONUSD] TP sell qty=0.4 trigger=$68.96
+16:09:45.441 | INFO | ⚙ EXECUTION    | [SILVER|DELTA:SLVONUSD] ✅ TP: 1325570439 @ $68.96
+16:09:45.441 | INFO | 💧 LIQUIDITY    | [SILVER|DELTA:SLVONUSD] ✅ TP_LADDER TP2 placed reduce-only SELL qty=0.4 trigger=$68.96 oid=1325570439
+16:09:45.442 | INFO | ⚙ EXECUTION    | [SILVER|DELTA:SLVONUSD] TP sell qty=0.4 trigger=$69.26
+16:09:46.260 | INFO | ⚙ EXECUTION    | [SILVER|DELTA:SLVONUSD] ✅ TP: 1325570466 @ $69.26
+16:09:46.260 | INFO | 💧 LIQUIDITY    | [SILVER|DELTA:SLVONUSD] ✅ TP_LADDER TP3 placed reduce-only SELL qty=0.4 trigger=$69.26 oid=1325570466
+16:09:46.260 | INFO | 💧 LIQUIDITY    | [SILVER|DELTA:SLVONUSD] ✅ TP_LADDER adoption repair placed 3 internal reduce-only legs; fixed SL remains $67.62
+16:09:51.818 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [DISPLACEMENT] tick=1 rev=20 cont=12 (need 76, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:09:52.081 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] POST_SWEEP [DISPLACEMENT] tick=1 rev=30 cont=17 (need 76, gap>=15) CISD=✗ DISP=2.5ATR OTE=✗
+16:09:56.036 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] 🧠 POSTERIOR ACCEPTED: REVERSAL LONG [DISPLACEMENT] (rev=93 vs cont=56) | p=0.889 min=0.660 EV=1.297 LLR=2.09 U=0.39 ACCEPT quant posterior auction: info=0.98/0.18 edge=+0.46 disp=0.98 struct=0.00 cons=0.63 flow=+0.47 learned=0.50/0 EV=+1.297 LLR=2.09/1.53 | vol=0.25 liq=1.00/0.74 of=+0.26 cvd=+1.00 htf=+0.00 pd=+0.14 U=0.39 tox=0.00
+16:09:56.059 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] RAW_SL_AUDIT: SL/LONG: no protective SL pool; best visible pool rejected: not beyond long invalidation | NO SSL@$4508.0 1m rr=0.00 ev=0.000 — not beyond long invalidation | NO SSL@$4495.9 15m rr=0.00 ev=0.000 — not beyond long invalidation | NO SSL@$4488.8 15m rr=0.00 ev=0.000 — not beyond long invalidation | NO SSL@$4486.4 15m rr=0.00 ev=0.000 — not beyond long invalidation
+16:09:56.073 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] RAW_TP_AUDIT: TP/LONG: no eligible TP pool; best visible pool rejected: delivery probability 0.9192 < required 0.9930 for RR 0.08 (static 2.40, cost=0.08R, payoff floor 1.35) | NO BSL@$4513.9 1h rr=0.08 ev=0.000 — delivery probability 0.9192 < required 0.9930 for RR 0.08 (static 2.40, cost=0.08R, payoff floor 1.35) | NO BSL@$4516.8 1m rr=0.14 ev=0.000 — delivery probability 0.6029 < required 0.9451 for RR 0.14 (static 2.40, cost=0.08R, payoff floor 1.35) | NO BSL@$4541.7 1h rr=0.61 ev=0.000 — delivery probability 0.3839 < required 0.6682 for RR 0.61 (static 2.40, cost=0.08R, payoff floor 1.80) | NO BSL@$4532.9 1m rr=0.44 ev=0.000 — delivery probability 0.3177 < required 0.7458 for RR 0.44 (static 2.40, cost=0.08R, payoff floor 2.39)
+16:09:56.073 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] CANDIDATE DEFERRED [no_liquidity_tp]: side=long sweep=$4496.6 entry=$4508.9 sl=$4458.8 | no eligible TP pool; best visible pool rejected: delivery probability 0.9192 < required 0.9930 for RR 0.08 (static 2.40, cost=0.08R, payoff floor 1.35)
+16:09:56.597 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [DISPLACEMENT] tick=10 rev=20 cont=184 (need 76, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:09:56.852 | INFO | ⚖ RISK         | [BTC|DELTA:BTCUSD] ANALYSIS_TICK asset=BTC primary=DELTA symbol=BTCUSD state=SCANNING price=77216.0000 eval_ms=0.1 slots=2/6 policy=crypto lev=45x margin=50% risk_mult=1.00 loop=0.25s
+16:09:56.852 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] ANALYSIS_CROSS_ASSET asset=BTC | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:09:56.853 | INFO | ⚖ RISK         | [NIFTY|ICICI:NIFTY] ANALYSIS_TICK asset=NIFTY primary=ICICI symbol=NIFTY state=ACTIVE price=23654.7000 eval_ms=0.1 slots=2/6 policy=option lev=1x margin=42% risk_mult=0.85 loop=0.50s
+16:09:56.853 | INFO | • SYSTEM       | [NIFTY|ICICI:NIFTY] ANALYSIS_CROSS_ASSET asset=NIFTY | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:09:56.860 | INFO | ⚖ RISK         | [GOLD|DELTA:PAXGUSD] ANALYSIS_TICK asset=GOLD primary=DELTA symbol=PAXGUSD state=SCANNING price=4509.3000 eval_ms=7.1 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:09:56.860 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] ANALYSIS_CROSS_ASSET asset=GOLD | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:09:56.863 | INFO | ⚖ RISK         | [SILVER|DELTA:SLVONUSD] ANALYSIS_TICK asset=SILVER primary=DELTA symbol=SLVONUSD state=ACTIVE price=68.0200 eval_ms=2.1 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:09:56.863 | INFO | • SYSTEM       | [SILVER|DELTA:SLVONUSD] ANALYSIS_CROSS_ASSET asset=SILVER | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:10:01.915 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [DISPLACEMENT] tick=20 rev=58 cont=222 (need 76, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:10:02.956 | INFO | 🧠 POSTERIOR    | [BTC|DELTA:BTCUSD] 🧭 DIR_TELEMETRY: hunt=BSL conf=0.26 delivery=bullish raw=+0.259 BSL=0.26 SSL=0.00 | BSL_HUNT (score=+0.259) | AMD=DISTRIBUTION(bullish,0.71) | HTF=+0.50 | DR=0.48 | flow=+0.17
+16:10:07.177 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [DISPLACEMENT] tick=30 rev=110 cont=167 (need 76, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:10:07.189 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] POST_SWEEP [DISPLACEMENT] tick=1 rev=30 cont=12 (need 76, gap>=15) CISD=✗ DISP=2.3ATR OTE=✗
+16:10:11.968 | INFO | ⚖ RISK         | [BTC|DELTA:BTCUSD] ANALYSIS_TICK asset=BTC primary=DELTA symbol=BTCUSD state=SCANNING price=77257.5000 eval_ms=0.1 slots=2/6 policy=crypto lev=45x margin=50% risk_mult=1.00 loop=0.25s
+16:10:11.968 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] ANALYSIS_CROSS_ASSET asset=BTC | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:10:11.969 | INFO | ⚖ RISK         | [NIFTY|ICICI:NIFTY] ANALYSIS_TICK asset=NIFTY primary=ICICI symbol=NIFTY state=ACTIVE price=23654.7000 eval_ms=0.1 slots=2/6 policy=option lev=1x margin=42% risk_mult=0.85 loop=0.50s
+16:10:11.969 | INFO | • SYSTEM       | [NIFTY|ICICI:NIFTY] ANALYSIS_CROSS_ASSET asset=NIFTY | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:10:11.973 | INFO | ⚖ RISK         | [SILVER|DELTA:SLVONUSD] ANALYSIS_TICK asset=SILVER primary=DELTA symbol=SLVONUSD state=ACTIVE price=67.9700 eval_ms=3.6 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:10:11.973 | INFO | • SYSTEM       | [SILVER|DELTA:SLVONUSD] ANALYSIS_CROSS_ASSET asset=SILVER | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:10:12.235 | INFO | 🧠 POSTERIOR    | [BTC|DELTA:BTCUSD] [THINK] State=POST_SWEEP | Flow=long(+0.28) | CVD=+0.91 | Target=short->$77,184(0.7ATR) | BSL=0.3ATR | SSL=0.7ATR | Struct=15m:ranging/4H:bullish | DR=EQ(50%) | SweepScore=R181/C151
+16:10:12.496 | INFO | 🧠 POSTERIOR    | [GOLD|DELTA:PAXGUSD] 🧭 DIR_TELEMETRY: hunt=NEUTRAL conf=0.00 delivery= raw=+0.069 BSL=0.07 SSL=0.00 | low_confidence(composite=0.069<0.1)
+16:10:12.502 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] 🧠 POSTERIOR ACCEPTED: REVERSAL LONG [DISPLACEMENT] (rev=93 vs cont=22) | p=0.909 min=0.660 EV=1.348 LLR=2.30 U=0.45 ACCEPT quant posterior auction: info=0.98/0.18 edge=+0.82 disp=0.98 struct=0.00 cons=0.67 flow=+0.27 learned=0.50/0 EV=+1.348 LLR=2.30/1.49 | vol=0.25 liq=1.00/0.74 of=+0.00 cvd=+0.77 htf=+0.00 pd=+0.14 U=0.45 tox=0.00
+16:10:12.503 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] RAW_SL_AUDIT: SL/LONG: no protective SL pool; best visible pool rejected: not beyond long invalidation | NO SSL@$4508.0 1m rr=0.00 ev=0.000 — not beyond long invalidation | NO SSL@$4495.9 15m rr=0.00 ev=0.000 — not beyond long invalidation | NO SSL@$4488.8 15m rr=0.00 ev=0.000 — not beyond long invalidation | NO SSL@$4486.4 15m rr=0.00 ev=0.000 — not beyond long invalidation
+16:10:12.514 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] RAW_TP_AUDIT: TP/LONG: no eligible TP pool; best visible pool rejected: delivery probability 0.9292 < required 0.9838 for RR 0.09 (static 2.40, cost=0.08R, payoff floor 1.35) | NO BSL@$4513.9 1h rr=0.09 ev=0.000 — delivery probability 0.9292 < required 0.9838 for RR 0.09 (static 2.40, cost=0.08R, payoff floor 1.35) | NO BSL@$4516.8 1m rr=0.15 ev=0.000 — delivery probability 0.5983 < required 0.9363 for RR 0.15 (static 2.40, cost=0.08R, payoff floor 1.35) | NO BSL@$4541.7 1h rr=0.63 ev=0.000 — delivery probability 0.3804 < required 0.6619 for RR 0.63 (static 2.40, cost=0.08R, payoff floor 1.83) | NO BSL@$4532.9 1m rr=0.46 ev=0.000 — delivery probability 0.3102 < required 0.7388 for RR 0.46 (static 2.40, cost=0.08R, payoff floor 2.47)
+16:10:12.516 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] CANDIDATE DEFERRED [no_liquidity_tp]: side=long sweep=$4496.6 entry=$4508.4 sl=$4458.8 | no eligible TP pool; best visible pool rejected: delivery probability 0.9292 < required 0.9838 for RR 0.09 (static 2.40, cost=0.08R, payoff floor 1.35)
+16:10:12.517 | INFO | 🧠 POSTERIOR    | [GOLD|DELTA:PAXGUSD] [THINK] State=SCANNING | Flow=neutral(+0.15) | CVD=+0.77 | Target=long->$4,514(1.0ATR) | BSL=0.1ATR | SSL=0.1ATR | Struct=15m:ranging/4H:ranging | DR=EQ(50%) | SweepState=[deferred:liq:processed=1] | TPPlan=no eligible TP pool; best visible pool rejected: delivery probability 0.9292 < required 0.9838 for RR 0.09 (static 2.40,
+16:10:12.518 | INFO | ⚖ RISK         | [GOLD|DELTA:PAXGUSD] ANALYSIS_TICK asset=GOLD primary=DELTA symbol=PAXGUSD state=SCANNING price=4508.3750 eval_ms=24.8 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:10:12.518 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] ANALYSIS_CROSS_ASSET asset=GOLD | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:10:13.296 | INFO | 🧠 POSTERIOR    | [BTC|DELTA:BTCUSD] 🧭 DIR_TELEMETRY: hunt=BSL conf=0.23 delivery=bullish raw=+0.231 BSL=0.23 SSL=0.00 | BSL_HUNT (score=+0.231) | AMD=DISTRIBUTION(bullish,0.71) | HTF=+0.50 | DR=0.49 | flow=-0.06
+16:10:13.312 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] 🎯 POST-SWEEP ENTERED [LIQ-MAP]: SSL $4,504.9 quality=0.91 wick=$4,462.2
+16:10:14.382 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [DISPLACEMENT] tick=40 rev=172 cont=154 (need 76, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:10:19.647 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [DISPLACEMENT] tick=50 rev=132 cont=142 (need 76, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:10:23.600 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] POST_SWEEP [DISPLACEMENT] tick=1 rev=25 cont=4 (need 76, gap>=15) CISD=✗ DISP=0.6ATR OTE=✗
+16:10:24.396 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] POST_SWEEP: OTE ZONE (65.5%)
+16:10:24.910 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [DISPLACEMENT] tick=60 rev=100 cont=157 (need 76, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:10:26.775 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] 🧠 POSTERIOR ACCEPTED: REVERSAL LONG [DISPLACEMENT] (rev=90 vs cont=20) | p=0.915 min=0.660 EV=1.322 LLR=2.38 U=0.46 ACCEPT quant posterior auction: info=0.83/0.18 edge=+0.82 disp=0.70 struct=0.45 cons=0.61 flow=+0.24 learned=0.50/0 EV=+1.322 LLR=2.38/1.49 | vol=0.25 liq=1.00/0.72 of=+0.00 cvd=+0.69 htf=+0.00 pd=+0.14 U=0.46 tox=0.00
+16:10:26.776 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] RAW_SL_AUDIT: SL/LONG: no protective SL pool; best visible pool rejected: not beyond long invalidation | NO SSL@$4495.9 15m rr=0.00 ev=0.000 — not beyond long invalidation | NO SSL@$4488.8 15m rr=0.00 ev=0.000 — not beyond long invalidation | NO SSL@$4486.4 15m rr=0.00 ev=0.000 — not beyond long invalidation | NO SSL@$4484.2 15m rr=0.00 ev=0.000 — not beyond long invalidation
+16:10:26.788 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] RAW_TP_AUDIT: TP/LONG: no eligible TP pool; best visible pool rejected: delivery probability 0.9120 < required 0.9343 for RR 0.16 (static 2.40, cost=0.08R, payoff floor 1.35) | NO BSL@$4513.9 1h rr=0.16 ev=0.000 — delivery probability 0.9120 < required 0.9343 for RR 0.16 (static 2.40, cost=0.08R, payoff floor 1.35) | NO BSL@$4509.2 15m rr=0.06 ev=0.000 — delivery probability 0.6948 < required 1.0000 for RR 0.06 (static 2.40, cost=0.08R, payoff floor 1.35) | NO BSL@$4516.8 1m rr=0.21 ev=0.000 — delivery probability 0.5260 < required 0.8897 for RR 0.21 (static 2.40, cost=0.08R, payoff floor 1.35) | NO BSL@$4541.7 1h rr=0.71 ev=0.000 — delivery probability 0.3345 < required 0.6312 for RR 0.71 (static 2.40, cost=0.08R, payoff floor 2.23)
+16:10:26.788 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] CANDIDATE DEFERRED [no_liquidity_tp]: side=long sweep=$4504.9 entry=$4505.5 sl=$4457.9 | no eligible TP pool; best visible pool rejected: delivery probability 0.9120 < required 0.9343 for RR 0.16 (static 2.40, cost=0.08R, payoff floor 1.35)
+16:10:27.049 | INFO | ⚖ RISK         | [BTC|DELTA:BTCUSD] ANALYSIS_TICK asset=BTC primary=DELTA symbol=BTCUSD state=SCANNING price=77239.5000 eval_ms=9.8 slots=2/6 policy=crypto lev=45x margin=50% risk_mult=1.00 loop=0.25s
+16:10:27.049 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] ANALYSIS_CROSS_ASSET asset=BTC | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:10:27.055 | INFO | ⚖ RISK         | [NIFTY|ICICI:NIFTY] ANALYSIS_TICK asset=NIFTY primary=ICICI symbol=NIFTY state=ACTIVE price=23654.7000 eval_ms=5.6 slots=2/6 policy=option lev=1x margin=42% risk_mult=0.85 loop=0.50s
+16:10:27.055 | INFO | • SYSTEM       | [NIFTY|ICICI:NIFTY] ANALYSIS_CROSS_ASSET asset=NIFTY | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:10:27.058 | INFO | ⚖ RISK         | [SILVER|DELTA:SLVONUSD] ANALYSIS_TICK asset=SILVER primary=DELTA symbol=SLVONUSD state=ACTIVE price=67.9550 eval_ms=2.0 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:10:27.058 | INFO | • SYSTEM       | [SILVER|DELTA:SLVONUSD] ANALYSIS_CROSS_ASSET asset=SILVER | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:10:27.579 | INFO | ⚖ RISK         | [GOLD|DELTA:PAXGUSD] ANALYSIS_TICK asset=GOLD primary=DELTA symbol=PAXGUSD state=SCANNING price=4506.4000 eval_ms=6.3 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:10:27.579 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] ANALYSIS_CROSS_ASSET asset=GOLD | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:10:30.210 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [CISD] tick=70 rev=83 cont=167 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:10:31.540 | INFO | 🧠 POSTERIOR    | [GOLD|DELTA:PAXGUSD] 🧭 DIR_TELEMETRY: hunt=BSL conf=0.10 delivery=bullish raw=+0.102 BSL=0.10 SSL=0.00 | BSL_HUNT (score=+0.102) | AMD=ACCUMULATION(bearish,0.60) | HTF=+0.00 | DR=0.50 | flow=+0.43
+16:10:35.513 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [CISD] tick=80 rev=76 cont=172 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:10:37.081 | INFO | 🧠 POSTERIOR    | [GOLD|DELTA:PAXGUSD] 🧭 DIR_TELEMETRY: hunt=NEUTRAL conf=0.00 delivery= raw=+0.021 BSL=0.02 SSL=0.00 | low_confidence(composite=0.021<0.1)
+16:10:37.891 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] POST_SWEEP [DISPLACEMENT] tick=1 rev=25 cont=4 (need 76, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:10:41.884 | INFO | • SYSTEM       | 🌐 CROSS-ASSET | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:10:41.885 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] BTC DELTA BTCUSD | price 77273.0000 | SCANNING | open=2/6
+16:10:41.885 | INFO | • SYSTEM       | [NIFTY|ICICI:NIFTY] NIFTY ICICI NIFTY | price 23654.7000 | IN_POSITION | open=2/6
+16:10:41.886 | INFO | • SYSTEM       | [SILVER|DELTA:SLVONUSD] SILVER DELTA SLVONUSD | price 67.8750 | IN_POSITION | open=2/6
+16:10:42.146 | INFO | ⚖ RISK         | [BTC|DELTA:BTCUSD] ANALYSIS_TICK asset=BTC primary=DELTA symbol=BTCUSD state=SCANNING price=77273.0000 eval_ms=9.7 slots=2/6 policy=crypto lev=45x margin=50% risk_mult=1.00 loop=0.25s
+16:10:42.146 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] ANALYSIS_CROSS_ASSET asset=BTC | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:10:42.154 | INFO | ⚖ RISK         | [NIFTY|ICICI:NIFTY] ANALYSIS_TICK asset=NIFTY primary=ICICI symbol=NIFTY state=ACTIVE price=23654.7000 eval_ms=7.0 slots=2/6 policy=option lev=1x margin=42% risk_mult=0.85 loop=0.50s
+16:10:42.154 | INFO | • SYSTEM       | [NIFTY|ICICI:NIFTY] ANALYSIS_CROSS_ASSET asset=NIFTY | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:10:42.168 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] GOLD DELTA PAXGUSD | price 4508.0500 | SCANNING | open=2/6
+16:10:42.168 | INFO | ⚖ RISK         | [SILVER|DELTA:SLVONUSD] ANALYSIS_TICK asset=SILVER primary=DELTA symbol=SLVONUSD state=ACTIVE price=67.8750 eval_ms=0.1 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:10:42.169 | INFO | • SYSTEM       | [SILVER|DELTA:SLVONUSD] ANALYSIS_CROSS_ASSET asset=SILVER | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:10:42.696 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [CISD] tick=90 rev=74 cont=171 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:10:42.697 | INFO | 🧠 POSTERIOR    | [BTC|DELTA:BTCUSD] [THINK] State=POST_SWEEP | Flow=neutral(-0.09) | CVD=-0.14 | Target=short->$77,184(0.8ATR) | BSL=0.2ATR | SSL=0.8ATR | Struct=15m:ranging/4H:bullish | DR=EQ(50%) | SweepScore=R74/C171
+16:10:42.962 | INFO | 🧠 POSTERIOR    | [GOLD|DELTA:PAXGUSD] [THINK] State=POST_SWEEP | Flow=long(+0.25) | CVD=+0.92 | Target=long->$4,514(1.0ATR) | BSL=0.2ATR | SSL=0.0ATR | Struct=15m:ranging/4H:ranging | DR=EQ(50%) | SweepScore=R57/C13 | TPPlan=no eligible TP pool; best visible pool rejected: delivery probability 0.9120 < required 0.9343 for RR 0.16 (static 2.40,
+16:10:42.963 | INFO | ⚖ RISK         | [GOLD|DELTA:PAXGUSD] ANALYSIS_TICK asset=GOLD primary=DELTA symbol=PAXGUSD state=SCANNING price=4508.1000 eval_ms=8.6 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:10:42.963 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] ANALYSIS_CROSS_ASSET asset=GOLD | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:10:43.736 | INFO | 🧠 POSTERIOR    | [BTC|DELTA:BTCUSD] 🧭 DIR_TELEMETRY: hunt=BSL conf=0.23 delivery=bullish raw=+0.226 BSL=0.23 SSL=0.00 | BSL_HUNT (score=+0.226) | AMD=DISTRIBUTION(bullish,0.71) | HTF=+0.50 | DR=0.49 | flow=-0.08
+16:10:46.126 | INFO | 💧 LIQUIDITY    | [GOLD|DELTA:PAXGUSD] SWEEPS detected: 🎯 SWEEP [1m] BSL @$4,517->short q=0.64 wick=$4,518 vol=1.1x
+16:10:47.706 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] POST_SWEEP [DISPLACEMENT] tick=10 rev=140 cont=37 (need 76, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:10:47.967 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [CISD] tick=100 rev=72 cont=193 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:10:53.234 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [CISD] tick=110 rev=71 cont=183 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:10:55.620 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] POST_SWEEP [DISPLACEMENT] tick=20 rev=221 cont=59 (need 76, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:10:57.182 | INFO | ⚖ RISK         | [BTC|DELTA:BTCUSD] ANALYSIS_TICK asset=BTC primary=DELTA symbol=BTCUSD state=SCANNING price=77270.5000 eval_ms=0.1 slots=2/6 policy=crypto lev=45x margin=50% risk_mult=1.00 loop=0.25s
+16:10:57.182 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] ANALYSIS_CROSS_ASSET asset=BTC | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:10:57.183 | INFO | ⚖ RISK         | [NIFTY|ICICI:NIFTY] ANALYSIS_TICK asset=NIFTY primary=ICICI symbol=NIFTY state=ACTIVE price=23654.7000 eval_ms=0.1 slots=2/6 policy=option lev=1x margin=42% risk_mult=0.85 loop=0.50s
+16:10:57.183 | INFO | • SYSTEM       | [NIFTY|ICICI:NIFTY] ANALYSIS_CROSS_ASSET asset=NIFTY | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:10:57.191 | INFO | ⚖ RISK         | [SILVER|DELTA:SLVONUSD] ANALYSIS_TICK asset=SILVER primary=DELTA symbol=SLVONUSD state=ACTIVE price=67.8750 eval_ms=0.1 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:10:57.191 | INFO | • SYSTEM       | [SILVER|DELTA:SLVONUSD] ANALYSIS_CROSS_ASSET asset=SILVER | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:10:58.017 | INFO | ⚖ RISK         | [GOLD|DELTA:PAXGUSD] ANALYSIS_TICK asset=GOLD primary=DELTA symbol=PAXGUSD state=SCANNING price=4507.6500 eval_ms=7.1 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:10:58.017 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] ANALYSIS_CROSS_ASSET asset=GOLD | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:10:58.531 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [CISD] tick=120 rev=70 cont=183 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:11:03.515 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] POST_SWEEP [DISPLACEMENT] tick=30 rev=256 cont=68 (need 76, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:11:03.776 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [CISD] tick=130 rev=70 cont=178 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:11:07.477 | INFO | 🧠 POSTERIOR    | [GOLD|DELTA:PAXGUSD] 🧭 DIR_TELEMETRY: hunt=NEUTRAL conf=0.00 delivery= raw=+0.091 BSL=0.09 SSL=0.00 | low_confidence(composite=0.091<0.1)
+16:11:09.042 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [CISD] tick=140 rev=70 cont=176 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:11:12.278 | INFO | ⚖ RISK         | [BTC|DELTA:BTCUSD] ANALYSIS_TICK asset=BTC primary=DELTA symbol=BTCUSD state=SCANNING price=77261.5000 eval_ms=0.1 slots=2/6 policy=crypto lev=45x margin=50% risk_mult=1.00 loop=0.25s
+16:11:12.278 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] ANALYSIS_CROSS_ASSET asset=BTC | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:11:12.279 | INFO | ⚖ RISK         | [NIFTY|ICICI:NIFTY] ANALYSIS_TICK asset=NIFTY primary=ICICI symbol=NIFTY state=ACTIVE price=23654.7000 eval_ms=0.1 slots=2/6 policy=option lev=1x margin=42% risk_mult=0.85 loop=0.50s
+16:11:12.279 | INFO | • SYSTEM       | [NIFTY|ICICI:NIFTY] ANALYSIS_CROSS_ASSET asset=NIFTY | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:11:12.279 | INFO | ⚖ RISK         | [SILVER|DELTA:SLVONUSD] ANALYSIS_TICK asset=SILVER primary=DELTA symbol=SLVONUSD state=ACTIVE price=67.8800 eval_ms=0.1 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:11:12.280 | INFO | • SYSTEM       | [SILVER|DELTA:SLVONUSD] ANALYSIS_CROSS_ASSET asset=SILVER | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:11:13.080 | INFO | 🧠 POSTERIOR    | [BTC|DELTA:BTCUSD] [THINK] State=POST_SWEEP | Flow=neutral(-0.10) | CVD=-0.13 | Target=short->$77,184(0.7ATR) | BSL=0.3ATR | SSL=0.7ATR | Struct=15m:ranging/4H:bullish | DR=EQ(50%) | SweepScore=R70/C176
+16:11:13.345 | INFO | 🧠 POSTERIOR    | [GOLD|DELTA:PAXGUSD] [THINK] State=POST_SWEEP | Flow=neutral(+0.14) | CVD=+0.56 | Target=long->$4,537(5.1ATR) | BSL=0.1ATR | SSL=0.1ATR | Struct=15m:ranging/4H:ranging | DR=EQ(50%) | SweepScore=R257/C72 | TPPlan=no eligible TP pool; best visible pool rejected: delivery probability 0.9120 < required 0.9343 for RR 0.16 (static 2.40,
+16:11:13.346 | INFO | ⚖ RISK         | [GOLD|DELTA:PAXGUSD] ANALYSIS_TICK asset=GOLD primary=DELTA symbol=PAXGUSD state=SCANNING price=4508.5000 eval_ms=8.5 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:11:13.347 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] ANALYSIS_CROSS_ASSET asset=GOLD | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:11:14.117 | INFO | 🧠 POSTERIOR    | [BTC|DELTA:BTCUSD] 🧭 DIR_TELEMETRY: hunt=BSL conf=0.23 delivery=bullish raw=+0.229 BSL=0.23 SSL=0.00 | BSL_HUNT (score=+0.229) | AMD=DISTRIBUTION(bullish,0.71) | HTF=+0.50 | DR=0.48 | flow=-0.07
+16:11:14.136 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] POST_SWEEP [CISD] tick=40 rev=250 cont=72 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:11:16.238 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [CISD] tick=150 rev=70 cont=176 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:11:21.513 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [CISD] tick=160 rev=74 cont=170 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:11:22.042 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] POST_SWEEP [CISD] tick=50 rev=205 cont=74 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:11:26.812 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [CISD] tick=170 rev=72 cont=173 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:11:27.338 | INFO | ⚖ RISK         | [BTC|DELTA:BTCUSD] ANALYSIS_TICK asset=BTC primary=DELTA symbol=BTCUSD state=SCANNING price=77257.5000 eval_ms=10.1 slots=2/6 policy=crypto lev=45x margin=50% risk_mult=1.00 loop=0.25s
+16:11:27.338 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] ANALYSIS_CROSS_ASSET asset=BTC | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:11:27.342 | INFO | ⚖ RISK         | [NIFTY|ICICI:NIFTY] ANALYSIS_TICK asset=NIFTY primary=ICICI symbol=NIFTY state=ACTIVE price=23654.7000 eval_ms=4.1 slots=2/6 policy=option lev=1x margin=42% risk_mult=0.85 loop=0.50s
+16:11:27.342 | INFO | • SYSTEM       | [NIFTY|ICICI:NIFTY] ANALYSIS_CROSS_ASSET asset=NIFTY | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:11:27.343 | INFO | ⚖ RISK         | [SILVER|DELTA:SLVONUSD] ANALYSIS_TICK asset=SILVER primary=DELTA symbol=SLVONUSD state=ACTIVE price=67.8800 eval_ms=0.1 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:11:27.343 | INFO | • SYSTEM       | [SILVER|DELTA:SLVONUSD] ANALYSIS_CROSS_ASSET asset=SILVER | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:11:28.391 | INFO | ⚖ RISK         | [GOLD|DELTA:PAXGUSD] ANALYSIS_TICK asset=GOLD primary=DELTA symbol=PAXGUSD state=SCANNING price=4508.1000 eval_ms=7.5 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:11:28.396 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] ANALYSIS_CROSS_ASSET asset=GOLD | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:11:30.026 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] POST_SWEEP [CISD] tick=60 rev=185 cont=74 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:11:32.105 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [CISD] tick=180 rev=71 cont=174 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:11:34.216 | INFO | 🧠 POSTERIOR    | [BTC|DELTA:BTCUSD] 🧭 DIR_TELEMETRY: hunt=BSL conf=0.27 delivery=bullish raw=+0.266 BSL=0.27 SSL=0.00 | BSL_HUNT (score=+0.266) | AMD=DISTRIBUTION(bullish,0.71) | HTF=+0.50 | DR=0.48 | flow=+0.22
+16:11:37.405 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [CISD] tick=190 rev=115 cont=146 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:11:37.930 | INFO | 🧠 POSTERIOR    | [GOLD|DELTA:PAXGUSD] 🧭 DIR_TELEMETRY: hunt=NEUTRAL conf=0.00 delivery= raw=+0.055 BSL=0.05 SSL=0.00 | low_confidence(composite=0.055<0.1)
+16:11:37.935 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] POST_SWEEP [CISD] tick=70 rev=172 cont=75 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:11:39.529 | INFO | 🧠 POSTERIOR    | [BTC|DELTA:BTCUSD] 🧭 DIR_TELEMETRY: hunt=BSL conf=0.24 delivery=bullish raw=+0.242 BSL=0.24 SSL=0.00 | BSL_HUNT (score=+0.242) | AMD=DISTRIBUTION(bullish,0.71) | HTF=+0.50 | DR=0.49 | flow=+0.03
+16:11:42.147 | INFO | • SYSTEM       | [NIFTY|ICICI:NIFTY] NIFTY ICICI NIFTY | price 23654.7000 | IN_POSITION | open=2/6
+16:11:42.149 | INFO | • SYSTEM       | [SILVER|DELTA:SLVONUSD] SILVER DELTA SLVONUSD | price 67.8800 | IN_POSITION | open=2/6
+16:11:42.406 | INFO | • SYSTEM       | 🌐 CROSS-ASSET | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:11:42.419 | INFO | ⚖ RISK         | [BTC|DELTA:BTCUSD] ANALYSIS_TICK asset=BTC primary=DELTA symbol=BTCUSD state=SCANNING price=77265.5000 eval_ms=11.8 slots=2/6 policy=crypto lev=45x margin=50% risk_mult=1.00 loop=0.25s
+16:11:42.419 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] ANALYSIS_CROSS_ASSET asset=BTC | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:11:42.419 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] BTC DELTA BTCUSD | price 77265.5000 | SCANNING | open=2/6
+16:11:42.423 | INFO | ⚖ RISK         | [NIFTY|ICICI:NIFTY] ANALYSIS_TICK asset=NIFTY primary=ICICI symbol=NIFTY state=ACTIVE price=23654.7000 eval_ms=4.1 slots=2/6 policy=option lev=1x margin=42% risk_mult=0.85 loop=0.50s
+16:11:42.424 | INFO | • SYSTEM       | [NIFTY|ICICI:NIFTY] ANALYSIS_CROSS_ASSET asset=NIFTY | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:11:42.426 | INFO | ⚖ RISK         | [SILVER|DELTA:SLVONUSD] ANALYSIS_TICK asset=SILVER primary=DELTA symbol=SLVONUSD state=ACTIVE price=67.8800 eval_ms=2.1 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:11:42.426 | INFO | • SYSTEM       | [SILVER|DELTA:SLVONUSD] ANALYSIS_CROSS_ASSET asset=SILVER | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:11:42.974 | INFO | 🧠 POSTERIOR    | [NIFTY|ICICI:NIFTY] 📝 POOL-GATE CONTINUE: next target $23,693 — TP stays at $0 (immutability policy) | conf=0.70 | AMD_DELIVERY_INTACT + FLOW_OK + NEXT_POOL @ $23,693 (2.0R potential)
+16:11:42.989 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] GOLD DELTA PAXGUSD | price 4508.7500 | SCANNING | open=2/6
+16:11:43.503 | INFO | 🧠 POSTERIOR    | [BTC|DELTA:BTCUSD] [THINK] State=POST_SWEEP | Flow=short(-0.23) | CVD=-0.47 | Target=short->$77,184(0.8ATR) | BSL=0.3ATR | SSL=0.8ATR | Struct=15m:ranging/4H:bullish | DR=EQ(50%) | SweepScore=R103/C162
+16:11:43.769 | INFO | 🧠 POSTERIOR    | [GOLD|DELTA:PAXGUSD] [THINK] State=POST_SWEEP | Flow=neutral(-0.04) | CVD=-0.04 | Target=long->$4,537(5.0ATR) | BSL=0.1ATR | SSL=0.1ATR | Struct=15m:ranging/4H:ranging | DR=EQ(50%) | SweepScore=R155/C79 | TPPlan=no eligible TP pool; best visible pool rejected: delivery probability 0.9120 < required 0.9343 for RR 0.16 (static 2.40,
+16:11:43.770 | INFO | ⚖ RISK         | [GOLD|DELTA:PAXGUSD] ANALYSIS_TICK asset=GOLD primary=DELTA symbol=PAXGUSD state=SCANNING price=4508.8000 eval_ms=8.3 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:11:43.770 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] ANALYSIS_CROSS_ASSET asset=GOLD | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:11:44.557 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [OTE] tick=200 rev=98 cont=189 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:11:48.547 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] POST_SWEEP [CISD] tick=80 rev=124 cont=94 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:11:49.858 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [OTE] tick=210 rev=82 cont=181 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:11:55.220 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [OTE] tick=220 rev=75 cont=178 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:11:56.528 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] POST_SWEEP [CISD] tick=90 rev=225 cont=83 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:11:57.570 | INFO | ⚖ RISK         | [BTC|DELTA:BTCUSD] ANALYSIS_TICK asset=BTC primary=DELTA symbol=BTCUSD state=SCANNING price=77270.0000 eval_ms=0.1 slots=2/6 policy=crypto lev=45x margin=50% risk_mult=1.00 loop=0.25s
+16:11:57.570 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] ANALYSIS_CROSS_ASSET asset=BTC | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:11:57.570 | INFO | ⚖ RISK         | [NIFTY|ICICI:NIFTY] ANALYSIS_TICK asset=NIFTY primary=ICICI symbol=NIFTY state=ACTIVE price=23654.7000 eval_ms=0.1 slots=2/6 policy=option lev=1x margin=42% risk_mult=0.85 loop=0.50s
+16:11:57.571 | INFO | • SYSTEM       | [NIFTY|ICICI:NIFTY] ANALYSIS_CROSS_ASSET asset=NIFTY | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:11:57.573 | INFO | ⚖ RISK         | [SILVER|DELTA:SLVONUSD] ANALYSIS_TICK asset=SILVER primary=DELTA symbol=SLVONUSD state=ACTIVE price=67.8800 eval_ms=2.4 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:11:57.574 | INFO | • SYSTEM       | [SILVER|DELTA:SLVONUSD] ANALYSIS_CROSS_ASSET asset=SILVER | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:11:58.886 | INFO | ⚖ RISK         | [GOLD|DELTA:PAXGUSD] ANALYSIS_TICK asset=GOLD primary=DELTA symbol=PAXGUSD state=SCANNING price=4508.4000 eval_ms=7.3 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:11:58.887 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] ANALYSIS_CROSS_ASSET asset=GOLD | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:12:00.491 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [OTE] tick=230 rev=72 cont=176 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:12:04.514 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] POST_SWEEP [CISD] tick=100 rev=253 cont=79 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:12:05.832 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [OTE] tick=240 rev=71 cont=184 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:12:08.486 | INFO | 🧠 POSTERIOR    | [GOLD|DELTA:PAXGUSD] 🧭 DIR_TELEMETRY: hunt=NEUTRAL conf=0.00 delivery= raw=+0.058 BSL=0.06 SSL=0.00 | low_confidence(composite=0.058<0.1)
+16:12:09.524 | INFO | 🧠 POSTERIOR    | [BTC|DELTA:BTCUSD] 🧭 DIR_TELEMETRY: hunt=BSL conf=0.21 delivery=bullish raw=+0.211 BSL=0.21 SSL=0.00 | BSL_HUNT (score=+0.211) | AMD=DISTRIBUTION(bullish,0.71) | HTF=+0.50 | DR=0.49 | flow=-0.22
+16:12:12.678 | INFO | ⚖ RISK         | [NIFTY|ICICI:NIFTY] ANALYSIS_TICK asset=NIFTY primary=ICICI symbol=NIFTY state=ACTIVE price=23654.7000 eval_ms=2103.5 slots=2/6 policy=option lev=1x margin=42% risk_mult=0.85 loop=0.50s
+16:12:12.678 | INFO | • SYSTEM       | [NIFTY|ICICI:NIFTY] ANALYSIS_CROSS_ASSET asset=NIFTY | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:12:12.679 | INFO | ⚖ RISK         | [SILVER|DELTA:SLVONUSD] ANALYSIS_TICK asset=SILVER primary=DELTA symbol=SLVONUSD state=ACTIVE price=67.8800 eval_ms=0.1 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:12:12.679 | INFO | • SYSTEM       | [SILVER|DELTA:SLVONUSD] ANALYSIS_CROSS_ASSET asset=SILVER | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:12:12.981 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [OTE] tick=250 rev=179 cont=155 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:12:12.982 | INFO | ⚖ RISK         | [BTC|DELTA:BTCUSD] ANALYSIS_TICK asset=BTC primary=DELTA symbol=BTCUSD state=SCANNING price=77290.0000 eval_ms=51.5 slots=2/6 policy=crypto lev=45x margin=50% risk_mult=1.00 loop=0.25s
+16:12:12.982 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] ANALYSIS_CROSS_ASSET asset=BTC | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:12:14.034 | INFO | 🧠 POSTERIOR    | [BTC|DELTA:BTCUSD] [THINK] State=POST_SWEEP | Flow=neutral(-0.03) | CVD=-0.04 | Target=long->$77,383(0.9ATR) | BSL=0.0ATR | SSL=1.0ATR | Struct=15m:ranging/4H:bullish | DR=EQ(50%) | SweepScore=R169/C154
+16:12:14.297 | INFO | 🧠 POSTERIOR    | [GOLD|DELTA:PAXGUSD] [THINK] State=POST_SWEEP | Flow=neutral(+0.17) | CVD=+0.44 | Target=long->$4,537(4.9ATR) | BSL=0.8ATR | SSL=0.3ATR | Struct=15m:ranging/4H:ranging | DR=EQ(50%) | SweepScore=R212/C77 | TPPlan=no eligible TP pool; best visible pool rejected: delivery probability 0.9120 < required 0.9343 for RR 0.16 (static 2.40,
+16:12:14.297 | INFO | ⚖ RISK         | [GOLD|DELTA:PAXGUSD] ANALYSIS_TICK asset=GOLD primary=DELTA symbol=PAXGUSD state=SCANNING price=4509.6500 eval_ms=8.9 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:12:14.298 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] ANALYSIS_CROSS_ASSET asset=GOLD | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:12:15.119 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] POST_SWEEP [CISD] tick=110 rev=209 cont=77 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:12:18.272 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [OTE] tick=260 rev=132 cont=150 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:12:23.058 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] POST_SWEEP [CISD] tick=120 rev=200 cont=76 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:12:23.580 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [OTE] tick=270 rev=97 cont=164 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:12:27.873 | INFO | ⚖ RISK         | [NIFTY|ICICI:NIFTY] ANALYSIS_TICK asset=NIFTY primary=ICICI symbol=NIFTY state=ACTIVE price=23654.7000 eval_ms=4.0 slots=2/6 policy=option lev=1x margin=42% risk_mult=0.85 loop=0.50s
+16:12:27.873 | INFO | • SYSTEM       | [NIFTY|ICICI:NIFTY] ANALYSIS_CROSS_ASSET asset=NIFTY | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:12:27.882 | INFO | ⚖ RISK         | [SILVER|DELTA:SLVONUSD] ANALYSIS_TICK asset=SILVER primary=DELTA symbol=SLVONUSD state=ACTIVE price=67.8800 eval_ms=0.1 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:12:27.882 | INFO | • SYSTEM       | [SILVER|DELTA:SLVONUSD] ANALYSIS_CROSS_ASSET asset=SILVER | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:12:28.133 | INFO | ⚖ RISK         | [BTC|DELTA:BTCUSD] ANALYSIS_TICK asset=BTC primary=DELTA symbol=BTCUSD state=SCANNING price=77310.0000 eval_ms=0.1 slots=2/6 policy=crypto lev=45x margin=50% risk_mult=1.00 loop=0.25s
+16:12:28.133 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] ANALYSIS_CROSS_ASSET asset=BTC | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:12:28.928 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [OTE] tick=280 rev=90 cont=159 (need 55, gap>=15) CISD=✗ DISP=0.1ATR OTE=✗
+16:12:29.495 | INFO | ⚖ RISK         | [GOLD|DELTA:PAXGUSD] ANALYSIS_TICK asset=GOLD primary=DELTA symbol=PAXGUSD state=SCANNING price=4510.6000 eval_ms=7.4 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:12:29.495 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] ANALYSIS_CROSS_ASSET asset=GOLD | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:12:31.068 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] POST_SWEEP [OTE] tick=130 rev=171 cont=75 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:12:34.296 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [OTE] tick=290 rev=84 cont=160 (need 55, gap>=15) CISD=✗ DISP=0.1ATR OTE=✗
+16:12:39.047 | INFO | 🧠 POSTERIOR    | [GOLD|DELTA:PAXGUSD] 🧭 DIR_TELEMETRY: hunt=NEUTRAL conf=0.00 delivery= raw=-0.025 BSL=0.00 SSL=0.03 | low_confidence(composite=0.025<0.1)
+16:12:39.051 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] POST_SWEEP [OTE] tick=140 rev=123 cont=95 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:12:39.568 | INFO | 🧠 POSTERIOR    | [BTC|DELTA:BTCUSD] 🧭 DIR_TELEMETRY: hunt=BSL conf=0.18 delivery=bullish raw=+0.185 BSL=0.18 SSL=0.00 | BSL_HUNT (score=+0.185) | AMD=DISTRIBUTION(bullish,0.71) | HTF=+0.50 | DR=0.51 | flow=+0.45
+16:12:39.574 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] POST_SWEEP [OTE] tick=300 rev=128 cont=104 (need 55, gap>=15) CISD=✗ DISP=0.3ATR OTE=✗
+16:12:40.098 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] 🧠 POSTERIOR ACCEPTED: REVERSAL LONG [OTE] (rev=145 vs cont=100) | p=0.840 min=0.660 EV=1.061 LLR=1.66 U=0.36 ACCEPT quant posterior auction: info=0.64/0.18 edge=+0.38 disp=0.64 struct=0.00 cons=0.50 flow=+0.57 learned=0.50/0 EV=+1.061 LLR=1.66/1.56 | vol=0.27 liq=1.00/0.70 of=+0.50 cvd=+1.00 htf=+0.00 pd=+0.14 U=0.36 tox=0.00
+16:12:40.099 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] RAW_SL_ANCHOR: anchor=$77145.0 sl=$77101.7 quality=0.42 buffer=0.41ATR (score=4.22, sig=3.8)
+16:12:40.099 | INFO | ⚖ RISK         | [BTC|DELTA:BTCUSD] SL envelope reversal: $77118.7 -> $77101.7 (risk 2.21ATR, noise floor 1.81ATR)
+16:12:40.112 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] RAW_TP_CANDIDATE: $79400.9 dist=20.1ATR rr=8.88 P=0.0148 EV=0.059 gauntlet=0 (external-final frontier×1.34, final-runner target beyond first-sweep reach (20.1>18.0ATR; reach×0.48), ladder path score 0.77 across 15 internal pools, R:R 8.9, cross-asset: fresh cross-asset state; no material adjustment)
+16:12:40.113 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] 🧪 EXECUTABLE CANDIDATE: REVERSAL LONG | SL=$77,101.7 TP=$79,400.9 R:R=8.9 DISP=0.3ATR
+16:12:40.113 | INFO | ⚖ RISK         | [BTC|DELTA:BTCUSD] 🌐 CrossAsset overlay [BTC LONG] pΔ=+0.000 risk×1.00 tpΔ=+0.00 sl×1.00 cluster=0.00 | fresh cross-asset state; no material adjustment
+16:12:40.114 | INFO | 🧠 POSTERIOR    | [BTC|DELTA:BTCUSD] TargetSurface advisory LONG REVERSAL: selected TP has no positive executable utility; selected=terminal $79,453.5 p=0.088 EV=-0.862 U=-2.366 fullU=-2.366 RR=9.10 d=20.1ATR
+16:12:40.384 | INFO | 📡 MARKET-DATA  | [BTC|DELTA:BTCUSD] ✅ Balance USD: available=$191.74 locked=$4.96 total=$196.70
+16:12:40.384 | INFO | ⚖ RISK         | [BTC|DELTA:BTCUSD] 💰 Initial balance set: $196.70
+16:12:40.385 | INFO | 🧠 POSTERIOR    | [BTC|DELTA:BTCUSD] Safety audit paused routing LONG REVERSAL: score=0.90 RR=8.88 target=0.93 | selected TP has no positive executable utility: terminal $79,453.5 p=0.088 EV=-0.862 U=-2.366 fullU=-2.366 RR=9.10 d=20.1ATR
+16:12:40.385 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] EntryEngine pre-order rejection: sweep lock shortened to 45s for SSL $77,305.0
+16:12:40.386 | INFO | ⚖ RISK         | [BTC|DELTA:BTCUSD] EntryEngine refine watch armed: SWEEP_REVERSAL LONG sweep $77305.0 -> terminal TP $79400.9 for 1200s (risk 232.8 pts, required 0.0 pts, gap 0.0 pts)
+16:12:42.924 | INFO | ⚖ RISK         | [NIFTY|ICICI:NIFTY] ANALYSIS_TICK asset=NIFTY primary=ICICI symbol=NIFTY state=ACTIVE price=23654.7000 eval_ms=2270.8 slots=2/6 policy=option lev=1x margin=42% risk_mult=0.85 loop=0.50s
+16:12:42.924 | INFO | • SYSTEM       | [NIFTY|ICICI:NIFTY] ANALYSIS_CROSS_ASSET asset=NIFTY | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:12:42.925 | INFO | • SYSTEM       | [NIFTY|ICICI:NIFTY] NIFTY ICICI NIFTY | price 23654.7000 | IN_POSITION | open=2/6
+16:12:42.933 | INFO | ⚖ RISK         | [SILVER|DELTA:SLVONUSD] ANALYSIS_TICK asset=SILVER primary=DELTA symbol=SLVONUSD state=ACTIVE price=67.8800 eval_ms=0.1 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:12:42.934 | INFO | • SYSTEM       | [SILVER|DELTA:SLVONUSD] ANALYSIS_CROSS_ASSET asset=SILVER | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:12:42.934 | INFO | • SYSTEM       | [SILVER|DELTA:SLVONUSD] SILVER DELTA SLVONUSD | price 67.8800 | IN_POSITION | open=2/6
+16:12:43.185 | INFO | • SYSTEM       | 🌐 CROSS-ASSET | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:12:43.198 | INFO | ⚖ RISK         | [BTC|DELTA:BTCUSD] ANALYSIS_TICK asset=BTC primary=DELTA symbol=BTCUSD state=SCANNING price=77324.0000 eval_ms=12.7 slots=2/6 policy=crypto lev=45x margin=50% risk_mult=1.00 loop=0.25s
+16:12:43.198 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] ANALYSIS_CROSS_ASSET asset=BTC | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:12:43.199 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] BTC DELTA BTCUSD | price 77324.0000 | SCANNING | open=2/6
+16:12:43.734 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] GOLD DELTA PAXGUSD | price 4510.6000 | SCANNING | open=2/6
+16:12:44.248 | INFO | 🧠 POSTERIOR    | [BTC|DELTA:BTCUSD] [THINK] State=SCANNING | Flow=long(+0.22) | CVD=+0.80 | Target=long->$77,383(0.6ATR) | BSL=0.6ATR | SSL=1.3ATR | Struct=15m:ranging/4H:bullish | DR=EQ(50%) | Track=long->$79,401 | SweepState=[deferred:liq:stale=12] | TPPlan=selected $79,400.9; RR=8.88; EV=0.059; P=0.01
+16:12:44.512 | INFO | 🧠 POSTERIOR    | [GOLD|DELTA:PAXGUSD] [THINK] State=POST_SWEEP | Flow=neutral(-0.16) | CVD=-0.32 | Target=long->$4,537(4.7ATR) | BSL=0.6ATR | SSL=0.5ATR | Struct=15m:ranging/4H:ranging | DR=EQ(50%) | SweepScore=R108/C103 | TPPlan=no eligible TP pool; best visible pool rejected: delivery probability 0.9120 < required 0.9343 for RR 0.16 (static 2.40,
+16:12:44.513 | INFO | ⚖ RISK         | [GOLD|DELTA:PAXGUSD] ANALYSIS_TICK asset=GOLD primary=DELTA symbol=PAXGUSD state=SCANNING price=4510.6000 eval_ms=8.4 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:12:44.513 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] ANALYSIS_CROSS_ASSET asset=GOLD | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:12:49.261 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] POST_SWEEP [OTE] tick=150 rev=93 cont=112 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:12:57.169 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] POST_SWEEP [OTE] tick=160 rev=89 cont=107 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:12:57.952 | INFO | ⚖ RISK         | [NIFTY|ICICI:NIFTY] ANALYSIS_TICK asset=NIFTY primary=ICICI symbol=NIFTY state=ACTIVE price=23654.7000 eval_ms=3.8 slots=2/6 policy=option lev=1x margin=42% risk_mult=0.85 loop=0.50s
+16:12:57.952 | INFO | • SYSTEM       | [NIFTY|ICICI:NIFTY] ANALYSIS_CROSS_ASSET asset=NIFTY | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:12:57.961 | INFO | ⚖ RISK         | [SILVER|DELTA:SLVONUSD] ANALYSIS_TICK asset=SILVER primary=DELTA symbol=SLVONUSD state=ACTIVE price=67.8800 eval_ms=0.1 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:12:57.961 | INFO | • SYSTEM       | [SILVER|DELTA:SLVONUSD] ANALYSIS_CROSS_ASSET asset=SILVER | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:12:58.212 | INFO | ⚖ RISK         | [BTC|DELTA:BTCUSD] ANALYSIS_TICK asset=BTC primary=DELTA symbol=BTCUSD state=SCANNING price=77346.5000 eval_ms=0.1 slots=2/6 policy=crypto lev=45x margin=50% risk_mult=1.00 loop=0.25s
+16:12:58.212 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] ANALYSIS_CROSS_ASSET asset=BTC | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:12:59.566 | INFO | ⚖ RISK         | [GOLD|DELTA:PAXGUSD] ANALYSIS_TICK asset=GOLD primary=DELTA symbol=PAXGUSD state=SCANNING price=4512.1000 eval_ms=7.4 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:12:59.567 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] ANALYSIS_CROSS_ASSET asset=GOLD | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:13:00.625 | INFO | 🧠 POSTERIOR    | [BTC|DELTA:BTCUSD] 🧭 DIR_TELEMETRY: hunt=BSL conf=0.14 delivery=bullish raw=+0.140 BSL=0.14 SSL=0.00 | BSL_HUNT (score=+0.140) | AMD=DISTRIBUTION(bullish,0.71) | HTF=+0.50 | DR=0.52 | flow=+0.11
+16:13:05.131 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] POST_SWEEP [OTE] tick=170 rev=89 cont=103 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:13:09.127 | INFO | 🧠 POSTERIOR    | [GOLD|DELTA:PAXGUSD] 🧭 DIR_TELEMETRY: hunt=NEUTRAL conf=0.00 delivery= raw=+0.013 BSL=0.01 SSL=0.00 | low_confidence(composite=0.013<0.1)
+16:13:13.073 | INFO | ⚖ RISK         | [NIFTY|ICICI:NIFTY] ANALYSIS_TICK asset=NIFTY primary=ICICI symbol=NIFTY state=ACTIVE price=23654.7000 eval_ms=3.9 slots=2/6 policy=option lev=1x margin=42% risk_mult=0.85 loop=0.50s
+16:13:13.074 | INFO | • SYSTEM       | [NIFTY|ICICI:NIFTY] ANALYSIS_CROSS_ASSET asset=NIFTY | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:13:13.076 | INFO | ⚖ RISK         | [SILVER|DELTA:SLVONUSD] ANALYSIS_TICK asset=SILVER primary=DELTA symbol=SLVONUSD state=ACTIVE price=67.8800 eval_ms=2.4 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:13:13.077 | INFO | • SYSTEM       | [SILVER|DELTA:SLVONUSD] ANALYSIS_CROSS_ASSET asset=SILVER | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:13:13.327 | INFO | ⚖ RISK         | [BTC|DELTA:BTCUSD] ANALYSIS_TICK asset=BTC primary=DELTA symbol=BTCUSD state=SCANNING price=77332.0000 eval_ms=0.1 slots=2/6 policy=crypto lev=45x margin=50% risk_mult=1.00 loop=0.25s
+16:13:13.328 | INFO | • SYSTEM       | [BTC|DELTA:BTCUSD] ANALYSIS_CROSS_ASSET asset=BTC | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:13:14.643 | INFO | 🧠 POSTERIOR    | [BTC|DELTA:BTCUSD] [THINK] State=SCANNING | Flow=short(-0.22) | CVD=-0.43 | Target=long->$77,383(0.5ATR) | BSL=0.5ATR | SSL=1.4ATR | Struct=15m:ranging/4H:bullish | DR=EQ(50%) | Track=long->$79,401 | SweepState=[deferred:liq:stale=12] | TPPlan=selected $79,400.9; RR=8.88; EV=0.059; P=0.01
+16:13:15.210 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] POST_SWEEP [OTE] tick=180 rev=131 cont=89 (need 55, gap>=15) CISD=✗ DISP=0.0ATR OTE=✗
+16:13:15.211 | INFO | 🧠 POSTERIOR    | [GOLD|DELTA:PAXGUSD] [THINK] State=POST_SWEEP | Flow=neutral(+0.07) | CVD=+0.31 | Target=long->$4,537(4.3ATR) | BSL=0.1ATR | SSL=0.9ATR | Struct=15m:ranging/4H:ranging | DR=EQ(50%) | SweepScore=R131/C89 | TPPlan=no eligible TP pool; best visible pool rejected: delivery probability 0.9120 < required 0.9343 for RR 0.16 (static 2.40,
+16:13:15.211 | INFO | ⚖ RISK         | [GOLD|DELTA:PAXGUSD] ANALYSIS_TICK asset=GOLD primary=DELTA symbol=PAXGUSD state=SCANNING price=4513.1500 eval_ms=9.5 slots=2/6 policy=commodity lev=25x margin=36% risk_mult=1.00 loop=0.65s
+16:13:15.212 | INFO | • SYSTEM       | [GOLD|DELTA:PAXGUSD] ANALYSIS_CROSS_ASSET asset=GOLD | metals=RELATIVE_VALUE_DIVERGENCE pref=SILVER relQ=0.73 GSρ=+0.48 BTC/Gρ=+0.75 BTC/Sρ=+0.33 AgRVz=+1.86 cluster=0.53
+16:13
