@@ -1931,10 +1931,23 @@ class QuantStrategy:
         lineage = dict(quality.get("lineage", {}) or {})
         frames = dict(quality.get("frames", {}) or {})
         if quality and (changed or periodic):
-            frame_txt = " | ".join(
-                f"{tf}:n={v.get('bars',0)} age={('N/A' if v.get('last_age_sec') is None else f'{v.get('last_age_sec'):.1f}s')} dup={v.get('duplicates',0)} gap={v.get('gaps',0)} badOHLC={v.get('invalid_ohlc',0)} vol={v.get('volume_status','?')}({v.get('nonzero_volume_bars',0)})"
-                for tf, v in frames.items()
-            )
+            frame_rows = []
+            for tf, frame in frames.items():
+                last_age = frame.get("last_age_sec")
+                last_age_txt = "N/A" if last_age is None else "{:.1f}s".format(float(last_age))
+                frame_rows.append(
+                    "{}:n={} age={} dup={} gap={} badOHLC={} vol={}({})".format(
+                        tf,
+                        frame.get("bars", 0),
+                        last_age_txt,
+                        frame.get("duplicates", 0),
+                        frame.get("gaps", 0),
+                        frame.get("invalid_ohlc", 0),
+                        frame.get("volume_status", "?"),
+                        frame.get("nonzero_volume_bars", 0),
+                    )
+                )
+            frame_txt = " | ".join(frame_rows)
             native = getattr(getattr(self, "_liq_map", None), "_native_atr_by_tf", {}) or {}
             native_txt = ",".join(f"{tf}={float(native.get(tf,0.0)):.4f}" for tf in ("5m","15m","4h") if tf in native) or "pending"
             logger.info(

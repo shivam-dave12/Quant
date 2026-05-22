@@ -573,3 +573,42 @@ def test_execution_cost_gate_observes_current_completed_five_minute_atr_before_s
     qs._evaluate_entry(DM(), SimpleNamespace(), SimpleNamespace(), now)
     assert seen and seen[0] > 0.0
     assert qs._entry_engine.get_signal() is None
+
+
+def test_data_lineage_snapshot_formats_frame_age_at_runtime_without_parser_sensitive_nested_fstrings(caplog):
+    import logging
+    qs = QuantStrategy.__new__(QuantStrategy)
+    qs._last_decision_fingerprint = None
+    qs._last_decision_log = 0.0
+    qs._decision_snapshot_sec = 60.0
+    qs._last_spread_gate_context = {}
+    qs._last_data_integrity_context = {
+        "ok": True,
+        "blockers": [],
+        "lineage": {
+            "analysis_source": "DeltaDataManager",
+            "analysis_domain": "CONTRACT_PRICE",
+            "execution_source": "DeltaDataManager",
+            "execution_domain": "CONTRACT_PRICE",
+        },
+        "analysis_quote_fresh": True,
+        "last_update_age_sec": 0.25,
+        "frames": {
+            "5m": {"bars": 200, "last_age_sec": 1.5, "duplicates": 0, "gaps": 0,
+                   "invalid_ohlc": 0, "volume_status": "OBSERVED", "nonzero_volume_bars": 200},
+            "15m": {"bars": 200, "last_age_sec": None, "duplicates": 0, "gaps": 0,
+                    "invalid_ohlc": 0, "volume_status": "UNAVAILABLE", "nonzero_volume_bars": 0},
+        },
+    }
+    qs._liq_map = SimpleNamespace(_native_atr_by_tf={"5m": 1.0, "15m": 2.0, "4h": 8.0})
+    info = {
+        "state": "SCANNING", "block_reason": "AWAITING_FRESH_5M_LIQUIDITY_RAID", "trigger": "WAIT",
+        "context_4h": "bearish", "context_15m": "bearish", "context_aligned": True,
+        "context_direction": "short", "entry_5m_atr": 1.0,
+    }
+    with caplog.at_level(logging.INFO, logger="strategy.quant_strategy"):
+        qs._log_ict_decision_snapshot(info, 100.0, 100.0)
+    lineage_lines = [r.message for r in caplog.records if "DATA_LINEAGE" in r.message]
+    assert len(lineage_lines) == 1
+    assert "5m:n=200 age=1.5s" in lineage_lines[0]
+    assert "15m:n=200 age=N/A" in lineage_lines[0]

@@ -1214,7 +1214,7 @@ class TelegramBotController:
         return "\n".join(["🛡️ <b>EXECUTION RISK STATUS</b>",
                           f"Trade gate: {'OPEN' if allowed else _esc(reason)}",
                           f"Realised today: {cur}{dpnl:+,.2f} ({dpct:+.2f}% of {cur}{init_bal:,.2f})",
-                          f"Re-entry interval: {'ready' if remaining == 0 else f'{remaining:.0f}s remaining'}",
+                          "Re-entry interval: {}".format("ready" if remaining == 0 else "{:.0f}s remaining".format(remaining)),
                           f"Position: {'ACTIVE' if strat.get_position() else 'FLAT'}"])
 
 
