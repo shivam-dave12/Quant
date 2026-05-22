@@ -730,6 +730,8 @@ class PositionState:
     entry_order_id: Optional[str] = None; entry_time: float = 0.0
     initial_risk: float = 0.0; initial_sl_dist: float = 0.0
     entry_signal: Optional[StructuralEntrySummary] = None
+    # Execution-time structural ATR retained for protected-position audit and recovery.
+    entry_atr: float = 0.0
     peak_profit: float = 0.0
     peak_price_abs: float = 0.0  # realised path extreme for execution analytics
     last_seen_price: float = 0.0
@@ -794,7 +796,8 @@ class PositionState:
                 "analysis_entry_price": float(self.analysis_entry_price or 0.0),
                 "analysis_sl_price": float(self.analysis_sl_price or 0.0),
                 "analysis_tp_price": float(self.analysis_tp_price or 0.0),
-                "analysis_atr": float(self.analysis_atr or 0.0)}
+                "analysis_atr": float(self.analysis_atr or 0.0),
+                "entry_atr": float(self.entry_atr or 0.0)}
 
 # ═══════════════════════════════════════════════════════════════
 # DAILY RISK GATE with consecutive loss lockout
@@ -989,6 +992,25 @@ class QuantStrategy:
         self._last_closed_atr = 0.0
         self._log_init()
 
+    @staticmethod
+    def _execution_session_label(now: Optional[datetime] = None) -> str:
+        """Auditable market-session label; never participates in entry alpha."""
+        dt = now or datetime.now(DailyRiskGate._IST)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=DailyRiskGate._IST)
+        local = dt.astimezone(DailyRiskGate._IST)
+        minute = local.hour * 60 + local.minute
+        weekday = local.weekday() < 5
+        if weekday and (9 * 60 + 15) <= minute < (15 * 60 + 30):
+            return "INDIA_FNO_SESSION"
+        if (5 * 60 + 30) <= minute < (13 * 60 + 30):
+            return "ASIA_GLOBAL_SESSION"
+        if (13 * 60 + 30) <= minute < (20 * 60 + 30):
+            return "EUROPE_GLOBAL_SESSION"
+        if (19 * 60) <= minute or minute < (2 * 60 + 30):
+            return "US_GLOBAL_SESSION"
+        return "OFF_SESSION"
+
     def _telegram_context(self) -> dict:
         """Runtime context attached to every asset-specific Telegram alert."""
         try:
@@ -1042,13 +1064,10 @@ class QuantStrategy:
         logger.info(f"   LiquidityMap: {'ACTIVE' if self._liq_map is not None else 'UNAVAILABLE'} | targets=opposing 15m/4H/1D liquidity")
         logger.info("   Context: ACTIVE (4H/15m) | Trigger: ACTIVE (5m raid→MSS→FVG)")
         logger.info("   Execution: venue lot rules + structural SL risk + bracket protection + exact-fill reconciliation")
-        logger.info("   ExitModel: fixed structural SL + liquidity TP ladder/final target")
+        logger.info("   ExitModel: structural SL + opposing 15m/4H/1D liquidity targets")
         logger.info("=" * 80)
 
-    def _signal_entry_type_value(signal) -> str:
-        et = getattr(signal, "entry_type", "")
-        return getattr(et, "value", str(et))
-
+    @staticmethod
     def _bounded(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
         return max(lo, min(hi, float(value)))
 
@@ -1843,7 +1862,7 @@ class QuantStrategy:
         if signal is None:
             if now - self._last_think_log >= self._think_interval:
                 self._last_think_log = now
-                info = self._entry_engine.analysis_info() or {}
+                info = self._entry_engine.analysis_info or {}
                 logger.info("ICT_LIQUIDITY SCAN state=%s 4H=%s 15m=%s trigger=%s price=%.4f", info.get("state", "SCANNING"), info.get("context_4h", "-"), info.get("context_15m", "-"), info.get("trigger", "WAIT"), price)
             return
         side = str(signal.side or "").lower()
@@ -1871,6 +1890,7 @@ class QuantStrategy:
         self._entry_engine.on_entry_placed(signal)
         self._launch_entry_async(data_manager, order_manager, risk_manager, side, sig, mode="ict_liquidity", setup_grade="STRUCTURAL", prefetched_bal_info=bal_info, entry_now=now)
 
+    @staticmethod
     def _clamp_ladder_value(value: float, lo: float, hi: float) -> float:
         """Local numeric clamp for TP-ladder path math.
 
@@ -2332,8 +2352,17 @@ class QuantStrategy:
         inst = getattr(self, "_instrument", None) or current_instrument()
         ex = _icici_exchange_name(inst)
         symbol = str(getattr(inst, "execution_symbol", "") or getattr(inst, "display_symbol", "") or QCfg.SYMBOL())
-        asset = str(getattr(inst, "asset_id", "") or getattr(self, "_asset_id", "") or symbol).upper()
         is_inr = ex == "icici"
+        if is_inr:
+            selected = _icici_selected_contract_dict(inst)
+            symbol = str(
+                selected.get("selected_symbol")
+                or selected.get("TradingSymbol")
+                or selected.get("trading_symbol")
+                or selected.get("symbol")
+                or symbol
+            )
+        asset = str(getattr(inst, "asset_id", "") or getattr(self, "_asset_id", "") or symbol).upper()
         pnl_model = "inverse_btcusd" if ex == "delta" and symbol.upper() == "BTCUSD" else "linear"
         return {
             "exchange": ex,
@@ -2461,6 +2490,11 @@ class QuantStrategy:
             exec_atr = _icici_execution_atr(data_manager, entry_premium=price)
             if exec_atr > 1e-10:
                 atr = exec_atr
+            # Contract activation changes the executable instrument identity from
+            # NIFTY underlying to the selected CE/PE. Ledger, P&L and reporting
+            # metadata must be bound to that exact NFO option before an order is sent.
+            _accounting = self._position_accounting_context()
+            _entry_cur = str(_accounting.get("currency_symbol", "₹"))
             logger.info(
                 "ICICI preselected session execution vehicle activated: %s %s strike=%s expiry=%s live_premium=%.2f lot=%.0f live_cost=%.2f funds=%.2f",
                 getattr(_icici_selected_choice, "right", ""),
@@ -3140,8 +3174,20 @@ class QuantStrategy:
                 logger.debug(f"ExecCost snapshot error (non-fatal): {e}")
 
         sdf = abs(fill_price - sl_price)
-        ir  = sdf * qty
-        entry_session = self._current_entry_session()
+        ir = sdf * qty
+        # Filled-order risk metrics must be defined from the confirmed execution,
+        # not from pre-order marks. Quantity represents executable exposure units
+        # for every supported venue; core.pnl applies the venue payoff model.
+        dollar_risk = abs(gross_pnl_usd(
+            side, fill_price, sl_price, qty,
+            inverse=(str(_accounting.get("pnl_model", "linear")).lower() == "inverse_btcusd"),
+        ))
+        reward_value = abs(gross_pnl_usd(
+            side, fill_price, tp_price, qty,
+            inverse=(str(_accounting.get("pnl_model", "linear")).lower() == "inverse_btcusd"),
+        ))
+        rr_a = reward_value / max(dollar_risk, 1e-12)
+        entry_session = self._execution_session_label()
 
 
         _quality = dict(getattr(getattr(self, "_last_entry_signal", None), "quality", {}) or {})
@@ -3242,7 +3288,7 @@ class QuantStrategy:
             f"5m raid: {_raid_label} @ {_entry_cur}{_raid_px:,.4f} | displacement: {_disp:.2f} ATR\n"
             f"Delivery probability: {_delivery_p:.2f} | structural utility: {_utility:+.2f}R\n"
             f"Structural risk: {_entry_cur}{dollar_risk:,.2f} | {_fee_line}\n"
-            "Exit authority: attached structural SL + liquidity TP ladder/final target"
+            "Exit authority: attached structural SL + opposing higher-timeframe liquidity targets"
         )
         self._send_telegram(_entry_msg, event_type="entry")
         logger.info("✅ ACTIVE ICT_LIQUIDITY %s @ %s%.4f | SL=%s%.4f TP=%s%.4f | R:R=1:%.2f", side.upper(), _entry_cur, fill_price, _entry_cur, sl_price, _entry_cur, tp_price, rr_a)
@@ -3272,7 +3318,14 @@ class QuantStrategy:
         return profit, new_extreme
 
     def _manage_active(self, data_manager, order_manager, now):
-        """Manage positions only through attached protection and liquidity TP fills."""
+        """Manage protected exposure without introducing a second alpha authority.
+
+        Delta/CoinSwitch positions are monetised through their exchange-resident
+        liquidity targets. ICICI long-premium options preserve the original
+        single-live-exit invariant: a broker STOPLOSS remains armed and the
+        locally supervised premium target triggers one priced SELL-to-close only
+        after the protective stop has been cancelled or proven terminal.
+        """
         pos = self._pos
         if pos.is_flat():
             return
@@ -3284,6 +3337,20 @@ class QuantStrategy:
             return
         self._last_known_price = price
         self._observe_position_extremes(pos, price)
+
+        exchange = str(getattr(pos, "exchange", "") or "").lower()
+        side = str(getattr(pos, "side", "") or "").lower()
+        tp = float(getattr(pos, "tp_price", 0.0) or 0.0)
+        tp_hit = tp > 0.0 and ((side == "long" and price >= tp) or (side == "short" and price <= tp))
+        if exchange == "icici" and tp_hit and pos.phase == PositionPhase.ACTIVE:
+            cur = str(getattr(pos, "currency_symbol", "") or "₹")
+            logger.info(
+                "ICICI supervised liquidity target reached: premium=%s%.4f target=%s%.4f; "
+                "cancelling protective SL before priced SELL-to-close",
+                cur, price, cur, tp)
+            self._exit_trade(order_manager, price, "liquidity_tp_hit")
+            return
+
         try:
             self._book_tp_ladder_partials(order_manager, pos)
             self._reconcile_tp_ladder_quantity(order_manager, pos)
@@ -3301,7 +3368,7 @@ class QuantStrategy:
         if pos is None or pos.is_flat() or pos.phase != PositionPhase.ACTIVE:
             return False
         exit_side = "sell" if pos.side == "long" else "buy"
-        cur = "₹" if _icici_exchange_name(getattr(self, "_instrument", None)) == "icici" else "$"
+        cur = str(getattr(pos, "currency_symbol", "") or ("₹" if _icici_exchange_name(getattr(self, "_instrument", None)) == "icici" else "$"))
         with self._lock:
             if self._pos.phase != PositionPhase.ACTIVE:
                 return False
@@ -3410,8 +3477,8 @@ class QuantStrategy:
             self._exit_completed = True   # CLAIM: this thread owns the exit
 
         # ─── Step 1: Get exchange-confirmed exit data ──────────────────────────
-        # Step 1A: manual/profit-defense reduce-only market exit.
-        # If _exit_trade() flattened with a market order, SL/TP child ids were
+        # Step 1A: manual/supervised-liquidity reduce-only exit.
+        # If _exit_trade() submitted a protected close, SL/TP child ids were
         # cancelled and identify_exit_order() cannot identify the fired order.
         # Query the tracked market order first and book exact PnL from it.
         exit_info: Dict = {"confirmed": False}
@@ -3547,9 +3614,12 @@ class QuantStrategy:
         elif exit_type == "protective_sl":
             exit_reason = "protective_sl_hit"; is_tp_hit = False; is_sl_hit = True
         elif exit_type == "manual_exit":
-            # Preserve the broker-confirmed manual-exit reason.
+            # Preserve the broker-confirmed supervised-close reason. A locally
+            # supervised ICICI liquidity target is economically a TP even though
+            # the broker sees one explicit priced SELL-to-close after SL cancel.
             exit_reason = str(exit_info.get('exit_reason') or getattr(pos, 'manual_exit_reason', '') or 'manual_exit')
-            is_tp_hit = False; is_sl_hit = False
+            is_tp_hit = exit_reason in ("liquidity_tp_hit", "tp_hit", "final_tp_hit")
+            is_sl_hit = False
         else:
             exit_reason = "sl_hit";       is_tp_hit = False; is_sl_hit = True
 
@@ -3727,7 +3797,7 @@ class QuantStrategy:
                 margin_used=_exit_margin_used,
                 fee_source=_fee_source,
                 exact_fees=entry_fee_is_exact and exit_fee_is_exact,
-                exit_model="fixed SL + dynamic liquidity TP ladder",
+                exit_model="structural SL + opposing-liquidity targets",
                 portfolio_pnl=self._total_pnl,
                 portfolio_open=0,
                 residual_qty=_residual_qty,
@@ -3772,6 +3842,8 @@ class QuantStrategy:
             "timestamp": time.time(), "currency": str(getattr(pos, "currency_symbol", "$") or "$"),
             "currency_code": str(getattr(pos, "currency_code", "USD") or "USD"),
             "asset": str(getattr(pos, "asset_id", "") or self._asset_id),
+            "exchange": str(getattr(pos, "exchange", "") or ""),
+            "execution_symbol": str(getattr(pos, "execution_symbol", "") or QCfg.SYMBOL()),
             "symbol": str(getattr(pos, "execution_symbol", "") or QCfg.SYMBOL()),
             "side": str(getattr(pos, "side", "") or ""), "mode": "ICT_LIQUIDITY_4H_15M_5M",
             "entry": float(getattr(pos, "entry_price", 0.0) or 0.0), "exit": float(exit_price or 0.0),
@@ -4502,7 +4574,7 @@ class QuantStrategy:
         price = float(current_price or self._last_known_price or 0.0)
         cur = str(getattr(p, "currency_symbol", self._position_accounting_context().get("currency_symbol", "$")) or "$")
         state = self._entry_engine.state if self._entry_engine is not None else "UNAVAILABLE"
-        analysis = self._entry_engine.analysis_info() if self._entry_engine is not None else {}
+        analysis = self._entry_engine.analysis_info if self._entry_engine is not None else {}
         atr = float(self._atr_5m.atr or 0.0)
         lines = [
             "🏛 <b>ICT + LIQUIDITY STATUS</b>",
@@ -4723,7 +4795,7 @@ class QuantStrategy:
             self._pos = PositionState(phase=PositionPhase.ACTIVE, side=iside, quantity=ex_size,
                 entry_price=ex_entry, sl_price=sl_p, tp_price=tp_p, sl_order_id=sl_oid,
                 tp_order_id=tp_oid, entry_time=time.time(), initial_sl_dist=_adopt_sl_dist,
-                entry_atr=_adopt_atr, entry_session=self._current_entry_session(),
+                entry_atr=_adopt_atr, entry_session=self._execution_session_label(),
                 tp_ladder_initial_qty=ex_size, tp_ladder_last_sync_qty=ex_size,
                 last_seen_price=ex_entry,
                 exchange=str(_adopt_accounting.get("exchange", "")),

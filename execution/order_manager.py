@@ -1975,7 +1975,8 @@ class OrderManager:
             if not self._check_window_rate_limit():
                 return None
             api_side = self._normalize_side(side)
-            logger.info(f"LIMIT {side} qty={quantity} @ ${price:,.2f}")
+            cur = "₹" if self._exchange_name == "icici" else "$"
+            logger.info(f"LIMIT {side} qty={quantity} @ {cur}{price:,.2f}")
             data = self._place_with_retry(
                 side=api_side, order_type="LIMIT",
                 quantity=quantity, price=price, reduce_only=reduce_only)
@@ -1986,7 +1987,7 @@ class OrderManager:
                     "status": data.get("status", "UNKNOWN"),
                     "timestamp": datetime.now().isoformat(),
                 })
-                logger.info(f"✅ Limit order: {data['order_id']} @ ${price:,.2f}")
+                logger.info(f"✅ Limit order: {data['order_id']} @ {cur}{price:,.2f}")
             return data
         except Exception as e:
             logger.error(f"place_limit_order error: {e}", exc_info=True)
@@ -2003,7 +2004,8 @@ class OrderManager:
           the REST call returns a valid order_id. Used by the strategy
           watchdog to switch from Stage-A to Stage-B timing. Never raises.
         """
-        logger.info(f"🎯 Maker entry: {side} {quantity} @ ${limit_price:.2f} "
+        cur = "₹" if self._exchange_name == "icici" else "$"
+        logger.info(f"🎯 Maker entry: {side} {quantity} @ {cur}{limit_price:.2f} "
                     f"(timeout={timeout_sec:.0f}s)")
 
         data = self.place_limit_order(side=side, quantity=quantity,
@@ -2052,8 +2054,8 @@ class OrderManager:
                 data["fill_price"] = fill_px
                 data["paid_commission"] = float(details.get("paid_commission", 0) or 0)
                 data["paid_commission_exact"] = bool(details.get("paid_commission_exact", False))
-                logger.info(f"✅ Maker fill: {order_id[:8]}… @ ${fill_px:.2f}"
-                            f" fee=${data['paid_commission']:.4f}"
+                logger.info(f"✅ Maker fill: {order_id[:8]}… @ {cur}{fill_px:.2f}"
+                            f" fee={cur}{data['paid_commission']:.4f}"
                             f" exact={data['paid_commission_exact']}")
                 return data
 
@@ -2064,7 +2066,7 @@ class OrderManager:
             if status == "PARTIAL_FILL":
                 filled_qty = float(details.get("filled_qty") or 0)
                 fill_px    = float(details.get("fill_price") or limit_price)
-                logger.info(f"⚠️ Partial fill: {filled_qty:.4f} @ ${fill_px:.2f}")
+                logger.info(f"⚠️ Partial fill: {filled_qty:.4f} @ {cur}{fill_px:.2f}")
                 self.cancel_order(order_id)
                 data["fill_type"]  = "maker"
                 data["fill_price"] = fill_px
@@ -2379,6 +2381,7 @@ class OrderManager:
         """
         try:
             api_side = self._normalize_side(side)
+            cur = self._currency_symbol()
 
             # Initialise limit_price to None; only assigned when use_limit=True.
             # BUG-UNBOUND-LIMIT-PRICE FIX: the original code never initialised
@@ -2397,8 +2400,8 @@ class OrderManager:
                 limit_price = self._sl_limit_price(api_side, trigger_price)
                 limit_offset = abs(limit_price - trigger_price)
                 logger.info(
-                    f"SL-LIMIT {side} qty={quantity} stop=${trigger_price:,.2f} "
-                    f"limit=${limit_price:,.2f} (±{limit_offset:.1f}pts offset)")
+                    f"SL-LIMIT {side} qty={quantity} stop={cur}{trigger_price:,.2f} "
+                    f"limit={cur}{limit_price:,.2f} (±{limit_offset:.1f}pts offset)")
                 data = self._place_with_retry(
                     side=api_side, order_type="limit_order",
                     quantity=quantity, trigger_price=trigger_price,
@@ -2406,7 +2409,7 @@ class OrderManager:
                     reduce_only=True, stop_order_type="stop_loss_order")
             else:
                 # Stop-market: guaranteed fill, taker fee (for non-trailing / emergency)
-                logger.info(f"SL-MARKET {side} qty={quantity} trigger=${trigger_price:,.2f}")
+                logger.info(f"SL-MARKET {side} qty={quantity} trigger={cur}{trigger_price:,.2f}")
                 data = self._place_with_retry(
                     side=api_side, order_type="market_order",
                     quantity=quantity, trigger_price=trigger_price,
@@ -2423,8 +2426,8 @@ class OrderManager:
                 })
                 logger.info(
                     f"✅ SL{'_LIMIT' if use_limit else ''}: {data['order_id']} "
-                    f"@ stop=${trigger_price:,.2f}"
-                    + (f" limit=${limit_price:,.2f}" if use_limit else ""))
+                    f"@ stop={cur}{trigger_price:,.2f}"
+                    + (f" limit={cur}{limit_price:,.2f}" if use_limit else ""))
             return data
         except Exception as e:
             logger.error(f"place_stop_loss error: {e}", exc_info=True)
@@ -2434,7 +2437,8 @@ class OrderManager:
                           trigger_price: float) -> Optional[Dict]:
         try:
             api_side = self._normalize_side(side)
-            logger.info(f"TP {side} qty={quantity} trigger=${trigger_price:,.2f}")
+            cur = self._currency_symbol()
+            logger.info(f"TP {side} qty={quantity} trigger={cur}{trigger_price:,.2f}")
             # API doc: standalone TP orders use order_type=market_order +
             # stop_order_type=take_profit_order.
             data = self._place_with_retry(
@@ -2448,7 +2452,7 @@ class OrderManager:
                     "status": data.get("status", "UNKNOWN"),
                     "timestamp": datetime.now().isoformat(),
                 })
-                logger.info(f"✅ TP: {data['order_id']} @ ${trigger_price:,.2f}")
+                logger.info(f"✅ TP: {data['order_id']} @ {cur}{trigger_price:,.2f}")
             return data
         except Exception as e:
             logger.error(f"place_take_profit error: {e}", exc_info=True)

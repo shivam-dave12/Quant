@@ -353,30 +353,11 @@ try:
 except ImportError:
     pass  # config_schema.py not present; schema validation skipped
 
-# ── Institutional exit accounting / anti-whipsaw controls ────────────────
-# Market/profit-defense exits must be reconciled from their own reduce-only
-# order id, not from cancelled SL/TP child orders. While that order is still
-# propagating, defer PnL booking instead of recording $0.00.
+# ── Exact execution reconciliation ───────────────────────────────────────
+# A broker-supervised liquidity exit is booked only after its own tracked
+# reduce-only close resolves to an exact fill; unresolved propagation cannot
+# create an artificial realised result.
 EXIT_MANUAL_CONFIRM_MAX_WAIT_SEC = 120.0
-
-# Do not flatten just because a trade gave back profit. Institutions treat
-# giveback as a watch condition; actual exit requires counter-flow, counter-BOS,
-# pool-gate reversal, or an explicit override.
-
-# More breathing room before BE / delivery-lock moves. Prevents being stopped
-# on normal pullbacks while still preventing fee-adjusted loss accounting.
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MARKET INTELLIGENCE ADAPTIVE PROFILE
-# ─────────────────────────────────────────────────────────────────────────────
-# Market-data quality priors used for monitoring and execution-cost controls only.
-MI_COMPRESSED_ATR_PCT = 0.08
-MI_EXPANDED_ATR_PCT   = 0.28
-MI_STRESS_ATR_PCT     = 0.55
-MI_LIQ_DENSITY_RADIUS_ATR = 4.0
-MI_WIDE_SPREAD_BPS = 5.0
-MI_ENABLE_DYNAMIC_ENTRY_GATES = True
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MULTI-ASSET LIVE CATALOG SCANNER
@@ -703,21 +684,3 @@ def _float_env(name: str, default: float) -> float:
 
 TELEGRAM_GETUPDATES_BACKOFF_BASE_SEC = _float_env("TELEGRAM_GETUPDATES_BACKOFF_BASE_SEC", 2.0)
 TELEGRAM_GETUPDATES_BACKOFF_MAX_SEC = _float_env("TELEGRAM_GETUPDATES_BACKOFF_MAX_SEC", 30.0)
-
-
-# Cross-asset institutional overlay (BTC/GOLD/SILVER)
-# Structural execution context only.
-# SL buffer, and risk sizing based on correlation, relative-value residuals,
-# BTC macro role, and cluster crowding.
-CROSS_ASSET_OVERLAY_ENABLED = True
-CROSS_ASSET_TIMEFRAME = "5m"
-CROSS_ASSET_WINDOW = 48
-CROSS_ASSET_HORIZON_BARS = 6
-CROSS_ASSET_EWMA_HALFLIFE = 16.0
-CROSS_ASSET_MIN_RETURNS = 24
-CROSS_ASSET_UPDATE_INTERVAL_SEC = 2.0
-CROSS_ASSET_MAX_STATE_AGE_SEC = 20.0
-CROSS_ASSET_METALS_CORR_STRONG = 0.55
-CROSS_ASSET_TP_AGGRESSION_WEIGHT = 0.25
-CROSS_ASSET_MAX_RISK_MULT = 1.18
-CROSS_ASSET_MIN_RISK_MULT = 0.25

@@ -549,7 +549,7 @@ class TelegramBotController:
             if strat is None:
                 return "Strategy not ready."
             eng = getattr(strat, "_entry_engine", None)
-            info = eng.analysis_info() if eng is not None else {}
+            info = eng.analysis_info if eng is not None else {}
             pos = getattr(strat, "_pos", None)
             lines = [
                 "🏛️ <b>ICT + Liquidity Thesis</b>",

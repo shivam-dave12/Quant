@@ -137,9 +137,10 @@ class ExecutionRouter:
                 if pos is not None:
                     side  = pos.get("side", "?")
                     entry = pos.get("entry_price", 0)
+                    _cur = str(pos.get("currency_symbol") or ("₹" if self._active_key == Exchange.ICICI.value else "$"))
                     return False, (
                         f"❌ Cannot switch exchange while position is open.\n"
-                        f"Current: {side} @ ${entry:,.2f}\n"
+                        f"Current: {side} @ {_cur}{entry:,.2f}\n"
                         f"Close position first, then /setexchange {target_key}."
                     )
 
@@ -165,12 +166,14 @@ class ExecutionRouter:
             # Update config so downstream reads (strategy, risk manager) see it
             config.EXECUTION_EXCHANGE = target_key
 
+            _cur = "₹" if target_key == Exchange.ICICI.value else "$"
+            _unit = "INR NFO available" if target_key == Exchange.ICICI.value else "USD/USDT available"
             logger.info(f"✅ ExecutionRouter switched: {old_key} → {target_key} "
-                        f"(balance on {target_key}: ${avail:,.2f})")
+                        f"(balance on {target_key}: {_cur}{avail:,.2f})")
 
             return True, (
                 f"✅ <b>Execution switched to {target_key.upper()}</b>\n"
-                f"Balance: ${avail:,.2f} USDT\n"
+                f"Balance: {_cur}{avail:,.2f} {_unit}\n"
                 f"Previous: {old_key}"
             )
 

@@ -607,7 +607,7 @@ class QuantBot:
         try:
             price = float(self.data_manager.get_last_price() or 0.0)
             eng = getattr(self.strategy, "_entry_engine", None)
-            info = eng.analysis_info() if eng is not None else {}
+            info = eng.analysis_info if eng is not None else {}
             logger.info("ICT_LIQUIDITY HEARTBEAT state=%s price=%.4f 4H=%s 15m=%s 5m=%s",
                         info.get("state", "SCANNING"), price, info.get("context_4h", "WAIT"),
                         info.get("context_15m", "WAIT"), info.get("trigger", "WAIT"))

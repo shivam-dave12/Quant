@@ -133,8 +133,7 @@ class MultiAssetQuantBot:
             return False
 
     @staticmethod
-
-    def _icici_market_open(self) -> tuple[bool, str]:
+    def _icici_market_open() -> tuple[bool, str]:
         if not bool(getattr(config, "ICICI_ANALYZE_ONLY_DURING_MARKET_SESSION", True)):
             return True, "ICICI session guard disabled"
         if icici_market_session_state is None:
@@ -326,24 +325,6 @@ class MultiAssetQuantBot:
     @staticmethod
     def _esc(x: Any) -> str:
         return str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-    @staticmethod
-    def _fmt_money(v: float, n: int = 2) -> str:
-        try:
-            return f"${float(v):+,.{n}f}"
-        except Exception:
-            return "$+0.00"
-
-    @staticmethod
-    def _fmt_price(v: float) -> str:
-        try:
-            f = float(v or 0.0)
-            if abs(f) >= 1000: return f"${f:,.2f}"
-            if abs(f) >= 100: return f"${f:,.2f}"
-            if abs(f) >= 1: return f"${f:,.4f}"
-            return f"${f:,.6f}"
-        except Exception:
-            return "$0.00"
 
     @staticmethod
     def _currency_for_instrument(inst: TradableInstrument) -> str:
@@ -701,43 +682,47 @@ class MultiAssetQuantBot:
         return "\n".join(lines)
 
     def format_portfolio_equity_report(self) -> str:
+        """Currency-separated cash, marked equity and open lifecycle exposure."""
         lines = ["💼 <b>INSTITUTIONAL EQUITY / BUDGET</b>", "<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>"]
         rows = [self._ctx_position_metrics(c) for c in self.contexts]
-        open_upnl = sum(self._float_val(r.get("upnl"), 0.0) for r in rows if r.get("position"))
-        open_ladder = sum(self._float_val(r.get("open_realized"), 0.0) for r in rows if r.get("position"))
-        open_live = sum(self._float_val(r.get("lifecycle_pnl"), self._float_val(r.get("upnl"), 0.0)) for r in rows if r.get("position"))
-        raw_total = raw_avail = 0.0
-        got = False
-        for ctx in self.contexts[:1]:
+        ledgers: Dict[str, Dict[str, float]] = {}
+        for ctx, r in zip(self.contexts, rows):
+            cur = str(r.get("currency") or self._currency_for_instrument(ctx.instrument))
+            ledger = ledgers.setdefault(cur, {"available": 0.0, "total": 0.0, "upnl": 0.0, "ladder": 0.0, "live": 0.0})
             try:
                 bal = ctx.risk_manager.get_available_balance() or {}
-                raw_avail = float(bal.get("available_raw", bal.get("available", 0.0)) or 0.0)
-                raw_total = float(bal.get("total_raw", bal.get("total", raw_avail)) or raw_avail)
-                got = True
+                ledger["available"] += float(bal.get("available_raw", bal.get("available", 0.0)) or 0.0)
+                ledger["total"] += float(bal.get("total_raw", bal.get("total", bal.get("available", 0.0))) or 0.0)
             except Exception:
                 pass
-        if got:
-            lines.append(f"<code>ACCOUNT available {self._fmt_price(raw_avail):>12}  total {self._fmt_price(raw_total):>12}</code>")
-            lines.append(f"<code>MARKED equity {self._fmt_price(raw_total + open_live):>12}  live {self._fmt_money(open_live):>12}</code>")
-        lines.append(f"<code>OPEN   UPNL {self._fmt_money(open_upnl):>10}  ladder {self._fmt_money(open_ladder):>10}</code>")
+            if r.get("position"):
+                ledger["upnl"] += self._float_val(r.get("upnl"), 0.0)
+                ledger["ladder"] += self._float_val(r.get("open_realized"), 0.0)
+                ledger["live"] += self._float_val(r.get("lifecycle_pnl"), self._float_val(r.get("upnl"), 0.0))
+        if not ledgers:
+            ledgers["$"] = {"available": 0.0, "total": 0.0, "upnl": 0.0, "ladder": 0.0, "live": 0.0}
+        for cur, ledger in sorted(ledgers.items(), key=lambda kv: kv[0]):
+            code = "INR" if cur == "₹" else "USD"
+            marked = ledger["total"] + ledger["live"]
+            lines.append(f"<b>{code}</b> <code>cash {self._fmt_currency(ledger['available'], currency=cur):>12} total {self._fmt_currency(ledger['total'], currency=cur):>12}</code>")
+            lines.append(f"<code>     marked {self._fmt_currency(marked, currency=cur):>12} live {self._fmt_currency(ledger['live'], signed=True, currency=cur):>12} upnl {self._fmt_currency(ledger['upnl'], signed=True, currency=cur):>12}</code>")
         lines.append(f"<code>SLOTS   used {self.guard.count_open(self.contexts):>2}/{self.guard.max_open_positions:<2}  mode {self._esc(self.guard.budget_mode)}</code>")
         for ctx, r in zip(self.contexts, rows):
             try:
                 bal = ctx.risk_manager.get_available_balance() or {}
                 pol = active_policy(ctx.instrument)
-                pos_tail = ""
+                cur = str(r.get("currency") or self._currency_for_instrument(ctx.instrument))
                 lev_display = float(r.get("entry_leverage", 0.0) or pol.leverage or 0.0) if r.get("position") else float(pol.leverage or 0.0)
+                pos_tail = ""
                 if r.get("position"):
-                    cur = str(r.get("currency") or self._currency_for_instrument(ctx.instrument))
                     pos_tail = (
-                        f" margin {self._fmt_currency(r.get('margin_used', 0.0), currency=cur)} "
-                        f"uPnL {self._fmt_currency(r.get('upnl', 0.0), signed=True, currency=cur)} "
-                        f"live {self._fmt_currency(r.get('lifecycle_pnl', r.get('upnl', 0.0)), signed=True, currency=cur)}"
+                        f" margin {self._fmt_currency(r.get('margin_used', 0.0), currency=cur)}"
+                        f" uPnL {self._fmt_currency(r.get('upnl', 0.0), signed=True, currency=cur)}"
+                        f" live {self._fmt_currency(r.get('lifecycle_pnl', r.get('upnl', 0.0)), signed=True, currency=cur)}"
                     )
-                bal_cur = self._currency_for_instrument(ctx.instrument)
                 lines.append(
-                    f"<code>{self._esc(ctx.instrument.asset_id):<6} cash {self._fmt_currency(float(bal.get('available',0) or 0), currency=bal_cur):>10} "
-                    f"riskbase {self._fmt_currency(float(bal.get('risk_total',0) or 0), currency=bal_cur):>10} lev {lev_display:>2.0f}x margin {pol.margin_pct:.0%} risk×{pol.risk_multiplier:.2f}{self._esc(pos_tail)}</code>"
+                    f"<code>{self._esc(ctx.instrument.asset_id):<6} cash {self._fmt_currency(float(bal.get('available',0) or 0), currency=cur):>10} "
+                    f"riskbase {self._fmt_currency(float(bal.get('risk_total',0) or 0), currency=cur):>10} lev {lev_display:>2.0f}x margin {pol.margin_pct:.0%} risk×{pol.risk_multiplier:.2f}{self._esc(pos_tail)}</code>"
                 )
             except Exception:
                 continue
@@ -759,14 +744,15 @@ class MultiAssetQuantBot:
             side = str(t.get("side", "?")).upper()
             desk = self._clip(t.get("desk", "?"), 5)
             asset = self._clip(t.get("asset", "?"), 8)
+            cur = str(t.get("currency") or "$")
             lines.append(
                 f"{ok} <code>{self._fmt_trade_time(self._trade_ts(t)):<11} {self._esc(desk):<5} "
                 f"{self._esc(asset):<8} {self._esc(side):<5} "
-                f"{self._fmt_price(float(t.get('entry',0) or 0)):>10}->{self._fmt_price(float(t.get('exit',0) or 0)):>10} "
-                f"net {self._fmt_money(pnl):>10} R {self._trade_r(t):+5.2f}</code>"
+                f"{self._fmt_currency(float(t.get('entry',0) or 0), currency=cur):>10}->{self._fmt_currency(float(t.get('exit',0) or 0), currency=cur):>10} "
+                f"net {self._fmt_currency(pnl, signed=True, currency=cur):>10} R {self._trade_r(t):+5.2f}</code>"
             )
             lines.append(
-                f"    <code>gross {self._fmt_money(gross):>10} fees ${fees:>8,.2f} "
+                f"    <code>gross {self._fmt_currency(gross, signed=True, currency=cur):>10} fees {self._fmt_currency(fees, currency=cur):>10} "
                 f"hold {self._float_val(t.get('hold_min'), 0.0):>5.1f}m</code>"
             )
             lines.append(f"    <i>{self._esc(str(t.get('reason',''))[:96])}</i>")
@@ -896,7 +882,7 @@ class MultiAssetQuantBot:
                     if not session_open:
                         ctx.ready = False
                         logger.warning(
-                            "%s ICICI desk dormant: %s. No NIFTY analysis, entries, adoption, or cross-asset overlay outside NSE/NFO hours.",
+                            "%s ICICI desk dormant: %s. No NIFTY analysis, entries or adoption outside NSE/NFO hours.",
                             inst.asset_id,
                             session_reason,
                         )
