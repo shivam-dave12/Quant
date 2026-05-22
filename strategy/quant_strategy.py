@@ -180,6 +180,22 @@ def _round_to_tick(price: float) -> float:
     return round(round(price / tick) * tick, 10) if tick > 0 else price
 
 
+def _round_structural_levels(pos_side: str, sl_price: float, tp_price: float) -> tuple[float, float]:
+    """Round execution levels conservatively without weakening the ICT geometry.
+
+    A long position has a stop below price and a target above price: both are
+    floored so the stop cannot move inside the raided wick and the TP cannot be
+    moved beyond the front-run liquidity objective.  A short position uses the
+    mirror-image ceiling rule.
+    """
+    tick = max(float(QCfg.TICK_SIZE() or 0.0), 1e-12)
+    if str(pos_side or "").lower() == "long":
+        return (round(math.floor(sl_price / tick) * tick, 10),
+                round(math.floor(tp_price / tick) * tick, 10))
+    return (round(math.ceil(sl_price / tick) * tick, 10),
+            round(math.ceil(tp_price / tick) * tick, 10))
+
+
 def _icici_primary_raw(instrument: Any = None) -> Dict[str, Any]:
     inst = instrument if instrument is not None else current_instrument()
     try:
@@ -395,22 +411,22 @@ def _icici_select_contract_for_thesis(
 def _icici_execution_atr(data_manager: Any, entry_premium: float = 0.0, period: int = 14) -> float:
     try:
         getter = getattr(data_manager, "get_execution_candles", None) or getattr(data_manager, "get_candles", None)
-        candles = getter("5m", max(period + 2, 25)) if callable(getter) else []
+        candles = getter("5m", max(period + 2, 60)) if callable(getter) else []
         rows = list(candles or [])
+        rows = rows[:-1] if len(rows) > 1 else []  # the option feed includes a forming bar
         trs: List[float] = []
-        prev_close = 0.0
-        for c in rows[-(period + 1):]:
-            h = _icici_float(c.get("h", c.get("high")), 0.0)
-            l = _icici_float(c.get("l", c.get("low")), 0.0)
-            close = _icici_float(c.get("c", c.get("close")), 0.0)
-            if h <= 0 or l <= 0 or close <= 0:
+        for i in range(1, len(rows)):
+            h = _icici_float(rows[i].get("h", rows[i].get("high")), 0.0)
+            l = _icici_float(rows[i].get("l", rows[i].get("low")), 0.0)
+            prev_close = _icici_float(rows[i - 1].get("c", rows[i - 1].get("close")), 0.0)
+            if h <= 0 or l <= 0 or prev_close <= 0 or h < l:
                 continue
-            tr = max(h - l, abs(h - prev_close) if prev_close > 0 else 0.0, abs(l - prev_close) if prev_close > 0 else 0.0)
-            if tr > 0:
-                trs.append(tr)
-            prev_close = close
-        if trs:
-            return sum(trs[-period:]) / max(1, min(period, len(trs)))
+            trs.append(max(h - l, abs(h - prev_close), abs(l - prev_close)))
+        if len(trs) >= period:
+            atr = sum(trs[:period]) / period
+            for value in trs[period:]:
+                atr = (atr * (period - 1) + value) / period
+            return atr
     except Exception:
         pass
     prem = float(entry_premium or 0.0)
@@ -2028,14 +2044,10 @@ class QuantStrategy:
                 "authority": "STRUCTURAL_ONLY",
             }, price, now)
             return
+        # Book/spread is execution evidence, not structural alpha.  Measure it
+        # every decision pass for transparency, but do not erase valid 4H/15m/5m
+        # analysis merely because an orderbook update is temporarily stale.
         spread_ok, _ = self._spread_atr_gate(data_manager)
-        if not spread_ok:
-            self._log_ict_decision_snapshot({
-                "state": self._entry_engine.state, "block_reason": "EXECUTION_SPREAD_OR_BOOK_BLOCK",
-                "trigger": "WAIT", "entry_5m_atr": atr, "atr_percentile": self._atr_5m.get_percentile(),
-                "authority": "STRUCTURAL_ONLY",
-            }, price, now)
-            return
         try:
             self._liq_map.update(candles_by_tf, price, atr, now)
             snapshot = self._liq_map.get_snapshot(price, atr)
@@ -2044,10 +2056,21 @@ class QuantStrategy:
             return
         pol = active_policy(getattr(self, "_instrument", None))
         self._entry_engine.set_structural_delivery_policy(float(pol.min_rr), float(pol.max_rr))
+        analysis_unit = self._analysis_unit()
+        if analysis_unit == "NIFTYpts":
+            estimated_cost_pts, estimated_cost_bps = 0.0, 0.0
+        else:
+            estimated_cost_pts, estimated_cost_bps = self._roundtrip_cost_points(price, use_maker_entry=True)
+        self._entry_engine.set_execution_cost_model(estimated_cost_pts, estimated_cost_bps)
         self._entry_engine.set_atr_pctile(self._atr_5m.get_percentile())
         self._entry_engine.update(snapshot, price, atr, now, candles_5m=c5, candles_15m=c15, candles_4h=c4h)
         signal = self._entry_engine.get_signal()
         info = self._entry_engine.analysis_info or {}
+        if signal is not None and not spread_ok:
+            blocked = dict(info)
+            blocked.update({"state": "EXECUTABLE", "block_reason": "EXECUTION_SPREAD_OR_BOOK_BLOCK", "trigger": "WAIT_FOR_EXECUTABLE_BOOK"})
+            self._log_ict_decision_snapshot(blocked, price, now, force=True)
+            return
         self._log_ict_decision_snapshot(info, price, now, force=signal is not None)
         if signal is None:
             return
@@ -2073,11 +2096,13 @@ class QuantStrategy:
         sig.structural_validation = signal.structural_validation
         unit = self._analysis_unit()
         logger.info(
-            "✅ ICT_ORDER_THESIS domain=%s %s entry=%s%.4f SL=%s%.4f TP=%s%.4f | risk=%.4f reward=%.4f RR=%.2f floor=%.2f "
-            "deliveryP=%.2f utility=%+.2fR target=%s@%.4f | account_balance=%s%.2f execution_conversion=%s | %s",
+            "✅ ICT_ORDER_THESIS domain=%s %s entry=%s%.4f SL=%s%.4f TP=%s%.4f | risk=%.4f reward=%.4f grossRR=%.2f floor=%.2f "
+            "estNetWinR=%s estNetEU=%s deliveryP=%.2f target=%s@%.4f | account_balance=%s%.2f execution_conversion=%s | %s",
             "UNDERLYING" if unit == "NIFTYpts" else "EXECUTION_INSTRUMENT", side.upper(), unit, entry, unit, sl, unit, tp,
-            abs(entry-sl), abs(tp-entry), rr, float(pol.min_rr), float(signal.delivery_probability or 0.0),
-            self._decision_num(info,"delivery_utility_r"), str(info.get("target_timeframe","-")), self._decision_num(info,"target_pool_price"),
+            abs(entry-sl), abs(tp-entry), rr, float(pol.min_rr),
+            f"{float(info.get('target_net_win_r')):.2f}" if info.get('target_net_win_r') is not None else "PREMIUM_PENDING" if unit == "NIFTYpts" else "N/A",
+            f"{float(info.get('delivery_utility_r')):+.2f}R" if info.get('delivery_utility_r') is not None else "PREMIUM_PENDING" if unit == "NIFTYpts" else "N/A",
+            float(signal.delivery_probability or 0.0), str(info.get("target_timeframe","-")), self._decision_num(info,"target_pool_price"),
             str(self._position_accounting_context().get("currency_symbol", "$")), total_bal,
             "OPTION_PREMIUM_PENDING" if unit == "NIFTYpts" else "DIRECT", signal.reason,
         )
@@ -2833,12 +2858,10 @@ class QuantStrategy:
                         self._last_tp_gate_rejection = time.time()
                     _release_icici_vehicle_if_unfilled("premium_sltp_conversion_rejected")
                     return
-                _fsl = _round_to_tick(_conv_sl)
-                _ftp = _round_to_tick(_conv_tp)
+                _fsl, _ftp = _round_structural_levels("long", _conv_sl, _conv_tp)
                 logger.info("ICICI premium SL/TP converted from NIFTY structure: %s", _conv_reason)
             else:
-                _fsl = _round_to_tick(_force_sl)
-                _ftp = _round_to_tick(_force_tp)
+                _fsl, _ftp = _round_structural_levels(side, _force_sl, _force_tp)
             _dir_ok = False
             if side == "long" and _fsl < entry_ref and _ftp > entry_ref:
                 _dir_ok = True
@@ -2892,6 +2915,16 @@ class QuantStrategy:
             _release_icici_vehicle_if_unfilled("zero_stop_distance")
             return
         rr = td / sd
+        _execution_policy = active_policy(getattr(self, "_instrument", None))
+        _execution_min_rr = float(getattr(_execution_policy, "min_rr", 1.0) or 1.0)
+        if rr + 1e-12 < _execution_min_rr:
+            logger.info(
+                "ICT_EXECUTION_REJECT grossRR=%.2f floor=%.2f | conservative tick/premium conversion no longer clears structural R:R floor",
+                rr, _execution_min_rr)
+            with self._lock:
+                self._last_tp_gate_rejection = time.time()
+            _release_icici_vehicle_if_unfilled("post_rounding_rr_below_floor")
+            return
         if _icici_mode:
             logger.info("ICICI long-premium option: liquidation guard skipped; paid premium is the maximum loss envelope")
 
@@ -2943,6 +2976,32 @@ class QuantStrategy:
             _release_icici_vehicle_if_unfilled("post_surface_zero_stop_distance")
             return
         rr = td / sd
+        executed_viability = self._execution_viability_model(
+            side=side, price=entry_ref, sl_price=sl_price, tp_price=tp_price,
+            use_maker_entry=use_maker, delivery_probability=exec_delivery_probability)
+        self._last_execution_viability = executed_viability.as_refine_context()
+        if not executed_viability.allocation_allowed:
+            logger.info(
+                "ICT_EXECUTION_REJECT grossRR=%.2f netWinR=%s netEU=%s | cost/risk=%.3fR reason=%s",
+                rr,
+                f"{executed_viability.net_win_r:.2f}" if executed_viability.utility_known else "N/A",
+                f"{executed_viability.expected_net_utility_r:+.2f}R" if executed_viability.utility_known else "N/A",
+                executed_viability.fee_to_risk, executed_viability.reason)
+            _release_icici_vehicle_if_unfilled("execution_cost_geometry_rejected")
+            return
+        if executed_viability.utility_known and executed_viability.expected_net_utility_r <= 0.0:
+            logger.info(
+                "ICT_EXECUTION_REJECT grossRR=%.2f netWinR=%.2f netLossR=%.2f netEU=%+.2fR | non-positive expected value after venue costs",
+                rr, executed_viability.net_win_r, executed_viability.net_loss_r, executed_viability.expected_net_utility_r)
+            _release_icici_vehicle_if_unfilled("non_positive_net_execution_utility")
+            return
+        logger.info(
+            "ICT_EXECUTION_ECONOMICS grossRR=%.2f netWinR=%s netLossR=%s netEU=%s cost/risk=%.3fR route=%s",
+            rr,
+            f"{executed_viability.net_win_r:.2f}" if executed_viability.utility_known else "N/A",
+            f"{executed_viability.net_loss_r:.2f}" if executed_viability.utility_known else "N/A",
+            f"{executed_viability.expected_net_utility_r:+.2f}R" if executed_viability.utility_known else "N/A",
+            executed_viability.fee_to_risk, executed_viability.route)
 
         qty = self._compute_quantity(
             risk_manager, entry_ref, sig=sig, setup_grade=setup_grade, sl_price=sl_price,

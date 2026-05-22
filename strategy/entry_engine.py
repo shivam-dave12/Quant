@@ -139,13 +139,23 @@ def _true_range(c: Dict, prev_close: float) -> float:
 
 
 def _timeframe_atr(candles: Sequence[Dict], period: int = 14) -> float:
-    """Closed-bar ATR for the timeframe being interpreted; prevents cross-TF unit distortion."""
+    """Canonical closed-bar Wilder ATR for structural interpretation.
+
+    `candles` is already a closed-bar series.  The same Wilder/RMA estimator is
+    used by execution ATR and liquidity-map ATR, so a 5m raid, its stop
+    clearance and its spread/R calculation cannot be normalised by different
+    volatility numbers.
+    """
     rows = list(candles or [])
-    if len(rows) < 2:
+    if len(rows) < period + 1:
         return 0.0
-    rows = rows[-min(len(rows), period + 1):]
     tr = [_true_range(rows[i], _f(rows[i - 1].get("c"))) for i in range(1, len(rows))]
-    return sum(tr) / len(tr) if tr else 0.0
+    if len(tr) < period:
+        return 0.0
+    atr = sum(tr[:period]) / period
+    for value in tr[period:]:
+        atr = (atr * (period - 1) + value) / period
+    return atr
 
 
 def _robust_trend(candles: Sequence[Dict], atr: float, window: int) -> _TrendContext:
@@ -221,6 +231,8 @@ class ICTLiquidityEntryEngine:
         self._atr_pctile: float = 0.5
         self._min_structural_rr: float = 1.0
         self._max_structural_rr_reference: float = 0.0
+        self._execution_cost_points: float = 0.0
+        self._execution_cost_bps: float = 0.0
         self._stop_clearance_base_atr: float = float(getattr(config, "ICT_STOP_CLEARANCE_BASE_ATR", 0.10) if config is not None else 0.10)
         self._stop_clearance_pctile_slope_atr: float = float(getattr(config, "ICT_STOP_CLEARANCE_PCTL_SLOPE_ATR", 0.18) if config is not None else 0.18)
 
@@ -238,6 +250,16 @@ class ICTLiquidityEntryEngine:
         """
         self._min_structural_rr = max(1.0, _f(min_rr, 1.0))
         self._max_structural_rr_reference = max(0.0, _f(max_rr_reference, 0.0))
+
+    def set_execution_cost_model(self, round_trip_cost_points: float = 0.0, round_trip_cost_bps: float = 0.0) -> None:
+        """Set observable, venue-derived execution cost in analysis-price units.
+
+        The structural target remains an actual liquidity pool.  Cost is used
+        only to calculate net R and reject non-positive net expectancy.  NIFTY
+        underlying thesis passes zero here and is checked after premium conversion.
+        """
+        self._execution_cost_points = max(0.0, _f(round_trip_cost_points, 0.0))
+        self._execution_cost_bps = max(0.0, _f(round_trip_cost_bps, 0.0))
 
     def _record_block(self, reason: str, **values: Any) -> None:
         """Record a transparent structural decision without changing entry geometry."""
@@ -550,6 +572,12 @@ class ICTLiquidityEntryEngine:
             thesis.last_reason = "invalid structural stop geometry"
             self._record_block("INVALID_STRUCTURAL_STOP")
             return
+        stop_protective = ((thesis.side == "long" and stop < entry) or
+                           (thesis.side == "short" and stop > entry))
+        if not stop_protective:
+            thesis.last_reason = "structural stop is not on the invalidation side of entry"
+            self._record_block("INVALID_STRUCTURAL_STOP_SIDE")
+            return
         target = self._select_liquidity_target(thesis.side, entry, stop, snap, atr)
         if target is None:
             thesis.last_reason = "no opposing HTF liquidity with positive delivery utility"
@@ -585,13 +613,16 @@ class ICTLiquidityEntryEngine:
             "state": self._state.value, "side": thesis.side, "trigger": "EXECUTABLE_FVG_REPRICE",
             "block_reason": "NONE", "displacement_atr": thesis.displacement_atr,
             "entry": entry, "sl": stop, "tp": tp, "rr": rr,
+            "gross_rr": rr,
             "delivery_probability": delivery_p, "delivery_utility_r": utility,
             "target_timeframe": str(getattr(target_obj.pool, "timeframe", "")),
             "target_pool_price": _f(getattr(target_obj.pool, "price", 0.0)),
             "target_significance": _f(getattr(target_obj, "significance", 0.0)),
         })
-        logger.info("ICT_LIQUIDITY ENTRY READY %s @ %.4f | SL=%.4f TP=%.4f RR=%.2f | %s",
-                    thesis.side.upper(), entry, stop, tp, rr, explanation)
+        logger.info("ICT_LIQUIDITY ENTRY READY %s @ %.4f | SL=%.4f TP=%.4f grossRR=%.2f netWinR=%s netEU=%s | %s",
+                    thesis.side.upper(), entry, stop, tp, rr,
+                    f"{self._last_analysis.get('target_net_win_r'):.2f}" if self._last_analysis.get('target_net_win_r') is not None else "N/A",
+                    f"{utility:+.2f}R", explanation)
 
     def _structural_stop(self, thesis: _Thesis, atr: float) -> Optional[float]:
         wick = _f(getattr(thesis.sweep, "wick_extreme", 0.0))
@@ -615,7 +646,8 @@ class ICTLiquidityEntryEngine:
                                  ) -> Optional[Tuple[PoolTarget, float, float, float, float]]:
         risk = abs(entry - sl)
         audit = {"pool_total": 0, "wrong_side": 0, "below_timeframe": 0,
-                 "rr_le_one": 0, "non_positive_utility": 0, "eligible": 0, "positive": 0}
+                 "tp_buffer_crossed_entry": 0, "gross_rr_below_floor": 0,
+                 "non_positive_net_utility": 0, "eligible": 0, "positive": 0}
         if risk <= _EPS:
             self._last_analysis.update({"target_audit": audit, "target_block": "ZERO_STRUCTURAL_RISK"})
             return None
@@ -638,23 +670,33 @@ class ICTLiquidityEntryEngine:
             significance = max(0.01, _f(getattr(t, "significance", 0.0), 0.01))
             buffer = min(0.28 * atr, max(0.04 * atr, 0.04 * atr * math.log1p(significance)))
             tp = px - buffer if side == "long" else px + buffer
+            profitable_tp = ((side == "long" and tp > entry) or
+                             (side == "short" and tp < entry))
+            if not profitable_tp:
+                audit["tp_buffer_crossed_entry"] += 1
+                continue
             reward = abs(tp - entry)
             rr = reward / risk
             if rr < self._min_structural_rr:
-                audit["rr_le_one"] += 1
+                audit["gross_rr_below_floor"] += 1
                 continue
             distance_atr = dist / max(atr, _EPS)
             context = 0.50 * (self._thesis.context_4h.confidence if self._thesis else 0.0) + 0.50 * (self._thesis.context_15m.confidence if self._thesis else 0.0)
             sig_term = math.tanh(significance / 5.0)
             dist_decay = math.exp(-max(0.0, distance_atr - 1.0) / 8.0)
             p = max(0.05, min(0.95, 0.18 + 0.34 * context + 0.30 * sig_term + 0.18 * dist_decay))
-            utility = p * rr - (1.0 - p)
+            cost_r = self._execution_cost_points / max(risk, _EPS)
+            net_win_r = rr - cost_r
+            net_loss_r = 1.0 + cost_r
+            utility = p * net_win_r - (1.0 - p) * net_loss_r
             if utility > 0:
                 audit["positive"] += 1
-                candidates.append((utility, significance, -distance_atr, t, tp, rr, p, buffer, distance_atr))
+                candidates.append((utility, significance, -distance_atr, t, tp, rr, p, buffer, distance_atr, cost_r, net_win_r, net_loss_r))
             else:
-                audit["non_positive_utility"] += 1
+                audit["non_positive_net_utility"] += 1
         audit["min_structural_rr"] = self._min_structural_rr
+        audit["round_trip_cost_points"] = self._execution_cost_points
+        audit["round_trip_cost_bps"] = self._execution_cost_bps
         self._last_analysis["target_audit"] = audit
         if not candidates:
             self._last_pool_plan = {"ts": time.time(), "role": "TP", "side": side,
@@ -662,16 +704,18 @@ class ICTLiquidityEntryEngine:
             self._last_analysis["target_block"] = "NO_POSITIVE_UTILITY_OPPOSING_15M_PLUS_POOL"
             return None
         best = max(candidates, key=lambda x: (x[0], x[1], x[2]))
-        utility, significance, _, target, tp, rr, p, buffer, distance_atr = best
+        utility, significance, _, target, tp, rr, p, buffer, distance_atr, cost_r, net_win_r, net_loss_r = best
         self._last_pool_plan = {
             "ts": time.time(), "role": "TP", "side": side,
-            "summary": f"{target.pool.timeframe} {target.pool.side.value}@{target.pool.price:.4f} RR={rr:.2f} P={p:.2f} U={utility:+.2f}R",
+            "summary": f"{target.pool.timeframe} {target.pool.side.value}@{target.pool.price:.4f} grossRR={rr:.2f} netWinR={net_win_r:.2f} P={p:.2f} netEU={utility:+.2f}R",
         }
         self._last_analysis.update({
             "target_timeframe": str(getattr(target.pool, "timeframe", "")),
             "target_pool_price": _f(getattr(target.pool, "price", 0.0)),
             "target_tp_buffer": buffer, "target_distance_atr": distance_atr,
             "target_significance": significance, "target_rr": rr,
+            "target_gross_rr": rr, "target_cost_r": cost_r,
+            "target_net_win_r": net_win_r, "target_net_loss_r": net_loss_r,
             "delivery_probability": p, "delivery_utility_r": utility,
         })
         return target, tp, rr, utility, p

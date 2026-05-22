@@ -430,6 +430,11 @@ class CoinSwitchDataManager:
 
     # ── Public interface (identical to DeltaDataManager) ──────────────────────
 
+    def get_last_update(self) -> float:
+        """Timestamp of the latest executable quote/mark update for lineage auditing."""
+        with self._lock:
+            return float(self._last_price_update_time or 0.0)
+
     def get_last_price(self) -> float:
         with self._lock:
             return self._last_price

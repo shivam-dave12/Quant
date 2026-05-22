@@ -293,12 +293,16 @@ class LiquidityMapSnapshot:
 
 
 def _native_closed_atr(candles: List[Dict], period: int = 14) -> float:
-    """ATR in the source timeframe's own bars; never scale HTF pools by 5m volatility."""
+    """Canonical timeframe-native Wilder ATR on completed bars only.
+
+    Pool creation, sweep significance, FVG/SL normalisation and spread/R
+    reporting now share the same estimator; this prevents a live raid being
+    measured with one 5m ATR while execution protection uses another.
+    """
     rows = list(candles or [])
     rows = rows[:-1] if len(rows) > 1 else []
-    if len(rows) < 2:
+    if len(rows) < int(period) + 1:
         return 0.0
-    rows = rows[-min(len(rows), int(period) + 1):]
     tr: List[float] = []
     for i in range(1, len(rows)):
         try:
@@ -309,7 +313,12 @@ def _native_closed_atr(candles: List[Dict], period: int = 14) -> float:
             tr.append(max(h - l, abs(h - pc), abs(l - pc)))
         except Exception:
             continue
-    return sum(tr) / len(tr) if tr else 0.0
+    if len(tr) < int(period):
+        return 0.0
+    atr = sum(tr[:period]) / period
+    for value in tr[period:]:
+        atr = (atr * (period - 1) + value) / period
+    return atr
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SWING DETECTION (module-level so ICTTrailManager can import them)

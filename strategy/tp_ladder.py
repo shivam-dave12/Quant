@@ -6,14 +6,11 @@ Builds TP1..TPn from internal liquidity between entry and final TP.
 Design constraints:
 - Final TP remains the strategy-selected final liquidity objective.
 - Internal BSL/SSL pools become partial reduce-only targets.
-- If no internal liquidity exists, a Fibonacci auction-geometry fallback may
-  create intermediate TP legs between entry and the already-selected final TP.
-  This does not create a new trade target; it only monetises the path to a
-  validated final objective.
+- If no validated internal liquidity exists, the selected final liquidity TP
+  remains the only executable target; synthetic path projections are prohibited.
 - SL price is never moved by this module.
 - Quantity allocation is dynamic: path distance, delivery probability,
-  liquidity quality, gauntlet, execution cost, liquidity+Fibonacci auction
-  geometry, and external adjustment decide how much size is monetised
+  liquidity quality, gauntlet and execution cost decide how much size is monetised
   before the final target.
 """
 from __future__ import annotations
@@ -51,10 +48,6 @@ class TPLadderLeg:
     delivery_prob: float = 0.0
     ev: float = 0.0
     gauntlet_n: int = 0
-    fib_confluence: float = 1.0
-    fib_score: float = 0.0
-    fib_ratio: float = 0.0
-    fib_role: str = ""
     gross_rr: float = 0.0
     cost_r: float = 0.0
     net_rr: float = 0.0
@@ -157,8 +150,6 @@ def _candidate_weight(row: Dict[str, Any], path_frac: float) -> float:
     ladder_score = _clamp(_num(row.get("ladder_path_score", 0.0), 0.0), 0.0, 1.25)
     qual = _clamp(_num(row.get("quality", 0.0), 0.0), 0.0, 1.0)
     confluence = _clamp(_num(row.get("confluence", 1.0), 1.0), 0.4, 2.5)
-    fib_mult = _clamp(_num(row.get("fib_confluence", row.get("fib_multiplier", 1.0)), 1.0), 0.90, 1.32)
-    fib_score = _clamp(_num(row.get("fib_score", 0.0), 0.0), 0.0, 1.0)
     gauntlet = max(0, int(_num(row.get("gauntlet_n", 0), 0)))
     gross_rr = max(0.0, _num(row.get("_ladder_gross_rr", row.get("rr", 0.0)), 0.0))
     net_rr = _num(row.get("_ladder_net_rr", gross_rr), gross_rr)
@@ -180,7 +171,6 @@ def _candidate_weight(row: Dict[str, Any], path_frac: float) -> float:
         1e-6,
         dp * (0.65 + 0.18 * math.sqrt(sig + 1.0)) * (0.75 + qual)
         * (0.75 + 0.25 * confluence)
-        * (0.88 + 0.12 * fib_mult + 0.10 * fib_score)
         * path_shape * too_near_pen
         * gauntlet_pen * (1.0 + 0.10 * min(ev, 3.0)) * (1.0 + 0.18 * ladder_score)
         * edge_mult,
@@ -194,7 +184,6 @@ def _tf_rank(tf: str) -> float:
         "1m": 1.0, "2m": 1.05, "3m": 1.08, "5m": 1.15,
         "15m": 1.32, "30m": 1.42, "1h": 1.62,
         "4h": 1.90, "1d": 2.15,
-        "fib_path": 1.0,
     }.get(tf, 1.0)
 
 
@@ -254,163 +243,11 @@ def _cluster_effective_liquidity(rows: List[Dict[str, Any]], *, side: str, entry
         c["significance"] = max(_num(r.get("significance", 0.0), 0.0) for r in cluster) + math.log1p(len(cluster))
         c["delivery_prob"] = _clamp(sum(_num(r.get("delivery_prob", r.get("sweep_prob", 0.0)), 0.0) * w for r, w in zip(cluster, weights)) / wsum, 0.01, 0.97)
         c["selection_ev"] = max(_num(r.get("selection_ev", r.get("ev", 0.0)), 0.0) for r in cluster)
-        c["fib_confluence"] = max(_num(r.get("fib_confluence", r.get("fib_multiplier", 1.0)), 1.0) for r in cluster)
-        c["fib_score"] = max(_num(r.get("fib_score", 0.0), 0.0) for r in cluster)
         c["reason"] = f"MTF effective liquidity cluster: {len(cluster)} pools across {c['cluster_timeframes']}"
         c["_ladder_weight"] = _candidate_weight(c, path_frac) * (1.0 + 0.10 * math.log1p(len(cluster)))
         out.append(c)
     out.sort(key=lambda x: abs(_num(x.get("_ladder_price"), 0.0) - entry))
     return out
-
-
-def _add_fib_gap_fillers(*, side: str, entry: float, sl: float, final_tp: float,
-                         atr: float, existing: List[Dict[str, Any]], max_internal_legs: int,
-                         min_spacing: float, structural_adjustment: float,
-                         final_fib_score: float, final_fib_mult: float,
-                         final_dist_atr: float) -> List[Dict[str, Any]]:
-    """Add Fibonacci monetisation only where the liquidity path is sparse.
-
-    This is not a target generator. It fills delivery gaps between MTF liquidity
-    clusters so a single nearest cluster cannot consume most of the position.
-    """
-    capacity = max(0, int(max_internal_legs or 0) - len(existing))
-    if capacity <= 0 or final_dist_atr < 2.10:
-        return existing
-    current = list(existing)
-    points = [0.0] + [_clamp(_num(c.get("_ladder_path_frac"), 0.0), 0.0, 1.0) for c in current] + [1.0]
-    points = sorted(points)
-    # Add ratios that sit in the largest uncovered path gaps first.
-    candidate_ratios = list(_FIB_FALLBACK_PATH_RATIOS)
-    candidate_ratios += [0.236, 0.707, 0.886]
-    ranked = []
-    for ratio in candidate_ratios:
-        if ratio <= 0.0 or ratio >= 1.0:
-            continue
-        if any(abs(ratio - p) < 0.08 for p in points):
-            continue
-        left = max([p for p in points if p < ratio] or [0.0])
-        right = min([p for p in points if p > ratio] or [1.0])
-        gap = right - left
-        if gap <= 0.18:
-            continue
-        ranked.append((gap, ratio))
-    ranked.sort(reverse=True)
-    for _, ratio in ranked:
-        if capacity <= 0:
-            break
-        fibs = _fib_fallback_internals(
-            side=side, entry=entry, sl=sl, final_tp=final_tp, atr=atr,
-            max_internal_legs=1, min_spacing=min_spacing, structural_adjustment=structural_adjustment,
-            final_fib_score=final_fib_score, final_fib_mult=final_fib_mult,
-            final_dist_atr=final_dist_atr,
-            ratios=(ratio,),
-        )
-        if not fibs:
-            continue
-        f = fibs[0]
-        px = _num(f.get("_ladder_price"), 0.0)
-        if any(abs(px - _num(c.get("_ladder_price"), 0.0)) < min_spacing for c in current):
-            continue
-        current.append(f); capacity -= 1
-        points.append(ratio); points.sort()
-    current.sort(key=lambda x: abs(_num(x.get("_ladder_price"), 0.0) - entry))
-    return current
-
-
-# Fibonacci fallback ratios are used only when no internal liquidity exists
-# between entry and the selected final TP.  They are path monetisation points,
-# not a standalone target generator.
-_FIB_FALLBACK_PATH_RATIOS = (0.382, 0.500, 0.618, 0.786)
-
-
-def _fib_path_price(side: str, entry: float, final_tp: float, frac: float) -> float:
-    if side == "long":
-        return entry + abs(final_tp - entry) * float(frac)
-    return entry - abs(final_tp - entry) * float(frac)
-
-
-def _fib_fallback_internals(*, side: str, entry: float, sl: float, final_tp: float,
-                            atr: float, max_internal_legs: int,
-                            min_spacing: float, structural_adjustment: float,
-                            final_fib_score: float, final_fib_mult: float,
-                            final_dist_atr: float,
-                            ratios: Iterable[float] = _FIB_FALLBACK_PATH_RATIOS) -> List[Dict[str, Any]]:
-    """Create Fibonacci path-monetisation legs when internal liquidity is absent.
-
-    This is deliberately conservative: the final TP must already be validated by
-    the strategy/selector, distance must be large enough to need staging, and
-    quantity capacity must permit at least one independent reduce-only leg.
-    """
-    if max_internal_legs <= 0:
-        return []
-    if final_dist_atr < 1.65:
-        return []
-    risk = abs(entry - sl)
-    if risk <= 1e-12:
-        return []
-    atr = max(float(atr or 0.0), 1e-9)
-    path = abs(final_tp - entry)
-    if path <= max(0.75 * atr, 1e-9):
-        return []
-    out: List[Dict[str, Any]] = []
-    seen: List[float] = []
-    max_legs = max(0, int(max_internal_legs or 0))
-    fib_quality = _clamp(0.55 * _clamp(final_fib_score, 0.0, 1.0) + 0.45 * ((final_fib_mult - 0.90) / 0.42), 0.0, 1.0)
-    sponsor = _clamp(structural_adjustment, -1.0, 1.0)
-    for ratio in ratios:
-        if len(out) >= max_legs:
-            break
-        px = _fib_path_price(side, entry, final_tp, ratio)
-        if not _in_path(side, entry, final_tp, px):
-            continue
-        # Avoid false precision around entry/final.  A fallback TP must be far
-        # enough to pay spread/fees/noise and far enough from final to remain a
-        # true intermediate monetisation leg.
-        if abs(px - entry) < max(0.55 * atr, 0.16 * risk):
-            continue
-        if abs(final_tp - px) < max(0.45 * atr, 0.08 * path):
-            continue
-        if any(abs(px - p) < min_spacing for p in seen):
-            continue
-        rr = abs(px - entry) / max(risk, 1e-9)
-        if rr < 0.35:
-            continue
-        path_frac = _path_fraction(side, entry, final_tp, px)
-        # Delivery estimate is path-based: nearer fallback legs have higher
-        # probability; strong final Fib geometry and external adjustment
-        # can lift it, but cannot overpower adverse structural_adjustment.
-        delivery = _clamp(
-            0.76 * math.exp(-0.82 * path_frac)
-            + 0.10 * fib_quality
-            + 0.06 * max(0.0, sponsor)
-            - 0.10 * max(0.0, -sponsor),
-            0.10,
-            0.84,
-        )
-        row = {
-            "pool_side": "BSL" if side == "long" else "SSL",
-            "tp_price": px,
-            "pool_price": px,
-            "quality": _clamp(0.46 + 0.22 * fib_quality + 0.08 * max(0.0, sponsor), 0.30, 0.82),
-            "significance": _clamp(2.2 + 2.4 * fib_quality + 1.0 * (1.0 - path_frac), 1.5, 6.0),
-            "delivery_prob": delivery,
-            "selection_ev": max(0.0, rr * delivery - (1.0 - delivery)),
-            "fib_confluence": _clamp(1.02 + 0.18 * fib_quality, 0.98, 1.20),
-            "fib_score": _clamp(0.55 + 0.35 * fib_quality, 0.35, 0.90),
-            "fib_ratio": ratio,
-            "fib_role": "fib_fallback_monetisation",
-            "timeframe": "fib_path",
-            "cost_r": 0.0,
-            "reason": f"fib fallback path monetisation {ratio:.3g}; no internal liquidity before selected final TP",
-            "_ladder_price": px,
-            "_ladder_path_frac": path_frac,
-            "_ladder_source": "fib_fallback_geometry",
-        }
-        row["_ladder_weight"] = _candidate_weight(row, path_frac) * (0.90 + 0.15 * fib_quality)
-        out.append(row)
-        seen.append(px)
-    return out
-
 
 
 def _cost_points_from_bps(entry: float, roundtrip_cost_bps: float) -> float:
@@ -469,11 +306,9 @@ def _prop_desk_internal_reward_floor(row: Dict[str, Any], *, risk_points: float,
 
     # The minimum multiple is fee-engine derived.  It increases only when the
     # candidate itself is weaker: near-entry/noisy, low delivery probability,
-    # low quality, or synthetic Fib-only geometry.
+    # or low liquidity quality.
     mult = max(1.0, float(base_fee_floor_mult or 1.0))
     mult *= 1.0 + 0.22 * (1.0 - dp) + 0.16 * (1.0 - qual) + 0.18 * max(0.0, 0.35 - path)
-    if "fib" in src and "liquidity" not in src:
-        mult *= 1.08
     mult = _clamp(mult, 1.05, 2.15)
     # Fees are only one part of the required move. A very near TP also has to
     # clear auction noise; otherwise the partial fill can be positive per unit
@@ -487,8 +322,6 @@ def _prop_desk_internal_reward_floor(row: Dict[str, Any], *, risk_points: float,
             + 0.08 * (1.0 - qual)
             + 0.08 * max(0.0, 0.32 - path)
         )
-        if "fib" in src and "liquidity" not in src:
-            noise_mult += 0.03
         noise_pts = atr_f * _clamp(noise_mult, 0.04, 0.30)
     required = max(cost_pts * mult, cost_pts + noise_pts, 0.18 * risk)
     return required, cost_pts
@@ -601,8 +434,8 @@ def _estimate_cost_floor_r(internals: List[Dict[str, Any]], selected_rows: List[
     return _clamp(0.65 * med + 0.35 * tail, 0.0, 0.85)
 
 
-def _runner_fraction_model(*, final_dist_atr: float, final_rr: float, structural_adjustment: float, internals: List[Dict[str, Any]], final_fib_score: float = 0.0, final_fib_mult: float = 1.0) -> Dict[str, float]:
-    """Earn final-runner size from path, structural_adjustment, and liquidity+Fib geometry."""
+def _runner_fraction_model(*, final_dist_atr: float, final_rr: float, structural_adjustment: float, internals: List[Dict[str, Any]]) -> Dict[str, float]:
+    """Earn final-runner size only from validated liquidity-path information."""
     n = len(internals)
     if n:
         fracs = [_clamp(_num(c.get("_ladder_path_frac"), 0.0), 0.0, 1.0) for c in internals]
@@ -618,29 +451,19 @@ def _runner_fraction_model(*, final_dist_atr: float, final_rr: float, structural
         max_gap = 1.0
     distance_penalty = _sigmoid((float(final_dist_atr) - 4.0) / 3.2)
     rr_saturation = 1.0 - math.exp(-max(0.0, float(final_rr)) / 3.0)
-    fib_score = _clamp(float(final_fib_score or 0.0), 0.0, 1.0)
-    fib_mult = _clamp(float(final_fib_mult or 1.0), 0.90, 1.32)
-    fib_quality = _clamp(0.55 * fib_score + 0.45 * ((fib_mult - 0.90) / 0.42), 0.0, 1.0)
-    path_strength = _clamp(0.30 * coverage + 0.24 * density + 0.22 * quality + 0.14 * early_quality + 0.10 * fib_quality, 0.0, 1.0)
+    path_strength = _clamp(0.34 * coverage + 0.27 * density + 0.24 * quality + 0.15 * early_quality, 0.0, 1.0)
     sponsor = _clamp(float(structural_adjustment or 0.0), -1.0, 1.0)
-    raw = 0.08 + 0.40 * path_strength + 0.10 * rr_saturation - 0.25 * distance_penalty + 0.14 * max(0.0, sponsor) - 0.12 * max(0.0, -sponsor) + 0.10 * fib_quality
-    # The final TP is a real thesis leg, not a dust remainder.  The reserve is
-    # earned from terminal-path information: path strength, Fib/geometry support,
-    # R:R saturation, and structural_adjustment.  Negative structural_adjustment lowers the raw
-    # runner, but it must not collapse the final leg to dust if the strategy has
-    # selected a far terminal liquidity objective; otherwise the ladder becomes
-    # a scalp disguised as a runner.
+    raw = 0.08 + 0.45 * path_strength + 0.12 * rr_saturation - 0.25 * distance_penalty + 0.14 * max(0.0, sponsor) - 0.12 * max(0.0, -sponsor)
     terminal_information = _clamp(
-        0.36 * path_strength
-        + 0.24 * fib_quality
-        + 0.18 * rr_saturation
-        + 0.14 * (1.0 - distance_penalty)
+        0.48 * path_strength
+        + 0.24 * rr_saturation
+        + 0.16 * (1.0 - distance_penalty)
         + 0.12 * max(0.0, sponsor)
         - 0.08 * max(0.0, -sponsor),
         0.0, 1.0,
     )
     min_runner = _clamp(0.06 + 0.28 * terminal_information, 0.055, 0.38)
-    max_runner = _clamp(0.30 + 0.28 * path_strength + 0.10 * max(0.0, sponsor) + 0.10 * fib_quality, 0.24, 0.80)
+    max_runner = _clamp(0.30 + 0.32 * path_strength + 0.10 * max(0.0, sponsor), 0.24, 0.80)
     final_fraction = _clamp(raw, min_runner, max_runner)
     return {
         "final_fraction": final_fraction,
@@ -654,13 +477,9 @@ def _runner_fraction_model(*, final_dist_atr: float, final_rr: float, structural
         "distance_penalty": distance_penalty,
         "rr_saturation": rr_saturation,
         "structural_adjustment": sponsor,
-        "fib_score": fib_score,
-        "fib_multiplier": fib_mult,
-        "fib_quality": fib_quality,
         "min_runner": min_runner,
         "max_runner": max_runner,
     }
-
 
 
 def _first_tp_balance_limits(row: Dict[str, Any], reward_r: float, final_rr: float,
@@ -675,7 +494,7 @@ def _first_tp_balance_limits(row: Dict[str, Any], reward_r: float, final_rr: flo
 
     If that contribution cannot become material without exceeding the earned
     cap, the caller should demote the noisy/too-near first level and let the
-    next deeper liquidity/fib zone become TP1.
+    next deeper validated liquidity zone become TP1.
     """
     rr = max(0.0, float(reward_r or 0.0))
     path_frac = _clamp(_num(row.get("_ladder_path_frac", 0.0), 0.0), 0.0, 1.0)
@@ -699,8 +518,7 @@ def _first_tp_balance_limits(row: Dict[str, Any], reward_r: float, final_rr: flo
 
     # Earned TP1 cap: nearer/noisier first levels get capped harder; stronger
     # delivery/liquidity quality earns more but never enough to dominate the
-    # trade.  Fib-only levels are slightly capped because they are execution
-    # geometry, not observed liquidity.
+    # trade.
     rr_credit = _clamp(rr / max(1.20, 0.45 * max(float(final_rr or 0.0), 1e-9)), 0.0, 1.0)
     path_credit = math.sqrt(max(path_frac, 0.0))
     max_fraction = _clamp(
@@ -713,8 +531,6 @@ def _first_tp_balance_limits(row: Dict[str, Any], reward_r: float, final_rr: flo
         max(float(min_leg_fraction or 0.0), 0.025),
         0.285,
     )
-    if "fib" in source and "liquidity" not in source:
-        max_fraction *= 0.92
     if path_frac < 0.16 and rr < 0.80:
         max_fraction *= _clamp(0.72 + 1.10 * path_frac + 0.10 * rr, 0.62, 0.92)
     max_fraction = _clamp(max_fraction, max(float(min_leg_fraction or 0.0), 0.015), 0.285)
@@ -753,7 +569,7 @@ def _balance_first_tp_materiality(*, internals: List[Dict[str, Any]], fracs: Lis
 
     If the nearest TP cannot produce a material booked R without requiring too
     much quantity, it is not a good TP1; it is demoted and its size is pushed to
-    deeper liquidity/fib zones.  If the first level can be meaningful inside its
+    deeper validated liquidity zones.  If the first level can be meaningful inside its
     earned cap, it may receive a small transfer from later legs/final runner, but
     never by violating the terminal-runner reserve.
     """
@@ -932,7 +748,7 @@ def _enforce_lifecycle_solvency(*, internals: List[Dict[str, Any]], fracs: List[
     # Prevent one nearest zone from swallowing the ladder when multiple
     # effective path zones exist. The cap is not a fixed TP percentage: it is
     # derived from the number of zones, path proof, RR and structural_adjustment. Excess
-    # is redistributed to later liquidity/fib zones before it becomes runner.
+    # is redistributed to later validated liquidity zones before it becomes runner.
     if len(fracs) > 1 and sum(fracs) > 0:
         sponsor = _clamp(_num(internals[0].get("_ladder_structural_adjustment", 0.0), 0.0), -1.0, 1.0)
         for i in range(len(fracs) - 1):
@@ -1054,9 +870,7 @@ def build_tp_ladder(
 
     selected_rows = [r for r in rows if r.get("selected") is True]
     final_rows = selected_rows or [r for r in rows if abs(_num(r.get("tp_price") or r.get("pool_price"), 0.0) - final_tp) <= max(0.35 * atr, 1e-9)]
-    final_fib_score = max([_clamp(_num(r.get("fib_score", 0.0), 0.0), 0.0, 1.0) for r in final_rows] or [0.0])
-    final_fib_mult = max([_clamp(_num(r.get("fib_confluence", r.get("fib_multiplier", 1.0)), 1.0), 0.90, 1.32) for r in final_rows] or [1.0])
-    final_fib_ratio = max([_num(r.get("fib_ratio", 0.0), 0.0) for r in final_rows] or [0.0])
+    # Final objective is already the strategy-selected structural liquidity target.
 
     selector_cost_r = max([_clamp(_num(r.get("cost_r", 0.0), 0.0), 0.0, 0.85) for r in rows] or [0.0])
     effective_cost_r = max(rt_cost_r, selector_cost_r)
@@ -1110,9 +924,6 @@ def build_tp_ladder(
         plan.final_runner_model = {
             "path_strength": 0.0,
             "reason": "final_only_" + str(reason or "native_final_tp"),
-            "fib_score": final_fib_score,
-            "fib_multiplier": final_fib_mult,
-            "fib_ratio": final_fib_ratio,
             "roundtrip_cost_bps": float(roundtrip_cost_bps or 0.0),
             "rt_cost_r": float(rt_cost_r or 0.0),
             "selector_cost_r": float(selector_cost_r or 0.0),
@@ -1124,7 +935,6 @@ def build_tp_ladder(
             index=1, role="FINAL", price=final_tp, qty_fraction=1.0,
             quantity=total_quantity, source="selected_final_tp",
             distance_atr=final_dist_atr, rr=final_gross_rr,
-            fib_confluence=final_fib_mult, fib_score=final_fib_score, fib_ratio=final_fib_ratio,
             gross_rr=final_gross_rr, cost_r=effective_cost_r, net_rr=final_net_rr,
             reason=reason,
         )]
@@ -1164,75 +974,19 @@ def build_tp_ladder(
         plan.regime_notes.extend(_net_edge_notes)
     if internals:
         plan.regime_notes.append(f"MTF liquidity clustering: {len(raw_internals)} raw pools → {len(internals)} effective zones")
-        internals = _add_fib_gap_fillers(
-            side=side,
-            entry=entry,
-            sl=sl,
-            final_tp=final_tp,
-            atr=atr,
-            existing=internals,
-            max_internal_legs=max_internal_legs,
-            min_spacing=min_spacing,
-            structural_adjustment=structural_adjustment,
-            final_fib_score=final_fib_score,
-            final_fib_mult=final_fib_mult,
-            final_dist_atr=final_dist_atr,
-        )
-        if len(internals) > len(_cluster_effective_liquidity(raw_internals, side=side, entry=entry, final_tp=final_tp, min_spacing=min_spacing)):
-            plan.regime_notes.append("sparse path: Fibonacci gap-fillers added between liquidity zones")
-        internals, _net_edge_notes = _filter_internal_levels_by_net_edge(
-            internals, side=side, entry=entry, risk_points=risk_points,
-            rt_cost_points=planning_cost_points, base_fee_floor_mult=fee_floor_mult,
-            fallback_cost_r=effective_cost_r, atr=atr,
-        )
-        plan.regime_notes.extend(_net_edge_notes)
+        # ICT + Liquidity invariant: no synthetic intermediate target may be
+        # inserted between observed liquidity zones.  All internal exits must
+        # originate from a validated executable liquidity pool.
         if max_internal_legs > 0 and len(internals) > max_internal_legs:
             internals = internals[:max_internal_legs]
             plan.regime_notes.append(f"internal targets capped by executable lot capacity at {max_internal_legs}")
 
-    # If no valid internal liquidity exists, build Fibonacci path-monetisation
-    # legs only when the final TP is already validated and exchange lot capacity
-    # allows partial reduce-only exits.  Otherwise return final-only and explain.
+    # If no valid intermediate liquidity exists, retain the selected final
+    # structural liquidity target only.  Synthetic staging is not an
+    # executable ICT/Liquidity target and is therefore prohibited.
     if not internals:
-        fib_internals = _fib_fallback_internals(
-            side=side,
-            entry=entry,
-            sl=sl,
-            final_tp=final_tp,
-            atr=atr,
-            max_internal_legs=max_internal_legs,
-            min_spacing=min_spacing,
-            structural_adjustment=structural_adjustment,
-            final_fib_score=final_fib_score,
-            final_fib_mult=final_fib_mult,
-            final_dist_atr=final_dist_atr,
-        )
-        if fib_internals:
-            fib_internals, _net_edge_notes = _filter_internal_levels_by_net_edge(
-                fib_internals, side=side, entry=entry, risk_points=risk_points,
-                rt_cost_points=planning_cost_points, base_fee_floor_mult=fee_floor_mult,
-                fallback_cost_r=effective_cost_r, atr=atr,
-            )
-            plan.regime_notes.extend(_net_edge_notes)
-        if fib_internals:
-            internals = fib_internals
-            plan.regime_notes.append(
-                f"no internal liquidity: using Fibonacci path-monetisation fallback ({len(internals)} legs)"
-            )
-        else:
-            reason = "no valid cost-efficient internal liquidity between entry and final TP"
-            if max_internal_legs <= 0:
-                reason += "; position size not splittable under exchange lot/min-qty constraints"
-                note = "no internal/fib ladder: quantity cannot be split under exchange lot size"
-            elif final_dist_atr < 1.65:
-                reason += "; final TP too close for non-noisy Fibonacci staging"
-                note = "no internal/fib ladder: final TP too close for non-noisy staging"
-            elif rt_cost_points > 0.0:
-                reason += "; all internal levels failed prop-desk net-edge cost filter"
-                note = "no internal/fib ladder: internal levels could not clear fees/slippage with net edge"
-            else:
-                note = "no internal/fib ladder: no robust Fibonacci staging level survived cost/noise filters"
-            return _return_final_only(reason, note)
+        reason = "no valid cost-efficient observed internal liquidity between entry and final TP; final structural liquidity target only"
+        return _return_final_only(reason, "no internal ladder: no validated liquidity pool survived execution-cost filters")
 
     for _c in internals:
         _c["_ladder_structural_adjustment"] = structural_adjustment
@@ -1242,8 +996,6 @@ def build_tp_ladder(
         final_rr=final_rr,
         structural_adjustment=structural_adjustment,
         internals=internals,
-        final_fib_score=final_fib_score,
-        final_fib_mult=final_fib_mult,
     )
     terminal_information = _clamp(_num(runner_model.get("terminal_information", 0.0), 0.0), 0.0, 1.0)
     # Final runner must be executable and meaningful.  The floor is derived
@@ -1362,10 +1114,6 @@ def build_tp_ladder(
             delivery_prob=_num(c.get("delivery_prob", c.get("sweep_prob", 0.0)), 0.0),
             ev=_num(c.get("selection_ev", c.get("ev", 0.0)), 0.0),
             gauntlet_n=int(_num(c.get("gauntlet_n", 0), 0)),
-            fib_confluence=_num(c.get("fib_confluence", c.get("fib_multiplier", 1.0)), 1.0),
-            fib_score=_num(c.get("fib_score", 0.0), 0.0),
-            fib_ratio=_num(c.get("fib_ratio", 0.0), 0.0),
-            fib_role=str(c.get("fib_role", "") or ""),
             gross_rr=gross_rr,
             cost_r=cost_r,
             net_rr=net_rr,
@@ -1393,10 +1141,6 @@ def build_tp_ladder(
         source="selected_final_tp",
         distance_atr=final_dist_atr,
         rr=final_gross_rr,
-        fib_confluence=final_fib_mult,
-        fib_score=final_fib_score,
-        fib_ratio=final_fib_ratio,
-        fib_role="final_runner_projection" if final_fib_score > 0 else "",
         gross_rr=final_gross_rr,
         cost_r=effective_cost_r,
         net_rr=final_net_rr,
@@ -1443,8 +1187,6 @@ def build_tp_ladder(
         plan.regime_notes.append(f"structural adjustment +{structural_adjustment:.2f}: runner earned by delivery geometry")
     elif structural_adjustment < -0.05:
         plan.regime_notes.append(f"structural adjustment {structural_adjustment:.2f}: internal monetisation preferred")
-    if final_fib_score >= 0.35:
-        plan.regime_notes.append(f"liq+Fib final geometry: ratio={final_fib_ratio:.3g} score={final_fib_score:.2f} ×{final_fib_mult:.2f}")
     if final_dist_atr > 6.0:
         plan.regime_notes.append(f"higher final TP {final_dist_atr:.1f}ATR: path ladder monetises internal liquidity")
     if final_dist_atr > 12.0:

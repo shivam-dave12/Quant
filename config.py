@@ -578,8 +578,8 @@ POLICY_OPTION_OB_DEPTH_LEVELS = 3
 POLICY_OPTION_TICK_AGG_WINDOW_SEC = 30.0
 POLICY_OPTION_VWAP_WINDOW = 35
 
-# Desk model: the alpha stack remains the same everywhere
-# (ICT FVG + Quant). Desks only change thresholds, sizing and exit parameters.
+# Desk model: every desk uses the single ICT + Liquidity authority.
+# Desks differ only in venue execution, risk, cost and lot-size policy.
 STRATEGY_CORE_NAME = "ICT_LIQUIDITY_4H15M5M"
 TELEGRAM_RECENT_TRADES_LIMIT = 30
 
