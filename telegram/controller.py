@@ -1,7 +1,7 @@
-"""Telegram controller for the ICT + Liquidity execution system.
+"""Telegram controller for the Institutional Auction execution system.
 
-Operator surfaces expose only: 4H/15m DOL bias, fresh 5m liquidity raid,
-MSS/displacement/FVG repricing, bracket protection, exact-fill P&L and risk.
+Operator surfaces expose measurable auction evidence, competing structural archetypes,
+bracket protection, exact-fill P&L and structural risk.
 """
 
 import logging
@@ -300,7 +300,7 @@ class TelegramBotController:
         try:
             url = f"https://api.telegram.org/bot{self.bot_token}/setMyCommands"
             commands = [
-                {"command": "start", "description": "Start ICT + Liquidity scanner"},
+                {"command": "start", "description": "Start Institutional Auction scanner"},
                 {"command": "stop", "description": "Stop scanner"},
                 {"command": "status", "description": "Desk and position status"},
                 {"command": "thinking", "description": "Current structural thesis"},
@@ -513,8 +513,8 @@ class TelegramBotController:
 
     def _cmd_help(self) -> str:
         return (
-            "🏛️ <b>ICT + LIQUIDITY EXECUTION SYSTEM</b>\n"
-            "<code>4H/15m DOL bias → 5m raid/MSS/FVG → bracketed trade</code>\n\n"
+            "🏛️ <b>INSTITUTIONAL AUCTION EXECUTION SYSTEM</b>\n"
+            "<code>Raid reversal | displacement continuation | liquidity-expansion retest → bracketed trade</code>\n\n"
             "/status — desks, open protection and P&L\n"
             "/thinking — current structural thesis\n"
             "/structures — 4H/15m/5m trigger geometry\n"
@@ -537,7 +537,7 @@ class TelegramBotController:
             return fn()
         return "Single-asset mode active. Use /status for the current BTCUSD scanner."
 
-    # /thinking — structural ICT/Liquidity thesis console
+    # /thinking — institutional auction thesis console
     # ================================================================
 
     def _cmd_thinking(self) -> str:
@@ -561,18 +561,22 @@ class TelegramBotController:
                 except Exception:
                     return "N/A"
             lines = [
-                "🏛️ <b>ICT + Liquidity Thesis</b>",
-                "<code>4H/15m DOL bias → 5m raid/MSS/FVG → protected execution</code>",
+                "🏛️ <b>Institutional Auction Thesis</b>",
+                "<code>Liquidity destination + protected structure + executable orderflow → protected execution</code>",
                 "<i>N/A means the prerequisite structural stage has not evaluated.</i>",
                 f"State: <b>{_esc(str(info.get('state', 'SCANNING')))}</b> | Block: {_esc(str(info.get('block_reason', 'WAIT')))}",
                 f"4H: {_esc(str(info.get('context_4h', 'WAIT')))} score={_fv('context_4h_score','+.3f')} ATR={_fv('context_4h_atr')}",
                 f"15m: {_esc(str(info.get('context_15m', 'WAIT')))} score={_fv('context_15m_score','+.3f')} ATR={_fv('context_15m_atr')}",
-                f"DOL bias: {_esc(str(info.get('context_bias_path', 'AWAITING_5M_DOL')))} dir={_esc(str(info.get('context_direction', 'none')))} score={_fv('context_delivery_score','.2f')} strict={'Y' if info.get('context_aligned') else 'N'}",
-                f"5m: ATR={_fv('entry_5m_atr')} trigger={_esc(str(info.get('trigger', 'WAITING_FOR_FRESH_RAID')))} minRR={_fv('min_structural_rr','.2f')}",
+                f"Auction path: {_esc(str(info.get('archetype', 'DISCOVERY')))} | delivery={_esc(str(info.get('context_bias_path', 'AWAITING_DESTINATION')))} dir={_esc(str(info.get('context_direction', 'none')))} evidence={_fv('context_delivery_score','.2f')} strict={'Y' if info.get('context_aligned') else 'N'}",
+                f"5m: ATR={_fv('entry_5m_atr')} trigger={_esc(str(info.get('trigger', 'WAITING_FOR_STRUCTURAL_OPPORTUNITY')))} minRR={_fv('min_structural_rr','.2f')}",
             ]
-            for key, label in (("raid_quality", "Raid quality"), ("displacement_atr", "Displacement ATR"), ("delivery_probability", "Delivery probability"), ("delivery_utility_r", "Delivery utility R")):
+            for key, label in (("raid_quality", "Raid quality"), ("displacement_atr", "Displacement ATR"), ("delivery_score", "Delivery evidence score")):
                 if key in info and info.get(key) is not None:
                     lines.append(f"{label}: {float(info[key]):.3f}")
+            if info.get("probability_calibrated") and info.get("delivery_probability") is not None:
+                lines.append(f"Calibrated delivery probability: {float(info['delivery_probability']):.3f}")
+            else:
+                lines.append("Calibrated delivery probability: N/A — structural risk and measured execution cost only")
             if info.get("raid_side") and not info.get("mss_broken"):
                 lines.append(f"MSS={_fv('mss_level')} broken=N | FVG=N/A (requires MSS break) | SL/TP=N/A")
             elif info.get("mss_broken") and info.get("fvg_low") is None:
@@ -593,7 +597,7 @@ class TelegramBotController:
     # ================================================================
 
     def _cmd_pools(self) -> str:
-        """Show structural liquidity pools used by the ICT/Liquidity authority."""
+        """Show structural liquidity pools used by the institutional auction authority."""
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
             return "Bot not running."
@@ -610,7 +614,7 @@ class TelegramBotController:
             if not hasattr(strat, '_liq_map') or strat._liq_map is None:
                 return "Structural liquidity map not ready."
             snap = strat._liq_map.get_snapshot(price, atr)
-            lines = [f"<b>💧 ICT + LIQUIDITY MAP @ {cur}{price:,.2f}</b>  5m ATR={cur}{atr:,.2f}"]
+            lines = [f"<b>💧 INSTITUTIONAL AUCTION LIQUIDITY MAP @ {cur}{price:,.2f}</b>  5m ATR={cur}{atr:,.2f}"]
             if snap.primary_target:
                 pt = snap.primary_target.pool
                 lines.append(f"\n🎯 <b>Delivery target: {pt.side.value} @ {cur}{pt.price:,.2f}</b>")
@@ -703,7 +707,7 @@ class TelegramBotController:
             return "⚠️ Trade ledger unavailable."
         cur = _currency_for_strategy(strat)
         history = list(getattr(strat, '_trade_history', []))
-        lines = ["📋 <b>ICT + LIQUIDITY EXECUTION LEDGER</b>", "<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>"]
+        lines = ["📋 <b>INSTITUTIONAL AUCTION EXECUTION LEDGER</b>", "<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>"]
         for trade in reversed(history[-10:]):
             side = str(trade.get('side', '?')).upper()
             entry = float(trade.get('entry', 0.0) or 0.0)
@@ -870,7 +874,7 @@ class TelegramBotController:
     def _cmd_config(self) -> str:
         import config as cfg
         return (
-            "⚙️ <b>ICT + Liquidity Configuration</b>\n"
+            "⚙️ <b>Institutional Auction Configuration</b>\n"
             "Entry authority: 4H/15m DOL bias / 5m execution\n"
             "Trigger: fresh external-liquidity raid → MSS/displacement → FVG rebalance\n"
             "Protection: venue-native SL/TP required before activation\n"
@@ -1164,7 +1168,7 @@ class TelegramBotController:
         wins = int(getattr(strat, '_winning_trades', 0) or 0)
         total_pnl = float(getattr(strat, '_total_pnl', 0.0) or 0.0)
         wr = wins / total_t * 100.0 if total_t else 0.0
-        lines = [f"📈 <b>ICT + LIQUIDITY P&amp;L</b>  <code>{cur}{price:,.2f}</code>"]
+        lines = [f"📈 <b>INSTITUTIONAL AUCTION P&amp;L</b>  <code>{cur}{price:,.2f}</code>"]
         if strat.get_position():
             p = strat._pos
             qty = float(getattr(p, 'quantity', 0.0) or 0.0)

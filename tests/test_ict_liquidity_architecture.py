@@ -8,8 +8,13 @@ from strategy.quant_strategy import QuantStrategy
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_single_entry_authority_is_ict_liquidity_only():
-    assert list(EntryType) == [EntryType.ICT_LIQUIDITY]
+def test_single_order_authority_exposes_multiple_structural_archetypes():
+    assert list(EntryType) == [
+        EntryType.LIQUIDITY_RAID_REVERSAL,
+        EntryType.DISPLACEMENT_CONTINUATION,
+        EntryType.LIQUIDITY_EXPANSION_RETEST,
+    ]
+    assert EntryType.ICT_LIQUIDITY is EntryType.LIQUIDITY_RAID_REVERSAL
     src = inspect.getsource(QuantStrategy._evaluate_entry)
     assert "EntryEngine" not in src or "_entry_engine" in src
     assert "_compute_signals" not in inspect.getsource(QuantStrategy)
@@ -21,7 +26,8 @@ def test_entry_authority_accepts_no_external_alpha_inputs():
     src = inspect.getsource(EntryEngine.update)
     assert "flow_state" not in src
     assert "ict_ctx" not in src
-    assert "delivery_probability" in inspect.getsource(EntryEngine)
+    src = inspect.getsource(EntryEngine)
+    assert "delivery_score" in src and "probability_calibrated" in src
 
 
 def test_retired_strategy_modules_are_physically_removed():
@@ -39,7 +45,7 @@ def test_operator_surface_contains_only_new_authority_vocabulary():
     combined = "\n".join(p.read_text() for p in files)
     for retired in ("QuantPosterior", "ConvictionFilter", "DirectionEngine", "AMD", "CVD", "flow_conviction"):
         assert retired not in combined
-    assert "ICT + LIQUIDITY" in combined
+    assert "INSTITUTIONAL AUCTION" in combined
     assert "/flow" not in combined and "_cmd_flow" not in combined
 
 
@@ -69,7 +75,7 @@ def test_only_fresh_five_minute_raids_can_trigger_entry():
     old_pool = LiquidityPool(97.0, PoolSide.SSL, "5m", status=PoolStatus.SWEPT, created_at=now - 900)
     fresh = SweepResult(fresh_pool, 5, 98.5, 0.5, 1.0, 0.8, "long", now - 20)
     htf = SweepResult(htf_pool, 5, 97.8, 0.5, 1.0, 0.8, "long", now - 20)
-    stale = SweepResult(old_pool, 5, 96.8, 0.5, 1.0, 0.8, "long", now - 700)
+    stale = SweepResult(old_pool, 5, 96.8, 0.5, 1.0, 0.8, "long", now - 1300)
     accepted = EntryEngine()._fresh_5m_sweeps(_snap(sweeps=[fresh, htf, stale]), now)
     assert accepted == [fresh]
 
@@ -114,13 +120,13 @@ def test_delivery_target_excludes_unpromoted_five_minute_pool():
     t15 = PoolTarget(p15, 7.0, "long", 4.0, ["15m"])
     selected = engine._select_liquidity_target("long", entry=100.0, sl=98.0, snap=_snap(bsl=[t5, t15]), atr=1.0)
     assert selected is not None
-    target, tp, rr, utility, probability = selected
+    target, tp, rr, rank_score, delivery_score = selected
     assert target.pool.timeframe == "15m"
     assert 100.0 < tp < 107.0
-    assert rr > 1.0 and utility > 0.0 and 0.05 <= probability <= 0.95
+    assert rr > 1.0 and rank_score > 0.0 and 0.0 < delivery_score < 1.0
 
 
-def test_delivery_target_uses_policy_bounded_sequential_dol_not_daily_jackpot():
+def test_delivery_target_uses_policy_bounded_net_r_rank_not_daily_jackpot():
     engine = EntryEngine()
     engine.set_structural_delivery_policy(min_rr=2.0, max_rr_reference=5.5)
     engine.set_execution_cost_model(0.0, 0.0)
@@ -138,13 +144,14 @@ def test_delivery_target_uses_policy_bounded_sequential_dol_not_daily_jackpot():
         "long", entry=100.0, sl=95.0, snap=_snap(bsl=[far_target, near_target]), atr=1.0
     )
     assert selected is not None
-    target, tp, rr, utility, probability = selected
+    target, tp, rr, rank_score, delivery_score = selected
     assert target.pool.timeframe == "15m"
     assert target.pool.price == pytest.approx(113.0)
     assert 2.0 <= rr <= 5.5
-    assert utility > 0.0 and 0.05 <= probability <= 0.95
+    assert rank_score > 0.0 and 0.0 < delivery_score < 1.0
     assert engine.analysis_info["target_audit"]["gross_rr_above_policy_cap"] == 1
-    assert engine.analysis_info["target_selection_model"] == "SEQUENTIAL_DOL"
+    assert engine.analysis_info["target_selection_model"] == "LIQUIDITY_GRAPH_NET_R_RANK"
+    assert engine.analysis_info["probability_calibrated"] is False
 
 
 def test_delivery_target_rejects_only_far_pool_above_policy_rr_cap():
@@ -214,6 +221,7 @@ def _short_raid_candles():
     c5 = [{"o": 100.60, "h": 100.90, "l": 100.10, "c": 100.45} for _ in range(34)]
     for i in range(8, 20):
         c5[i] = {"o": 100.55, "h": 101.00, "l": 100.10, "c": 100.40}
+    c5[18] = {"o": 100.55, "h": 101.00, "l": 99.60, "c": 100.40}  # confirmed protected internal low
     c5[20] = {"o": 100.50, "h": 102.00, "l": 100.20, "c": 100.60}  # BSL raid
     c5[21] = {"o": 100.50, "h": 100.70, "l": 100.00, "c": 100.20}
     c5[22] = {"o": 99.80, "h": 99.90, "l": 96.80, "c": 97.00}  # displacement
@@ -278,7 +286,8 @@ def test_full_4h_15m_5m_structural_sequence_emits_one_executable_ticket():
     assert signal.side == "long" and signal.entry_price == pytest.approx(100.50)
     assert signal.sl_price < 98.0 < signal.entry_price < signal.tp_price < 110.0
     assert signal.target_pool.pool.timeframe == "15m"
-    assert signal.delivery_probability > 0 and signal.rr_ratio > 1.0
+    assert signal.delivery_score > 0 and signal.rr_ratio > 1.0
+    assert signal.delivery_probability == 0.0 and signal.probability_calibrated is False
     assert engine.state == "EXECUTABLE"
 
 
@@ -320,7 +329,7 @@ def test_htf_trend_misalignment_no_longer_hard_blocks_without_a_raid():
     info = engine.analysis_info
     assert info["context_4h"] == "bullish" and info["context_15m"] == "bearish"
     assert info["context_aligned"] is False
-    assert info["block_reason"] == "AWAITING_FRESH_5M_LIQUIDITY_RAID"
+    assert info["block_reason"] == "AWAITING_STRUCTURAL_OPPORTUNITY"
     assert engine.state == "CONTEXT_READY"
 
 
@@ -343,6 +352,7 @@ def test_ranging_4h_with_15m_dol_can_approve_short_external_liquidity_raid():
     assert info["context_4h"] == "ranging" and info["context_15m"] == "bearish"
     assert info["context_permission"] is True
     assert info["context_bias_path"] == "PARTIAL_HTF_DOL"
+    assert info["mss_source"] == "LATEST_CONFIRMED_INTERNAL_SWING"
     assert info["block_reason"] == "NONE"
 
 
@@ -373,7 +383,7 @@ def test_decision_snapshot_exposes_native_atr_and_waiting_gate_calculations():
                   candles_4h=_trend_candles(2.00, 30))
     info = engine.analysis_info
     assert engine.state == "CONTEXT_READY"
-    assert info["block_reason"] == "AWAITING_FRESH_5M_LIQUIDITY_RAID"
+    assert info["block_reason"] == "AWAITING_STRUCTURAL_OPPORTUNITY"
     assert info["context_aligned"] is True and info["context_direction"] == "long"
     for key in ("context_4h_slope_atr", "context_4h_efficiency", "context_4h_atr",
                 "context_15m_slope_atr", "context_15m_efficiency", "context_15m_atr",

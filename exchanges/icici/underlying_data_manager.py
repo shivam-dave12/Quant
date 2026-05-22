@@ -393,6 +393,13 @@ class ICICIUnderlyingDataManager:
                     target.append(candle)
                 self._last_price = float(candle["c"])
                 self._last_quote_ts = time.time()
+                quote_price = self._last_price
+            # Wake active candidate monitoring outside the feed lock; the strategy
+            # remains the single execution authority on its own evaluation thread.
+            if self._strategy_ref is not None:
+                callback = getattr(self._strategy_ref, "_on_realtime_quote", None)
+                if callable(callback):
+                    callback(quote_price)
         except Exception:
             return
 

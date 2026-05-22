@@ -209,8 +209,9 @@ class ProfitFloorModel:
     An additional spread penalty applies when spread/ATR ratio exceeds
     FEE_SPREAD_ATR_WARN — this market is expensive relative to its moves.
 
-    Structural delivery probability provides a bounded execution-cost adjustment only
-    after geometry is approved; the hard floor FEE_FLOOR_ABS_MIN_MULT always applies.
+    A replay-calibrated probability may provide a bounded execution-cost adjustment
+    after geometry is approved; uncalibrated structural evidence never discounts fees.
+    The hard floor FEE_FLOOR_ABS_MIN_MULT always applies.
     """
 
     def compute_multiplier(
@@ -219,14 +220,14 @@ class ProfitFloorModel:
         spread_bps: float,
         atr: float,
         price: float,
-        delivery_probability: float = 0.5,
+        delivery_probability: Optional[float] = None,
     ) -> float:
         """
         atr_percentile: 0..1, where current ATR sits in its own history
         spread_bps:     current median spread in basis points
         atr:            current ATR in price units
         price:          current mid-price
-        delivery_probability: structural target-delivery probability mapped to 0..1
+        delivery_probability: optional replay-calibrated delivery probability; None leaves fee floor probability-neutral
 
         FEE_FLOOR_MULT calibration:
           Original FEE_FLOOR_MULT_LOW=5.5 was physically impossible.
@@ -262,11 +263,15 @@ class ProfitFloorModel:
         else:
             spread_penalty = 1.0
 
-        # Structural delivery adjustment
-        delivery_norm = max(0.0, min(1.0, delivery_probability))
-        if delivery_norm > delivery_neutral and (1.0 - delivery_neutral) > 1e-10:
-            delivery_excess = (delivery_norm - delivery_neutral) / (1.0 - delivery_neutral)
-            delivery_adjustment = 1.0 - delivery_excess * delivery_max_discount
+        # Probability adjustment is permitted only when a calibrated model is
+        # explicitly supplied. Structural evidence scores never discount fees.
+        if delivery_probability is not None:
+            delivery_norm = max(0.0, min(1.0, float(delivery_probability)))
+            if delivery_norm > delivery_neutral and (1.0 - delivery_neutral) > 1e-10:
+                delivery_excess = (delivery_norm - delivery_neutral) / (1.0 - delivery_neutral)
+                delivery_adjustment = 1.0 - delivery_excess * delivery_max_discount
+            else:
+                delivery_adjustment = 1.0
         else:
             delivery_adjustment = 1.0
 
@@ -280,7 +285,7 @@ class ProfitFloorModel:
         atr_percentile: float,
         total_rt_cost_bps: float,
         spread_bps: float,
-        delivery_probability: float = 0.5,
+        delivery_probability: Optional[float] = None,
     ) -> float:
         """
         Returns the minimum gross price move (always positive) required
@@ -321,10 +326,11 @@ class ProfitFloorModel:
         atr_cap      = max_atr_mult * atr
         result       = min(result, atr_cap)
 
+        calibrated_p_txt = f"{delivery_probability:.2f}" if delivery_probability is not None else "N/A"
         logger.debug(
             f"ProfitFloor: rt_cost={rt_cost_price:.2f} × mult={mult:.2f} "
             f"(pctile={atr_percentile:.2f}, spread={spread_bps:.1f}bps, "
-            f"delivery_p={delivery_probability:.2f}) → min_move={result:.2f} "
+            f"calibrated_p={calibrated_p_txt}) → min_move={result:.2f} "
             f"(atr_cap={atr_cap:.2f})"
         )
         return result
@@ -626,7 +632,7 @@ class ExecutionCostEngine:
         atr: float,
         atr_percentile: float,
         use_maker_entry: bool,
-        delivery_probability: float = 0.5,
+        delivery_probability: Optional[float] = None,
     ) -> float:
         """
         Minimum gross TP distance (in price units) for the trade to be

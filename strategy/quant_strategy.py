@@ -1,16 +1,16 @@
 """
-ICT + LIQUIDITY STRATEGY — SINGLE ENTRY AUTHORITY
-==================================================
+INSTITUTIONAL AUCTION STRATEGY — UNIFIED STRUCTURAL AUTHORITY
+============================================================
 
-Entry authority:
-    4H/15m draw-on-liquidity context -> 5m external-liquidity raid
-    -> 5m displacement/MSS -> 5m FVG repricing -> bracketed execution.
+Entry authority represents several auditable auction archetypes under one
+execution/risk lifecycle: stop-run reversal, displacement continuation and
+liquidity expansion retest.  All routes require protected structure, an
+imbalance/reprice entry and an actual opposing liquidity destination.
 
-No secondary scoring, order-flow scoring, directional overlay, session tier or
-adaptive re-entry alpha is permitted to create, reject or resize an entry.
-Structural invalidation and opposing higher-timeframe liquidity determine the
-trade geometry. Venue-specific lot sizing, margin limits, native bracket
-protection and exact-fill P&L reconciliation remain mechanical controls.
+Multi-level order-book/micro-price and aggressive trade-flow data are consumed
+as execution-horizon evidence and latency triggers.  They do not become a
+standalone directional overlay and they are never represented as calibrated
+probability without labelled replay calibration.
 """
 
 from __future__ import annotations
@@ -40,27 +40,29 @@ except ImportError:
     ExecutionCostEngine = None   # fee_engine.py not yet present — graceful fallback
 
 
-# ── ICT Institutional Trade Engine — fully inlined; external module removed ─
+# ── Institutional Auction Trade Engine — unified structural authority ────────
 
 logger = logging.getLogger(__name__)
 
-# -- Single ICT + Liquidity entry authority -----------------------------------
+# -- Unified structural auction entry authority -------------------------------
 try:
-    from strategy.liquidity_map import LiquidityMap
+    from strategy.liquidity_map import LiquidityMap, _last_closed_candle_idx
     _LIQ_MAP_AVAILABLE = True
 except ImportError:
     try:
-        from liquidity_map import LiquidityMap  # type: ignore
+        from liquidity_map import LiquidityMap, _last_closed_candle_idx  # type: ignore
         _LIQ_MAP_AVAILABLE = True
     except ImportError:
         _LIQ_MAP_AVAILABLE = False
 
 try:
     from strategy.entry_engine import EntryEngine, EntryType
+    from strategy.auction_state import build_microstructure_state
     _ENTRY_ENGINE_AVAILABLE = True
 except ImportError:
     try:
         from entry_engine import EntryEngine, EntryType  # type: ignore
+        from auction_state import build_microstructure_state  # type: ignore
         _ENTRY_ENGINE_AVAILABLE = True
     except ImportError:
         _ENTRY_ENGINE_AVAILABLE = False
@@ -572,8 +574,9 @@ class ATREngine:
         if not candles: return self._atr
         period = QCfg.ATR_PERIOD()
 
-        # Same closed-candle fix as ADXEngine: dedup on candles[-2] (last
-        # closed bar), not candles[-1] (forming bar with partial H/L/C).
+        # Resolve the latest fully closed bar exactly as LiquidityMap and the
+        # entry engine do.  The previous unconditional candles[-2] rule lagged
+        # one full bar whenever the stream already contained closed bars only.
         def _ts(c) -> int:
             try:
                 return int(c['t'])
@@ -584,18 +587,25 @@ class ATREngine:
             except Exception:
                 return 0
 
-        last_ts = _ts(candles[-2]) if len(candles) >= 2 else _ts(candles[-1])
-        if last_ts == self._last_ts and self._seeded: return self._atr
-        if len(candles) < period + 1: return self._atr
+        closed_idx = _last_closed_candle_idx(candles, "5m", time.time())
+        if closed_idx < 0:
+            return self._atr
+        closed = list(candles[:closed_idx + 1])
+        if not closed:
+            return self._atr
+        last_ts = _ts(closed[-1])
+        if last_ts == self._last_ts and self._seeded:
+            return self._atr
+        if len(closed) < period + 1:
+            return self._atr
 
         if not self._seeded:
-            # Seed on closed bars only — exclude forming candles[-1]
-            closed = candles[:-1]
             trs = [max(float(closed[i]['h'])-float(closed[i]['l']),
                        abs(float(closed[i]['h'])-float(closed[i-1]['c'])),
                        abs(float(closed[i]['l'])-float(closed[i-1]['c'])))
                    for i in range(1, len(closed))]
-            if len(trs) < period: return self._atr
+            if len(trs) < period:
+                return self._atr
             atr = sum(trs[:period]) / period
             for tr in trs[period:]:
                 atr = (atr * (period - 1) + tr) / period
@@ -603,15 +613,18 @@ class ATREngine:
             # from poisoning live percentile ranking.
             self._atr_hist.clear()
             self._atr_hist.append(atr)
-            self._atr = atr; self._seeded = True
+            self._atr = atr
+            self._seeded = True
             self._last_ts = last_ts
             return self._atr
         else:
-            # Incremental: candles[-2] = just-closed, candles[-3] = prior closed
-            if len(candles) < 3: return self._atr
-            hi  = float(candles[-2]['h'])
-            lo  = float(candles[-2]['l'])
-            prc = float(candles[-3]['c'])
+            # Incremental: closed[-1] has just completed; closed[-2] supplies
+            # the prior close for its true-range update.
+            if len(closed) < 2:
+                return self._atr
+            hi  = float(closed[-1]['h'])
+            lo  = float(closed[-1]['l'])
+            prc = float(closed[-2]['c'])
             self._atr = (self._atr*(period-1)+max(hi-lo,abs(hi-prc),abs(lo-prc)))/period
         self._atr_hist.append(self._atr); self._last_ts = last_ts
         return self._atr
@@ -649,13 +662,21 @@ class ATREngine:
 # ═══════════════════════════════════════════════════════════════
 @dataclass
 class StructuralEntrySummary:
-    """Execution audit record for one approved ICT/Liquidity thesis."""
+    """Execution audit record for one approved structural auction thesis.
+
+    ``delivery_score`` is observed evidence and is not a trade win
+    probability.  A probability is populated only after replay calibration.
+    """
     atr: float = 0.0
-    delivery_probability: float = 0.0
+    delivery_score: float = 0.0
+    delivery_probability: Optional[float] = None
+    probability_calibrated: bool = False
+    archetype: str = ""
     structural_validation: str = ""
 
     def __str__(self) -> str:
-        return f"ICT_LIQUIDITY deliveryP={self.delivery_probability:.3f} ATR={self.atr:.4f} | {self.structural_validation}"
+        p = f" calibratedP={self.delivery_probability:.3f}" if self.probability_calibrated and self.delivery_probability is not None else " calibratedP=N/A"
+        return f"{self.archetype or 'STRUCTURAL_AUCTION'} deliveryScore={self.delivery_score:+.3f}{p} ATR={self.atr:.4f} | {self.structural_validation}"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -681,7 +702,7 @@ class ExecutionViability:
     geometry_gap_pts: float
     required_sl_price: float
     required_entry_price: float
-    delivery_probability: float
+    delivery_probability: Optional[float]
     net_win_r: float
     net_loss_r: float
     expected_net_utility_r: float
@@ -759,8 +780,11 @@ class PositionState:
     # Previously deviation_atr was stored under "htf_15m" key — all HTF analytics were wrong.
     entry_htf_15m: float = 0.0
     entry_htf_4h:  float = 0.0
-    delivery_probability: float = 0.0
-    delivery_utility_r: float = 0.0
+    delivery_probability: float = 0.0  # non-zero only when probability_calibrated=True
+    probability_calibrated: bool = False
+    delivery_score: float = 0.0
+    archetype: str = ""
+    delivery_utility_r: float = 0.0  # non-zero only for calibrated probability
     quant_components: Dict[str, float] = field(default_factory=dict)
     # Exact Maximum Adverse Excursion in price units for execution analytics.
     peak_adverse:  float = 0.0
@@ -1001,6 +1025,14 @@ class QuantStrategy:
         self._last_spread_gate_context = {}
         self._last_data_integrity_context: Dict[str, Any] = {}
         self._last_data_integrity_log = 0.0
+        # Non-blocking market-event bridge: WS callbacks only wake the scanner;
+        # all calculations and order routing remain in the controlled strategy loop.
+        self._market_event = threading.Event()
+        self._market_wakeup_cb = None
+        self._last_market_event_time = 0.0
+        self._last_event_eval_delay_ms = 0.0
+        self._last_event_eval_time = 0.0
+        self._last_eval_source = "POLL"
         # This initial value is only a venue cap fallback for pre-position UI.
         # Real positions store the structural-funding leverage selected at entry.
         self._active_effective_leverage = 1.0
@@ -1076,7 +1108,7 @@ class QuantStrategy:
 
     def _log_init(self):
         logger.info("=" * 80)
-        logger.info("🏛 ICT + LIQUIDITY STRATEGY — SINGLE ENTRY AUTHORITY")
+        logger.info("🏛 INSTITUTIONAL AUCTION STRATEGY — UNIFIED STRUCTURAL ORDER AUTHORITY")
         with instrument_scope(getattr(self, "_instrument", None)):
             inst = getattr(self, "_instrument", None)
             asset = getattr(inst, "asset_id", QCfg.SYMBOL())
@@ -1192,10 +1224,16 @@ class QuantStrategy:
         min_required = max(1.0, math.ceil(target_notional / max(margin_budget, 1e-12) - 1e-12))
         return float(min(safe_cap, int(min_required)))
 
-    def _capital_allocation_scalar(self, delivery_probability: float, fee_drag_mult: float = 1.0) -> float:
-        """Continuous allocation pressure from structural delivery and executable cost."""
-        p = self._bounded(float(delivery_probability or 0.0), 0.10, 1.0)
+    def _capital_allocation_scalar(self, calibrated_probability: Optional[float], fee_drag_mult: float = 1.0) -> float:
+        """Risk allocation pressure from cost and, only when available, calibrated odds.
+
+        Structural evidence is deliberately excluded from this function because a
+        live evidence score is not a statistically calibrated hit probability.
+        """
         fee = self._bounded(float(fee_drag_mult or 1.0), 0.20, 1.0)
+        if calibrated_probability is None:
+            return fee
+        p = self._bounded(float(calibrated_probability), 0.10, 1.0)
         return self._bounded((0.35 + 0.65 * p) * fee, 0.10, 1.0)
 
 
@@ -1508,11 +1546,57 @@ class QuantStrategy:
         except Exception:
             pass
 
-    def on_tick(self, data_manager, order_manager, risk_manager, timestamp_ms: int) -> None:
-        with instrument_scope(getattr(self, "_instrument", None)):
-            return self._on_tick_scoped(data_manager, order_manager, risk_manager, timestamp_ms)
+    def bind_market_wakeup(self, callback) -> None:
+        """Bind a cheap scanner wake-up callback; no exchange I/O occurs here."""
+        self._market_wakeup_cb = callback if callable(callback) else None
 
-    def _on_tick_scoped(self, data_manager, order_manager, risk_manager, timestamp_ms: int) -> None:
+    def _wake_for_market_event(self, price: float = 0.0) -> None:
+        ts = time.time()
+        self._last_market_event_time = ts
+        if float(price or 0.0) > 0.0:
+            self._last_known_price = float(price)
+        self._market_event.set()
+        wake = self._market_wakeup_cb
+        if wake is not None:
+            try:
+                wake()
+            except Exception:
+                pass
+
+    def _on_realtime_trade(self, price: float, quantity: float, side: str) -> None:
+        """Wake structural monitoring from an observed trade; never route here."""
+        del quantity, side
+        self._wake_for_market_event(price)
+
+    def _on_realtime_quote(self, price: float) -> None:
+        """Wake retest monitoring on book changes even before the next print."""
+        self._wake_for_market_event(price)
+
+    def _calibrated_signal_probability(self) -> Optional[float]:
+        signal = getattr(self, "_last_entry_signal", None)
+        if not bool(getattr(signal, "probability_calibrated", False)):
+            return None
+        try:
+            p = float(getattr(signal, "delivery_probability", 0.0) or 0.0)
+            return p if 0.0 < p < 1.0 else None
+        except Exception:
+            return None
+
+    def consume_market_event(self) -> bool:
+        seen = self._market_event.is_set()
+        if seen:
+            self._market_event.clear()
+        return seen
+
+    def has_urgent_structural_monitor(self) -> bool:
+        engine = getattr(self, "_entry_engine", None)
+        return bool(engine is not None and (engine.tracking_info is not None or engine.get_signal() is not None))
+
+    def on_tick(self, data_manager, order_manager, risk_manager, timestamp_ms: int, event_driven: bool = False) -> None:
+        with instrument_scope(getattr(self, "_instrument", None)):
+            return self._on_tick_scoped(data_manager, order_manager, risk_manager, timestamp_ms, event_driven=event_driven)
+
+    def _on_tick_scoped(self, data_manager, order_manager, risk_manager, timestamp_ms: int, event_driven: bool = False) -> None:
         # ── Bug 1 fix: locked section is non-blocking — only state reads/writes.
         # All exchange API calls (_sync_position, _evaluate_entry, _manage_active,
         # _finalise_exit) happen AFTER the lock is released so protection
@@ -1525,9 +1609,16 @@ class QuantStrategy:
             # Bug #10 fix: store risk_manager reference so _record_exchange_exit
             # can call risk_manager.record_trade without a parameter chain change.
             self._risk_manager_ref = risk_manager
-            if now - self._last_eval_time < QCfg.TICK_EVAL_SEC():
+            urgent = bool(event_driven and self.has_urgent_structural_monitor())
+            min_event_gap = 0.025  # coalesces event bursts without adding candle/polling latency
+            required_gap = min_event_gap if urgent else QCfg.TICK_EVAL_SEC()
+            if now - self._last_eval_time < required_gap:
                 return
             self._last_eval_time = now
+            self._last_eval_source = "MARKET_EVENT" if urgent else "POLL"
+            if urgent and self._last_market_event_time > 0.0:
+                self._last_event_eval_time = now
+                self._last_event_eval_delay_ms = max(0.0, (now - self._last_market_event_time) * 1000.0)
 
             # Local data feeds — all in-process reads, no I/O
             try:
@@ -1936,11 +2027,12 @@ class QuantStrategy:
         else:
             spread_txt = "not-evaluated"
         logger.info(
-            "🧭 ICT_DECISION %s state=%s block=%s | domain=%s mark=%s ATR5=%s pct=%s%% | "
+            "🧭 AUCTION_DECISION %s state=%s block=%s archetype=%s | domain=%s mark=%s ATR5=%s pct=%s%% | "
             "4H=%s score=%s=[slope%s+struct%s] threshold=±%s ATR=%s | "
             "15m=%s score=%s=[slope%s+struct%s] threshold=±%s ATR=%s | "
             "bias=%s dir=%s score=%s strict=%s raids=fresh5m:%d parent_htf:%d accepted:%d opposed:%d invalid:%d accepted=%s parent=%s | cost=%s",
-            mode, info.get("state", "SCANNING"), info.get("block_reason", "UNKNOWN"), self._analysis_unit(),
+            mode, info.get("state", "SCANNING"), info.get("block_reason", "UNKNOWN"),
+            str(info.get("candidate_archetype", info.get("archetype", "-") or "-")), self._analysis_unit(),
             self._decision_fmt({"v": price}, "v"), self._decision_fmt(info,"entry_5m_atr"),
             self._decision_fmt({"p": 100.0*self._decision_num(info,"atr_percentile",0.5)},"p",".0f"),
             info.get("context_4h", "WAIT"), self._decision_fmt(info,"context_4h_score","+.3f"),
@@ -1989,14 +2081,18 @@ class QuantStrategy:
         if changed and info.get("raid_side"):
             if not info.get("mss_broken"):
                 logger.info(
-                    "📐 ICT_GEOMETRY stage=MSS_WAIT side=%s raid=%s | MSS=%s broken=N displacement=%sATR | "
+                    "📐 ICT_GEOMETRY stage=MSS_WAIT side=%s raid=%s | MSS=%s source=%s age=%sb broken=N displacement=%sATR | "
                     "FVG=N/A prerequisite=MSS_BREAK | SL=N/A prerequisite=FVG_REPRICE | TP=N/A prerequisite=EXECUTABLE_GEOMETRY",
-                    str(info.get("raid_side")).upper(), raid, self._decision_fmt(info,"mss_level"), self._decision_fmt(info,"displacement_atr",".2f"),
+                    str(info.get("raid_side")).upper(), raid, self._decision_fmt(info,"mss_level"),
+                    str(info.get("mss_source") or "N/A"), int(info.get("mss_age_bars", -1) or -1),
+                    self._decision_fmt(info,"displacement_atr",".2f"),
                 )
             elif not self._decision_has(info, "fvg_low"):
                 logger.info(
-                    "📐 ICT_GEOMETRY stage=FVG_WAIT side=%s MSS=%s broken=Y displacement=%sATR | FVG=N/A prerequisite=VALID_REBALANCE_GAP | SL=N/A | TP=N/A",
-                    str(info.get("raid_side")).upper(), self._decision_fmt(info,"mss_level"), self._decision_fmt(info,"displacement_atr",".2f"),
+                    "📐 ICT_GEOMETRY stage=FVG_WAIT side=%s MSS=%s source=%s age=%sb broken=Y displacement=%sATR | FVG=N/A prerequisite=VALID_REBALANCE_GAP | SL=N/A | TP=N/A",
+                    str(info.get("raid_side")).upper(), self._decision_fmt(info,"mss_level"),
+                    str(info.get("mss_source") or "N/A"), int(info.get("mss_age_bars", -1) or -1),
+                    self._decision_fmt(info,"displacement_atr",".2f"),
                 )
             else:
                 audit = dict(info.get("target_audit", {}) or {})
@@ -2007,8 +2103,8 @@ class QuantStrategy:
                 except Exception:
                     cap_txt = "N/A"
                 logger.info(
-                    "📐 ICT_GEOMETRY stage=EXECUTABLE side=%s MSS=%s broken=Y disp=%sATR | FVG=[%s,%s] eq=%s gap=%sATR | "
-                    "SL=%s clearance=%sATR model=%s+%s×pct | target=%s@%s model=%s eligible=%d/%d positive=%d RR=%s floor=%s cap=%s P=%s U=%sR",
+                    "📐 AUCTION_GEOMETRY stage=EXECUTABLE side=%s MSS=%s broken=Y disp=%sATR | FVG=[%s,%s] eq=%s gap=%sATR | "
+                    "SL=%s clearance=%sATR model=%s+%s×pct | target=%s@%s model=%s eligible=%d/%d positive=%d RR=%s floor=%s cap=%s deliveryScore=%s calibratedP=%s",
                     str(info.get("side", info.get("raid_side", "-"))).upper(), self._decision_fmt(info,"mss_level"),
                     self._decision_fmt(info,"displacement_atr",".2f"), self._decision_fmt(info,"fvg_low"), self._decision_fmt(info,"fvg_high"),
                     self._decision_fmt(info,"fvg_equilibrium"), self._decision_fmt(info,"fvg_distance_atr",".2f"),
@@ -2016,18 +2112,18 @@ class QuantStrategy:
                     self._decision_fmt(info,"stop_clearance_base_atr",".2f"), self._decision_fmt(info,"stop_clearance_pctile_slope_atr",".2f"),
                     info.get("target_timeframe", "N/A"), self._decision_fmt(info,"target_pool_price"), target_model, int(audit.get("eligible",0) or 0),
                     int(audit.get("pool_total",0) or 0), int(audit.get("positive",0) or 0), self._decision_fmt(info,"rr",".2f"),
-                    self._decision_fmt(info,"min_structural_rr",".2f"), cap_txt, self._decision_fmt(info,"delivery_probability",".2f"), self._decision_fmt(info,"delivery_utility_r","+.2f"),
+                    self._decision_fmt(info,"min_structural_rr",".2f"), cap_txt, self._decision_fmt(info,"delivery_score","+.2f"), "Y" if bool(info.get("probability_calibrated")) else "N/A",
                 )
 
     def _evaluate_entry(self, data_manager, order_manager, risk_manager, now):
-        """Evaluate exactly one 4H/15m/5m ICT + Liquidity thesis with data lineage gates."""
+        """Evaluate unified institutional auction archetypes with data lineage gates."""
         if self._entry_engine is None or self._liq_map is None:
-            logger.error("ICT + Liquidity authority unavailable — entries disabled")
+            logger.error("Institutional auction authority unavailable — entries disabled")
             return
         if self.watchdog_trading_frozen:
             if now - self._last_watchdog_freeze_log >= 60.0:
                 self._last_watchdog_freeze_log = now
-                logger.info("ICT + Liquidity entries paused: watchdog circuit breaker engaged")
+                logger.info("Institutional auction entries paused: watchdog circuit breaker engaged")
             return
         try:
             analysis_getter = getattr(data_manager, "get_analysis_price", None)
@@ -2048,7 +2144,7 @@ class QuantStrategy:
         if len(c5) < QCfg.MIN_5M_BARS() or len(c15) < 20 or len(c4h) < 20:
             if now - self._last_data_warn >= 30.0:
                 self._last_data_warn = now
-                logger.info("ICT + Liquidity warmup waiting: 5m=%d 15m=%d 4h=%d", len(c5), len(c15), len(c4h))
+                logger.info("Institutional auction warmup waiting: 5m=%d 15m=%d 4h=%d", len(c5), len(c15), len(c4h))
             return
         self._atr_5m.compute(c5)
         atr = float(self._atr_5m.atr or 0.0)
@@ -2059,7 +2155,7 @@ class QuantStrategy:
             self._log_ict_decision_snapshot({
                 "state": "SCANNING", "block_reason": "DATA_INTEGRITY_BLOCK:" + ",".join(quality.get("blockers", [])),
                 "trigger": "WAIT", "entry_5m_atr": atr, "atr_percentile": self._atr_5m.get_percentile(),
-                "authority": "STRUCTURAL_ONLY",
+                "authority": "UNIFIED_STRUCTURAL_AUCTION",
             }, price, now)
             return
         # Book/spread is execution evidence, not structural alpha.  Measure it
@@ -2081,7 +2177,18 @@ class QuantStrategy:
             estimated_cost_pts, estimated_cost_bps = self._roundtrip_cost_points(price, use_maker_entry=True)
         self._entry_engine.set_execution_cost_model(estimated_cost_pts, estimated_cost_bps)
         self._entry_engine.set_atr_pctile(self._atr_5m.get_percentile())
-        self._entry_engine.update(snapshot, price, atr, now, candles_5m=c5, candles_15m=c15, candles_4h=c4h)
+        try:
+            micro = build_microstructure_state(
+                data_manager.get_orderbook() if hasattr(data_manager, "get_orderbook") else {},
+                data_manager.get_recent_trades_raw() if hasattr(data_manager, "get_recent_trades_raw") else [],
+                atr, now=now, book_max_age_sec=float(getattr(config, "ORDERBOOK_MAX_AGE_SECONDS", 5.0) or 5.0),
+            )
+        except Exception:
+            micro = None
+        self._entry_engine.update(
+            snapshot, price, atr, now, candles_5m=c5, candles_15m=c15, candles_4h=c4h,
+            candles_1h=candles_by_tf.get("1h", []), micro_state=micro,
+        )
         signal = self._entry_engine.get_signal()
         info = self._entry_engine.analysis_info or {}
         if signal is not None and not spread_ok:
@@ -2110,22 +2217,27 @@ class QuantStrategy:
         self._force_sl, self._force_tp, self._last_entry_signal = sl, tp, signal
         sig = StructuralEntrySummary()
         sig.atr = atr
-        sig.delivery_probability = float(signal.delivery_probability or 0.0)
+        sig.delivery_score = float(getattr(signal, "delivery_score", 0.0) or 0.0)
+        sig.probability_calibrated = bool(getattr(signal, "probability_calibrated", False))
+        sig.delivery_probability = (float(signal.delivery_probability) if sig.probability_calibrated and signal.delivery_probability is not None else None)
+        sig.archetype = str(getattr(signal, "archetype", "") or getattr(signal.entry_type, "value", "STRUCTURAL_AUCTION"))
         sig.structural_validation = signal.structural_validation
         unit = self._analysis_unit()
         logger.info(
-            "✅ ICT_ORDER_THESIS domain=%s %s entry=%s%.4f SL=%s%.4f TP=%s%.4f | risk=%.4f reward=%.4f grossRR=%.2f floor=%.2f "
-            "estNetWinR=%s estNetEU=%s deliveryP=%.2f target=%s@%.4f | account_balance=%s%.2f execution_conversion=%s | %s",
+            "✅ INSTITUTIONAL_ORDER_THESIS archetype=%s domain=%s %s entry=%s%.4f SL=%s%.4f TP=%s%.4f | risk=%.4f reward=%.4f grossRR=%.2f floor=%.2f "
+            "estNetWinR=%s deliveryScore=%s calibratedP=%s target=%s@%.4f | account_balance=%s%.2f execution_conversion=%s evalSource=%s eventDelayMs=%.2f | %s",
+            str(getattr(signal, "archetype", "") or getattr(signal.entry_type, "value", "STRUCTURAL")),
             "UNDERLYING" if unit == "NIFTYpts" else "EXECUTION_INSTRUMENT", side.upper(), unit, entry, unit, sl, unit, tp,
             abs(entry-sl), abs(tp-entry), rr, float(pol.min_rr),
             f"{float(info.get('target_net_win_r')):.2f}" if info.get('target_net_win_r') is not None else "PREMIUM_PENDING" if unit == "NIFTYpts" else "N/A",
-            f"{float(info.get('delivery_utility_r')):+.2f}R" if info.get('delivery_utility_r') is not None else "PREMIUM_PENDING" if unit == "NIFTYpts" else "N/A",
-            float(signal.delivery_probability or 0.0), str(info.get("target_timeframe","-")), self._decision_num(info,"target_pool_price"),
+            f"{float(info.get('delivery_score')):.2f}" if info.get('delivery_score') is not None else "N/A",
+            "Y" if bool(info.get("probability_calibrated")) else "N/A",
+            str(info.get("target_timeframe","-")), self._decision_num(info,"target_pool_price"),
             str(self._position_accounting_context().get("currency_symbol", "$")), total_bal,
-            "OPTION_PREMIUM_PENDING" if unit == "NIFTYpts" else "DIRECT", signal.reason,
+            "OPTION_PREMIUM_PENDING" if unit == "NIFTYpts" else "DIRECT", getattr(self, "_last_eval_source", "POLL"), float(getattr(self, "_last_event_eval_delay_ms", 0.0) or 0.0), signal.reason,
         )
         self._entry_engine.on_entry_placed(signal)
-        self._launch_entry_async(data_manager, order_manager, risk_manager, side, sig, mode="ict_liquidity", setup_grade="STRUCTURAL", prefetched_bal_info=bal_info, entry_now=now)
+        self._launch_entry_async(data_manager, order_manager, risk_manager, side, sig, mode="institutional_auction", setup_grade="STRUCTURAL", prefetched_bal_info=bal_info, entry_now=now)
 
     @staticmethod
     def _clamp_ladder_value(value: float, lo: float, hi: float) -> float:
@@ -2614,7 +2726,7 @@ class QuantStrategy:
     def _enter_trade(self, data_manager, order_manager, risk_manager, side, sig, mode="ict_liquidity",
                      setup_grade: str = "", prefetched_bal_info: dict = None,
                      entry_now: float = 0.0):
-        """Execute an approved ICT + Liquidity structural thesis with attached protection.
+        """Execute an approved institutional auction thesis with attached protection.
 
         The entry authority has already fixed side, invalidation and delivery target.
         This method performs only derivative routing, fee/cost feasibility, structural-risk
@@ -2747,9 +2859,10 @@ class QuantStrategy:
             side = "long"
         # NOTE: risk gate already checked in _evaluate_entry — no duplicate check here
 
-        # ── Read structural delivery probability from the authorised thesis ───────────
-        # NOTE: kept before entry routing so delivery_probability is available.
-        delivery_probability = float(getattr(getattr(self, "_last_entry_signal", None), "delivery_probability", 0.0) or 0.0)
+        # ── Statistical calibration boundary ───────────────────────────────────
+        # Structural delivery_score is execution evidence, not a win probability.
+        # Only replay-calibrated probabilities may affect utility or risk allocation.
+        delivery_probability = self._calibrated_signal_probability()
 
         # ── Limit price: prefer FVG rebalance signal price, fall back to live book ──
         # A valid FVG rebalance price is routed as a maker LIMIT. When that
@@ -2826,7 +2939,9 @@ class QuantStrategy:
         # (they're limit orders by construction).
         if not _icici_mode and not _sig_is_valid and self._fee_engine is not None and self._fee_engine.is_warmed_up():
             try:
-                _urgency = 1.0 - min(1.0, delivery_probability)   # lower structural delivery probability permits faster execution
+                # Queue urgency is neutral until a replay-calibrated probability exists.
+                # A structural evidence score is not allowed to alter routing cost assumptions.
+                _urgency = (0.50 if delivery_probability is None else 1.0 - min(1.0, delivery_probability))
                 _fe_maker, _fe_lim, _fe_reason = self._fee_engine.decide_entry_type(
                     side=side, quantity=1.0,   # qty not yet known; use 1.0 for fill-prob estimate
                     price=price,
@@ -2845,8 +2960,9 @@ class QuantStrategy:
         logger.info(f"Entry routing: {'LIMIT/maker' if use_maker else 'MARKET/taker'} | {mt_reason}")
 
         # ── Structural order sequence: bind SL/TP before sizing ────────────────────────────────
-        # SL/TP computation does not depend on position size — it uses price, ATR,
-        # mode, and delivery_probability only.  Computing it first passes the
+        # SL/TP computation does not depend on position size — it uses price, ATR
+        # and approved structural geometry. Optional calibrated odds affect cost
+        # conservatism only. Computing it first passes the
         # actual structural invalidation distance (not an ATR proxy) into position sizing, which is the
         # correct industry-grade approach: risk-in-dollars / SL-distance = quantity.
 
@@ -2937,7 +3053,7 @@ class QuantStrategy:
         _execution_min_rr = float(getattr(_execution_policy, "min_rr", 1.0) or 1.0)
         if rr + 1e-12 < _execution_min_rr:
             logger.info(
-                "ICT_EXECUTION_REJECT grossRR=%.2f floor=%.2f | conservative tick/premium conversion no longer clears structural R:R floor",
+                "AUCTION_EXECUTION_REJECT grossRR=%.2f floor=%.2f | conservative tick/premium conversion no longer clears structural R:R floor",
                 rr, _execution_min_rr)
             with self._lock:
                 self._last_tp_gate_rejection = time.time()
@@ -2949,19 +3065,7 @@ class QuantStrategy:
         # ── Structural order sequence: size from exact invalidation distance ──────────────────────
         # Now that sl_price is known, size from dollar risk / actual SL distance.
         # Structural delivery and venue-cost scaling are applied within account-risk limits.
-        exec_delivery_probability = None
-        try:
-            qp = float(getattr(getattr(self, "_last_entry_signal", None), "delivery_probability", 0.0) or 0.0)
-            if qp > 0.0:
-                exec_delivery_probability = qp
-        except Exception:
-            exec_delivery_probability = None
-        if exec_delivery_probability is None:
-            exec_delivery_probability = max(
-                float(getattr(getattr(self, "_last_entry_signal", None), "delivery_probability", 0.0) or 0.0),
-            )
-            if exec_delivery_probability <= 0.0:
-                exec_delivery_probability = None
+        exec_delivery_probability = self._calibrated_signal_probability()
 
         if not use_maker:
             taker_v = self._execution_viability_model(
@@ -3000,7 +3104,7 @@ class QuantStrategy:
         self._last_execution_viability = executed_viability.as_refine_context()
         if not executed_viability.allocation_allowed:
             logger.info(
-                "ICT_EXECUTION_REJECT grossRR=%.2f netWinR=%s netEU=%s | cost/risk=%.3fR reason=%s",
+                "AUCTION_EXECUTION_REJECT grossRR=%.2f netWinR=%s netEU=%s | cost/risk=%.3fR reason=%s",
                 rr,
                 f"{executed_viability.net_win_r:.2f}" if executed_viability.utility_known else "N/A",
                 f"{executed_viability.expected_net_utility_r:+.2f}R" if executed_viability.utility_known else "N/A",
@@ -3009,12 +3113,12 @@ class QuantStrategy:
             return
         if executed_viability.utility_known and executed_viability.expected_net_utility_r <= 0.0:
             logger.info(
-                "ICT_EXECUTION_REJECT grossRR=%.2f netWinR=%.2f netLossR=%.2f netEU=%+.2fR | non-positive expected value after venue costs",
+                "AUCTION_EXECUTION_REJECT grossRR=%.2f netWinR=%.2f netLossR=%.2f netEU=%+.2fR | non-positive expected value after venue costs",
                 rr, executed_viability.net_win_r, executed_viability.net_loss_r, executed_viability.expected_net_utility_r)
             _release_icici_vehicle_if_unfilled("non_positive_net_execution_utility")
             return
         logger.info(
-            "ICT_EXECUTION_ECONOMICS grossRR=%.2f netWinR=%s netLossR=%s netEU=%s cost/risk=%.3fR route=%s",
+            "AUCTION_EXECUTION_ECONOMICS grossRR=%.2f netWinR=%s netLossR=%s netEU=%s cost/risk=%.3fR route=%s",
             rr,
             f"{executed_viability.net_win_r:.2f}" if executed_viability.utility_known else "N/A",
             f"{executed_viability.net_loss_r:.2f}" if executed_viability.utility_known else "N/A",
@@ -3446,8 +3550,11 @@ class QuantStrategy:
 
 
         _quality = dict(getattr(getattr(self, "_last_entry_signal", None), "quality", {}) or {})
-        _delivery_probability = float(_quality.get("delivery_probability", 0.0) or 0.0)
-        _delivery_utility_r = float(_quality.get("delivery_utility_r", 0.0) or 0.0)
+        _prob_calibrated = bool(_quality.get("probability_calibrated", False))
+        _delivery_probability = float(_quality.get("delivery_probability", 0.0) or 0.0) if _prob_calibrated else 0.0
+        _delivery_score = float(_quality.get("delivery_score", 0.0) or 0.0)
+        _delivery_utility_r = float(_quality.get("delivery_utility_r", 0.0) or 0.0) if _prob_calibrated else 0.0
+        _archetype = str(_quality.get("archetype", getattr(getattr(self, "_last_entry_signal", None), "archetype", "STRUCTURAL_AUCTION")) or "STRUCTURAL_AUCTION")
 
         # ── Update position state ─────────────────────────────────────────────────
         self._pos = PositionState(
@@ -3474,7 +3581,10 @@ class QuantStrategy:
             entry_htf_15m   = float(getattr(getattr(self, "_last_entry_signal", None), "quality", {}).get("context_15m", 0.0) or 0.0),
             entry_htf_4h    = float(getattr(getattr(self, "_last_entry_signal", None), "quality", {}).get("context_4h", 0.0) or 0.0),
             delivery_probability = _delivery_probability,
-            delivery_utility_r        = _delivery_utility_r,
+            probability_calibrated = _prob_calibrated,
+            delivery_score = _delivery_score,
+            archetype = _archetype,
+            delivery_utility_r = _delivery_utility_r,
             quant_components = _quality,
             tp_ladder = tp_ladder_dicts,
             tp_ladder_order_ids = tp_ladder_order_ids,
@@ -3522,7 +3632,7 @@ class QuantStrategy:
             self._entry_engine.on_position_opened()
 
 
-        # ── ICT + Liquidity entry notification ───────────────────────────────
+        # ── Institutional auction entry notification ─────────────────────────
         _es = getattr(self, "_last_entry_signal", None)
         _quality = dict(getattr(_es, "quality", {}) or {}) if _es is not None else {}
         _raid = getattr(_es, "sweep_result", None) if _es is not None else None
@@ -3530,23 +3640,27 @@ class QuantStrategy:
         _raid_label = str(getattr(getattr(_raid_pool, "side", None), "value", "-") or "-")
         _raid_px = float(getattr(_raid_pool, "price", 0.0) or 0.0)
         _entry_cur = str(getattr(self._pos, "currency_symbol", "$") or "$")
-        _delivery_p = float(_quality.get("delivery_probability", 0.0) or 0.0)
-        _utility = float(_quality.get("delivery_utility_r", 0.0) or 0.0)
+        _prob_calibrated = bool(_quality.get("probability_calibrated", False))
+        _delivery_p = float(_quality.get("delivery_probability", 0.0) or 0.0) if _prob_calibrated else 0.0
+        _delivery_score = float(_quality.get("delivery_score", 0.0) or 0.0)
+        _utility = float(_quality.get("delivery_utility_r", 0.0) or 0.0) if _prob_calibrated else 0.0
+        _archetype = str(_quality.get("archetype", getattr(_es, "archetype", "STRUCTURAL_AUCTION")) or "STRUCTURAL_AUCTION")
+        _prob_line = (f"Calibrated delivery P: {_delivery_p:.2f} | expected net utility: {_utility:+.2f}R" if _prob_calibrated else "Calibrated delivery P: not available; sizing uses structural risk and measured execution cost only")
         _disp = float(_quality.get("displacement_atr", 0.0) or 0.0)
         _fee_line = (f"Broker fee exact {_entry_cur}{entry_fee_paid:.4f}" if entry_fee_exact else "Broker fee pending exact execution report")
         _entry_msg = (
-            "🏛 <b>ICT + LIQUIDITY ENTRY FILLED</b>\n"
-            f"{side.upper()} | {str(getattr(self._instrument, 'asset_id', QCfg.SYMBOL()))}\n"
+            "🏛 <b>INSTITUTIONAL AUCTION ENTRY FILLED</b>\n"
+            f"{side.upper()} | {str(getattr(self._instrument, 'asset_id', QCfg.SYMBOL()))} | {_archetype}\n"
             f"Entry: {_entry_cur}{fill_price:,.4f} | SL: {_entry_cur}{sl_price:,.4f} | TP: {_entry_cur}{tp_price:,.4f}\n"
             f"Qty: {qty:g} | Leverage: {_entry_leverage:g}x | R:R: 1:{rr_a:.2f}\n"
             f"4H context: {_quality.get('context_4h', 0.0):.2f} | 15m context: {_quality.get('context_15m', 0.0):.2f}\n"
             f"5m raid: {_raid_label} @ {_entry_cur}{_raid_px:,.4f} | displacement: {_disp:.2f} ATR\n"
-            f"Delivery probability: {_delivery_p:.2f} | structural utility: {_utility:+.2f}R\n"
+            f"Delivery evidence score: {_delivery_score:+.2f} | {_prob_line}\n"
             f"Structural risk: {_entry_cur}{dollar_risk:,.2f} | {_fee_line}\n"
             "Exit authority: attached structural SL + opposing higher-timeframe liquidity targets"
         )
         self._send_telegram(_entry_msg, event_type="entry")
-        logger.info("✅ ACTIVE ICT_LIQUIDITY %s @ %s%.4f | SL=%s%.4f TP=%s%.4f | R:R=1:%.2f", side.upper(), _entry_cur, fill_price, _entry_cur, sl_price, _entry_cur, tp_price, rr_a)
+        logger.info("✅ ACTIVE STRUCTURAL_AUCTION %s @ %s%.4f | SL=%s%.4f TP=%s%.4f | R:R=1:%.2f", side.upper(), _entry_cur, fill_price, _entry_cur, sl_price, _entry_cur, tp_price, rr_a)
 
     def _observe_position_extremes(self, pos, price: float) -> tuple:
         profit = (price - pos.entry_price) if pos.side == "long" else (pos.entry_price - price)
@@ -4100,7 +4214,7 @@ class QuantStrategy:
             "exchange": str(getattr(pos, "exchange", "") or ""),
             "execution_symbol": str(getattr(pos, "execution_symbol", "") or QCfg.SYMBOL()),
             "symbol": str(getattr(pos, "execution_symbol", "") or QCfg.SYMBOL()),
-            "side": str(getattr(pos, "side", "") or ""), "mode": "ICT_LIQUIDITY_4H_15M_5M",
+            "side": str(getattr(pos, "side", "") or ""), "mode": "INSTITUTIONAL_AUCTION_V514",
             "entry": float(getattr(pos, "entry_price", 0.0) or 0.0), "exit": float(exit_price or 0.0),
             "qty": float(getattr(pos, "quantity", 0.0) or 0.0), "sl": float(getattr(pos, "sl_price", 0.0) or 0.0),
             "tp": float(getattr(pos, "tp_price", 0.0) or 0.0), "pnl": float(pnl), "is_win": is_win,
@@ -4114,8 +4228,11 @@ class QuantStrategy:
             "context_15m": float(quality.get("context_15m", getattr(pos, "entry_htf_15m", 0.0)) or 0.0),
             "raid_quality": float(quality.get("raid_quality", 0.0) or 0.0),
             "displacement_atr": float(quality.get("displacement_atr", 0.0) or 0.0),
-            "delivery_probability": float(getattr(pos, "delivery_probability", quality.get("delivery_probability", 0.0)) or 0.0),
-            "delivery_utility_r": float(getattr(pos, "delivery_utility_r", quality.get("delivery_utility_r", 0.0)) or 0.0),
+            "delivery_score": float(getattr(pos, "delivery_score", quality.get("delivery_score", 0.0)) or 0.0),
+            "probability_calibrated": bool(getattr(pos, "probability_calibrated", quality.get("probability_calibrated", False))),
+            "delivery_probability": float(getattr(pos, "delivery_probability", quality.get("delivery_probability", 0.0)) or 0.0) if bool(getattr(pos, "probability_calibrated", quality.get("probability_calibrated", False))) else None,
+            "delivery_utility_r": float(getattr(pos, "delivery_utility_r", quality.get("delivery_utility_r", 0.0)) or 0.0) if bool(getattr(pos, "probability_calibrated", quality.get("probability_calibrated", False))) else None,
+            "archetype": str(getattr(pos, "archetype", quality.get("archetype", "STRUCTURAL_AUCTION")) or "STRUCTURAL_AUCTION"),
             "analysis_entry_price": float(getattr(pos, "analysis_entry_price", 0.0) or 0.0),
             "analysis_sl_price": float(getattr(pos, "analysis_sl_price", 0.0) or 0.0),
             "analysis_tp_price": float(getattr(pos, "analysis_tp_price", 0.0) or 0.0),
@@ -4223,19 +4340,21 @@ class QuantStrategy:
             required_entry = 0.0
 
         utility_known = False
-        delivery_p = 0.0
+        delivery_p = None
         net_win_r = 0.0
         net_loss_r = 0.0
         net_delivery_utility = 0.0
-        if delivery_probability is not None and reward > 0.0 and sl_dist > 1e-9:
-            try:
-                delivery_p = max(0.01, min(0.99, float(delivery_probability)))
-                utility_known = True
-                net_win_r = (reward - rt_cost_pts) / sl_dist
-                net_loss_r = (sl_dist + rt_cost_pts) / sl_dist
-                net_delivery_utility = delivery_p * net_win_r - (1.0 - delivery_p) * net_loss_r
-            except Exception:
-                utility_known = False
+        if reward > 0.0 and sl_dist > 1e-9:
+            net_win_r = (reward - rt_cost_pts) / sl_dist
+            net_loss_r = (sl_dist + rt_cost_pts) / sl_dist
+            if delivery_probability is not None:
+                try:
+                    delivery_p = max(0.01, min(0.99, float(delivery_probability)))
+                    utility_known = True
+                    net_delivery_utility = delivery_p * net_win_r - (1.0 - delivery_p) * net_loss_r
+                except Exception:
+                    utility_known = False
+                    delivery_p = None
 
         allocation_allowed = fee_to_risk < fee_no_alloc
         if fee_to_risk >= fee_no_alloc:
@@ -4282,7 +4401,7 @@ class QuantStrategy:
         viability = self._execution_viability_model(side=side, price=entry_price, sl_price=sl_price, tp_price=tp_price, use_maker_entry=use_maker_entry, delivery_probability=delivery_probability)
         self._last_execution_viability = viability.as_refine_context()
         if not viability.allocation_allowed:
-            logger.info("ICT_LIQUIDITY execution rejected: structural setup cannot absorb venue costs | %s", viability.reason)
+            logger.info("STRUCTURAL_AUCTION execution rejected: structural setup cannot absorb venue costs | %s", viability.reason)
         return sl_price, tp_price, False
 
     def _compute_quantity(self, risk_manager, price,
@@ -4294,11 +4413,11 @@ class QuantStrategy:
                            tp_price: float = 0.0,
                            use_maker_entry: bool = False,
                            delivery_probability: Optional[float] = None) -> Optional[float]:
-        """Allocate an approved ICT/Liquidity thesis from structural invalidation risk.
+        """Allocate an approved auction thesis from structural invalidation risk.
 
         Allocation is bounded by live free cash, venue lot rules, bracket SL
-        distance, cost-adjusted structural delivery probability, leverage and
-        liquidation safety, and account circuit limits.
+        distance, measured cost, leverage/liquidation safety and account limits.
+        A replay-calibrated probability may reduce risk only when supplied.
         """
         # ── SL distance guard — required for risk-based sizing ────────────────
         if sl_price is None or sl_price <= 0:
@@ -4333,17 +4452,19 @@ class QuantStrategy:
             max_qty = max(min_qty, float(_cfg("ICICI_OPTION_MAX_QTY", 1000000.0)))
             leverage = 1.0
 
-        # ── Structural delivery allocation scalar ─────────────────────────────
-        # The setup is already approved by the ICT/Liquidity authority. Capital
-        # pressure is continuous and depends only on the selected structural
-        # target's estimated delivery probability plus venue cost impairment.
-        delivery_p = max(0.25, min(1.0, float(delivery_probability or 0.25)))
+        # ── Institutional risk boundary ───────────────────────────────────────
+        # Evidence decides whether a structure exists; it cannot scale capital as
+        # though it were a calibrated win probability.  Capital is reduced only
+        # by observable venue cost/spread impairment, desk risk policy, and an
+        # explicitly calibrated probability model when one is supplied.
+        calibrated_p = delivery_probability if delivery_probability is not None else None
         spread_cost_mult = float(getattr(self, "_active_spread_cost_mult", 1.0) or 1.0)
         try:
             policy_risk_mult = float(policy_value("risk_multiplier", 1.0))
         except Exception:
             policy_risk_mult = 1.0
-        allocation_scalar = max(0.05, min(1.0, delivery_p * spread_cost_mult * policy_risk_mult))
+        probability_scalar = (self._capital_allocation_scalar(calibrated_p, 1.0) if calibrated_p is not None else 1.0)
+        allocation_scalar = max(0.05, min(1.0, probability_scalar * spread_cost_mult * policy_risk_mult))
 
         # ── Available balance (reuse prefetched — SIG-8 fix) ─────────────────
         bal = prefetched_bal_info if prefetched_bal_info is not None else risk_manager.get_available_balance()
@@ -4479,9 +4600,9 @@ class QuantStrategy:
         policy_target_margin = margin_budget_base * policy_margin_frac
         margin_capacity = cash_available
 
-        # Structural delivery and measured execution costs can reduce capital
-        # allocation, but never increase the configured account-risk budget.
-        allocation_intensity = self._capital_allocation_scalar(delivery_p, fee_drag_mult)
+        # Measured execution costs and an optional replay-calibrated model can
+        # reduce allocation, but evidence scores cannot increase or decrease risk.
+        allocation_intensity = self._capital_allocation_scalar(calibrated_p, fee_drag_mult)
         allocation_intensity = max(0.05, min(1.0, allocation_intensity * spread_cost_mult * policy_risk_mult))
         allocation_scalar = min(allocation_scalar, allocation_intensity)
         target_margin_budget = min(margin_capacity, policy_target_margin * allocation_intensity)
@@ -4667,9 +4788,9 @@ class QuantStrategy:
         logger.info(
             f"✅ Sizing [ict_liquidity_structural_risk] | "
             f"RISK_BASE={risk_pct:.3%} RISK_EFF={effective_risk_pct:.3%} | "
-            f"deliveryP={delivery_p:.2f} "
+            f"calibratedP={calibrated_p if calibrated_p is not None else 'N/A'} "
             f"allocation_scalar={allocation_scalar:.2f} allocation_intensity={allocation_intensity:.2f} "
-            f"(delivery={delivery_p:.2f} fee={fee_drag_mult:.2f}) | "
+            f"(probability_control={'ACTIVE' if calibrated_p is not None else 'OFF'} fee={fee_drag_mult:.2f}) | "
             f"target_risk={risk_capital:.2f} risk_qty={qty_by_risk:.4f} "
             f"margin_qty={qty_by_target_margin:.4f} raw_qty={qty_raw:.4f} | "
             f"SL-dist={sl_dist:.1f}pts | risk={dollar_risk:.2f} "
@@ -4826,8 +4947,8 @@ class QuantStrategy:
         analysis = self._entry_engine.analysis_info if self._entry_engine is not None else {}
         atr = float(self._atr_5m.atr or 0.0)
         lines = [
-            "🏛 <b>ICT + LIQUIDITY STATUS</b>",
-            f"Authority: 4H/15m DOL bias → 5m raid/MSS/FVG",
+            "🏛 <b>INSTITUTIONAL AUCTION STATUS</b>",
+            f"Authority: liquidity-raid reversal | displacement continuation | liquidity-expansion retest",
             f"State: {state} | Price: {cur}{price:,.4f} | ATR(5m): {cur}{atr:,.4f}",
             f"Context: 4H={analysis.get('context_4h', '-')} | 15m={analysis.get('context_15m', '-')} | Bias={analysis.get('context_bias_path', 'AWAITING_5M_DOL')} | Trigger={analysis.get('trigger', 'WAIT')}",
             f"Closed trades: {self._total_trades} | Wins: {self._winning_trades} | Realised P&L: {cur}{self._total_pnl:+,.2f}",
@@ -4841,7 +4962,7 @@ class QuantStrategy:
             ])
         if analysis.get("entry"):
             lines.append(f"Candidate: entry={cur}{float(analysis.get('entry',0)):.4f} SL={cur}{float(analysis.get('sl',0)):.4f} TP={cur}{float(analysis.get('tp',0)):.4f} RR={float(analysis.get('rr',0)):.2f}")
-            lines.append(f"Delivery probability={float(analysis.get('delivery_probability',0)):.2f} | Structural utility={float(analysis.get('delivery_utility_r',0)):+.2f}R")
+            lines.append(f"Delivery score={float(analysis.get('delivery_score',0) or 0):.2f} | Calibrated probability={'available' if analysis.get('probability_calibrated') else 'not claimed'}")
         return "\n".join(lines)
 
     def _reconcile_query_thread(self, order_manager):

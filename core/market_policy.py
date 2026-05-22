@@ -130,7 +130,7 @@ class InstrumentPolicy:
     notes: str = ""
     desk_id: str = "BTC"
     desk_name: str = "BTC Desk"
-    strategy_key: str = "ICT_LIQUIDITY_4H15M5M"
+    strategy_key: str = "INSTITUTIONAL_AUCTION_V514"
 
     @property
     def evaluation_interval_sec(self) -> float:
@@ -203,7 +203,7 @@ def build_instrument_policy(inst: Optional[TradableInstrument]) -> InstrumentPol
     base_cooldown = _i('MIN_TIME_BETWEEN_TRADES_SEC', 300)
     desk_id, desk = _desk_config_for(inst)
     desk_name = str(desk.get("display_name", f"{desk_id.title()} Desk"))
-    strategy_key = str(desk.get("strategy", _cfg("STRATEGY_CORE_NAME", "ICT_LIQUIDITY_4H15M5M")))
+    strategy_key = str(desk.get("strategy", _cfg("STRATEGY_CORE_NAME", "INSTITUTIONAL_AUCTION_V514")))
     desk_fields = {
         "desk_id": desk_id,
         "desk_name": desk_name,

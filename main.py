@@ -1,8 +1,8 @@
-"""Entry point for the institutional ICT + Liquidity execution system.
+"""Entry point for the Institutional Auction execution system.
 
-Alpha authority is singular: 4H/15m draw-on-liquidity context and a fresh
-5m liquidity raid with MSS/displacement and FVG repricing. Risk, bracket
-protection and exact-fill reconciliation remain venue-scoped controls.
+Alpha authority is singular but multi-archetype: liquidity raid reversal, displacement
+continuation and liquidity-expansion retest compete using measurable auction evidence.
+Risk, bracket protection and exact-fill reconciliation remain venue-scoped controls.
 """
 
 from __future__ import annotations
@@ -197,7 +197,7 @@ class TerminalBurstFilter(logging.Filter):
     """Suppress repeated tick-level terminal messages while keeping file logs intact."""
 
     _NOISY_MARKERS = (
-        "ICT_DECISION SNAPSHOT",
+        "AUCTION_DECISION SNAPSHOT",
         "DESK_HEALTH",
         "Spread cost impairment",
     )
@@ -328,7 +328,7 @@ class QuantBot:
     Decision hierarchy on every tick:
       1. Build feed-reliability and market-state context.   → MarketAggregator
       2. Map live BSL/SSL features and archived sweeps.      → LiquidityMap
-      3. Approve only 5m raid/MSS/FVG with HTF DOL bias and real target. → ICT_LIQUIDITY
+      3. Compete structural auction archetypes using liquidity destination, protected structure and executable evidence. → AUCTION_ENGINE
       4. Validate sizing, liquidation, lots and fills.       → Risk/Execution
       5. Manage live trade via fixed SL + TP ladder.       → TPLadder
 
@@ -372,7 +372,7 @@ class QuantBot:
     def initialize(self) -> bool:
         try:
             logger.info("=" * 80)
-            logger.info("⚡ ICT + LIQUIDITY EXECUTION SYSTEM — DUAL-EXCHANGE")
+            logger.info("⚡ INSTITUTIONAL AUCTION EXECUTION SYSTEM — DUAL-EXCHANGE")
             logger.info("   4H/15m DOL Bias → 5m Raid/MSS/FVG → Protected Execution")
             logger.info(f"   Symbol: {config.SYMBOL} | Leverage: {config.LEVERAGE}x | "
                         f"Execution: {config.EXECUTION_EXCHANGE.upper()}")
@@ -555,21 +555,21 @@ class QuantBot:
             dual_feed      = agg_status["alive"]
             secondary_name = agg_status.get("secondary", "none")
             send_telegram_message(
-                "⚡ <b>ICT + LIQUIDITY EXECUTION SYSTEM STARTED</b>\n\n"
+                "⚡ <b>INSTITUTIONAL AUCTION EXECUTION SYSTEM STARTED</b>\n\n"
                 f"Symbol:    {QCfg.SYMBOL()}\n"
                 f"Price:     ${price:,.2f}\n"
                 f"Execution: {self.execution_router.active_exchange.upper()}\n"
                 f"Leverage:  {QCfg.LEVERAGE()}x\n\n"
                 "<b>Architecture:</b>\n"
                 "  1️⃣  Market data: executable venue candles and order state\n"
-                "  2️⃣  LiquidityMap: live BSL/SSL geometry and fresh raid detection\n"
-                "  3️⃣  Entry authority: 4H/15m DOL bias with 5m raid-MSS-FVG trigger\n"
+                "  2️⃣  Auction state: liquidity destinations plus observable book/trade evidence\n"
+                "  3️⃣  Entry authority: raid reversal, displacement continuation and expansion retest\n"
                 "  4️⃣  Risk/Execution: structural-stop sizing, liquidation guard, native bracket\n"
                 "  5️⃣  Reconciliation: exact broker fills and instrument-scoped P&amp;L\n"
                 "\n"
                 "<b>Authority model:</b>\n"
-                "  🏛️ ICT + Liquidity is the only entry authority\n"
-                "  🎯 SL beyond raided liquidity; TP at opposing higher-timeframe liquidity\n"
+                "  🏛️ One unified auction authority; competing structural archetypes\n"
+                "  🎯 Structural invalidation and positive net-R liquidity destination required\n"
                 "  🔒 No trade is active without venue protection\n"
                 "  💰 PnL is exchange-fill reconciled, not estimated\n\n"
                 f"📡 <b>Data feed:</b> "
@@ -577,7 +577,7 @@ class QuantBot:
                 f"<i>/setexchange delta|coinswitch to switch execution exchange</i>"
             )
 
-            logger.info("🚀 ICT + LIQUIDITY EXECUTION SYSTEM RUNNING")
+            logger.info("🚀 INSTITUTIONAL AUCTION EXECUTION SYSTEM RUNNING")
             return True
 
         except Exception:
@@ -600,7 +600,7 @@ class QuantBot:
             price = float(self.data_manager.get_last_price() or 0.0)
             eng = getattr(self.strategy, "_entry_engine", None)
             info = eng.analysis_info if eng is not None else {}
-            logger.info("ICT_LIQUIDITY HEARTBEAT state=%s price=%.4f 4H=%s 15m=%s 5m=%s",
+            logger.info("INSTITUTIONAL_AUCTION HEARTBEAT state=%s price=%.4f 4H=%s 15m=%s 5m=%s",
                         info.get("state", "SCANNING"), price, info.get("context_4h", "WAIT"),
                         info.get("context_15m", "WAIT"), info.get("trigger", "WAIT"))
         except Exception as exc:

@@ -92,6 +92,20 @@ _TF_SECONDS: Dict[str, int] = {
     "1d": 86400,
 }
 
+# Structural sweep events must survive while the close-confirmed confirmation
+# sequence can form.  Timeframe-aware retention prevents both premature loss of
+# a 5m trigger and premature loss of 15m/4h draw-on-liquidity context.
+SWEEP_CONFIRMATION_WINDOW_SEC_BY_TF: Dict[str, float] = {
+    "5m": float(4 * _TF_SECONDS["5m"]),      # raid -> MSS -> FVG -> reprice proof
+    "15m": float(2 * _TF_SECONDS["15m"]),
+    "30m": float(2 * _TF_SECONDS["30m"]),
+    "1h": float(2 * _TF_SECONDS["1h"]),
+    "2h": float(2 * _TF_SECONDS["2h"]),
+    "4h": float(2 * _TF_SECONDS["4h"]),
+    "1d": float(_TF_SECONDS["1d"]),
+}
+STRUCTURAL_RAID_CONFIRMATION_WINDOW_SEC: float = SWEEP_CONFIRMATION_WINDOW_SEC_BY_TF["5m"]
+
 # v2.4: fallback external-liquidity windows.  These create one low-touch range
 # high/low pool only when the swing-cluster detector has no fresh level on that
 # side.  Most recent lookback bars are excluded, so a just-swept wick is not
@@ -292,15 +306,16 @@ class LiquidityMapSnapshot:
 
 
 
-def _native_closed_atr(candles: List[Dict], period: int = 14) -> float:
+def _native_closed_atr(candles: List[Dict], period: int = 14,
+                       timeframe: str = "5m", now: Optional[float] = None) -> float:
     """Canonical timeframe-native Wilder ATR on completed bars only.
 
     Pool creation, sweep significance, FVG/SL normalisation and spread/R
-    reporting now share the same estimator; this prevents a live raid being
-    measured with one 5m ATR while execution protection uses another.
+    reporting share the same timestamp-resolved closed-bar information set.
     """
-    rows = list(candles or [])
-    rows = rows[:-1] if len(rows) > 1 else []
+    source = list(candles or [])
+    closed_idx = _last_closed_candle_idx(source, timeframe, float(now or time.time()))
+    rows = source[:closed_idx + 1] if closed_idx >= 0 else []
     if len(rows) < int(period) + 1:
         return 0.0
     tr: List[float] = []
@@ -637,13 +652,18 @@ class _TimeframeRegistry:
         if len(candles) < 10 or atr < 1e-10:
             return
 
-        # Deduplicate on last CLOSED candle timestamp.
+        # Pool geometry and sweeps must share one close-confirmed information
+        # set.  A forming candle may visit liquidity, but it cannot create or
+        # confirm a tradeable pool before closing.
         try:
-            _idx = _last_closed_candle_idx(candles, self.tf, now)
-            _c  = candles[_idx] if _idx >= 0 else candles[-1]
+            closed_idx = _last_closed_candle_idx(candles, self.tf, now)
+            closed_candles = list(candles[:closed_idx + 1]) if closed_idx >= 0 else []
+            if len(closed_candles) < 10:
+                return
+            _c = closed_candles[-1]
             _ts = int(_c.get('t', 0) or 0) if hasattr(_c, 'get') else 0
         except Exception:
-            _ts = 0
+            return
 
         if _ts > 0 and _ts == self._last_ts:
             return
@@ -654,19 +674,19 @@ class _TimeframeRegistry:
         cluster_r = _CLUSTER_RADIUS_ATR.get(self.tf, 0.25)
 
         bsl_clusters = _detect_equal_level_clusters(
-            _find_swing_highs(candles, lookback), candles, atr, cluster_r)
+            _find_swing_highs(closed_candles, lookback), closed_candles, atr, cluster_r)
         ssl_clusters = _detect_equal_level_clusters(
-            _find_swing_lows(candles, lookback),  candles, atr, cluster_r)
+            _find_swing_lows(closed_candles, lookback), closed_candles, atr, cluster_r)
 
         # v2.4: seed one rolling external-liquidity boundary only if the normal
         # swing/cluster detector has no level for that side.  This prevents the
         # map from going empty in trend days without relying on swept pools.
         if not bsl_clusters:
-            rb = _range_extreme_cluster(candles, self.tf, PoolSide.BSL)
+            rb = _range_extreme_cluster(closed_candles, self.tf, PoolSide.BSL)
             if rb is not None:
                 _append_unique_cluster(bsl_clusters, rb, atr, cluster_r)
         if not ssl_clusters:
-            rs = _range_extreme_cluster(candles, self.tf, PoolSide.SSL)
+            rs = _range_extreme_cluster(closed_candles, self.tf, PoolSide.SSL)
             if rs is not None:
                 _append_unique_cluster(ssl_clusters, rs, atr, cluster_r)
 
@@ -1105,7 +1125,7 @@ class LiquidityMap:
         for tf, reg in list(self._registries.items()):
             candles = candles_by_tf.get(tf)
             if candles:
-                native_atr = _native_closed_atr(candles)
+                native_atr = _native_closed_atr(candles, timeframe=tf, now=now)
                 if native_atr > 1e-10:
                     native_atr_by_tf[tf] = native_atr
                     reg.update(candles, native_atr, now)
@@ -1143,10 +1163,17 @@ class LiquidityMap:
         for tf, reg in self._registries.items():
             reg.check_consumed(price, self._native_atr_by_tf.get(tf, atr))
 
-        # Step 6: Rolling 5-minute sweep history
+        # Step 6: Rolling structural sweep history.  The old global five-minute
+        # eviction deleted a valid 5m raid before closed-bar MSS/FVG proof could
+        # complete and also removed HTF context before its declared horizon.
         self._recent_sweeps.extend(new_sweeps)
-        cutoff = now - 300.0
-        self._recent_sweeps = [s for s in self._recent_sweeps if s.detected_at > cutoff]
+        self._recent_sweeps = [
+            sweep for sweep in self._recent_sweeps
+            if sweep.detected_at > now - SWEEP_CONFIRMATION_WINDOW_SEC_BY_TF.get(
+                str(getattr(getattr(sweep, "pool", None), "timeframe", "") or "").lower(),
+                STRUCTURAL_RAID_CONFIRMATION_WINDOW_SEC,
+            )
+        ]
 
     # ─────────────────────────────────────────────────────────────────────
     # get_snapshot() — build immutable tick state for entry engine

@@ -538,7 +538,7 @@ def test_decision_tape_emits_transition_and_slow_snapshot_without_tick_spam(capl
         changed = dict(info, block_reason="AWAITING_5M_MSS_DISPLACEMENT", raid_side="long", raid_price=99.0)
         qs._log_ict_decision_snapshot(changed, 100.2, 102.0)  # state transition: immediate
         qs._log_ict_decision_snapshot(changed, 100.3, 170.0)  # periodic snapshot
-    decision_lines = [r.message for r in caplog.records if "ICT_DECISION" in r.message]
+    decision_lines = [r.message for r in caplog.records if "AUCTION_DECISION" in r.message]
     assert len(decision_lines) == 3
     assert "TRANSITION" in decision_lines[0] and "TRANSITION" in decision_lines[1]
     assert "SNAPSHOT" in decision_lines[2]

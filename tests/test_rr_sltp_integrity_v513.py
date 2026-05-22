@@ -52,7 +52,7 @@ def test_structural_level_rounding_never_tightens_stop_or_moves_tp_past_front_ru
     assert short_tp == pytest.approx(90.1) and short_tp >= 90.02
 
 
-def test_target_utility_is_net_of_venue_cost_and_rejects_negative_expected_value():
+def test_target_rank_is_net_of_venue_cost_and_rejects_non_positive_net_reward():
     engine=EntryEngine()
     engine.set_structural_delivery_policy(min_rr=1.0, max_rr_reference=5.0)
     engine._thesis=SimpleNamespace(context_4h=SimpleNamespace(confidence=0.20), context_15m=SimpleNamespace(confidence=0.20))
@@ -60,9 +60,10 @@ def test_target_utility_is_net_of_venue_cost_and_rejects_negative_expected_value
     t=PoolTarget(p, 3.2, 'long', 0.10, ['15m'])
     engine.set_execution_cost_model(0.0, 0.0)
     assert engine._select_liquidity_target('long', 100.0, 98.0, _snap([t]), 1.0) is not None
-    engine.set_execution_cost_model(2.0, 200.0)
+    engine.set_execution_cost_model(3.25, 325.0)
     assert engine._select_liquidity_target('long', 100.0, 98.0, _snap([t]), 1.0) is None
-    assert engine.analysis_info['target_audit']['non_positive_net_utility'] >= 1
+    assert engine.analysis_info['target_audit']['non_positive_net_reward'] >= 1
+    assert engine.analysis_info['target_audit']['probability_calibrated'] is False
 
 
 def test_delta_fee_engine_uses_exchange_specific_maker_rebate(monkeypatch):

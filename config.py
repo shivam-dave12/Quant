@@ -578,9 +578,10 @@ POLICY_OPTION_OB_DEPTH_LEVELS = 3
 POLICY_OPTION_TICK_AGG_WINDOW_SEC = 30.0
 POLICY_OPTION_VWAP_WINDOW = 35
 
-# Desk model: every desk uses the single ICT + Liquidity authority.
+# Desk model: every desk uses the unified structural auction authority.
+# Archetypes compete under one execution/risk authority; evidence is not probability.
 # Desks differ only in venue execution, risk, cost and lot-size policy.
-STRATEGY_CORE_NAME = "ICT_LIQUIDITY_4H15M5M"
+STRATEGY_CORE_NAME = "INSTITUTIONAL_AUCTION_V514"
 TELEGRAM_RECENT_TRADES_LIMIT = 30
 
 TRADING_DESKS = {

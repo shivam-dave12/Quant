@@ -94,6 +94,7 @@ class MultiAssetQuantBot:
         self.trading_pause_reason = ""
         self._last_scan_report = 0.0
         self._lock = threading.RLock()
+        self._market_wakeup = threading.Event()
 
     def _build_api_clients(self):
         has_delta = bool(config.DELTA_API_KEY and config.DELTA_SECRET_KEY)
@@ -344,8 +345,8 @@ class MultiAssetQuantBot:
             except Exception:
                 return missing
         lines = [
-            "🏛 <b>ICT + LIQUIDITY DECISION BOOK</b>",
-            "<code>4H/15m DOL bias → 5m raid/MSS/FVG → protected execution</code>",
+            "🏛 <b>INSTITUTIONAL AUCTION DECISION BOOK</b>",
+            "<code>Liquidity raid reversal | displacement continuation | liquidity-expansion retest → protected execution</code>",
             "<i>Every number below is sourced; N/A means that calculation stage has not been reached.</i>",
         ]
         for ctx in self.contexts:
@@ -396,7 +397,7 @@ class MultiAssetQuantBot:
                     f"=[slope {val(info,'context_15m_slope_component','+.3f')} + struct {val(info,'context_15m_structure_component','+.3f')}] "
                     f"threshold=±{threshold} ATR={val(info,'context_15m_atr')}</code>"
                 )
-                lines.append(f"<code>DOL bias={self._esc(info.get('context_bias_path','AWAITING_5M_DOL'))} dir={self._esc(info.get('context_direction','none'))} score={val(info,'context_delivery_score','.2f')} strict={'Y' if info.get('context_aligned') else 'N'}</code>")
+                lines.append(f"<code>auction path={self._esc(info.get('archetype','DISCOVERY'))} | HTF delivery={self._esc(info.get('context_bias_path','AWAITING_DESTINATION'))} dir={self._esc(info.get('context_direction','none'))} score={val(info,'context_delivery_score','.2f')} strict={'Y' if info.get('context_aligned') else 'N'}</code>")
                 pct_value = {"pct": 100 * float(info.get("atr_percentile", 0.5) or 0.5)}
                 lines.append(f"<code>5m ATR={val(info,'entry_5m_atr')} pct={val(pct_value,'pct','.0f')}% trigger={self._esc(info.get('trigger','WAIT'))} minRR={val(info,'min_structural_rr','.2f')}</code>")
                 if info.get("raid_side"):
@@ -409,7 +410,8 @@ class MultiAssetQuantBot:
                     lines.append(f"<code>MSS={val(info,'mss_level')} broken=Y disp={val(info,'displacement_atr','.2f')}ATR | FVG=N/A (awaiting valid displacement gap) | SL/TP=N/A</code>")
                 elif info.get("fvg_low") is not None:
                     lines.append(f"<code>MSS={val(info,'mss_level')} broken=Y disp={val(info,'displacement_atr','.2f')}ATR | FVG=[{val(info,'fvg_low')},{val(info,'fvg_high')}] eq={val(info,'fvg_equilibrium')}</code>")
-                    lines.append(f"<code>SL={val(info,'structural_stop')} clearance={val(info,'stop_clearance_atr','.2f')}ATR | target {self._esc(info.get('target_timeframe','N/A'))}@{val(info,'target_pool_price')} RR={val(info,'rr','.2f')} P={val(info,'delivery_probability','.2f')} U={val(info,'delivery_utility_r','+.2f')}R</code>")
+                    calibrated = val(info, 'delivery_probability', '.3f') if info.get('probability_calibrated') else 'N/A'
+                    lines.append(f"<code>SL={val(info,'structural_stop')} clearance={val(info,'stop_clearance_atr','.2f')}ATR | target {self._esc(info.get('target_timeframe','N/A'))}@{val(info,'target_pool_price')} RR={val(info,'rr','.2f')} deliveryScore={val(info,'delivery_score','+.3f')} calibratedP={calibrated}</code>")
             liq = getattr(ctx.strategy, "_liq_map", None)
             native = getattr(liq, "_native_atr_by_tf", {}) or {}
             if native:
@@ -974,6 +976,7 @@ class MultiAssetQuantBot:
             manager=self.guard,
         )
         strategy = QuantStrategy(router, instrument=inst)
+        strategy.bind_market_wakeup(self._market_wakeup.set)
         data.register_strategy(strategy)
         ctx = AssetContext(inst, data, router, risk, strategy)
         ctx_holder["ctx"] = ctx
@@ -1072,8 +1075,9 @@ class MultiAssetQuantBot:
             f"• Slots: <code>{self.guard.max_open_positions}</code> portfolio positions, <code>{self.guard.max_per_contract}</code> per contract",
             f"• Balance allocation: <code>{self.guard.budget_mode}</code>; risk base <code>{self.guard.risk_budget_mode}</code>",
             "• Live exchange products only; no synthetic executable symbols",
-            "• Alpha: single ICT + Liquidity authority; portfolio manager controls exposure mechanics only",
-            "• Entry: 4H/15m DOL bias → fresh 5m raid/MSS/FVG",
+            "• Alpha: unified structural auction authority; portfolio manager controls exposure mechanics only",
+            "• Setups: raid reversal, displacement continuation and liquidity-expansion retest",
+            "• Low latency: websocket trade/book events wake active structural candidates; polling remains recovery path",
             "• Exits and P&amp;L: venue protection and exact-fill reconciliation",
         ])
         return "\n".join(lines)
@@ -1097,7 +1101,9 @@ class MultiAssetQuantBot:
                             )
                             continue
                     interval = self.guard.evaluation_interval(ctx)
-                    if not ctx.has_position and ctx.last_tick_time > 0 and time.time() - ctx.last_tick_time < interval:
+                    event_driven = bool(ctx.strategy.consume_market_event())
+                    urgent = bool(event_driven and ctx.strategy.has_urgent_structural_monitor())
+                    if not ctx.has_position and not urgent and ctx.last_tick_time > 0 and time.time() - ctx.last_tick_time < interval:
                         continue
                     allowed, reason = self.guard.can_evaluate_entry(ctx, self.contexts)
                     if not allowed and not ctx.has_position:
@@ -1107,14 +1113,15 @@ class MultiAssetQuantBot:
                         continue
                     with instrument_scope(ctx.instrument):
                         t0 = time.time()
-                        ctx.strategy.on_tick(ctx.data_manager, ctx.execution_router, ctx.risk_manager, now_ms)
+                        ctx.strategy.on_tick(ctx.data_manager, ctx.execution_router, ctx.risk_manager, now_ms, event_driven=urgent)
                         dt_ms = (time.time() - t0) * 1000.0
                     ctx.last_tick_time = time.time()
                     if dt_ms > 5000:
                         logger.warning("%s on_tick took %.0fms", ctx.instrument.asset_id, dt_ms)
                     self._maybe_analysis_audit(ctx, dt_ms)
                     self._maybe_asset_heartbeat(ctx)
-                time.sleep(float(getattr(config, "SCANNER_TICK_SLEEP_SEC", 0.25)))
+                self._market_wakeup.wait(timeout=float(getattr(config, "SCANNER_TICK_SLEEP_SEC", 0.25)))
+                self._market_wakeup.clear()
             except KeyboardInterrupt:
                 logger.warning(
                     "KeyboardInterrupt ignored by Telegram-only shutdown guard; "

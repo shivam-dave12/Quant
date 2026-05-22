@@ -1,4 +1,4 @@
-"""Telegram notifications for the ICT + Liquidity execution system.
+"""Telegram notifications for the Institutional Auction execution system.
 
 Only structural thesis geometry, venue protection, exact-fill reconciliation
 and instrument-correct P&L are displayed.
@@ -140,7 +140,7 @@ def _classify_priority(message: str) -> int:
     if any(tag in upper for tag in (
         "ENTRY", "EXIT", "TRADE OPEN", "TRADE CLOSED",
         "POSITION ADOPTED", "WATCHDOG HEAL", "WATCHDOG CIRCUIT",
-        "ICT_DECISION", "ICT_ORDER_THESIS", "ICT / LIQUIDITY",
+        "AUCTION_DECISION", "INSTITUTIONAL_ORDER_THESIS", "INSTITUTIONAL_AUCTION",
         "STRUCTURAL SL", "LIQUIDITY TARGET", "EXACT-FILL",
     )):
         return PRIO_IMPORTANT
@@ -396,8 +396,8 @@ def _tg_infer_event_type(message: str) -> str:
         return "PROTECTED RISK"
     if "EXIT" in m or "PNL" in m or "TP HIT" in m:
         return "EXIT"
-    if "ICT_DECISION" in m or "ICT_ORDER_THESIS" in m or "UTILITY=" in m:
-        return "ICT / LIQUIDITY DECISION"
+    if "AUCTION_DECISION" in m or "INSTITUTIONAL_ORDER_THESIS" in m or "INSTITUTIONAL_AUCTION" in m:
+        return "INSTITUTIONAL AUCTION DECISION"
     if "LIQUIDITY" in m or "SWEEP" in m or "POOL" in m:
         return "LIQUIDITY"
     if "STATUS" in m or "THINK" in m:
@@ -1078,8 +1078,10 @@ def format_entry_alert(*, side: str, price: float = 0.0, entry: float = 0.0, sl:
                        qty: float = 0.0, leverage: float = 1.0, venue: str = "",
                        context_4h: Any = "-", context_15m: Any = "-",
                        raid_quality: float = 0.0, displacement_atr: float = 0.0,
-                       delivery_probability: float = 0.0, delivery_utility_r: float = 0.0,
-                       rr: float = 0.0, instrument: Any = None, **kwargs) -> str:
+                       delivery_score: float = 0.0, delivery_probability: Optional[float] = None,
+                       delivery_utility_r: float = 0.0, probability_calibrated: bool = False,
+                       archetype: str = "STRUCTURAL_AUCTION", rr: float = 0.0,
+                       instrument: Any = None, **kwargs) -> str:
     inst = instrument or _tg_current_instrument()
     sym = _venue_currency(venue, inst)
     price = float(price or entry or 0.0)
@@ -1096,12 +1098,16 @@ def format_entry_alert(*, side: str, price: float = 0.0, entry: float = 0.0, sl:
             vehicle = f"\nOption Vehicle: {action} <code>{_html_lib.escape(str(contract))}</code>"
     except Exception:
         vehicle = ""
-    return (f"🏛️ <b>ICT + LIQUIDITY ENTRY TICKET — {_side_arrow(side)}</b>\n"
+    calibration = (f"Calibrated delivery P={float(delivery_probability):.3f} | utility={float(delivery_utility_r):+.3f}R"
+                   if probability_calibrated and delivery_probability is not None
+                   else "Calibrated delivery P=N/A | sizing=structural risk + measured execution cost")
+    return (f"🏛️ <b>INSTITUTIONAL AUCTION ENTRY TICKET — {_side_arrow(side)}</b>\n"
+            f"Archetype: {_html_lib.escape(str(archetype))}\n"
             f"Entry {sym}{float(price):,.2f} | SL {sym}{float(sl):,.2f} | TP {sym}{float(tp):,.2f}{vehicle}\n"
             f"Qty {float(qty):.6f} | Lev {float(leverage):.1f}x | R:R {float(rr):.2f}\n"
             f"4H { _html_lib.escape(str(context_4h)) } | 15m { _html_lib.escape(str(context_15m)) }\n"
-            f"5m raid {float(raid_quality):.3f} | displacement {float(displacement_atr):.2f} ATR\n"
-            f"Delivery p={float(delivery_probability):.3f} | utility={float(delivery_utility_r):+.3f}R\n"
+            f"Raid evidence {float(raid_quality):.3f} | displacement {float(displacement_atr):.2f} ATR | delivery score={float(delivery_score):+.3f}\n"
+            f"{calibration}\n"
             "Protection: venue-native bracket required")
 
 
@@ -1137,7 +1143,7 @@ def format_periodic_report(*, asset: str = "", symbol: str = "", state: str = "S
     sl_price = float(sl_price or position.get("sl_price", 0.0) or 0.0)
     tp_price = float(tp_price or position.get("tp_price", 0.0) or 0.0)
     pnl = float(pnl or position.get("unrealized_pnl", 0.0) or 0.0)
-    lines = [f"🏛️ <b>ICT + LIQUIDITY | {_html_lib.escape(str(asset or symbol or 'DESK'))}</b>",
+    lines = [f"🏛️ <b>INSTITUTIONAL AUCTION | {_html_lib.escape(str(asset or symbol or 'DESK'))}</b>",
              f"Price: {sym}{float(current_price):,.2f} | Balance: {sym}{float(balance):,.2f}",
              f"Today: {'+' if float(daily_pnl) >= 0 else '-'}{sym}{abs(float(daily_pnl)):,.2f} | Total: {'+' if float(total_pnl) >= 0 else '-'}{sym}{abs(float(total_pnl)):,.2f}",
              f"State: {_html_lib.escape(str(state))}",
@@ -1150,5 +1156,5 @@ def format_periodic_report(*, asset: str = "", symbol: str = "", state: str = "S
 
 
 def format_log_alert(level: str, logger_name: str, message: str) -> str:
-    label = "ICT/LIQUIDITY" if any(x in str(logger_name).lower() for x in ("strategy", "entry_engine", "liquidity")) else "RUNTIME"
+    label = "AUCTION/LIQUIDITY" if any(x in str(logger_name).lower() for x in ("strategy", "entry_engine", "liquidity")) else "RUNTIME"
     return f"{_html_lib.escape(str(level))} | <b>{label}</b>\n<code>{_html_lib.escape(str(message))}</code>"

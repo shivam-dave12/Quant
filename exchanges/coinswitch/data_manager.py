@@ -345,6 +345,8 @@ class CoinSwitchDataManager:
 
     def _on_orderbook(self, data: Dict) -> None:
         try:
+            callback = None
+            quote_price = 0.0
             with self._lock:
                 self._orderbook = {
                     "bids": data.get("bids", []),
@@ -354,12 +356,14 @@ class CoinSwitchDataManager:
                 bids = self._orderbook["bids"]
                 asks = self._orderbook["asks"]
                 if bids and asks:
-                    try:
-                        self._last_price = (float(bids[0][0]) + float(asks[0][0])) / 2.0
-                        self._last_price_update_time = self._last_orderbook_update_time
-                    except Exception:
-                        pass
+                    quote_price = (float(bids[0][0]) + float(asks[0][0])) / 2.0
+                    self._last_price = quote_price
+                    self._last_price_update_time = self._last_orderbook_update_time
+                    if self._strategy_ref is not None:
+                        callback = getattr(self._strategy_ref, "_on_realtime_quote", None)
                 self.stats.record_orderbook()
+            if callback is not None and quote_price > 0.0:
+                callback(quote_price)
         except Exception as e:
             logger.debug(f"CoinSwitch OB callback: {e}")
 

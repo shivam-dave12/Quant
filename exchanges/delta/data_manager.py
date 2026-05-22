@@ -621,8 +621,10 @@ class DeltaDataManager:
 
     def _on_orderbook(self, data: Dict) -> None:
         try:
+            callback = None
+            quote_price = 0.0
             with self._lock:
-                # Delta WS uses "buy"/"sell" keys, NOT "bids"/"asks"
+                # Delta WS uses "buy"/"sell" keys, NOT "bids"/"asks".
                 raw_bids = data.get("buy") or data.get("bids", [])
                 raw_asks = data.get("sell") or data.get("asks", [])
                 self._orderbook = {
@@ -632,46 +634,43 @@ class DeltaDataManager:
                 self._last_orderbook_update_time = time.time()
                 bids, asks = self._orderbook["bids"], self._orderbook["asks"]
                 if bids and asks:
-                    try:
-                        self._last_price = (bids[0][0] + asks[0][0]) / 2.0
-                        self._last_price_update_time = time.time()
-                    except Exception:
-                        pass
+                    quote_price = (bids[0][0] + asks[0][0]) / 2.0
+                    self._last_price = quote_price
+                    self._last_price_update_time = self._last_orderbook_update_time
+                    if self._strategy_ref is not None:
+                        callback = getattr(self._strategy_ref, "_on_realtime_quote", None)
                 self.stats.record_orderbook()
+            if callback is not None and quote_price > 0.0:
+                callback(quote_price)
         except Exception as e:
             logger.debug(f"Delta OB callback: {e}")
 
     def _on_trade(self, data: Dict) -> None:
         try:
+            callback = None
+            price = qty = 0.0
+            side = "buy"
             with self._lock:
                 # Delta public trades channel uses "price"/"size"/"side" fields.
                 # "p"/"q"/"m" is the aggregated ticker format — different channel.
-                # Support both formats defensively.
                 price = float(data.get("price") or data.get("p") or 0)
                 qty   = float(data.get("size")  or data.get("q") or 0)
                 side_raw = data.get("side", "")
                 if side_raw:
                     side = "buy" if str(side_raw).lower() == "buy" else "sell"
                 else:
-                    # Fallback: "m" = True means buyer was maker = sell aggressor
                     side = "sell" if bool(data.get("m")) else "buy"
                 if price > 0:
                     self._last_price = price
                     self._last_price_update_time = time.time()
                     self._recent_trades.append({
-                        "price":     price,
-                        "quantity":  qty,
-                        "side":      side,
-                        "timestamp": time.time(),
+                        "price": price, "quantity": qty, "side": side, "timestamp": time.time(),
                     })
                     if self._strategy_ref is not None:
-                        try:
-                            on_rt = getattr(self._strategy_ref, "_on_realtime_trade", None)
-                            if on_rt:
-                                on_rt(price, qty, side)
-                        except Exception:
-                            pass
+                        callback = getattr(self._strategy_ref, "_on_realtime_trade", None)
                 self.stats.record_trade()
+            if callback is not None and price > 0.0:
+                callback(price, qty, side)
         except Exception as e:
             logger.debug(f"Delta trade callback: {e}")
 
