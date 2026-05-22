@@ -217,6 +217,7 @@ def _pool_score(target: Any, *, side: str, entry: float, atr: float) -> Tuple[fl
 class DOLAssessment:
     side: str
     action: str
+    stage: str = "executable"
     direction: str = "NEUTRAL"
     grade: str = "F"
     confidence: float = 0.0
@@ -240,7 +241,7 @@ class DOLAssessment:
     def compact(self) -> str:
         tgt = f"${self.target_price:,.2f}" if self.target_price else "none"
         return (
-            f"DOL={self.direction} grade={self.grade} conf={self.confidence:.2f} "
+            f"DOL[{self.stage}]={self.direction} grade={self.grade} conf={self.confidence:.2f} "
             f"clarity={self.clarity:.2f} target={tgt} dist={self.target_distance_atr:.2f}ATR "
             f"p1={self.first_target_probability:.2f} rr={self.rr:.2f} EV={self.net_expectancy_r:+.2f} "
             f"struct={self.structure_alignment:+.2f} flow={self.flow_alignment:+.2f} PD={self.pd_affinity:+.2f}"
@@ -263,6 +264,7 @@ def assess_trade_thesis(
     tp: Optional[float] = None,
     posterior: float = 0.0,
     quality_score: float = 0.0,
+    stage: str = "executable",
 ) -> DOLAssessment:
     """Score whether a proposed trade has a clean draw-on-liquidity.
 
@@ -272,9 +274,12 @@ def assess_trade_thesis(
     """
     side = str(side or "").lower()
     action = str(action or "").lower() or "unknown"
+    stage = str(stage or "executable").lower()
+    if stage not in {"context", "confirmation", "executable"}:
+        stage = "executable"
     entry = float(entry or 0.0)
     atr = max(float(atr or 0.0), _EPS)
-    out = DOLAssessment(side=side, action=action)
+    out = DOLAssessment(side=side, action=action, stage=stage)
     if side not in {"long", "short"} or entry <= 0.0:
         out.reason = "invalid side/entry"
         return out
@@ -349,6 +354,50 @@ def assess_trade_thesis(
     out.pd_affinity = pd_aff
     out.first_target_probability = delivery_signal
 
+    if stage == "context":
+        # DOL is a destination model, not a self-contained entry signal.
+        # At context stage we only decide whether a real, directionally useful
+        # liquidity draw exists.  Delivery/confirmation is tested downstream.
+        distance_utility = _clamp(target_dist_atr / 4.0, 0.0, 1.0)
+        out.score = _clamp(
+            0.50 * clarity
+            + 0.32 * target_quality
+            + 0.18 * distance_utility
+            - 0.22 * out.protective_pressure,
+            0.0, 1.0,
+        )
+        out.confidence = out.score
+        # Floors are conditional on competing stop-side liquidity: a crowded
+        # two-sided auction needs a clearer destination than an asymmetric book.
+        clarity_floor = _clamp(
+            0.18 + 0.24 * out.protective_pressure - 0.08 * target_quality,
+            0.12, 0.42,
+        )
+        quality_floor = _clamp(0.10 + 0.16 * out.protective_pressure, 0.10, 0.30)
+        distance_floor = 0.25 + 0.20 * (1.0 - target_quality) + 0.10 * out.protective_pressure
+        out.grade = "A" if out.score >= 0.64 else "B" if out.score >= 0.48 else "C" if out.score >= 0.34 else "D"
+        out.accepted = bool(
+            target_dist_atr >= distance_floor
+            and clarity >= clarity_floor
+            and target_quality >= quality_floor
+        )
+        if out.accepted:
+            out.reason = (
+                f"DOL context qualified: draw present before entry model "
+                f"(clarity={clarity:.2f}/{clarity_floor:.2f}, "
+                f"quality={target_quality:.2f}/{quality_floor:.2f}, "
+                f"dist={target_dist_atr:.2f}/{distance_floor:.2f}ATR)"
+            )
+        else:
+            out.reason = (
+                f"DOL context unavailable: no dominant executable draw "
+                f"(clarity={clarity:.2f}/{clarity_floor:.2f}, "
+                f"quality={target_quality:.2f}/{quality_floor:.2f}, "
+                f"dist={target_dist_atr:.2f}/{distance_floor:.2f}ATR)"
+            )
+        out.notes = best_notes + [struct_note, flow_note, pd_note, f"protective_pressure={out.protective_pressure:.2f}"]
+        return out
+
     risk = abs(entry - float(sl or 0.0)) if sl else 0.0
     if risk > _EPS and target_px > 0:
         out.rr = abs(target_px - entry) / risk
@@ -420,7 +469,7 @@ def assess_trade_thesis(
             f"clarity={clarity:.2f}"
         )
     else:
-        out.reason = "DOL thesis accepted"
+        out.reason = f"DOL {stage} thesis accepted"
     out.accepted = accepted
     out.notes = best_notes + [struct_note, flow_note, pd_note, f"protective_pressure={out.protective_pressure:.2f}"]
     return out

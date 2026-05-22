@@ -3210,3 +3210,131 @@ def test_quant_posterior_rejects_score_only_structure_void():
     finally:
         qm.GLOBAL_QUANT_CALIBRATOR = old_calibrator
 # ===== END test_dol_first_trade_thesis.py =====
+
+
+# ===== BEGIN test_dol_first_runtime_wiring_20260522.py =====
+
+def test_dol_context_stage_qualifies_destination_before_posterior():
+    from strategy.dol_engine import assess_trade_thesis
+
+    snap = SimpleNamespace(
+        bsl_pools=[_dol_pool(103.5, "BSL", "1h", 20.0)],
+        ssl_pools=[_dol_pool(98.0, "SSL", "15m", 4.0)],
+    )
+    ict = SimpleNamespace(structure_15m="ranging", structure_4h="ranging", dealing_range_pd=0.50)
+    flow = SimpleNamespace(direction="", conviction=0.0, cvd_trend=0.0)
+
+    ctx = assess_trade_thesis(
+        snap=snap, side="long", entry=100.0, atr=1.0, ict=ict, flow=flow,
+        action="reverse", posterior=0.0, quality_score=0.0, stage="context",
+    )
+    assert ctx.accepted
+    assert ctx.stage == "context"
+    assert "context qualified" in ctx.reason
+    assert ctx.target_price == 103.5
+
+
+def test_quant_posterior_is_conditioned_on_valid_dol_context():
+    from strategy import quantitative_models as qm
+    from strategy.dol_engine import assess_trade_thesis
+
+    old_calibrator = qm.GLOBAL_QUANT_CALIBRATOR
+    qm.GLOBAL_QUANT_CALIBRATOR = qm.AdaptiveQuantCalibrator()
+    try:
+        snap = SimpleNamespace(
+            bsl_pools=[_dol_pool(104.0, "BSL", "1h", 22.0)],
+            ssl_pools=[_dol_pool(98.0, "SSL", "15m", 3.0)],
+        )
+        flow = SimpleNamespace(direction="long", conviction=0.75, cvd_trend=0.70)
+        ict = SimpleNamespace(
+            structure_5m="bullish", structure_15m="bullish", structure_4h="bullish",
+            dealing_range_pd=0.24, choch_5m="bullish", bos_5m="bullish",
+        )
+        ctx = assess_trade_thesis(
+            snap=snap, side="long", entry=100.0, atr=1.0, ict=ict, flow=flow,
+            action="reverse", stage="context",
+        )
+        assert ctx.accepted
+        qd = qm.evaluate_post_sweep_quant(
+            action="reverse", side="long", rev_score=150.0, cont_score=10.0,
+            displacement_atr=1.50, cisd=True, ote=True, phase="CISD",
+            price=100.0, atr=1.0, snap=snap, flow=flow, ict=ict, dol_context=ctx,
+        )
+        assert qd.components.get("dol_supplied") == 1.0
+        assert qd.components.get("dol_valid") == 1.0
+        assert qd.components.get("dol_signal", 0.0) > 0.0
+        assert qd.accept
+        assert qd.components.get("admission_mode") == "PROVISIONAL_DOL"
+        assert "DOL=" in qd.reason
+    finally:
+        qm.GLOBAL_QUANT_CALIBRATOR = old_calibrator
+
+
+def test_entry_engine_calls_dol_context_before_posterior_evaluation():
+    from pathlib import Path
+    source = (Path(__file__).resolve().parents[1] / "strategy" / "entry_engine.py").read_text()
+    reverse = source[source.index("if rev_total >= threshold"):source.index("elif cont_total >= threshold")]
+    continuation = source[source.index("elif cont_total >= threshold"):source.index("cont_target = self._find_opposing_target")]
+    assert reverse.index('label="DOL_CONTEXT"') < reverse.index("evaluate_post_sweep_quant(")
+    assert continuation.index('label="DOL_CONTEXT"') < continuation.index("evaluate_post_sweep_quant(")
+
+
+
+def test_quant_cold_start_dol_cannot_replace_delivery_confirmation():
+    from strategy import quantitative_models as qm
+    from strategy.dol_engine import assess_trade_thesis
+
+    old_calibrator = qm.GLOBAL_QUANT_CALIBRATOR
+    qm.GLOBAL_QUANT_CALIBRATOR = qm.AdaptiveQuantCalibrator()
+    try:
+        snap = SimpleNamespace(
+            bsl_pools=[_dol_pool(104.0, "BSL", "1h", 22.0)],
+            ssl_pools=[_dol_pool(98.0, "SSL", "15m", 3.0)],
+        )
+        flow = SimpleNamespace(direction="long", conviction=0.72, cvd_trend=0.65)
+        ict = SimpleNamespace(structure_15m="ranging", structure_4h="ranging", dealing_range_pd=0.30)
+        ctx = assess_trade_thesis(
+            snap=snap, side="long", entry=100.0, atr=1.0, ict=ict, flow=flow,
+            action="reverse", stage="context",
+        )
+        assert ctx.accepted
+        qd = qm.evaluate_post_sweep_quant(
+            action="reverse", side="long", rev_score=150.0, cont_score=10.0,
+            displacement_atr=1.20, cisd=False, ote=False, phase="DISPLACEMENT",
+            price=100.0, atr=1.0, snap=snap, flow=flow, ict=ict, dol_context=ctx,
+        )
+        assert not qd.accept
+        assert qd.components.get("cold_start_delivery") == 0.0
+    finally:
+        qm.GLOBAL_QUANT_CALIBRATOR = old_calibrator
+
+
+def test_refined_and_both_entry_paths_require_final_executable_dol_validation():
+    from pathlib import Path
+    source = (Path(__file__).resolve().parents[1] / "strategy" / "entry_engine.py").read_text()
+    refined = source[source.index("def _evaluate_pending_refined_entry"):source.index("def _handle_reversal")]
+    reversal = source[source.index("def _handle_reversal"):source.index("def _handle_continuation")]
+    continuation = source[source.index("def _handle_continuation"):source.index("# ── Helpers")]
+    for block in (refined, reversal, continuation):
+        assert 'stage="executable"' in block
+        assert block.index('stage="executable"') < block.index("self._signal = EntrySignal(")
+
+
+
+def test_live_thesis_gate_fails_closed_if_dol_engine_is_unavailable():
+    from strategy import entry_engine as ee
+
+    engine = object.__new__(ee.EntryEngine)
+    old = ee.assess_trade_thesis
+    ee.assess_trade_thesis = None
+    try:
+        ok, reason, thesis = engine._institutional_thesis_gate(
+            SimpleNamespace(bsl_pools=[], ssl_pools=[]), "long", "reverse", 100.0, 1.0
+        )
+        assert not ok
+        assert thesis is None
+        assert "fail-closed" in reason
+    finally:
+        ee.assess_trade_thesis = old
+
+# ===== END test_dol_first_runtime_wiring_20260522.py =====

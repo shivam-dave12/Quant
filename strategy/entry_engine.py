@@ -504,6 +504,8 @@ class EntryEngine:
         self._suppress_posterior_accept_log: bool = False
         self._last_accept_log_key: tuple = ()
         self._last_accept_log_ts: float = 0.0
+        self._last_dol_log_key: tuple = ()
+        self._last_dol_log_ts: float = 0.0
 
         # BUG-1 FIX: Processed-sweeps registry (SWEEP-LOOP root cause).
         # After a verdict fires, _handle_reversal/_handle_continuation previously
@@ -1358,6 +1360,14 @@ class EntryEngine:
         self._last_accept_log_ts = now
         logger.info(message)
 
+    def _log_dol_context_once(self, key: tuple, message: str, now: float) -> None:
+        """Keep DOL-first telemetry visible without flooding the live loop."""
+        if key == self._last_dol_log_key and (now - self._last_dol_log_ts) < 30.0:
+            return
+        self._last_dol_log_key = key
+        self._last_dol_log_ts = now
+        logger.info(message)
+
     def _evaluate_evidence(self, ps, snap, flow, ict, price, atr, now):
         sweep = ps.sweep
         rev_dir = sweep.direction
@@ -1603,11 +1613,25 @@ class EntryEngine:
                 f"OTE={'✓' if ps.ote_reached else '✗'}")
 
         if rev_total >= threshold and gap >= gap_min:
+            # DOL-first: establish a real direction-specific destination before
+            # allowing the posterior auction model to judge delivery timing.
+            dol_ctx_ok, dol_ctx_reason, dol_ctx = self._institutional_thesis_gate(
+                snap, rev_dir, "reverse", price, atr, ict=ict, flow=flow,
+                label="DOL_CONTEXT", stage="context")
+            self._log_dol_context_once(
+                ("reverse", rev_dir, phase, round(sweep.pool.price, 1), int(ps.entered_at), bool(dol_ctx_ok)),
+                f"🧲 DOL CONTEXT {'QUALIFIED' if dol_ctx_ok else 'WAIT'}: REVERSAL {rev_dir.upper()} [{phase}] | {dol_ctx_reason}",
+                now,
+            )
+            if not dol_ctx_ok:
+                return PostSweepDecision(
+                    action="wait", direction="", confidence=0.0,
+                    reason=f"DOL_CONTEXT_WAIT: {dol_ctx_reason}")
             qd = evaluate_post_sweep_quant(
                 action="reverse", side=rev_dir, rev_score=rev_total, cont_score=cont_total,
                 displacement_atr=ps.max_displacement, cisd=ps.cisd_detected,
                 ote=ps.ote_reached or ps.ote_holding, phase=phase, price=price, atr=atr,
-                snap=snap, flow=flow, ict=ict)
+                snap=snap, flow=flow, ict=ict, dol_context=dol_ctx)
             self._last_sweep_analysis["quant_posterior"] = qd.posterior
             self._last_sweep_analysis["quant_ev"] = qd.expected_value
             self._last_sweep_analysis["quant_components"] = qd.components
@@ -1623,7 +1647,7 @@ class EntryEngine:
                     reason=f"DYNAMIC_QUALITY_WAIT: {gate_reason}")
             dol_ok, dol_reason, _dol = self._institutional_thesis_gate(
                 snap, rev_dir, "reverse", price, atr, ict=ict, flow=flow,
-                label="DOL_PRECHECK", qd=qd)
+                label="DOL_CONFIRMATION", qd=qd, stage="confirmation")
             if not dol_ok:
                 return PostSweepDecision(
                     action="wait", direction="", confidence=0.0,
@@ -1645,11 +1669,23 @@ class EntryEngine:
                        f"[{phase}] {' + '.join(rev_r[:5])}")
 
         elif cont_total >= threshold * 0.9 and gap >= gap_min:
+            dol_ctx_ok, dol_ctx_reason, dol_ctx = self._institutional_thesis_gate(
+                snap, cont_dir, "continue", price, atr, ict=ict, flow=flow,
+                label="DOL_CONTEXT", stage="context")
+            self._log_dol_context_once(
+                ("continue", cont_dir, phase, round(sweep.pool.price, 1), int(ps.entered_at), bool(dol_ctx_ok)),
+                f"🧲 DOL CONTEXT {'QUALIFIED' if dol_ctx_ok else 'WAIT'}: CONTINUATION {cont_dir.upper()} [{phase}] | {dol_ctx_reason}",
+                now,
+            )
+            if not dol_ctx_ok:
+                return PostSweepDecision(
+                    action="wait", direction="", confidence=0.0,
+                    reason=f"DOL_CONTEXT_WAIT: {dol_ctx_reason}")
             qd = evaluate_post_sweep_quant(
                 action="continue", side=cont_dir, rev_score=rev_total, cont_score=cont_total,
                 displacement_atr=ps.max_displacement, cisd=ps.cisd_detected,
                 ote=ps.ote_reached or ps.ote_holding, phase=phase, price=price, atr=atr,
-                snap=snap, flow=flow, ict=ict)
+                snap=snap, flow=flow, ict=ict, dol_context=dol_ctx)
             self._last_sweep_analysis["quant_posterior"] = qd.posterior
             self._last_sweep_analysis["quant_ev"] = qd.expected_value
             self._last_sweep_analysis["quant_components"] = qd.components
@@ -1665,7 +1701,7 @@ class EntryEngine:
                     reason=f"DYNAMIC_QUALITY_WAIT: {gate_reason}")
             dol_ok, dol_reason, _dol = self._institutional_thesis_gate(
                 snap, cont_dir, "continue", price, atr, ict=ict, flow=flow,
-                label="DOL_PRECHECK", qd=qd)
+                label="DOL_CONFIRMATION", qd=qd, stage="confirmation")
             if not dol_ok:
                 return PostSweepDecision(
                     action="wait", direction="", confidence=0.0,
@@ -2251,7 +2287,7 @@ class EntryEngine:
     def _institutional_thesis_gate(
         self, snap, side: str, action: str, price: float, atr: float,
         ict=None, flow=None, sl: Optional[float] = None, tp: Optional[float] = None,
-        label: str = "preflight", qd: Any = None,
+        label: str = "preflight", qd: Any = None, stage: str = "executable",
     ) -> tuple[bool, str, Any]:
         """DOL-first executable-thesis gate.
 
@@ -2260,7 +2296,9 @@ class EntryEngine:
         first-target probability, and positive payoff after the structural SL.
         """
         if assess_trade_thesis is None:
-            return True, "DOL engine unavailable; legacy gate path retained", None
+            # Live trading must not silently bypass the destination/thesis
+            # engine because of an import or deployment defect.
+            return False, "DOL engine unavailable; fail-closed candidate refusal", None
         # Unit/offline tests sometimes pass a bare namespace as snapshot.  Live
         # LiquidityMapSnapshot always exposes bsl_pools/ssl_pools; only enforce
         # DOL when the liquidity map actually exists.
@@ -2280,6 +2318,7 @@ class EntryEngine:
             thesis = assess_trade_thesis(
                 snap=snap, side=side, entry=price, atr=atr, ict=ict, flow=flow,
                 action=action, sl=sl, tp=tp, posterior=posterior, quality_score=qscore,
+                stage=stage,
             )
             try:
                 self._last_sweep_analysis["dol_thesis"] = thesis.as_dict() if hasattr(thesis, "as_dict") else {}
@@ -2435,7 +2474,7 @@ class EntryEngine:
         action_label = "reverse" if str(getattr(sig.entry_type, "name", sig.entry_type)).lower().endswith("reversal") else "continue"
         thesis_ok, thesis_reason, _thesis = self._institutional_thesis_gate(
             snap, side, action_label, price, atr, ict=ict, flow=flow,
-            sl=sl, tp=tp, label="REFINED_THESIS")
+            sl=sl, tp=tp, label="REFINED_THESIS", stage="executable")
         if not thesis_ok:
             p.last_reason = f"refined DOL thesis unavailable: {thesis_reason}"
             return
@@ -2581,7 +2620,7 @@ class EntryEngine:
 
         thesis_ok, thesis_reason, thesis = self._institutional_thesis_gate(
             snap, side, "reverse", price, atr, ict=ict, flow=flow,
-            sl=sl, tp=tp, label="EXECUTABLE_THESIS")
+            sl=sl, tp=tp, label="EXECUTABLE_THESIS", stage="executable")
         if not thesis_ok:
             logger.info(
                 f"CANDIDATE DEFERRED [dol_thesis]: side={side} "
@@ -2726,7 +2765,7 @@ class EntryEngine:
 
         thesis_ok, thesis_reason, thesis = self._institutional_thesis_gate(
             snap, side, "continue", price, atr, ict=ict, flow=flow,
-            sl=sl, tp=tp, label="EXECUTABLE_THESIS")
+            sl=sl, tp=tp, label="EXECUTABLE_THESIS", stage="executable")
         if not thesis_ok:
             logger.info(
                 f"CANDIDATE DEFERRED [dol_thesis]: side={side} "

@@ -402,7 +402,7 @@ def build_state_vector(*, side: str, price: float, atr: float, snap: Any = None,
 def evaluate_post_sweep_quant(*, action: str, side: str, rev_score: float, cont_score: float,
                               displacement_atr: float, cisd: bool, ote: bool, phase: str,
                               price: float, atr: float, snap: Any = None, flow: Any = None,
-                              ict: Any = None) -> QuantDecision:
+                              ict: Any = None, dol_context: Any = None) -> QuantDecision:
     """Adaptive Bayesian/EV/SPRT post-sweep auction decision.
 
     The function deliberately rejects "score-only" setups. A score imbalance must
@@ -416,6 +416,31 @@ def evaluate_post_sweep_quant(*, action: str, side: str, rev_score: float, cont_
     action_code = 1.0 if action == "reverse" else 2.0
     phase_code = float({"DISPLACEMENT": 1, "CISD": 2, "OTE": 3, "MATURE": 4}.get(phase_u, 0))
     st = build_state_vector(side=side, price=price, atr=atr, snap=snap, flow=flow, ict=ict)
+
+    # A directional posterior is conditioned on a destination, not allowed to
+    # invent one after a signal scores well.  DOL context is computed upstream
+    # from the live liquidity map before this auction model is called.
+    dol_supplied = dol_context is not None
+    dol_valid = bool(getattr(dol_context, "accepted", False)) if dol_supplied else False
+    dol_clarity = clamp(float(getattr(dol_context, "clarity", 0.0) or 0.0), 0.0, 1.0) if dol_supplied else 0.0
+    dol_quality = clamp(float(getattr(dol_context, "target_quality", 0.0) or 0.0), 0.0, 1.0) if dol_supplied else 0.0
+    dol_p1 = clamp(float(getattr(dol_context, "first_target_probability", 0.0) or 0.0), 0.0, 1.0) if dol_supplied else 0.0
+    dol_pressure = clamp(float(getattr(dol_context, "protective_pressure", 0.0) or 0.0), 0.0, 1.0) if dol_supplied else 0.0
+    dol_dist = max(float(getattr(dol_context, "target_distance_atr", 0.0) or 0.0), 0.0) if dol_supplied else 0.0
+    dol_reach = clamp(dol_dist / 4.0, 0.0, 1.0) if dol_supplied else 0.0
+    dol_signal = clamp(
+        0.32 * dol_clarity + 0.30 * dol_quality + 0.18 * dol_p1 + 0.20 * dol_reach - 0.28 * dol_pressure,
+        0.0, 1.0,
+    ) if dol_supplied else 0.0
+    if dol_supplied and not dol_valid:
+        reason = (
+            f"REJECT no executable DOL context: clarity={dol_clarity:.2f} "
+            f"quality={dol_quality:.2f} p1={dol_p1:.2f} pressure={dol_pressure:.2f}"
+        )
+        return QuantDecision(False, 0.0, 0.0, -1.0, -99.0, st.regime_uncertainty, reason,
+                             {"dol_supplied": 1.0, "dol_valid": 0.0, "dol_signal": dol_signal,
+                              "dol_clarity": dol_clarity, "dol_quality": dol_quality,
+                              "dol_p1": dol_p1, "dol_pressure": dol_pressure})
 
     chosen = float(rev_score if action == "reverse" else cont_score)
     other = float(cont_score if action == "reverse" else rev_score)
@@ -464,6 +489,9 @@ def evaluate_post_sweep_quant(*, action: str, side: str, rev_score: float, cont_
         structure_term = 0.85 * structural + 0.75 * disp_info
 
     liq_term = 0.36 * st.liquidity_quality + 0.22 * st.liquidity_density
+    # Direction-specific destination evidence is not a second generic filter:
+    # it makes the posterior conditional on a reachable liquidity objective.
+    dol_term = (0.72 * dol_signal + 0.16 * dol_p1 - 0.26 * dol_pressure) if dol_supplied else 0.0
     pd_term = 0.30 * st.dealing_range_affinity
     cost_penalty = 0.45 * st.spread_cost_atr + 0.70 * st.toxicity
     uncertainty_penalty = (0.70 + 0.25 * (phase_u == "DISPLACEMENT")) * st.regime_uncertainty
@@ -473,19 +501,25 @@ def evaluate_post_sweep_quant(*, action: str, side: str, rev_score: float, cont_
         + 0.18 * max(flow_term, 0.0)
         + 0.12 * max(st.htf_alignment, 0.0)
         + 0.12 * st.liquidity_quality
+        + (0.16 * dol_signal if dol_supplied else 0.0)
         - 0.25 * st.toxicity,
         0.0,
         1.0,
     )
     independence = clamp(0.52 + 0.48 * evidence_consensus - 0.30 * st.toxicity, 0.32, 1.0)
 
-    base_prior = clamp(0.42 + 0.06 * st.liquidity_quality + 0.04 * max(st.htf_alignment, 0.0) - 0.06 * st.toxicity, 0.25, 0.65)
+    base_prior = clamp(
+        0.42 + 0.06 * st.liquidity_quality + 0.04 * max(st.htf_alignment, 0.0)
+        - 0.06 * st.toxicity + (0.05 * (dol_signal - 0.50) if dol_supplied else 0.0),
+        0.25, 0.65,
+    )
     z = (
         logit(base_prior)
         + 1.25 * score_edge * independence
         + 1.35 * structure_term * (0.72 + 0.28 * auction_information)
         + 0.78 * flow_term * (0.70 + 0.30 * evidence_consensus)
         + liq_term
+        + dol_term
         + pd_term
         + 0.45 * evidence_consensus
         - cost_penalty
@@ -496,7 +530,12 @@ def evaluate_post_sweep_quant(*, action: str, side: str, rev_score: float, cont_
     components_seed = {
         "score_edge": score_edge, "disp_info": disp_info,
         "structural": structural, "flow_term": flow_term,
-        "liq_term": liq_term, "pd_term": pd_term,
+        "liq_term": liq_term, "dol_term": dol_term, "pd_term": pd_term,
+        "dol_supplied": 1.0 if dol_supplied else 0.0,
+        "dol_valid": 1.0 if dol_valid else 0.0,
+        "dol_signal": dol_signal, "dol_clarity": dol_clarity,
+        "dol_quality": dol_quality, "dol_p1": dol_p1,
+        "dol_pressure": dol_pressure, "dol_distance_atr": dol_dist,
         "cost_penalty": cost_penalty, "evidence_floor": dynamic_evidence_floor,
         "evidence_mass": auction_information, "evidence_consensus": evidence_consensus,
         "independence": independence, "action_code": action_code, "phase_code": phase_code,
@@ -525,10 +564,19 @@ def evaluate_post_sweep_quant(*, action: str, side: str, rev_score: float, cont_
         posterior_cap = min(posterior_cap, 0.74 if exceptional_delivery else 0.66)
         cap_reasons.append("structure_void")
     if uncalibrated:
-        # A new bucket can trade only when the full thesis is strong downstream;
-        # it should not self-certify as 85% before outcome history exists.
-        posterior_cap = min(posterior_cap, 0.82 if evidence_consensus >= 0.70 else 0.76)
+        # Cold-start risk is real, but a valid, direction-specific DOL must be
+        # counted before suppressing all opportunities.  The cap remains
+        # conservative; it only relaxes when destination and auction evidence
+        # jointly support the same side.
+        thesis_evidence = clamp(
+            evidence_consensus + (0.18 * dol_signal if dol_valid else 0.0)
+            - (0.10 * dol_pressure if dol_valid else 0.0),
+            0.0, 1.0,
+        )
+        posterior_cap = min(posterior_cap, 0.82 if thesis_evidence >= 0.70 else 0.76)
         cap_reasons.append("uncalibrated_bucket")
+        if dol_valid:
+            cap_reasons.append("dol_conditioned")
     outcome_p = float(outcome.get("outcome_p", 0.50) or 0.50)
     outcome_n = float(outcome.get("outcome_n", 0.0) or 0.0)
     if outcome_n >= 12.0 and outcome_p < 0.46:
@@ -546,7 +594,10 @@ def evaluate_post_sweep_quant(*, action: str, side: str, rev_score: float, cont_
     # EV in normalized risk units. Loss burden widens under uncertainty/toxicity;
     # reward is capped by liquidity quality and alignment. Far TP/RR cannot rescue
     # a low-quality posterior.
-    reward_proxy = 0.85 + 0.70 * st.liquidity_quality + 0.35 * max(st.htf_alignment, 0.0) + 0.25 * auction_information
+    reward_proxy = (
+        0.85 + 0.70 * st.liquidity_quality + 0.35 * max(st.htf_alignment, 0.0)
+        + 0.25 * auction_information + (0.18 * dol_signal if dol_valid else 0.0)
+    )
     loss_proxy = 1.00 + 0.65 * st.regime_uncertainty + 0.45 * st.toxicity
     ev = posterior * reward_proxy - (1.0 - posterior) * loss_proxy - 0.12 * st.spread_cost_atr
 
@@ -554,27 +605,53 @@ def evaluate_post_sweep_quant(*, action: str, side: str, rev_score: float, cont_
     calibrated_p = cal["posterior_q"] if cal["ready"] else 0.66
     min_p = clamp(max(calibrated_p, 0.52 + 0.20 * st.regime_uncertainty + 0.05 * st.toxicity), 0.54, 0.88)
 
-    # SPRT barrier with market-derived error tolerance. No static score threshold.
+    # SPRT is statistically meaningful only after this setup bucket has
+    # outcomes.  In a cold-start bucket, using an outcome-SPRT barrier while
+    # capping posterior confidence makes every opportunity impossible.  A new
+    # bucket can therefore trade only as PROVISIONAL_DOL: destination, delivery,
+    # auction information and expectancy must agree; otherwise it still waits.
     alpha = clamp(0.16 - 0.07 * (1.0 - st.regime_uncertainty), 0.05, 0.16)
     beta = clamp(0.20 - 0.09 * (1.0 - st.regime_uncertainty), 0.07, 0.20)
     llr = logit(posterior)
     llr_barrier = math.log((1.0 - beta) / alpha)
     dynamic_llr_barrier = llr_barrier - 0.45 * clamp(ev, -1.0, 1.0)
 
-    accept = bool(
-        posterior >= min_p
-        and ev > 0.0
-        and llr >= dynamic_llr_barrier
-        and auction_information >= dynamic_evidence_floor
+    provisional_dol = bool(uncalibrated and dol_valid)
+    cold_start_floor = clamp(
+        max(min_p, 0.60 + 0.15 * st.regime_uncertainty + 0.06 * st.toxicity - 0.05 * dol_signal),
+        0.60, 0.78,
     )
+    cold_start_delivery = bool(
+        structural >= 0.40
+        and dol_signal >= 0.38
+        and evidence_consensus >= 0.52
+        and not structure_void
+    )
+    if provisional_dol:
+        accept = bool(
+            posterior >= cold_start_floor
+            and ev > 0.0
+            and auction_information >= dynamic_evidence_floor
+            and cold_start_delivery
+        )
+        admission = "PROVISIONAL_DOL" if accept else "PROVISIONAL_DOL_WAIT"
+    else:
+        accept = bool(
+            posterior >= min_p
+            and ev > 0.0
+            and llr >= dynamic_llr_barrier
+            and auction_information >= dynamic_evidence_floor
+        )
+        admission = "CALIBRATED_SPRT" if accept else "SPRT_WAIT"
 
     reason = (
         ("ACCEPT" if accept else "REJECT")
-        + f" quant posterior auction: info={auction_information:.2f}/{dynamic_evidence_floor:.2f} "
+        + f"[{admission}] quant posterior auction: info={auction_information:.2f}/{dynamic_evidence_floor:.2f} "
           f"edge={score_edge:+.2f} disp={disp_info:.2f} struct={structural:.2f} "
           f"cons={evidence_consensus:.2f} flow={flow_term:+.2f} "
           f"learned={float(outcome.get('outcome_p', 0.5)):.2f}/{float(outcome.get('outcome_n', 0.0)):.0f} "
           f"cap={posterior_cap:.2f}{('/' + ','.join(cap_reasons)) if cap_reasons else ''} "
+          f"DOL={dol_signal:.2f}/{dol_clarity:.2f}{('/conditioned' if dol_valid else '') if dol_supplied else ''} "
           f"EV={ev:+.3f} LLR={llr:.2f}/{dynamic_llr_barrier:.2f} | {st.compact()}"
     )
     return QuantDecision(accept, posterior, min_p, ev, llr, st.regime_uncertainty, reason,
@@ -582,6 +659,9 @@ def evaluate_post_sweep_quant(*, action: str, side: str, rev_score: float, cont_
                           "structure_void": 1.0 if structure_void else 0.0,
                           "posterior_cap": posterior_cap,
                           "posterior_cap_reasons": ",".join(cap_reasons),
+                          "admission_mode": admission,
+                          "cold_start_floor": cold_start_floor,
+                          "cold_start_delivery": 1.0 if cold_start_delivery else 0.0,
                           "outcome_p": float(outcome.get("outcome_p", 0.50) or 0.50),
                           "outcome_n": float(outcome.get("outcome_n", 0.0) or 0.0),
                           "outcome_r": float(outcome.get("outcome_r", 0.0) or 0.0),
