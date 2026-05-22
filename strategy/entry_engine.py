@@ -4,13 +4,13 @@ ict_liquidity_entry.py — single-authority ICT + Liquidity execution engine.
 This module is intentionally the only alpha authority for new positions.
 It expresses one institutional auction model:
 
-    4H delivery context -> 15m dealing-range confirmation ->
+    4H/15m draw-on-liquidity context ->
     5m external-liquidity raid -> 5m displacement/MSS ->
     5m FVG retracement -> structural invalidation -> opposing HTF liquidity TP.
 
 It does not consume secondary score layers or non-structural directional overlays,
-session quotas, approach/momentum entries, or layered confirmation stacks. Risk,
-lot sizing, bracket protection and reconciliation remain downstream mechanical
+session quotas, approach/momentum entries, or trend-permission gates. Risk, lot
+sizing, bracket protection and reconciliation remain downstream mechanical
 controls in the execution/risk modules.
 """
 from __future__ import annotations
@@ -95,6 +95,19 @@ class _FVG:
         return (self.low + self.high) / 2.0
 
 
+@dataclass(frozen=True)
+class _ContextDecision:
+    side: str
+    allowed: bool
+    path: str
+    block: str
+    delivery_score: float
+    strict_aligned: bool
+    supporting_tfs: int
+    opposing_tfs: int
+    ranging_tfs: int
+
+
 @dataclass
 class _Thesis:
     sweep_key: tuple
@@ -103,6 +116,8 @@ class _Thesis:
     formed_at: float
     context_4h: _TrendContext
     context_15m: _TrendContext
+    context_path: str
+    context_delivery_score: float
     mss_level: float
     displacement_atr: float
     fvg: _FVG
@@ -111,6 +126,7 @@ class _Thesis:
 
 _EPS = 1e-12
 _TF_15M_RANK = TF_HIERARCHY.get("15m", 3)
+_CONTEXT_DIRECTION_THRESHOLD = 0.18
 
 
 def _f(x: Any, default: float = 0.0) -> float:
@@ -186,7 +202,8 @@ def _robust_trend(candles: Sequence[Dict], atr: float, window: int) -> _TrendCon
     structure_component = 0.32 * structure
     signed_strength = slope_component + structure_component
     strength = abs(signed_strength) * (0.55 + 0.45 * efficiency)
-    side = 1 if signed_strength > 0.18 else (-1 if signed_strength < -0.18 else 0)
+    side = 1 if signed_strength > _CONTEXT_DIRECTION_THRESHOLD else (
+        -1 if signed_strength < -_CONTEXT_DIRECTION_THRESHOLD else 0)
     return _TrendContext(side, min(1.0, strength), slope_atr, efficiency, structure,
                          signed_strength, slope_component, structure_component)
 
@@ -268,6 +285,63 @@ class ICTLiquidityEntryEngine:
         payload.update(values)
         self._last_analysis.update(payload)
 
+    @staticmethod
+    def _direction_int(side: str) -> int:
+        side = str(side or "").lower()
+        return 1 if side == "long" else (-1 if side == "short" else 0)
+
+    def _context_decision_for_raid(self, side: str, ctx4: _TrendContext,
+                                   ctx15: _TrendContext, sweep_quality: float) -> _ContextDecision:
+        """Classify HTF context without using trend alignment as an entry gate.
+
+        The executable evidence is still the 5m raid -> MSS/displacement -> FVG
+        repricing sequence.  4H/15m context supplies draw-on-liquidity bias and
+        probability.  Only a unanimous, explicit HTF delivery against the raid is
+        blocked before the 5m proof sequence can finish.
+        """
+        direction = self._direction_int(side)
+        if direction == 0:
+            return _ContextDecision(side, False, "INVALID_RAID_DIRECTION",
+                                    "INVALID_RAID_DIRECTION", 0.0, False, 0, 0, 0)
+        contexts = (ctx4, ctx15)
+        supporting = sum(1 for ctx in contexts if ctx.side == direction)
+        opposing = sum(1 for ctx in contexts if ctx.side == -direction)
+        ranging = sum(1 for ctx in contexts if ctx.side == 0)
+        support_strength = sum(ctx.confidence for ctx in contexts if ctx.side == direction)
+        opposing_strength = sum(ctx.confidence for ctx in contexts if ctx.side == -direction)
+        range_balance = sum(
+            max(0.0, 1.0 - min(1.0, abs(ctx.signed_score) / _CONTEXT_DIRECTION_THRESHOLD))
+            for ctx in contexts if ctx.side == 0
+        )
+        strict = supporting == 2
+        if opposing == 2:
+            score = max(0.0, 0.10 + 0.10 * _f(sweep_quality) - 0.35 * opposing_strength)
+            return _ContextDecision(side, False, "HTF_DELIVERY_OPPOSES_RAID",
+                                    "HTF_DELIVERY_OPPOSES_RAID", score, False,
+                                    supporting, opposing, ranging)
+        if strict:
+            path = "STRICT_4H_15M_DOL"
+        elif supporting == 1 and ranging == 1:
+            path = "PARTIAL_HTF_DOL"
+        elif supporting == 1 and opposing == 1:
+            path = "MITIGATION_RAID_WITH_SPLIT_HTF"
+        elif ranging == 2:
+            path = "BALANCED_RANGE_EXTERNAL_RAID"
+        elif ranging == 1 and opposing == 1:
+            path = "COUNTER_DELIVERY_RAID_REQUIRES_5M_PROOF"
+        else:
+            path = "LIQUIDITY_RAID_DOL"
+        score = (
+            0.26
+            + 0.24 * min(1.0, support_strength)
+            + 0.16 * min(1.0, range_balance)
+            + 0.20 * max(0.0, min(1.0, _f(sweep_quality)))
+            - 0.18 * min(1.0, opposing_strength)
+        )
+        return _ContextDecision(side, True, path, "NONE",
+                                max(0.05, min(0.95, score)), strict,
+                                supporting, opposing, ranging)
+
     def update(self, liq_snapshot: LiquidityMapSnapshot, price: float, atr: float, now: float,
                candles_5m: Optional[List[Dict]] = None,
                candles_15m: Optional[List[Dict]] = None,
@@ -324,10 +398,12 @@ class ICTLiquidityEntryEngine:
             "context_15m_slope_atr": ctx15.slope_atr, "context_15m_efficiency": ctx15.efficiency,
             "context_15m_structure": ctx15.structure, "context_15m_score": ctx15.signed_score,
             "context_15m_slope_component": ctx15.slope_component, "context_15m_structure_component": ctx15.structure_component,
-            "context_15m_atr": atr15m, "context_direction_threshold": 0.18,
+            "context_15m_atr": atr15m, "context_direction_threshold": _CONTEXT_DIRECTION_THRESHOLD,
             "min_structural_rr": self._min_structural_rr,
             "max_structural_rr_reference": self._max_structural_rr_reference,
             "context_aligned": bool(aligned_side), "context_direction": aligned_label,
+            "context_permission": False, "context_bias_path": "AWAITING_5M_DOL",
+            "context_delivery_score": 0.0,
             "entry_5m_atr": atr, "atr_percentile": self._atr_pctile,
             "bars_5m": len(c5), "bars_15m": len(c15), "bars_4h": len(c4h),
             "authority": "STRUCTURAL_ONLY", "trigger": "WAIT", "block_reason": "EVALUATING",
@@ -348,21 +424,20 @@ class ICTLiquidityEntryEngine:
                 self._try_reprice_thesis(self._thesis, liq_snapshot, price, atr, now)
                 return
 
-        self._state = EngineState.CONTEXT_READY if aligned_side else EngineState.SCANNING
-        self._last_analysis["state"] = self._state.value
-        if not aligned_side:
-            self._record_block("CONTEXT_NOT_ALIGNED")
-            return
         fresh = self._fresh_5m_sweeps(liq_snapshot, now)
         self._last_analysis.update({"fresh_5m_raid_count": len(fresh), "aligned_5m_raid_count": 0,
                                     "opposed_5m_raid_count": 0, "invalid_5m_raid_count": 0})
+        self._state = EngineState.CONTEXT_READY
+        self._last_analysis["state"] = self._state.value
         if not fresh:
             self._record_block("AWAITING_FRESH_5M_LIQUIDITY_RAID")
             return
         for sweep in sorted(fresh, key=lambda sw: _f(getattr(sw, "quality", 0.0)), reverse=True):
             side = str(getattr(sweep, "direction", "") or "").lower()
-            direction = 1 if side == "long" else (-1 if side == "short" else 0)
+            direction = self._direction_int(side)
             pool = getattr(sweep, "pool", None)
+            context_decision = self._context_decision_for_raid(
+                side, ctx4, ctx15, _f(getattr(sweep, "quality", 0.0)))
             candidate = {
                 "candidate_raid_side": side or "unknown",
                 "candidate_raid_pool_side": str(getattr(getattr(pool, "side", None), "value", "") or ""),
@@ -370,19 +445,35 @@ class ICTLiquidityEntryEngine:
                 "candidate_raid_wick": _f(getattr(sweep, "wick_extreme", 0.0)),
                 "candidate_raid_quality": _f(getattr(sweep, "quality", 0.0)),
                 "candidate_raid_age_sec": max(0.0, now - _f(getattr(sweep, "detected_at", now))),
+                "candidate_context_bias_path": context_decision.path,
+                "candidate_context_delivery_score": context_decision.delivery_score,
             }
             self._last_analysis.update(candidate)
             if direction == 0:
                 self._last_analysis["invalid_5m_raid_count"] += 1
                 self._record_block("INVALID_RAID_DIRECTION")
                 continue
-            if aligned_side != direction:
+            if not context_decision.allowed:
                 self._last_analysis["opposed_5m_raid_count"] += 1
-                self._record_block("RAID_DIRECTION_OPPOSES_CONTEXT")
+                self._record_block(context_decision.block,
+                                   context_bias_path=context_decision.path,
+                                   context_delivery_score=context_decision.delivery_score,
+                                   context_direction=side or "none",
+                                   context_permission=False)
                 continue
             self._last_analysis["aligned_5m_raid_count"] += 1
             self._last_analysis.update({k.replace("candidate_", ""): v for k, v in candidate.items()})
-            thesis = self._build_thesis(sweep, side, ctx4, ctx15, c5, atr, now)
+            self._last_analysis.update({
+                "context_permission": True,
+                "context_bias_path": context_decision.path,
+                "context_delivery_score": context_decision.delivery_score,
+                "context_direction": side,
+                "context_aligned": context_decision.strict_aligned,
+                "context_supporting_tfs": context_decision.supporting_tfs,
+                "context_opposing_tfs": context_decision.opposing_tfs,
+                "context_ranging_tfs": context_decision.ranging_tfs,
+            })
+            thesis = self._build_thesis(sweep, side, ctx4, ctx15, context_decision, c5, atr, now)
             if thesis is None:
                 continue
             self._thesis = thesis
@@ -391,7 +482,7 @@ class ICTLiquidityEntryEngine:
             self._try_reprice_thesis(thesis, liq_snapshot, price, atr, now)
             return
         if self._last_analysis.get("block_reason") == "EVALUATING":
-            self._record_block("NO_EXECUTABLE_ALIGNED_RAID")
+            self._record_block("NO_EXECUTABLE_INSTITUTIONAL_RAID")
 
     def get_signal(self) -> Optional[EntrySignal]:
         return self._signal
@@ -503,7 +594,8 @@ class ICTLiquidityEntryEngine:
         return out
 
     def _build_thesis(self, sweep: SweepResult, side: str, ctx4: _TrendContext,
-                      ctx15: _TrendContext, candles_5m: List[Dict], atr: float,
+                      ctx15: _TrendContext, context_decision: _ContextDecision,
+                      candles_5m: List[Dict], atr: float,
                       now: float) -> Optional[_Thesis]:
         idx = int(getattr(sweep, "sweep_candle_idx", len(candles_5m) - 4) or 0)
         idx = max(3, min(idx, len(candles_5m) - 2))
@@ -538,7 +630,10 @@ class ICTLiquidityEntryEngine:
         })
         return _Thesis(
             sweep_key=_sweep_key(sweep), side=side, sweep=sweep, formed_at=now,
-            context_4h=ctx4, context_15m=ctx15, mss_level=mss,
+            context_4h=ctx4, context_15m=ctx15,
+            context_path=context_decision.path,
+            context_delivery_score=context_decision.delivery_score,
+            mss_level=mss,
             displacement_atr=displacement, fvg=fvg,
         )
 
@@ -550,6 +645,10 @@ class ICTLiquidityEntryEngine:
         distance_to_zone = 0.0 if in_reprice else min(abs(price - low_bound), abs(price - high_bound))
         self._last_analysis.update({
             "state": self._state.value, "side": thesis.side,
+            "context_permission": True,
+            "context_bias_path": thesis.context_path,
+            "context_delivery_score": thesis.context_delivery_score,
+            "context_direction": thesis.side,
             "fvg_low": thesis.fvg.low, "fvg_high": thesis.fvg.high,
             "fvg_equilibrium": thesis.fvg.equilibrium, "fvg_tolerance": zone_tol,
             "fvg_distance_atr": distance_to_zone / max(atr, _EPS),
@@ -587,6 +686,7 @@ class ICTLiquidityEntryEngine:
         quality = {
             "context_4h": thesis.context_4h.confidence,
             "context_15m": thesis.context_15m.confidence,
+            "context_delivery_score": thesis.context_delivery_score,
             "raid_quality": _f(getattr(thesis.sweep, "quality", 0.0)),
             "displacement_atr": thesis.displacement_atr,
             "delivery_probability": delivery_p,
@@ -595,6 +695,7 @@ class ICTLiquidityEntryEngine:
         explanation = (
             f"4H={thesis.context_4h.label}({thesis.context_4h.confidence:.2f}) | "
             f"15m={thesis.context_15m.label}({thesis.context_15m.confidence:.2f}) | "
+            f"bias={thesis.context_path}({thesis.context_delivery_score:.2f}) | "
             f"5m raid={getattr(getattr(thesis.sweep, 'pool', None), 'side', '')} "
             f"MSS/FVG | displacement={thesis.displacement_atr:.2f}ATR | "
             f"deliveryP={delivery_p:.2f} utility={utility:+.2f}R"
@@ -615,6 +716,8 @@ class ICTLiquidityEntryEngine:
             "entry": entry, "sl": stop, "tp": tp, "rr": rr,
             "gross_rr": rr,
             "delivery_probability": delivery_p, "delivery_utility_r": utility,
+            "context_bias_path": thesis.context_path,
+            "context_delivery_score": thesis.context_delivery_score,
             "target_timeframe": str(getattr(target_obj.pool, "timeframe", "")),
             "target_pool_price": _f(getattr(target_obj.pool, "price", 0.0)),
             "target_significance": _f(getattr(target_obj, "significance", 0.0)),
@@ -681,7 +784,15 @@ class ICTLiquidityEntryEngine:
                 audit["gross_rr_below_floor"] += 1
                 continue
             distance_atr = dist / max(atr, _EPS)
-            context = 0.50 * (self._thesis.context_4h.confidence if self._thesis else 0.0) + 0.50 * (self._thesis.context_15m.confidence if self._thesis else 0.0)
+            if self._thesis is not None:
+                context = _f(getattr(self._thesis, "context_delivery_score", 0.0), 0.0)
+                if context <= 0.0:
+                    context = (
+                        0.50 * _f(getattr(getattr(self._thesis, "context_4h", None), "confidence", 0.0))
+                        + 0.50 * _f(getattr(getattr(self._thesis, "context_15m", None), "confidence", 0.0))
+                    )
+            else:
+                context = 0.0
             sig_term = math.tanh(significance / 5.0)
             dist_decay = math.exp(-max(0.0, distance_atr - 1.0) / 8.0)
             p = max(0.05, min(0.95, 0.18 + 0.34 * context + 0.30 * sig_term + 0.18 * dist_decay))

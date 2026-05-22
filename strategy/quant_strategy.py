@@ -3,7 +3,7 @@ ICT + LIQUIDITY STRATEGY — SINGLE ENTRY AUTHORITY
 ==================================================
 
 Entry authority:
-    4H delivery context -> 15m confirmation -> 5m external-liquidity raid
+    4H/15m draw-on-liquidity context -> 5m external-liquidity raid
     -> 5m displacement/MSS -> 5m FVG repricing -> bracketed execution.
 
 No secondary scoring, order-flow scoring, directional overlay, session tier or
@@ -1082,9 +1082,9 @@ class QuantStrategy:
             asset = getattr(inst, "asset_id", QCfg.SYMBOL())
             venues = ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in getattr(inst, "by_exchange", {}).items()) if inst is not None else QCfg.EXCHANGE().upper()
             logger.info(f"   {asset} | {QCfg.SYMBOL()} | venues={venues} | leverage_cap={QCfg.LEVERAGE()}x | margin_policy={QCfg.MARGIN_PCT():.0%}")
-        logger.info(f"   EntryAuthority: {'ACTIVE' if self._entry_engine is not None else 'UNAVAILABLE'} | 4H context → 15m confirmation → 5m raid/MSS/FVG")
+        logger.info(f"   EntryAuthority: {'ACTIVE' if self._entry_engine is not None else 'UNAVAILABLE'} | 4H/15m DOL → 5m raid/MSS/FVG")
         logger.info(f"   LiquidityMap: {'ACTIVE' if self._liq_map is not None else 'UNAVAILABLE'} | targets=opposing 15m/4H/1D liquidity")
-        logger.info("   Context: ACTIVE (4H/15m) | Trigger: ACTIVE (5m raid→MSS→FVG)")
+        logger.info("   Context: ACTIVE (4H/15m DOL bias, no trend-permission gate) | Trigger: ACTIVE (5m raid→MSS→FVG)")
         logger.info("   Execution: venue lot rules + structural SL risk + bracket protection + exact-fill reconciliation")
         logger.info("   ExitModel: structural SL + opposing 15m/4H/1D liquidity targets")
         logger.info("=" * 80)
@@ -1890,6 +1890,8 @@ class QuantStrategy:
             str(info.get("state", "SCANNING")), str(info.get("block_reason", "")),
             str(info.get("context_4h", "")), str(info.get("context_15m", "")),
             str(info.get("context_direction", "")), str(info.get("trigger", "")),
+            str(info.get("context_bias_path", "")),
+            round(self._decision_num(info, "context_delivery_score"), 4),
             str(info.get("side", info.get("raid_side", ""))),
             round(self._decision_num(info, "raid_price"), 6),
             round(self._decision_num(info, "mss_level"), 6),
@@ -1930,7 +1932,7 @@ class QuantStrategy:
             "🧭 ICT_DECISION %s state=%s block=%s | domain=%s mark=%s ATR5=%s pct=%s%% | "
             "4H=%s score=%s=[slope%s+struct%s] threshold=±%s ATR=%s | "
             "15m=%s score=%s=[slope%s+struct%s] threshold=±%s ATR=%s | "
-            "aligned=%s/%s raids=fresh:%d aligned:%d opposed:%d invalid:%d accepted=%s | cost=%s",
+            "bias=%s dir=%s score=%s strict=%s raids=fresh:%d accepted:%d opposed:%d invalid:%d accepted=%s | cost=%s",
             mode, info.get("state", "SCANNING"), info.get("block_reason", "UNKNOWN"), self._analysis_unit(),
             self._decision_fmt({"v": price}, "v"), self._decision_fmt(info,"entry_5m_atr"),
             self._decision_fmt({"p": 100.0*self._decision_num(info,"atr_percentile",0.5)},"p",".0f"),
@@ -1940,7 +1942,9 @@ class QuantStrategy:
             info.get("context_15m", "WAIT"), self._decision_fmt(info,"context_15m_score","+.3f"),
             self._decision_fmt(info,"context_15m_slope_component","+.3f"), self._decision_fmt(info,"context_15m_structure_component","+.3f"),
             self._decision_fmt(info,"context_direction_threshold",".2f"), self._decision_fmt(info,"context_15m_atr"),
-            "Y" if info.get("context_aligned") else "N", info.get("context_direction", "none"),
+            info.get("context_bias_path", "AWAITING_5M_DOL"), info.get("context_direction", "none"),
+            self._decision_fmt(info, "context_delivery_score", ".2f"),
+            "Y" if info.get("context_aligned") else "N",
             int(info.get("fresh_5m_raid_count",0) or 0), int(info.get("aligned_5m_raid_count",0) or 0),
             int(info.get("opposed_5m_raid_count",0) or 0), int(info.get("invalid_5m_raid_count",0) or 0), raid, spread_txt,
         )
@@ -4809,9 +4813,9 @@ class QuantStrategy:
         atr = float(self._atr_5m.atr or 0.0)
         lines = [
             "🏛 <b>ICT + LIQUIDITY STATUS</b>",
-            f"Authority: 4H context → 15m confirmation → 5m raid/MSS/FVG",
+            f"Authority: 4H/15m DOL bias → 5m raid/MSS/FVG",
             f"State: {state} | Price: {cur}{price:,.4f} | ATR(5m): {cur}{atr:,.4f}",
-            f"Context: 4H={analysis.get('context_4h', '-')} | 15m={analysis.get('context_15m', '-')} | Trigger={analysis.get('trigger', 'WAIT')}",
+            f"Context: 4H={analysis.get('context_4h', '-')} | 15m={analysis.get('context_15m', '-')} | Bias={analysis.get('context_bias_path', 'AWAITING_5M_DOL')} | Trigger={analysis.get('trigger', 'WAIT')}",
             f"Closed trades: {self._total_trades} | Wins: {self._winning_trades} | Realised P&L: {cur}{self._total_pnl:+,.2f}",
         ]
         if not p.is_flat():

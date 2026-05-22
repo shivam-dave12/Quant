@@ -1,6 +1,6 @@
 """Telegram controller for the ICT + Liquidity execution system.
 
-Operator surfaces expose only: 4H/15m context, fresh 5m liquidity raid,
+Operator surfaces expose only: 4H/15m DOL bias, fresh 5m liquidity raid,
 MSS/displacement/FVG repricing, bracket protection, exact-fill P&L and risk.
 """
 
@@ -514,7 +514,7 @@ class TelegramBotController:
     def _cmd_help(self) -> str:
         return (
             "🏛️ <b>ICT + LIQUIDITY EXECUTION SYSTEM</b>\n"
-            "<code>4H context → 15m confirmation → 5m raid/MSS/FVG → bracketed trade</code>\n\n"
+            "<code>4H/15m DOL bias → 5m raid/MSS/FVG → bracketed trade</code>\n\n"
             "/status — desks, open protection and P&L\n"
             "/thinking — current structural thesis\n"
             "/structures — 4H/15m/5m trigger geometry\n"
@@ -562,11 +562,12 @@ class TelegramBotController:
                     return "N/A"
             lines = [
                 "🏛️ <b>ICT + Liquidity Thesis</b>",
-                "<code>4H context → 15m confirmation → 5m raid/MSS/FVG → protected execution</code>",
+                "<code>4H/15m DOL bias → 5m raid/MSS/FVG → protected execution</code>",
                 "<i>N/A means the prerequisite structural stage has not evaluated.</i>",
                 f"State: <b>{_esc(str(info.get('state', 'SCANNING')))}</b> | Block: {_esc(str(info.get('block_reason', 'WAIT')))}",
                 f"4H: {_esc(str(info.get('context_4h', 'WAIT')))} score={_fv('context_4h_score','+.3f')} ATR={_fv('context_4h_atr')}",
-                f"15m: {_esc(str(info.get('context_15m', 'WAIT')))} score={_fv('context_15m_score','+.3f')} ATR={_fv('context_15m_atr')} aligned={'Y' if info.get('context_aligned') else 'N'}",
+                f"15m: {_esc(str(info.get('context_15m', 'WAIT')))} score={_fv('context_15m_score','+.3f')} ATR={_fv('context_15m_atr')}",
+                f"DOL bias: {_esc(str(info.get('context_bias_path', 'AWAITING_5M_DOL')))} dir={_esc(str(info.get('context_direction', 'none')))} score={_fv('context_delivery_score','.2f')} strict={'Y' if info.get('context_aligned') else 'N'}",
                 f"5m: ATR={_fv('entry_5m_atr')} trigger={_esc(str(info.get('trigger', 'WAITING_FOR_FRESH_RAID')))} minRR={_fv('min_structural_rr','.2f')}",
             ]
             for key, label in (("raid_quality", "Raid quality"), ("displacement_atr", "Displacement ATR"), ("delivery_probability", "Delivery probability"), ("delivery_utility_r", "Delivery utility R")):
@@ -870,7 +871,7 @@ class TelegramBotController:
         import config as cfg
         return (
             "⚙️ <b>ICT + Liquidity Configuration</b>\n"
-            "Entry authority: 4H context / 15m confirmation / 5m execution\n"
+            "Entry authority: 4H/15m DOL bias / 5m execution\n"
             "Trigger: fresh external-liquidity raid → MSS/displacement → FVG rebalance\n"
             "Protection: venue-native SL/TP required before activation\n"
             "Accounting: exact broker fills; instrument-scoped currency/payoff model\n"

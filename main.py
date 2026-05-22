@@ -1,6 +1,6 @@
 """Entry point for the institutional ICT + Liquidity execution system.
 
-Alpha authority is singular: 4H delivery context, 15m confirmation and a fresh
+Alpha authority is singular: 4H/15m draw-on-liquidity context and a fresh
 5m liquidity raid with MSS/displacement and FVG repricing. Risk, bracket
 protection and exact-fill reconciliation remain venue-scoped controls.
 """
@@ -328,7 +328,7 @@ class QuantBot:
     Decision hierarchy on every tick:
       1. Build feed-reliability and market-state context.   → MarketAggregator
       2. Map live BSL/SSL features and archived sweeps.      → LiquidityMap
-      3. Approve only 5m raid/MSS/FVG aligned with 4H/15m context. → ICT_LIQUIDITY
+      3. Approve only 5m raid/MSS/FVG with HTF DOL bias and real target. → ICT_LIQUIDITY
       4. Validate sizing, liquidation, lots and fills.       → Risk/Execution
       5. Manage live trade via fixed SL + TP ladder.       → TPLadder
 
@@ -373,7 +373,7 @@ class QuantBot:
         try:
             logger.info("=" * 80)
             logger.info("⚡ ICT + LIQUIDITY EXECUTION SYSTEM — DUAL-EXCHANGE")
-            logger.info("   4H Context → 15m Confirmation → 5m Raid/MSS/FVG → Protected Execution")
+            logger.info("   4H/15m DOL Bias → 5m Raid/MSS/FVG → Protected Execution")
             logger.info(f"   Symbol: {config.SYMBOL} | Leverage: {config.LEVERAGE}x | "
                         f"Execution: {config.EXECUTION_EXCHANGE.upper()}")
             logger.info("=" * 80)
@@ -563,7 +563,7 @@ class QuantBot:
                 "<b>Architecture:</b>\n"
                 "  1️⃣  Market data: executable venue candles and order state\n"
                 "  2️⃣  LiquidityMap: live BSL/SSL geometry and fresh raid detection\n"
-                "  3️⃣  Entry authority: 4H / 15m context with 5m raid-MSS-FVG trigger\n"
+                "  3️⃣  Entry authority: 4H/15m DOL bias with 5m raid-MSS-FVG trigger\n"
                 "  4️⃣  Risk/Execution: structural-stop sizing, liquidation guard, native bracket\n"
                 "  5️⃣  Reconciliation: exact broker fills and instrument-scoped P&amp;L\n"
                 "\n"

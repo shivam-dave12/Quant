@@ -345,7 +345,7 @@ class MultiAssetQuantBot:
                 return missing
         lines = [
             "🏛 <b>ICT + LIQUIDITY DECISION BOOK</b>",
-            "<code>4H context → 15m confirmation → 5m raid/MSS/FVG → protected execution</code>",
+            "<code>4H/15m DOL bias → 5m raid/MSS/FVG → protected execution</code>",
             "<i>Every number below is sourced; N/A means that calculation stage has not been reached.</i>",
         ]
         for ctx in self.contexts:
@@ -394,8 +394,9 @@ class MultiAssetQuantBot:
                 lines.append(
                     f"<code>15m {self._esc(info.get('context_15m','WAIT'))} score={val(info,'context_15m_score','+.3f')} "
                     f"=[slope {val(info,'context_15m_slope_component','+.3f')} + struct {val(info,'context_15m_structure_component','+.3f')}] "
-                    f"threshold=±{threshold} ATR={val(info,'context_15m_atr')} aligned={'Y' if info.get('context_aligned') else 'N'}</code>"
+                    f"threshold=±{threshold} ATR={val(info,'context_15m_atr')}</code>"
                 )
+                lines.append(f"<code>DOL bias={self._esc(info.get('context_bias_path','AWAITING_5M_DOL'))} dir={self._esc(info.get('context_direction','none'))} score={val(info,'context_delivery_score','.2f')} strict={'Y' if info.get('context_aligned') else 'N'}</code>")
                 pct_value = {"pct": 100 * float(info.get("atr_percentile", 0.5) or 0.5)}
                 lines.append(f"<code>5m ATR={val(info,'entry_5m_atr')} pct={val(pct_value,'pct','.0f')}% trigger={self._esc(info.get('trigger','WAIT'))} minRR={val(info,'min_structural_rr','.2f')}</code>")
                 if info.get("raid_side"):
@@ -1072,7 +1073,7 @@ class MultiAssetQuantBot:
             f"• Balance allocation: <code>{self.guard.budget_mode}</code>; risk base <code>{self.guard.risk_budget_mode}</code>",
             "• Live exchange products only; no synthetic executable symbols",
             "• Alpha: single ICT + Liquidity authority; portfolio manager controls exposure mechanics only",
-            "• Entry: 4H context → 15m confirmation → fresh 5m raid/MSS/FVG",
+            "• Entry: 4H/15m DOL bias → fresh 5m raid/MSS/FVG",
             "• Exits and P&amp;L: venue protection and exact-fill reconciliation",
         ])
         return "\n".join(lines)

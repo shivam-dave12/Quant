@@ -110,6 +110,24 @@ def _trend_candles(step: float, n: int):
     return rows
 
 
+def _ranging_candles(n: int, base: float = 100.0):
+    return [{"o": base, "h": base + 1.0, "l": base - 1.0, "c": base + 0.10} for _ in range(n)]
+
+
+def _short_raid_candles():
+    c5 = [{"o": 100.60, "h": 100.90, "l": 100.10, "c": 100.45} for _ in range(34)]
+    for i in range(8, 20):
+        c5[i] = {"o": 100.55, "h": 101.00, "l": 100.10, "c": 100.40}
+    c5[20] = {"o": 100.50, "h": 102.00, "l": 100.20, "c": 100.60}  # BSL raid
+    c5[21] = {"o": 100.50, "h": 100.70, "l": 100.00, "c": 100.20}
+    c5[22] = {"o": 99.80, "h": 99.90, "l": 96.80, "c": 97.00}  # displacement
+    c5[23] = {"o": 98.70, "h": 99.00, "l": 96.70, "c": 96.90}  # bearish FVG below index 21 low
+    for i in range(24, 33):
+        c5[i] = {"o": 96.80, "h": 97.10, "l": 95.70, "c": 96.20}
+    c5[33] = {"o": 99.50, "h": 99.80, "l": 99.20, "c": 99.50}  # still forming; live mark reprices FVG
+    return c5
+
+
 def test_context_strength_uses_each_timeframes_own_atr_not_entry_atr():
     now = time.time()
     c5 = _trend_candles(0.10, 32)
@@ -168,7 +186,7 @@ def test_full_4h_15m_5m_structural_sequence_emits_one_executable_ticket():
     assert engine.state == "EXECUTABLE"
 
 
-def test_context_ready_requires_aligned_four_hour_and_fifteen_minute_direction():
+def test_htf_trend_misalignment_no_longer_hard_blocks_without_a_raid():
     now = time.time()
     c5 = _trend_candles(0.10, 32)
     c4h = _trend_candles(2.00, 30)
@@ -179,8 +197,48 @@ def test_context_ready_requires_aligned_four_hour_and_fifteen_minute_direction()
     info = engine.analysis_info
     assert info["context_4h"] == "bullish" and info["context_15m"] == "bearish"
     assert info["context_aligned"] is False
-    assert info["block_reason"] == "CONTEXT_NOT_ALIGNED"
-    assert engine.state == "SCANNING"
+    assert info["block_reason"] == "AWAITING_FRESH_5M_LIQUIDITY_RAID"
+    assert engine.state == "CONTEXT_READY"
+
+
+def test_ranging_4h_with_15m_dol_can_approve_short_external_liquidity_raid():
+    now = time.time()
+    c4h = _ranging_candles(30)
+    c15 = _trend_candles(-0.70, 34)
+    c5 = _short_raid_candles()
+    raid_pool = LiquidityPool(101.0, PoolSide.BSL, "5m", status=PoolStatus.SWEPT, created_at=now - 40)
+    raid = SweepResult(raid_pool, 20, 102.0, 1.0, 1.5, 0.92, "short", now - 30)
+    ssl_pool = LiquidityPool(90.0, PoolSide.SSL, "15m", status=PoolStatus.DETECTED, created_at=now - 90, htf_count=1)
+    target = PoolTarget(ssl_pool, 9.50, "short", 5.0, ["15m"])
+    engine = EntryEngine()
+    engine.update(_snap(ssl=[target], sweeps=[raid]), price=99.50, atr=1.0, now=now,
+                  candles_5m=c5, candles_15m=c15, candles_4h=c4h)
+    signal = engine.get_signal()
+    info = engine.analysis_info
+    assert signal is not None
+    assert signal.side == "short" and signal.tp_price < signal.entry_price < signal.sl_price
+    assert info["context_4h"] == "ranging" and info["context_15m"] == "bearish"
+    assert info["context_permission"] is True
+    assert info["context_bias_path"] == "PARTIAL_HTF_DOL"
+    assert info["block_reason"] == "NONE"
+
+
+def test_unanimous_htf_delivery_against_raid_is_rejected_before_execution():
+    now = time.time()
+    c4h = _trend_candles(1.00, 30)
+    c15 = _trend_candles(0.70, 34)
+    c5 = _short_raid_candles()
+    raid_pool = LiquidityPool(101.0, PoolSide.BSL, "5m", status=PoolStatus.SWEPT, created_at=now - 40)
+    raid = SweepResult(raid_pool, 20, 102.0, 1.0, 1.5, 0.92, "short", now - 30)
+    ssl_pool = LiquidityPool(90.0, PoolSide.SSL, "15m", status=PoolStatus.DETECTED, created_at=now - 90, htf_count=1)
+    target = PoolTarget(ssl_pool, 9.50, "short", 5.0, ["15m"])
+    engine = EntryEngine()
+    engine.update(_snap(ssl=[target], sweeps=[raid]), price=99.50, atr=1.0, now=now,
+                  candles_5m=c5, candles_15m=c15, candles_4h=c4h)
+    info = engine.analysis_info
+    assert engine.get_signal() is None
+    assert info["block_reason"] == "HTF_DELIVERY_OPPOSES_RAID"
+    assert info["context_permission"] is False
 
 
 def test_decision_snapshot_exposes_native_atr_and_waiting_gate_calculations():
