@@ -416,6 +416,9 @@ class _PostSweepState:
     static_scored:      bool  = False
     static_rev_base:    float = 0.0
     static_cont_base:   float = 0.0
+    no_displacement_scored: bool = False
+    displacement_score_tier: int = 0
+    ote_score_tier:    int = 0
 
 
 @dataclass
@@ -1492,12 +1495,21 @@ class EntryEngine:
                 cont_d += pts; cont_r.append(f"DIR_CONTINUE({hint_conf:.0%})")
 
         # Live displacement
+        disp_tier = 0
         if ps.max_displacement >= disp_strong_atr:
-            rev_d += 10.0; rev_r.append(f"DISP {ps.max_displacement:.1f}ATR")
+            disp_tier = 2
         elif ps.max_displacement >= disp_min_atr:
-            rev_d += 5.0
-        elif ps.max_displacement < 0.2 and elapsed > 15.0:
+            disp_tier = 1
+        if disp_tier > ps.displacement_score_tier:
+            if disp_tier == 2:
+                rev_d += 10.0 if ps.displacement_score_tier == 0 else 5.0
+                rev_r.append(f"DISP {ps.max_displacement:.1f}ATR")
+            else:
+                rev_d += 5.0
+            ps.displacement_score_tier = disp_tier
+        elif ps.max_displacement < 0.2 and elapsed > 15.0 and not ps.no_displacement_scored:
             cont_d += 6.0; cont_r.append("NO DISP")
+            ps.no_displacement_scored = True
 
         # CISD
         if ps.cisd_detected:
@@ -1506,10 +1518,14 @@ class EntryEngine:
 
         # OTE
         if ps.ote_reached:
-            if ps.ote_holding:
-                rev_d += 12.0; rev_r.append("IN OTE")
-            else:
-                rev_d += 6.0
+            ote_tier = 2 if ps.ote_holding else 1
+            if ote_tier > ps.ote_score_tier:
+                if ote_tier == 2:
+                    rev_d += 12.0 if ps.ote_score_tier == 0 else 6.0
+                    rev_r.append("IN OTE")
+                else:
+                    rev_d += 6.0
+                ps.ote_score_tier = ote_tier
 
         # Flow
         if flow.direction == rev_dir and abs(flow.conviction) >= 0.40:

@@ -324,11 +324,14 @@ class PostSweepState:
     # ── Displacement tracking ────────────────────────────────────────
     max_displacement_atr: float = 0.0
     disp_velocity_atr_s:  float = 0.0   # ATR per second
+    displacement_score_tier: int = 0
+    no_displacement_scored: bool = False
 
     # ── OTE zone tracking ────────────────────────────────────────────
     ote_reached:        bool  = False
     ote_timestamp:      float = 0.0
     ote_holding:        bool  = False
+    ote_score_tier:     int   = 0
 
     # ── Price extremes since sweep ───────────────────────────────────
     highest_since:      float = 0.0
@@ -1745,15 +1748,23 @@ class DirectionEngine:
         a = max(atr, 1e-9)
 
         # ── Live displacement from sweep level ────────────────────────────
+        _disp_tier = 0
         if ps.max_displacement_atr >= _DISP_STRONG_ATR:
-            rev_delta += 12.0
-            rev_reasons.append(f"STRONG_DISP {ps.max_displacement_atr:.2f}ATR")
+            _disp_tier = 2
         elif ps.max_displacement_atr >= _DISP_WEAK_ATR:
-            rev_delta += 6.0
-            rev_reasons.append(f"DISP {ps.max_displacement_atr:.2f}ATR")
-        elif ps.max_displacement_atr < 0.2 and (now - ps.entered_at) > 15.0:
+            _disp_tier = 1
+        if _disp_tier > ps.displacement_score_tier:
+            if _disp_tier == 2:
+                rev_delta += 12.0 if ps.displacement_score_tier == 0 else 6.0
+                rev_reasons.append(f"STRONG_DISP {ps.max_displacement_atr:.2f}ATR")
+            else:
+                rev_delta += 6.0
+                rev_reasons.append(f"DISP {ps.max_displacement_atr:.2f}ATR")
+            ps.displacement_score_tier = _disp_tier
+        elif ps.max_displacement_atr < 0.2 and (now - ps.entered_at) > 15.0 and not ps.no_displacement_scored:
             cont_delta += 8.0
             cont_reasons.append(f"NO_DISP ({ps.max_displacement_atr:.2f}ATR)")
+            ps.no_displacement_scored = True
 
         # ── CISD freshness (decays with age) ──────────────────────────────
         if ps.cisd_detected:
@@ -1764,12 +1775,15 @@ class DirectionEngine:
 
         # ── OTE zone  (FIX-1: fires at 50% retrace, aligned with entry_engine)
         if ps.ote_reached:
-            if ps.ote_holding:
-                rev_delta += 15.0
-                rev_reasons.append("IN_OTE_ZONE")
-            else:
-                rev_delta +=  8.0
-                rev_reasons.append("OTE_WAS_REACHED")
+            _ote_tier = 2 if ps.ote_holding else 1
+            if _ote_tier > ps.ote_score_tier:
+                if _ote_tier == 2:
+                    rev_delta += 15.0 if ps.ote_score_tier == 0 else 7.0
+                    rev_reasons.append("IN_OTE_ZONE")
+                else:
+                    rev_delta += 8.0
+                    rev_reasons.append("OTE_WAS_REACHED")
+                ps.ote_score_tier = _ote_tier
 
         # ── Order flow (instantaneous) ────────────────────────────────────
         if tick_flow > 0.40 and rev_dir == "long":

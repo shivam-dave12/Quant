@@ -3403,6 +3403,222 @@ def test_post_sweep_neutral_cvd_does_not_create_continuation_evidence():
     assert ps.cont_evidence == 0.0
 
 
+def test_post_sweep_no_displacement_continuation_evidence_is_capped():
+    from strategy import entry_engine as ee
+    from strategy.liquidity_map import LiquidityPool, PoolSide, SweepResult
+
+    engine = ee.EntryEngine()
+    now = time.time()
+    pool = LiquidityPool(price=100.0, side=PoolSide.SSL, timeframe="5m", created_at=now)
+    sweep = SweepResult(
+        pool=pool,
+        sweep_candle_idx=0,
+        wick_extreme=99.5,
+        rejection_pct=0.5,
+        volume_ratio=1.0,
+        quality=0.75,
+        direction="long",
+        detected_at=now,
+    )
+    ps = ee._PostSweepState(
+        sweep=sweep,
+        entered_at=now,
+        highest_since=100.0,
+        lowest_since=100.0,
+        static_scored=True,
+    )
+    flow = SimpleNamespace(direction="", conviction=0.0, cvd_trend=0.0)
+    ict = SimpleNamespace(
+        amd_phase="",
+        amd_bias="",
+        amd_confidence=0.0,
+        direction_hint="",
+        direction_hint_side="",
+        direction_hint_confidence=0.0,
+        choch_5m="",
+        bos_5m="",
+        structure_15m="ranging",
+        structure_4h="ranging",
+        dealing_range_pd=0.50,
+        ict_sweeps=[],
+    )
+    snap = SimpleNamespace(bsl_pools=[], ssl_pools=[])
+
+    engine._evaluate_evidence(ps, snap, flow, ict, price=100.0, atr=1.0, now=now + 16.0)
+    first = ps.cont_evidence
+    engine._evaluate_evidence(ps, snap, flow, ict, price=100.0, atr=1.0, now=now + 17.0)
+
+    assert first == 6.0
+    assert ps.no_displacement_scored is True
+    assert ps.cont_evidence < first
+
+
+def test_post_sweep_displacement_evidence_is_capped_to_tier_upgrade():
+    from strategy import entry_engine as ee
+    from strategy.liquidity_map import LiquidityPool, PoolSide, SweepResult
+
+    engine = ee.EntryEngine()
+    now = time.time()
+    pool = LiquidityPool(price=100.0, side=PoolSide.SSL, timeframe="5m", created_at=now)
+    sweep = SweepResult(
+        pool=pool,
+        sweep_candle_idx=0,
+        wick_extreme=99.5,
+        rejection_pct=0.5,
+        volume_ratio=1.0,
+        quality=0.75,
+        direction="long",
+        detected_at=now,
+    )
+    ps = ee._PostSweepState(
+        sweep=sweep,
+        entered_at=now,
+        highest_since=110.0,
+        lowest_since=100.0,
+        max_displacement=10.0,
+        static_scored=True,
+    )
+    flow = SimpleNamespace(direction="", conviction=0.0, cvd_trend=0.0)
+    ict = SimpleNamespace(
+        amd_phase="",
+        amd_bias="",
+        amd_confidence=0.0,
+        direction_hint="",
+        direction_hint_side="",
+        direction_hint_confidence=0.0,
+        choch_5m="",
+        bos_5m="",
+        structure_15m="ranging",
+        structure_4h="ranging",
+        dealing_range_pd=0.50,
+        ict_sweeps=[],
+    )
+    snap = SimpleNamespace(bsl_pools=[], ssl_pools=[])
+
+    engine._evaluate_evidence(ps, snap, flow, ict, price=110.0, atr=1.0, now=now + 16.0)
+    first = ps.rev_evidence
+    engine._evaluate_evidence(ps, snap, flow, ict, price=110.0, atr=1.0, now=now + 17.0)
+
+    assert first == 10.0
+    assert ps.displacement_score_tier == 2
+    assert ps.rev_evidence < first
+
+
+def test_post_sweep_ote_evidence_is_capped_to_zone_event():
+    from strategy import entry_engine as ee
+    from strategy.liquidity_map import LiquidityPool, PoolSide, SweepResult
+
+    engine = ee.EntryEngine()
+    now = time.time()
+    pool = LiquidityPool(price=100.0, side=PoolSide.SSL, timeframe="5m", created_at=now)
+    sweep = SweepResult(
+        pool=pool,
+        sweep_candle_idx=0,
+        wick_extreme=99.5,
+        rejection_pct=0.5,
+        volume_ratio=1.0,
+        quality=0.75,
+        direction="long",
+        detected_at=now,
+    )
+    ps = ee._PostSweepState(
+        sweep=sweep,
+        entered_at=now,
+        highest_since=110.0,
+        lowest_since=100.0,
+        max_displacement=10.0,
+        displacement_score_tier=2,
+        ote_reached=True,
+        ote_holding=True,
+        static_scored=True,
+    )
+    flow = SimpleNamespace(direction="", conviction=0.0, cvd_trend=0.0)
+    ict = SimpleNamespace(
+        amd_phase="",
+        amd_bias="",
+        amd_confidence=0.0,
+        direction_hint="",
+        direction_hint_side="",
+        direction_hint_confidence=0.0,
+        choch_5m="",
+        bos_5m="",
+        structure_15m="ranging",
+        structure_4h="ranging",
+        dealing_range_pd=0.50,
+        ict_sweeps=[],
+    )
+    snap = SimpleNamespace(bsl_pools=[], ssl_pools=[])
+
+    engine._evaluate_evidence(ps, snap, flow, ict, price=106.0, atr=1.0, now=now + 16.0)
+    first = ps.rev_evidence
+    engine._evaluate_evidence(ps, snap, flow, ict, price=106.0, atr=1.0, now=now + 17.0)
+
+    assert first == 12.0
+    assert ps.ote_score_tier == 2
+    assert ps.rev_evidence < first
+
+
+def test_direction_engine_discrete_post_sweep_events_are_capped():
+    from strategy import direction_engine as de
+
+    engine = de.DirectionEngine()
+    now = time.time()
+    ps = de.PostSweepState(
+        swept_pool_price=100.0,
+        swept_pool_type="SSL",
+        entered_at=now,
+        quality=0.75,
+        max_displacement_atr=2.0,
+    )
+
+    first = engine._score_sweep_dynamic(
+        ps, None, "long", "short", 102.0, 1.0, now + 16.0, tick_flow=0.0, cvd_trend=0.11
+    )
+    second = engine._score_sweep_dynamic(
+        ps, None, "long", "short", 102.0, 1.0, now + 17.0, tick_flow=0.0, cvd_trend=0.11
+    )
+    assert first[0] == 12.0
+    assert second[0] == 0.0
+    assert ps.displacement_score_tier == 2
+
+    no_disp = de.PostSweepState(
+        swept_pool_price=100.0,
+        swept_pool_type="SSL",
+        entered_at=now,
+        quality=0.75,
+        max_displacement_atr=0.0,
+    )
+    first = engine._score_sweep_dynamic(
+        no_disp, None, "long", "short", 100.0, 1.0, now + 16.0, tick_flow=0.0, cvd_trend=0.11
+    )
+    second = engine._score_sweep_dynamic(
+        no_disp, None, "long", "short", 100.0, 1.0, now + 17.0, tick_flow=0.0, cvd_trend=0.11
+    )
+    assert first[1] == 8.0
+    assert second[1] == 0.0
+    assert no_disp.no_displacement_scored is True
+
+    ote = de.PostSweepState(
+        swept_pool_price=100.0,
+        swept_pool_type="SSL",
+        entered_at=now,
+        quality=0.75,
+        max_displacement_atr=2.0,
+        displacement_score_tier=2,
+        ote_reached=True,
+        ote_holding=True,
+    )
+    first = engine._score_sweep_dynamic(
+        ote, None, "long", "short", 101.0, 1.0, now + 16.0, tick_flow=0.0, cvd_trend=0.11
+    )
+    second = engine._score_sweep_dynamic(
+        ote, None, "long", "short", 101.0, 1.0, now + 17.0, tick_flow=0.0, cvd_trend=0.11
+    )
+    assert first[0] == 15.0
+    assert second[0] == 0.0
+    assert ote.ote_score_tier == 2
+
+
 
 def test_live_thesis_gate_fails_closed_if_dol_engine_is_unavailable():
     from strategy import entry_engine as ee
