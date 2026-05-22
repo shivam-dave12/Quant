@@ -2000,17 +2000,23 @@ class QuantStrategy:
                 )
             else:
                 audit = dict(info.get("target_audit", {}) or {})
+                target_model = str(info.get("target_selection_model") or audit.get("target_selection_model") or "N/A")
+                cap_raw = info.get("target_policy_max_rr", audit.get("max_structural_rr_reference"))
+                try:
+                    cap_txt = f"{float(cap_raw):.2f}" if cap_raw is not None and float(cap_raw) > 0.0 else "N/A"
+                except Exception:
+                    cap_txt = "N/A"
                 logger.info(
                     "📐 ICT_GEOMETRY stage=EXECUTABLE side=%s MSS=%s broken=Y disp=%sATR | FVG=[%s,%s] eq=%s gap=%sATR | "
-                    "SL=%s clearance=%sATR model=%s+%s×pct | target=%s@%s eligible=%d/%d positive=%d RR=%s floor=%s P=%s U=%sR",
+                    "SL=%s clearance=%sATR model=%s+%s×pct | target=%s@%s model=%s eligible=%d/%d positive=%d RR=%s floor=%s cap=%s P=%s U=%sR",
                     str(info.get("side", info.get("raid_side", "-"))).upper(), self._decision_fmt(info,"mss_level"),
                     self._decision_fmt(info,"displacement_atr",".2f"), self._decision_fmt(info,"fvg_low"), self._decision_fmt(info,"fvg_high"),
                     self._decision_fmt(info,"fvg_equilibrium"), self._decision_fmt(info,"fvg_distance_atr",".2f"),
                     self._decision_fmt(info,"structural_stop"), self._decision_fmt(info,"stop_clearance_atr",".2f"),
                     self._decision_fmt(info,"stop_clearance_base_atr",".2f"), self._decision_fmt(info,"stop_clearance_pctile_slope_atr",".2f"),
-                    info.get("target_timeframe", "N/A"), self._decision_fmt(info,"target_pool_price"), int(audit.get("eligible",0) or 0),
+                    info.get("target_timeframe", "N/A"), self._decision_fmt(info,"target_pool_price"), target_model, int(audit.get("eligible",0) or 0),
                     int(audit.get("pool_total",0) or 0), int(audit.get("positive",0) or 0), self._decision_fmt(info,"rr",".2f"),
-                    self._decision_fmt(info,"min_structural_rr",".2f"), self._decision_fmt(info,"delivery_probability",".2f"), self._decision_fmt(info,"delivery_utility_r","+.2f"),
+                    self._decision_fmt(info,"min_structural_rr",".2f"), cap_txt, self._decision_fmt(info,"delivery_probability",".2f"), self._decision_fmt(info,"delivery_utility_r","+.2f"),
                 )
 
     def _evaluate_entry(self, data_manager, order_manager, risk_manager, now):

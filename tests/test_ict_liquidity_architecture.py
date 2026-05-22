@@ -120,6 +120,53 @@ def test_delivery_target_excludes_unpromoted_five_minute_pool():
     assert rr > 1.0 and utility > 0.0 and 0.05 <= probability <= 0.95
 
 
+def test_delivery_target_uses_policy_bounded_sequential_dol_not_daily_jackpot():
+    engine = EntryEngine()
+    engine.set_structural_delivery_policy(min_rr=2.0, max_rr_reference=5.5)
+    engine.set_execution_cost_model(0.0, 0.0)
+    engine._thesis = SimpleNamespace(
+        context_path="COUNTER_DELIVERY_RAID_REQUIRES_5M_PROOF",
+        context_delivery_score=0.38,
+        context_4h=SimpleNamespace(confidence=0.10),
+        context_15m=SimpleNamespace(confidence=0.34),
+    )
+    near = LiquidityPool(113.0, PoolSide.BSL, "15m", status=PoolStatus.DETECTED, created_at=time.time(), htf_count=1)
+    far_daily = LiquidityPool(300.0, PoolSide.BSL, "1d", status=PoolStatus.DETECTED, created_at=time.time(), htf_count=1)
+    near_target = PoolTarget(near, 13.0, "long", 3.0, ["15m"])
+    far_target = PoolTarget(far_daily, 200.0, "long", 50.0, ["1d"])
+    selected = engine._select_liquidity_target(
+        "long", entry=100.0, sl=95.0, snap=_snap(bsl=[far_target, near_target]), atr=1.0
+    )
+    assert selected is not None
+    target, tp, rr, utility, probability = selected
+    assert target.pool.timeframe == "15m"
+    assert target.pool.price == pytest.approx(113.0)
+    assert 2.0 <= rr <= 5.5
+    assert utility > 0.0 and 0.05 <= probability <= 0.95
+    assert engine.analysis_info["target_audit"]["gross_rr_above_policy_cap"] == 1
+    assert engine.analysis_info["target_selection_model"] == "SEQUENTIAL_DOL"
+
+
+def test_delivery_target_rejects_only_far_pool_above_policy_rr_cap():
+    engine = EntryEngine()
+    engine.set_structural_delivery_policy(min_rr=2.0, max_rr_reference=5.5)
+    engine.set_execution_cost_model(0.0, 0.0)
+    engine._thesis = SimpleNamespace(
+        context_path="COUNTER_DELIVERY_RAID_REQUIRES_5M_PROOF",
+        context_delivery_score=0.38,
+        context_4h=SimpleNamespace(confidence=0.10),
+        context_15m=SimpleNamespace(confidence=0.34),
+    )
+    far_daily = LiquidityPool(300.0, PoolSide.BSL, "1d", status=PoolStatus.DETECTED, created_at=time.time(), htf_count=1)
+    far_target = PoolTarget(far_daily, 200.0, "long", 50.0, ["1d"])
+    selected = engine._select_liquidity_target(
+        "long", entry=100.0, sl=95.0, snap=_snap(bsl=[far_target]), atr=1.0
+    )
+    assert selected is None
+    assert engine.analysis_info["target_block"] == "NO_POLICY_BOUNDED_OPPOSING_15M_PLUS_POOL"
+    assert engine.analysis_info["target_audit"]["gross_rr_above_policy_cap"] == 1
+
+
 def _trend_candles(step: float, n: int):
     rows = []
     for i in range(n):
@@ -233,6 +280,33 @@ def test_full_4h_15m_5m_structural_sequence_emits_one_executable_ticket():
     assert signal.target_pool.pool.timeframe == "15m"
     assert signal.delivery_probability > 0 and signal.rr_ratio > 1.0
     assert engine.state == "EXECUTABLE"
+
+
+def test_long_entry_waits_for_fvg_equilibrium_not_upper_gap_touch():
+    now = time.time()
+    c15 = _trend_candles(0.55, 33)
+    c4h = _trend_candles(1.40, 28)
+    c5 = [{"o": 99.20, "h": 99.70, "l": 99.00, "c": 99.45} for _ in range(34)]
+    for i in range(8, 20):
+        c5[i] = {"o": 99.30, "h": 100.00, "l": 99.10, "c": 99.60}
+    c5[20] = {"o": 99.40, "h": 99.70, "l": 98.00, "c": 99.30}
+    c5[21] = {"o": 99.40, "h": 100.00, "l": 99.30, "c": 99.80}
+    c5[22] = {"o": 100.20, "h": 103.20, "l": 100.10, "c": 103.00}
+    c5[23] = {"o": 101.30, "h": 103.40, "l": 101.00, "c": 103.10}
+    for i in range(24, 33):
+        c5[i] = {"o": 103.00, "h": 104.30, "l": 102.90, "c": 104.00}
+    c5[33] = {"o": 100.60, "h": 100.80, "l": 100.30, "c": 100.50}
+    raid_pool = LiquidityPool(99.0, PoolSide.SSL, "5m", status=PoolStatus.SWEPT, created_at=now - 40)
+    raid = SweepResult(raid_pool, 20, 98.0, 1.0, 1.4, 0.91, "long", now - 30)
+    bsl_pool = LiquidityPool(110.0, PoolSide.BSL, "15m", status=PoolStatus.DETECTED, created_at=now - 90, htf_count=1)
+    target = PoolTarget(bsl_pool, 9.50, "long", 5.0, ["15m"])
+    engine = EntryEngine()
+    engine.update(_snap(bsl=[target], sweeps=[raid]), price=100.90, atr=1.0, now=now,
+                  candles_5m=c5, candles_15m=c15, candles_4h=c4h)
+    assert engine.get_signal() is None
+    assert engine.analysis_info["block_reason"] == "AWAITING_FVG_EQUILIBRIUM_REBALANCE"
+    assert engine.analysis_info["fvg_rebalanced"] is False
+    assert engine.state == "LIQUIDITY_RAID"
 
 
 def test_htf_trend_misalignment_no_longer_hard_blocks_without_a_raid():

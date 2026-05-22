@@ -694,8 +694,15 @@ class ICTLiquidityEntryEngine:
                             price: float, atr: float, now: float) -> None:
         zone_tol = 0.08 * atr
         low_bound, high_bound = thesis.fvg.low - zone_tol, thesis.fvg.high + zone_tol
-        in_reprice = low_bound <= price <= high_bound
-        distance_to_zone = 0.0 if in_reprice else min(abs(price - low_bound), abs(price - high_bound))
+        in_reprice_zone = low_bound <= price <= high_bound
+        eq_tol = 0.02 * atr
+        if thesis.side == "long":
+            fvg_rebalanced = in_reprice_zone and price <= thesis.fvg.equilibrium + eq_tol
+            rebalance_trigger = thesis.fvg.equilibrium + eq_tol
+        else:
+            fvg_rebalanced = in_reprice_zone and price >= thesis.fvg.equilibrium - eq_tol
+            rebalance_trigger = thesis.fvg.equilibrium - eq_tol
+        distance_to_zone = 0.0 if in_reprice_zone else min(abs(price - low_bound), abs(price - high_bound))
         self._last_analysis.update({
             "state": self._state.value, "side": thesis.side,
             "context_permission": True,
@@ -704,13 +711,19 @@ class ICTLiquidityEntryEngine:
             "context_direction": thesis.side,
             "fvg_low": thesis.fvg.low, "fvg_high": thesis.fvg.high,
             "fvg_equilibrium": thesis.fvg.equilibrium, "fvg_tolerance": zone_tol,
+            "fvg_rebalanced": bool(fvg_rebalanced),
+            "fvg_rebalance_trigger": rebalance_trigger,
             "fvg_distance_atr": distance_to_zone / max(atr, _EPS),
             "displacement_atr": thesis.displacement_atr,
             "thesis_age_sec": max(0.0, now - thesis.formed_at),
         })
-        if not in_reprice:
+        if not in_reprice_zone:
             thesis.last_reason = "MSS confirmed; awaiting 5m FVG rebalance"
             self._record_block("AWAITING_FVG_REBALANCE", trigger="AWAITING_FVG_REBALANCE")
+            return
+        if not fvg_rebalanced:
+            thesis.last_reason = "FVG touched; awaiting equilibrium rebalance"
+            self._record_block("AWAITING_FVG_EQUILIBRIUM_REBALANCE", trigger="AWAITING_FVG_EQUILIBRIUM_REBALANCE")
             return
         entry = price
         stop = self._structural_stop(thesis, atr)
@@ -803,7 +816,9 @@ class ICTLiquidityEntryEngine:
         risk = abs(entry - sl)
         audit = {"pool_total": 0, "wrong_side": 0, "below_timeframe": 0,
                  "tp_buffer_crossed_entry": 0, "gross_rr_below_floor": 0,
-                 "non_positive_net_utility": 0, "eligible": 0, "positive": 0}
+                 "gross_rr_above_policy_cap": 0, "non_positive_net_utility": 0,
+                 "eligible": 0, "positive": 0}
+        max_rr_cap = self._max_structural_rr_reference
         if risk <= _EPS:
             self._last_analysis.update({"target_audit": audit, "target_block": "ZERO_STRUCTURAL_RISK"})
             return None
@@ -836,6 +851,9 @@ class ICTLiquidityEntryEngine:
             if rr < self._min_structural_rr:
                 audit["gross_rr_below_floor"] += 1
                 continue
+            if max_rr_cap > 0.0 and rr > max_rr_cap:
+                audit["gross_rr_above_policy_cap"] += 1
+                continue
             distance_atr = dist / max(atr, _EPS)
             if self._thesis is not None:
                 context = _f(getattr(self._thesis, "context_delivery_score", 0.0), 0.0)
@@ -855,23 +873,62 @@ class ICTLiquidityEntryEngine:
             utility = p * net_win_r - (1.0 - p) * net_loss_r
             if utility > 0:
                 audit["positive"] += 1
-                candidates.append((utility, significance, -distance_atr, t, tp, rr, p, buffer, distance_atr, cost_r, net_win_r, net_loss_r))
+                candidates.append({
+                    "utility": utility,
+                    "significance": significance,
+                    "tf_rank": tf_rank,
+                    "target": t,
+                    "tp": tp,
+                    "rr": rr,
+                    "probability": p,
+                    "buffer": buffer,
+                    "distance_atr": distance_atr,
+                    "cost_r": cost_r,
+                    "net_win_r": net_win_r,
+                    "net_loss_r": net_loss_r,
+                })
             else:
                 audit["non_positive_net_utility"] += 1
         audit["min_structural_rr"] = self._min_structural_rr
+        audit["max_structural_rr_reference"] = max_rr_cap
+        audit["target_selection_model"] = "SEQUENTIAL_DOL"
         audit["round_trip_cost_points"] = self._execution_cost_points
         audit["round_trip_cost_bps"] = self._execution_cost_bps
         self._last_analysis["target_audit"] = audit
         if not candidates:
+            if audit.get("gross_rr_above_policy_cap"):
+                summary = f"no opposing 15m+ pool inside policy maxRR={max_rr_cap:.2f}"
+                block = "NO_POLICY_BOUNDED_OPPOSING_15M_PLUS_POOL"
+            else:
+                summary = "no positive-utility opposing 15m+ pool"
+                block = "NO_POSITIVE_UTILITY_OPPOSING_15M_PLUS_POOL"
             self._last_pool_plan = {"ts": time.time(), "role": "TP", "side": side,
-                                    "summary": "no positive-utility opposing 15m+ pool"}
-            self._last_analysis["target_block"] = "NO_POSITIVE_UTILITY_OPPOSING_15M_PLUS_POOL"
+                                    "summary": summary}
+            self._last_analysis["target_block"] = block
             return None
-        best = max(candidates, key=lambda x: (x[0], x[1], x[2]))
-        utility, significance, _, target, tp, rr, p, buffer, distance_atr, cost_r, net_win_r, net_loss_r = best
+        best = min(
+            candidates,
+            key=lambda x: (
+                x["distance_atr"],
+                -x["tf_rank"],
+                -x["significance"],
+                -x["utility"],
+            ),
+        )
+        utility = float(best["utility"])
+        significance = float(best["significance"])
+        target = best["target"]
+        tp = float(best["tp"])
+        rr = float(best["rr"])
+        p = float(best["probability"])
+        buffer = float(best["buffer"])
+        distance_atr = float(best["distance_atr"])
+        cost_r = float(best["cost_r"])
+        net_win_r = float(best["net_win_r"])
+        net_loss_r = float(best["net_loss_r"])
         self._last_pool_plan = {
             "ts": time.time(), "role": "TP", "side": side,
-            "summary": f"{target.pool.timeframe} {target.pool.side.value}@{target.pool.price:.4f} grossRR={rr:.2f} netWinR={net_win_r:.2f} P={p:.2f} netEU={utility:+.2f}R",
+            "summary": f"SEQUENTIAL_DOL {target.pool.timeframe} {target.pool.side.value}@{target.pool.price:.4f} grossRR={rr:.2f} netWinR={net_win_r:.2f} P={p:.2f} netEU={utility:+.2f}R",
         }
         self._last_analysis.update({
             "target_timeframe": str(getattr(target.pool, "timeframe", "")),
@@ -880,6 +937,8 @@ class ICTLiquidityEntryEngine:
             "target_significance": significance, "target_rr": rr,
             "target_gross_rr": rr, "target_cost_r": cost_r,
             "target_net_win_r": net_win_r, "target_net_loss_r": net_loss_r,
+            "target_selection_model": "SEQUENTIAL_DOL",
+            "target_policy_max_rr": max_rr_cap,
             "delivery_probability": p, "delivery_utility_r": utility,
         })
         return target, tp, rr, utility, p
