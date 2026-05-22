@@ -1535,7 +1535,7 @@ class EntryEngine:
             rev_d += 8.0; rev_r.append(f"CVD {cvd:+.2f}")
         elif (rev_dir == "short" and cvd < 0) or (rev_dir == "long" and cvd > 0):
             rev_d += 3.0
-        else:
+        elif (rev_dir == "short" and cvd > 0) or (rev_dir == "long" and cvd < 0):
             cont_d += 4.0
 
         # 5m structure

@@ -3350,6 +3350,59 @@ def test_refined_and_both_entry_paths_require_final_executable_dol_validation():
         assert block.index('stage="executable"') < block.index("self._signal = EntrySignal(")
 
 
+def test_post_sweep_neutral_cvd_does_not_create_continuation_evidence():
+    from strategy import entry_engine as ee
+    from strategy.liquidity_map import LiquidityPool, PoolSide, SweepResult
+
+    engine = ee.EntryEngine()
+    now = time.time()
+    pool = LiquidityPool(price=100.0, side=PoolSide.SSL, timeframe="5m", created_at=now)
+    sweep = SweepResult(
+        pool=pool,
+        sweep_candle_idx=0,
+        wick_extreme=99.5,
+        rejection_pct=0.5,
+        volume_ratio=1.0,
+        quality=0.75,
+        direction="long",
+        detected_at=now,
+    )
+    ps = ee._PostSweepState(
+        sweep=sweep,
+        entered_at=now,
+        highest_since=100.0,
+        lowest_since=100.0,
+        static_scored=True,
+    )
+    flow = SimpleNamespace(direction="", conviction=0.0, cvd_trend=0.0)
+    ict = SimpleNamespace(
+        amd_phase="",
+        amd_bias="",
+        amd_confidence=0.0,
+        direction_hint="",
+        direction_hint_side="",
+        direction_hint_confidence=0.0,
+        choch_5m="",
+        bos_5m="",
+        structure_15m="ranging",
+        structure_4h="ranging",
+        dealing_range_pd=0.50,
+        ict_sweeps=[],
+    )
+
+    engine._evaluate_evidence(
+        ps,
+        SimpleNamespace(bsl_pools=[], ssl_pools=[]),
+        flow,
+        ict,
+        price=100.0,
+        atr=1.0,
+        now=now + 1.0,
+    )
+
+    assert ps.cont_evidence == 0.0
+
+
 
 def test_live_thesis_gate_fails_closed_if_dol_engine_is_unavailable():
     from strategy import entry_engine as ee

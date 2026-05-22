@@ -390,7 +390,7 @@ def assess_trade_thesis(
             )
         else:
             out.reason = (
-                f"DOL context unavailable: no dominant executable draw "
+                f"DOL context waiting: draw candidate below dominance floor "
                 f"(clarity={clarity:.2f}/{clarity_floor:.2f}, "
                 f"quality={target_quality:.2f}/{quality_floor:.2f}, "
                 f"dist={target_dist_atr:.2f}/{distance_floor:.2f}ATR)"
