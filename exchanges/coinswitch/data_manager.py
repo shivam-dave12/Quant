@@ -96,6 +96,7 @@ class CoinSwitchDataManager:
 
         self._last_price:             float = 0.0
         self._last_price_update_time: float = 0.0
+        self._last_orderbook_update_time: float = 0.0
         self._orderbook:              Dict  = {"bids": [], "asks": []}
         self._recent_trades:          deque = deque(maxlen=500)
 
@@ -349,11 +350,13 @@ class CoinSwitchDataManager:
                     "bids": data.get("bids", []),
                     "asks": data.get("asks", []),
                 }
+                self._last_orderbook_update_time = time.time()
                 bids = self._orderbook["bids"]
                 asks = self._orderbook["asks"]
                 if bids and asks:
                     try:
                         self._last_price = (float(bids[0][0]) + float(asks[0][0])) / 2.0
+                        self._last_price_update_time = self._last_orderbook_update_time
                     except Exception:
                         pass
                 self.stats.record_orderbook()
@@ -436,7 +439,7 @@ class CoinSwitchDataManager:
             return {
                 "bids": list(self._orderbook.get("bids", [])),
                 "asks": list(self._orderbook.get("asks", [])),
-                "timestamp": time.time(),
+                "timestamp": float(self._last_orderbook_update_time or 0.0),
             }
 
     def get_recent_trades_raw(self) -> List[Dict]:
@@ -444,8 +447,8 @@ class CoinSwitchDataManager:
             return list(self._recent_trades)[-200:]
 
     def is_price_fresh(self, max_stale_seconds: float = 90.0) -> bool:
-        if self._last_price_update_time == 0:
-            return True
+        if self._last_price_update_time <= 0:
+            return False
         return (time.time() - self._last_price_update_time) < max_stale_seconds
 
     def get_candles(self, timeframe: str = "5m", limit: int = 100) -> List[Dict]:

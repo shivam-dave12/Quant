@@ -290,6 +290,27 @@ class LiquidityMapSnapshot:
     timestamp:        float
 
 
+
+
+def _native_closed_atr(candles: List[Dict], period: int = 14) -> float:
+    """ATR in the source timeframe's own bars; never scale HTF pools by 5m volatility."""
+    rows = list(candles or [])
+    rows = rows[:-1] if len(rows) > 1 else []
+    if len(rows) < 2:
+        return 0.0
+    rows = rows[-min(len(rows), int(period) + 1):]
+    tr: List[float] = []
+    for i in range(1, len(rows)):
+        try:
+            h, l = float(rows[i].get("h", 0.0)), float(rows[i].get("l", 0.0))
+            pc = float(rows[i - 1].get("c", 0.0))
+            if h <= 0 or l <= 0 or pc <= 0 or h < l:
+                continue
+            tr.append(max(h - l, abs(h - pc), abs(l - pc)))
+        except Exception:
+            continue
+    return sum(tr) / len(tr) if tr else 0.0
+
 # ═══════════════════════════════════════════════════════════════════════════
 # SWING DETECTION (module-level so ICTTrailManager can import them)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -993,6 +1014,7 @@ class LiquidityMap:
         }
         self._recent_sweeps: List[SweepResult]          = []
         self._last_snapshot: Optional[LiquidityMapSnapshot] = None
+        self._native_atr_by_tf: Dict[str, float] = {}
 
     # ─────────────────────────────────────────────────────────────────────
     # reset_snapshot() — FIX-B4: invalidate stale post-trade snapshot
@@ -1042,12 +1064,19 @@ class LiquidityMap:
             if candles and tf not in self._registries:
                 self._registries[tf] = _TimeframeRegistry(tf)
 
+        native_atr_by_tf: Dict[str, float] = {}
         for tf, reg in list(self._registries.items()):
             candles = candles_by_tf.get(tf)
             if candles:
-                reg.update(candles, atr, now)
+                native_atr = _native_closed_atr(candles)
+                if native_atr > 1e-10:
+                    native_atr_by_tf[tf] = native_atr
+                    reg.update(candles, native_atr, now)
+        self._native_atr_by_tf = native_atr_by_tf
 
-        # Step 2: HTF confluence promotion
+        # Step 2: cross-timeframe confluence remains expressed in execution
+        # (5m) ATR so target distance/R:R is comparable to execution risk. Pool
+        # formation and sweep geometry above/below use native timeframe ATR.
         self._promote_htf_confluence(atr)
 
         # No external score or legacy context may alter liquidity geometry.
@@ -1057,8 +1086,9 @@ class LiquidityMap:
         sweep_log_parts: List[str] = []
         for tf, reg in self._registries.items():
             candles = candles_by_tf.get(tf)
-            if candles:
-                tf_sweeps = reg.check_sweeps(candles, atr, now)
+            native_atr = self._native_atr_by_tf.get(tf, 0.0)
+            if candles and native_atr > 1e-10:
+                tf_sweeps = reg.check_sweeps(candles, native_atr, now)
                 for s in tf_sweeps:
                     sweep_log_parts.append(
                         f"🎯 SWEEP [{tf}] {s.pool.side.value} "
@@ -1073,8 +1103,8 @@ class LiquidityMap:
             logger.info(f"SWEEPS detected: {preview}{suffix}")
 
         # Step 5: SWEPT -> CONSUMED promotion
-        for reg in self._registries.values():
-            reg.check_consumed(price, atr)
+        for tf, reg in self._registries.items():
+            reg.check_consumed(price, self._native_atr_by_tf.get(tf, atr))
 
         # Step 6: Rolling 5-minute sweep history
         self._recent_sweeps.extend(new_sweeps)
@@ -1315,4 +1345,5 @@ class LiquidityMap:
                 for tf, reg in self._registries.items()
                 if reg.bsl_pools or reg.ssl_pools
             },
+            "native_atr_by_tf": dict(self._native_atr_by_tf),
         }

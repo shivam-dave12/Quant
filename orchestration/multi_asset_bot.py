@@ -272,13 +272,25 @@ class MultiAssetQuantBot:
         lines.append(f"💼 Budget: <code>{esc(self.guard.budget_mode)}</code> · one-contract cap <code>{self.guard.max_per_contract}</code>")
         for ctx in self.contexts:
             inst = ctx.instrument
-            try:
-                px = ctx.data_manager.get_last_price()
-            except Exception:
-                px = 0.0
-            cur = self._currency_for_instrument(inst)
             pos = ctx.strategy.get_position()
+            is_icici = self._is_icici_context(ctx)
+            try:
+                px_raw = ctx.data_manager.get_last_price()
+                px = float(px_raw) if px_raw is not None else None
+                if not pos and not ctx.ready and (px is None or px <= 0.0):
+                    px = None
+            except Exception:
+                px = None
+            cur = self._currency_for_instrument(inst)
             state = ctx.phase_name if pos else ("READY" if ctx.ready else "NOT READY")
+            if not pos and not ctx.ready and is_icici:
+                try:
+                    is_open, _closed_reason = self._icici_market_open()
+                    if not is_open:
+                        state = "DORMANT"
+                except Exception:
+                    pass
+            px_txt = f"{px:,.4f}" if px is not None and px > 0.0 else "N/A"
             try:
                 bal = ctx.risk_manager.get_available_balance() or {}
                 budget = float(bal.get("available", 0.0) or 0.0)
@@ -305,7 +317,7 @@ class MultiAssetQuantBot:
             status_icon = "🟢" if state in ("READY", "SCANNING") else ("🔵" if pos else "🟠")
             lines.append(
                 f"{status_icon} <b>{esc(inst.asset_id)}</b>  <code>{esc(inst.primary_exchange.value.upper())}:{esc(inst.display_symbol)}</code>\n"
-                f"   <code>{esc(state):<11} px {px:,.4f} · {esc(budget_txt)}{lev_txt}</code>\n"
+                f"   <code>{esc(state):<11} px {esc(px_txt)} · {esc(budget_txt)}{lev_txt}</code>\n"
                 f"   <code>{esc(venues)}</code>\n"
                 f"   <i>{esc(pol_txt)}{pnl_txt}</i>"
             )
@@ -321,49 +333,91 @@ class MultiAssetQuantBot:
         return self.format_assets_report()
 
     def format_portfolio_thinking_report(self) -> str:
-        """On-demand calculation tape for every desk; rich detail without periodic spam."""
+        """On-demand multi-desk calculation book; never fabricates missing numeric stages."""
+        def val(info: Dict[str, Any], key: str, fmt: str = ".4f", missing: str = "N/A") -> str:
+            try:
+                raw = info.get(key, None)
+                if raw is None:
+                    return missing
+                f = float(raw)
+                return format(f, fmt) if f == f else missing
+            except Exception:
+                return missing
         lines = [
             "🏛 <b>ICT + LIQUIDITY DECISION BOOK</b>",
             "<code>4H context → 15m confirmation → 5m raid/MSS/FVG → protected execution</code>",
-            "<i>Logs emit on transition and one slow audit snapshot; this view is full on-demand detail.</i>",
+            "<i>Every number below is sourced; N/A means that calculation stage has not been reached.</i>",
         ]
         for ctx in self.contexts:
             inst = ctx.instrument
-            cur = self._currency_for_instrument(inst)
             eng = getattr(ctx.strategy, "_entry_engine", None)
             info = eng.analysis_info if eng is not None else {}
+            quality = dict(getattr(ctx.strategy, "_last_data_integrity_context", {}) or {})
+            lineage = dict(quality.get("lineage", {}) or {})
+            is_icici = self._is_icici_context(ctx)
+            unit = "NIFTYpts" if is_icici or str(lineage.get("analysis_domain", "")).upper() == "UNDERLYING" else self._currency_for_instrument(inst)
             try:
-                mark = float(ctx.data_manager.get_last_price() or info.get("price", 0.0) or 0.0)
+                analysis_getter = getattr(ctx.data_manager, "get_analysis_price", None)
+                mark_raw = analysis_getter() if callable(analysis_getter) else ctx.data_manager.get_last_price()
+                mark = float(mark_raw) if mark_raw is not None and float(mark_raw) > 0.0 else None
             except Exception:
-                mark = float(info.get("price", 0.0) or 0.0)
+                fallback_mark = info.get("price", None)
+                try:
+                    mark = float(fallback_mark) if fallback_mark is not None and float(fallback_mark) > 0.0 else None
+                except Exception:
+                    mark = None
             state = str(info.get("state", "WARMUP" if ctx.ready else "DORMANT"))
             block = str(info.get("block_reason", "DATA_NOT_STARTED" if not ctx.ready else "WAIT"))
-            if not ctx.ready and self._is_icici_context(ctx):
+            if not ctx.ready and is_icici:
                 is_open, reason = self._icici_market_open()
                 if not is_open:
                     state, block = "DORMANT", reason
             lines.append(f"\n<b>{self._esc(inst.asset_id)} · {self._esc(inst.primary_exchange.value.upper())}:{self._esc(inst.display_symbol)}</b>  <code>{self._esc(state)}</code>")
-            lines.append(f"<code>mark {cur}{mark:,.4f} | block {self._esc(block)}</code>")
+            mark_txt = f"{self._esc(unit)}{mark:,.4f}" if mark is not None else "N/A"
+            lines.append(f"<code>analysis mark {mark_txt} | block {self._esc(block)}</code>")
+            if quality:
+                frames = quality.get("frames", {}) or {}
+                qparts = []
+                for tf in ("5m", "15m", "4h"):
+                    q = frames.get(tf, {}) or {}
+                    age = "N/A" if q.get("last_age_sec") is None else f"{float(q.get('last_age_sec')):.0f}s"
+                    qparts.append(f"{tf}:n={q.get('bars','-')},age={age},dup={q.get('duplicates','-')},gap={q.get('gaps','-')},bad={q.get('invalid_ohlc','-')},vol={q.get('volume_status','-')}")
+                lines.append(f"<code>data {'PASS' if quality.get('ok') else 'BLOCK'} | analysis={self._esc(lineage.get('analysis_source','?'))}/{self._esc(lineage.get('analysis_domain','?'))} → execution={self._esc(lineage.get('execution_source','?'))}/{self._esc(lineage.get('execution_domain','?'))}</code>")
+                lines.append(f"<code>fresh={'Y' if quality.get('analysis_quote_fresh') else 'N'} | {' | '.join(qparts)}</code>")
             if info:
+                threshold = val(info, "context_direction_threshold", ".2f")
                 lines.append(
-                    f"<code>4H {self._esc(info.get('context_4h','-'))} p={float(info.get('context_4h_conf',0) or 0):.2f} "
-                    f"slope={float(info.get('context_4h_slope_atr',0) or 0):+.3f}ATR eff={float(info.get('context_4h_efficiency',0) or 0):.2f} "
-                    f"ATR={float(info.get('context_4h_atr',0) or 0):.4f}</code>"
+                    f"<code>4H {self._esc(info.get('context_4h','WAIT'))} score={val(info,'context_4h_score','+.3f')} "
+                    f"=[slope {val(info,'context_4h_slope_component','+.3f')} + struct {val(info,'context_4h_structure_component','+.3f')}] "
+                    f"threshold=±{threshold} ATR={val(info,'context_4h_atr')}</code>"
                 )
                 lines.append(
-                    f"<code>15m {self._esc(info.get('context_15m','-'))} p={float(info.get('context_15m_conf',0) or 0):.2f} "
-                    f"slope={float(info.get('context_15m_slope_atr',0) or 0):+.3f}ATR eff={float(info.get('context_15m_efficiency',0) or 0):.2f} "
-                    f"ATR={float(info.get('context_15m_atr',0) or 0):.4f} | aligned={'Y' if info.get('context_aligned') else 'N'}</code>"
+                    f"<code>15m {self._esc(info.get('context_15m','WAIT'))} score={val(info,'context_15m_score','+.3f')} "
+                    f"=[slope {val(info,'context_15m_slope_component','+.3f')} + struct {val(info,'context_15m_structure_component','+.3f')}] "
+                    f"threshold=±{threshold} ATR={val(info,'context_15m_atr')} aligned={'Y' if info.get('context_aligned') else 'N'}</code>"
                 )
-                lines.append(f"<code>5m ATR={float(info.get('entry_5m_atr',0) or 0):.4f} pct={100*float(info.get('atr_percentile',0) or 0):.0f}% trigger={self._esc(info.get('trigger','WAIT'))}</code>")
+                pct_value = {"pct": 100 * float(info.get("atr_percentile", 0.5) or 0.5)}
+                lines.append(f"<code>5m ATR={val(info,'entry_5m_atr')} pct={val(pct_value,'pct','.0f')}% trigger={self._esc(info.get('trigger','WAIT'))} minRR={val(info,'min_structural_rr','.2f')}</code>")
                 if info.get("raid_side"):
-                    lines.append(f"<code>raid {self._esc(str(info.get('raid_side')).upper())} @{float(info.get('raid_price',0) or 0):.4f} wick={float(info.get('raid_wick',0) or 0):.4f} q={float(info.get('raid_quality',0) or 0):.2f} age={float(info.get('raid_age_sec',0) or 0):.0f}s</code>")
-                if info.get("mss_level") is not None:
-                    lines.append(f"<code>MSS={float(info.get('mss_level',0) or 0):.4f} broken={'Y' if info.get('mss_broken') else 'N'} disp={float(info.get('displacement_atr',0) or 0):.2f}ATR | FVG=[{float(info.get('fvg_low',0) or 0):.4f},{float(info.get('fvg_high',0) or 0):.4f}]</code>")
-                if info.get("target_pool_price") is not None:
-                    lines.append(f"<code>target {self._esc(info.get('target_timeframe','-'))}@{float(info.get('target_pool_price',0) or 0):.4f} RR={float(info.get('rr', info.get('target_rr',0)) or 0):.2f} P={float(info.get('delivery_probability',0) or 0):.2f} U={float(info.get('delivery_utility_r',0) or 0):+.2f}R</code>")
-            pos = ctx.strategy.get_position()
-            if pos:
+                    lines.append(f"<code>raid accepted {self._esc(str(info.get('raid_side')).upper())} @{val(info,'raid_price')} wick={val(info,'raid_wick')} q={val(info,'raid_quality','.2f')} age={val(info,'raid_age_sec','.0f')}s</code>")
+                elif info.get("candidate_raid_side"):
+                    lines.append(f"<code>raid rejected {self._esc(str(info.get('candidate_raid_side')).upper())} @{val(info,'candidate_raid_price')} q={val(info,'candidate_raid_quality','.2f')} reason={self._esc(block)}</code>")
+                if info.get("raid_side") and not info.get("mss_broken"):
+                    lines.append(f"<code>MSS={val(info,'mss_level')} broken=N disp={val(info,'displacement_atr','.2f')}ATR | FVG=N/A (requires MSS break) | SL/TP=N/A</code>")
+                elif info.get("mss_broken") and info.get("fvg_low") is None:
+                    lines.append(f"<code>MSS={val(info,'mss_level')} broken=Y disp={val(info,'displacement_atr','.2f')}ATR | FVG=N/A (awaiting valid displacement gap) | SL/TP=N/A</code>")
+                elif info.get("fvg_low") is not None:
+                    lines.append(f"<code>MSS={val(info,'mss_level')} broken=Y disp={val(info,'displacement_atr','.2f')}ATR | FVG=[{val(info,'fvg_low')},{val(info,'fvg_high')}] eq={val(info,'fvg_equilibrium')}</code>")
+                    lines.append(f"<code>SL={val(info,'structural_stop')} clearance={val(info,'stop_clearance_atr','.2f')}ATR | target {self._esc(info.get('target_timeframe','N/A'))}@{val(info,'target_pool_price')} RR={val(info,'rr','.2f')} P={val(info,'delivery_probability','.2f')} U={val(info,'delivery_utility_r','+.2f')}R</code>")
+            liq = getattr(ctx.strategy, "_liq_map", None)
+            native = getattr(liq, "_native_atr_by_tf", {}) or {}
+            if native:
+                lines.append("<code>native ATR pools: " + " | ".join(f"{tf}={float(native[tf]):.4f}" for tf in ("5m", "15m", "4h") if tf in native) + "</code>")
+            spread = getattr(ctx.strategy, "_last_spread_gate_context", {}) or {}
+            if spread:
+                age = "N/A" if spread.get("book_age_sec") is None else f"{float(spread.get('book_age_sec')):.2f}s"
+                lines.append(f"<code>execution book={self._esc(spread.get('book_status','N/A'))} age={age} spread={val(spread,'spread_bps','.2f')}bps/{val(spread,'spread_atr','.3f')}ATR size×{val(spread,'size_mult','.2f')} hard={'Y' if spread.get('hard_fail') else 'N'}</code>")
+            if ctx.strategy.get_position():
                 lines.append("🔒 <i>Broker-protected position active; exact-fill reconciliation armed.</i>")
         return "\n".join(lines)
 
@@ -939,10 +993,9 @@ class MultiAssetQuantBot:
                         )
                         return False
                 logger.info("▶️ Starting %s [%s/%s] | %s", inst.asset_id, inst.primary_exchange.value, inst.display_symbol, self.guard.report_line(ctx))
-                target_lev = self._instrument_leverage(inst)
-                effective_lev = self._set_leverage_with_backoff(ctx, target_lev)
-                max_txt = f" (cap={inst.max_leverage:g}x)" if getattr(inst, "max_leverage", 0.0) else ""
-                logger.info("%s leverage target=%sx effective=%sx%s", inst.asset_id, target_lev, effective_lev, max_txt)
+                venue_cap = self._instrument_leverage(inst)
+                max_txt = f" product_cap={inst.max_leverage:g}x" if getattr(inst, "max_leverage", 0.0) else ""
+                logger.info("%s leverage venue_cap=%sx%s leverage_set=DEFERRED_UNTIL_APPROVED_STRUCTURAL_ENTRY", inst.asset_id, venue_cap, max_txt)
                 if self._is_icici_context(ctx) and not self._icici_account_preflight(ctx):
                     ctx.ready = False
                     logger.error("%s ICICI desk disabled: F&O account verification did not pass", inst.asset_id)
@@ -1008,7 +1061,7 @@ class MultiAssetQuantBot:
             cadence = getattr(pol, "loop_interval_sec", getattr(pol, "tick_eval_sec", 0.0))
             lines.append(
                 f"🟢 <b>{inst.asset_id}</b>  <code>{inst.primary_exchange.value.upper()}:{inst.display_symbol}</code>\n"
-                f"   <code>lev {lev}x · risk×{pol.risk_multiplier:.2f} · margin {pol.margin_pct:.0%} · cadence {float(cadence):.2f}s</code>\n"
+                f"   <code>venue-cap {lev}x · risk×{pol.risk_multiplier:.2f} · margin-policy {pol.margin_pct:.0%} · cadence {float(cadence):.2f}s</code>\n"
                 f"   <code>{venues}</code>"
             )
         if not bool(getattr(config, "STOCK_DESK_TRADING_ENABLED", True)):

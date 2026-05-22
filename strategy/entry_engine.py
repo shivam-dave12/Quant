@@ -19,6 +19,10 @@ import logging
 import math
 import statistics
 import time
+try:
+    import config
+except Exception:  # pragma: no cover - test stubs may not load runtime config
+    config = None
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -69,6 +73,9 @@ class _TrendContext:
     slope_atr: float
     efficiency: float
     structure: float
+    signed_score: float = 0.0
+    slope_component: float = 0.0
+    structure_component: float = 0.0
 
     @property
     def label(self) -> str:
@@ -165,10 +172,13 @@ def _robust_trend(candles: Sequence[Dict], atr: float, window: int) -> _TrendCon
     latest_low = min(_f(x.get("l")) for x in rows[-q:])
     structure = 1.0 if latest_high > earlier_high and latest_low > earlier_low else (
         -1.0 if latest_high < earlier_high and latest_low < earlier_low else 0.0)
-    signed_strength = 0.68 * math.tanh(slope_atr * window / 3.0) + 0.32 * structure
+    slope_component = 0.68 * math.tanh(slope_atr * window / 3.0)
+    structure_component = 0.32 * structure
+    signed_strength = slope_component + structure_component
     strength = abs(signed_strength) * (0.55 + 0.45 * efficiency)
     side = 1 if signed_strength > 0.18 else (-1 if signed_strength < -0.18 else 0)
-    return _TrendContext(side, min(1.0, strength), slope_atr, efficiency, structure)
+    return _TrendContext(side, min(1.0, strength), slope_atr, efficiency, structure,
+                         signed_strength, slope_component, structure_component)
 
 
 def _find_fvg(candles: Sequence[Dict], side: str, start: int, atr: float) -> Optional[_FVG]:
@@ -209,11 +219,25 @@ class ICTLiquidityEntryEngine:
         self._last_pool_plan: Optional[Dict[str, Any]] = None
         self._last_scan_skip: Dict[str, int] = {}
         self._atr_pctile: float = 0.5
+        self._min_structural_rr: float = 1.0
+        self._max_structural_rr_reference: float = 0.0
+        self._stop_clearance_base_atr: float = float(getattr(config, "ICT_STOP_CLEARANCE_BASE_ATR", 0.10) if config is not None else 0.10)
+        self._stop_clearance_pctile_slope_atr: float = float(getattr(config, "ICT_STOP_CLEARANCE_PCTL_SLOPE_ATR", 0.18) if config is not None else 0.18)
 
     # ---------- public interface retained for execution lifecycle ----------
 
     def set_atr_pctile(self, pctile: float) -> None:
         self._atr_pctile = max(0.0, min(1.0, _f(pctile, 0.5)))
+
+    def set_structural_delivery_policy(self, min_rr: float, max_rr_reference: float = 0.0) -> None:
+        """Receive instrument-scoped execution policy without adding an alpha overlay.
+
+        The liquidity pool remains the target source.  This policy only prevents
+        accepting a target whose structural payoff is below the desk's declared
+        minimum reward for one unit of invalidation risk.
+        """
+        self._min_structural_rr = max(1.0, _f(min_rr, 1.0))
+        self._max_structural_rr_reference = max(0.0, _f(max_rr_reference, 0.0))
 
     def _record_block(self, reason: str, **values: Any) -> None:
         """Record a transparent structural decision without changing entry geometry."""
@@ -271,10 +295,16 @@ class ICTLiquidityEntryEngine:
             "price": price,
             "context_4h": ctx4.label, "context_4h_conf": ctx4.confidence,
             "context_4h_slope_atr": ctx4.slope_atr, "context_4h_efficiency": ctx4.efficiency,
-            "context_4h_structure": ctx4.structure, "context_4h_atr": atr4h,
+            "context_4h_structure": ctx4.structure, "context_4h_score": ctx4.signed_score,
+            "context_4h_slope_component": ctx4.slope_component, "context_4h_structure_component": ctx4.structure_component,
+            "context_4h_atr": atr4h,
             "context_15m": ctx15.label, "context_15m_conf": ctx15.confidence,
             "context_15m_slope_atr": ctx15.slope_atr, "context_15m_efficiency": ctx15.efficiency,
-            "context_15m_structure": ctx15.structure, "context_15m_atr": atr15m,
+            "context_15m_structure": ctx15.structure, "context_15m_score": ctx15.signed_score,
+            "context_15m_slope_component": ctx15.slope_component, "context_15m_structure_component": ctx15.structure_component,
+            "context_15m_atr": atr15m, "context_direction_threshold": 0.18,
+            "min_structural_rr": self._min_structural_rr,
+            "max_structural_rr_reference": self._max_structural_rr_reference,
             "context_aligned": bool(aligned_side), "context_direction": aligned_label,
             "entry_5m_atr": atr, "atr_percentile": self._atr_pctile,
             "bars_5m": len(c5), "bars_15m": len(c15), "bars_4h": len(c4h),
@@ -302,7 +332,8 @@ class ICTLiquidityEntryEngine:
             self._record_block("CONTEXT_NOT_ALIGNED")
             return
         fresh = self._fresh_5m_sweeps(liq_snapshot, now)
-        self._last_analysis["fresh_5m_raid_count"] = len(fresh)
+        self._last_analysis.update({"fresh_5m_raid_count": len(fresh), "aligned_5m_raid_count": 0,
+                                    "opposed_5m_raid_count": 0, "invalid_5m_raid_count": 0})
         if not fresh:
             self._record_block("AWAITING_FRESH_5M_LIQUIDITY_RAID")
             return
@@ -310,18 +341,25 @@ class ICTLiquidityEntryEngine:
             side = str(getattr(sweep, "direction", "") or "").lower()
             direction = 1 if side == "long" else (-1 if side == "short" else 0)
             pool = getattr(sweep, "pool", None)
-            self._last_analysis.update({
-                "raid_side": side or "unknown", "raid_pool_side": str(getattr(getattr(pool, "side", None), "value", "") or ""),
-                "raid_price": _f(getattr(pool, "price", 0.0)), "raid_wick": _f(getattr(sweep, "wick_extreme", 0.0)),
-                "raid_quality": _f(getattr(sweep, "quality", 0.0)),
-                "raid_age_sec": max(0.0, now - _f(getattr(sweep, "detected_at", now))),
-            })
+            candidate = {
+                "candidate_raid_side": side or "unknown",
+                "candidate_raid_pool_side": str(getattr(getattr(pool, "side", None), "value", "") or ""),
+                "candidate_raid_price": _f(getattr(pool, "price", 0.0)),
+                "candidate_raid_wick": _f(getattr(sweep, "wick_extreme", 0.0)),
+                "candidate_raid_quality": _f(getattr(sweep, "quality", 0.0)),
+                "candidate_raid_age_sec": max(0.0, now - _f(getattr(sweep, "detected_at", now))),
+            }
+            self._last_analysis.update(candidate)
             if direction == 0:
+                self._last_analysis["invalid_5m_raid_count"] += 1
                 self._record_block("INVALID_RAID_DIRECTION")
                 continue
             if aligned_side != direction:
+                self._last_analysis["opposed_5m_raid_count"] += 1
                 self._record_block("RAID_DIRECTION_OPPOSES_CONTEXT")
                 continue
+            self._last_analysis["aligned_5m_raid_count"] += 1
+            self._last_analysis.update({k.replace("candidate_", ""): v for k, v in candidate.items()})
             thesis = self._build_thesis(sweep, side, ctx4, ctx15, c5, atr, now)
             if thesis is None:
                 continue
@@ -560,7 +598,12 @@ class ICTLiquidityEntryEngine:
         if wick <= 0:
             return None
         # The stop is behind the raided liquidity extreme; volatility only sizes clearance.
-        regime_clearance = atr * (0.10 + 0.18 * self._atr_pctile)
+        regime_clearance = atr * (self._stop_clearance_base_atr + self._stop_clearance_pctile_slope_atr * self._atr_pctile)
+        self._last_analysis.update({
+            "stop_clearance_base_atr": self._stop_clearance_base_atr,
+            "stop_clearance_pctile_slope_atr": self._stop_clearance_pctile_slope_atr,
+            "stop_clearance_model_atr": regime_clearance / max(atr, _EPS),
+        })
         if thesis.side == "long":
             sl = wick - regime_clearance
             return sl if sl < thesis.fvg.low else None
@@ -597,7 +640,7 @@ class ICTLiquidityEntryEngine:
             tp = px - buffer if side == "long" else px + buffer
             reward = abs(tp - entry)
             rr = reward / risk
-            if rr <= 1.0:
+            if rr < self._min_structural_rr:
                 audit["rr_le_one"] += 1
                 continue
             distance_atr = dist / max(atr, _EPS)
@@ -611,6 +654,7 @@ class ICTLiquidityEntryEngine:
                 candidates.append((utility, significance, -distance_atr, t, tp, rr, p, buffer, distance_atr))
             else:
                 audit["non_positive_utility"] += 1
+        audit["min_structural_rr"] = self._min_structural_rr
         self._last_analysis["target_audit"] = audit
         if not candidates:
             self._last_pool_plan = {"ts": time.time(), "role": "TP", "side": side,

@@ -983,7 +983,11 @@ class QuantStrategy:
         self._watchdog_freeze_active_since = 0.0
         self._active_spread_cost_mult = 1.0
         self._last_spread_gate_context = {}
-        self._active_effective_leverage = float(QCfg.LEVERAGE())
+        self._last_data_integrity_context: Dict[str, Any] = {}
+        self._last_data_integrity_log = 0.0
+        # This initial value is only a venue cap fallback for pre-position UI.
+        # Real positions store the structural-funding leverage selected at entry.
+        self._active_effective_leverage = 1.0
         self._active_margin_risk_pct = 0.0
         self._last_closed_side = ""
         self._last_closed_reason = ""
@@ -1323,6 +1327,7 @@ class QuantStrategy:
             ATR price-units.  We no longer reconstruct the spread from last_price;
             midpoint is the correct reference for bid/ask cost.
         """
+        strict_live = callable(getattr(data_manager, "get_data_lineage", None))
         try:
             self._active_spread_cost_mult = 1.0
             self._last_spread_gate_context = {}
@@ -1336,7 +1341,19 @@ class QuantStrategy:
             bids  = (ob or {}).get("bids", [])
             asks  = (ob or {}).get("asks", [])
             if not bids or not asks:
+                self._last_spread_gate_context = {"book_status": "NO_EXECUTABLE_BOOK", "hard_fail": False}
                 return True, 0.0
+            book_ts = float((ob or {}).get("timestamp", 0.0) or 0.0)
+            book_age = max(0.0, time.time() - book_ts) if book_ts > 0 else None
+            max_book_age = float(getattr(config, "EXECUTION_BOOK_MAX_STALE_SEC", 5.0) or 5.0)
+            if strict_live and (book_age is None or book_age > max_book_age):
+                self._last_spread_gate_context = {
+                    "book_status": "STALE" if book_age is not None else "MISSING_TIMESTAMP",
+                    "book_age_sec": book_age, "max_book_age_sec": max_book_age,
+                    "hard_fail": True, "hard_fail_reason": "STALE_EXECUTION_BOOK",
+                    "size_mult": 0.0,
+                }
+                return False, float("inf")
 
             def _get_px(lvl) -> float:
                 if isinstance(lvl, (list, tuple)):
@@ -1423,6 +1440,10 @@ class QuantStrategy:
                 "hard_bps": hard_bps,
                 "size_mult": float(getattr(self, "_active_spread_cost_mult", 1.0) or 1.0),
                 "hard_fail": bool(hard_fail),
+                "book_status": "FRESH",
+                "book_timestamp": book_ts,
+                "book_age_sec": book_age,
+                "max_book_age_sec": max_book_age,
             }
 
             _now = time.time()
@@ -1446,9 +1467,10 @@ class QuantStrategy:
                         f"size_mult={self._active_spread_cost_mult:.2f}")
 
             return True, ratio
-        except Exception:
+        except Exception as exc:
             self._active_spread_cost_mult = 1.0
-            return True, 0.0
+            self._last_spread_gate_context = {"book_status": "CALCULATION_ERROR", "hard_fail": bool(strict_live), "error": str(exc)[:120]}
+            return (False, float("inf")) if strict_live else (True, 0.0)
 
     def _on_entry_engine_self_recovery(self, state_name: str, age_sec: float) -> None:
         """Surface EntryEngine self-recovery and clear stale reconcile latches."""
@@ -1758,10 +1780,94 @@ class QuantStrategy:
     @staticmethod
     def _decision_num(info: Dict[str, Any], key: str, default: float = 0.0) -> float:
         try:
-            value = float(info.get(key, default) or default)
+            value = info.get(key, None)
+            if value is None:
+                return default
+            value = float(value)
             return value if math.isfinite(value) else default
         except Exception:
             return default
+
+    @staticmethod
+    def _decision_has(info: Dict[str, Any], key: str) -> bool:
+        try:
+            return key in info and info.get(key) is not None and math.isfinite(float(info.get(key)))
+        except Exception:
+            return False
+
+    @classmethod
+    def _decision_fmt(cls, info: Dict[str, Any], key: str, fmt: str = ".4f", missing: str = "N/A") -> str:
+        return format(cls._decision_num(info, key), fmt) if cls._decision_has(info, key) else missing
+
+    def _analysis_unit(self) -> str:
+        try:
+            ctx = self._position_accounting_context()
+            if str(ctx.get("exchange", "")).lower() == "icici":
+                return "NIFTYpts"
+            return str(ctx.get("currency_symbol", "$"))
+        except Exception:
+            return "$"
+
+    @staticmethod
+    def _bar_timestamp_sec(row: Dict[str, Any]) -> float:
+        raw = row.get("t", row.get("timestamp", 0.0)) if isinstance(row, dict) else 0.0
+        try:
+            val = float(raw or 0.0)
+            return val / 1000.0 if val > 1e11 else val
+        except Exception:
+            return 0.0
+
+    def _audit_structural_inputs(self, data_manager, candles_by_tf: Dict[str, List[Dict]], price: float, now: float) -> Dict[str, Any]:
+        """Validate and expose the exact data domain admitted to entry authority."""
+        lineage_getter = getattr(data_manager, "get_data_lineage", None)
+        lineage = lineage_getter() if callable(lineage_getter) else {
+            "analysis_source": type(data_manager).__name__, "execution_source": type(data_manager).__name__,
+            "analysis_domain": "EXECUTION_INSTRUMENT", "execution_domain": "EXECUTION_INSTRUMENT",
+        }
+        strict_live = callable(lineage_getter)
+        quote_fn = getattr(data_manager, "is_analysis_price_fresh", None) or getattr(data_manager, "is_price_fresh", None)
+        quote_fresh = bool(quote_fn(float(getattr(config, "PRICE_STALE_SECONDS", 90.0)))) if callable(quote_fn) else not strict_live
+        update_age = None
+        try:
+            analysis_update = getattr(data_manager, "get_analysis_last_update", None)
+            updated = float((analysis_update() if callable(analysis_update) else data_manager.get_last_update()) or 0.0)
+            if updated > 0:
+                update_age = max(0.0, now - updated)
+        except Exception:
+            pass
+        continuous = str(QCfg.EXCHANGE()).lower() in ("delta", "coinswitch")
+        tf_rules = {"5m": (QCfg.MIN_5M_BARS(), 300), "15m": (20, 900), "4h": (20, 14400)}
+        frames: Dict[str, Dict[str, Any]] = {}
+        blockers: List[str] = []
+        for tf, (min_bars, step) in tf_rules.items():
+            rows = list(candles_by_tf.get(tf, []) or [])
+            ts = [self._bar_timestamp_sec(r) for r in rows if self._bar_timestamp_sec(r) > 0]
+            duplicate = len(ts) - len(set(ts))
+            nonmono = sum(1 for a, b in zip(ts, ts[1:]) if b <= a)
+            gaps = sum(1 for a, b in zip(ts, ts[1:]) if b - a > step * float(getattr(config, "DATA_INTEGRITY_MAX_GAP_MULT_CONTINUOUS", 2.25))) if continuous else 0
+            invalid = 0
+            for row in rows:
+                try:
+                    o, h, l, c = (float(row.get(k, 0.0) or 0.0) for k in ("o", "h", "l", "c"))
+                    invalid += int(min(o, h, l, c) <= 0 or h < max(o, c, l) or l > min(o, c, h))
+                except Exception:
+                    invalid += 1
+            age = max(0.0, now - ts[-1]) if ts else None
+            stale = bool(age is not None and age > step * float(getattr(config, "DATA_INTEGRITY_MAX_CLOSED_BAR_AGE_MULT", 3.25)))
+            volume_rows = sum(1 for row in rows if float((row or {}).get("v", (row or {}).get("volume", 0.0)) or 0.0) > 0.0)
+            frames[tf] = {"bars": len(rows), "min_bars": min_bars, "last_age_sec": age, "duplicates": duplicate, "nonmonotonic": nonmono, "gaps": gaps, "invalid_ohlc": invalid, "stale": stale, "nonzero_volume_bars": volume_rows, "volume_status": "OBSERVED" if volume_rows else "UNAVAILABLE"}
+            if len(rows) < min_bars: blockers.append(f"{tf}_INSUFFICIENT_BARS")
+            if duplicate or nonmono: blockers.append(f"{tf}_TIMESTAMP_INTEGRITY")
+            if invalid: blockers.append(f"{tf}_INVALID_OHLC")
+            if gaps: blockers.append(f"{tf}_GAP")
+            if strict_live and (not ts or stale): blockers.append(f"{tf}_STALE_OR_UNTIMESTAMPED")
+        if strict_live and bool(getattr(config, "DATA_INTEGRITY_REQUIRE_FRESH_QUOTES", True)) and not quote_fresh:
+            blockers.append("ANALYSIS_QUOTE_STALE")
+        return {
+            "ok": not blockers and price > 0.0, "blockers": blockers or ["NONE"], "lineage": lineage,
+            "analysis_price": price, "analysis_quote_fresh": quote_fresh, "last_update_age_sec": update_age,
+            "frames": frames, "strict_live": strict_live,
+        }
 
     def _decision_fingerprint(self, info: Dict[str, Any]) -> tuple:
         return (
@@ -1776,65 +1882,98 @@ class QuantStrategy:
         )
 
     def _log_ict_decision_snapshot(self, info: Dict[str, Any], price: float, now: float, force: bool = False) -> None:
-        """Audit structural reasoning on transition plus periodic snapshot, never every tick."""
+        """Decision tape: stage-aware numeric provenance on change plus slow snapshot."""
         info = dict(info or {})
         fp = self._decision_fingerprint(info)
         changed = fp != getattr(self, "_last_decision_fingerprint", None)
-        base_interval = float(getattr(self, "_decision_snapshot_sec", 60.0) or 60.0)
-        interval = max(10.0, float(getattr(config, "ICT_DECISION_SNAPSHOT_SEC", base_interval) or base_interval))
+        interval = max(10.0, float(getattr(config, "ICT_DECISION_SNAPSHOT_SEC", getattr(self, "_decision_snapshot_sec", 60.0)) or 60.0))
         periodic = (now - float(getattr(self, "_last_decision_log", 0.0) or 0.0)) >= interval
         if not force and not changed and not periodic:
             return
-        self._last_decision_fingerprint = fp
-        self._last_decision_log = now
+        self._last_decision_fingerprint, self._last_decision_log = fp, now
         mode = "TRANSITION" if changed else "SNAPSHOT"
         spread = dict(getattr(self, "_last_spread_gate_context", {}) or {})
+        quality = dict(getattr(self, "_last_data_integrity_context", {}) or {})
         raid = "none"
         if info.get("raid_side"):
-            raid = (f"{str(info.get('raid_side')).upper()}@{self._decision_num(info,'raid_price'):.4f}"
-                    f" wick={self._decision_num(info,'raid_wick'):.4f}"
-                    f" q={self._decision_num(info,'raid_quality'):.2f}"
-                    f" age={self._decision_num(info,'raid_age_sec'):.0f}s")
-        spread_txt = "n/a"
+            raid = (f"{str(info.get('raid_side')).upper()}@{self._decision_fmt(info,'raid_price')} "
+                    f"wick={self._decision_fmt(info,'raid_wick')} q={self._decision_fmt(info,'raid_quality','.2f')} "
+                    f"age={self._decision_fmt(info,'raid_age_sec','.0f')}s")
+        elif info.get("candidate_raid_side"):
+            raid = (f"REJECTED:{str(info.get('candidate_raid_side')).upper()}@{self._decision_fmt(info,'candidate_raid_price')} "
+                    f"q={self._decision_fmt(info,'candidate_raid_quality','.2f')}")
         if spread:
-            spread_txt = (f"{float(spread.get('spread_bps',0.0) or 0.0):.2f}bps/"
-                          f"{float(spread.get('spread_atr',0.0) or 0.0):.3f}ATR"
-                          f" size×{float(spread.get('size_mult',1.0) or 1.0):.2f}"
-                          f" hard={'Y' if spread.get('hard_fail') else 'N'}")
+            age = spread.get("book_age_sec")
+            age_txt = f"{float(age):.2f}s" if age is not None else "N/A"
+            spread_txt = (f"book={spread.get('book_status','?')}/{age_txt} spread={self._decision_fmt(spread,'spread_bps','.2f')}bps/"
+                          f"{self._decision_fmt(spread,'spread_atr','.3f')}ATR size×{self._decision_fmt(spread,'size_mult','.2f','N/A')} "
+                          f"hard={'Y' if spread.get('hard_fail') else 'N'}")
+        else:
+            spread_txt = "not-evaluated"
         logger.info(
-            "🧭 ICT_DECISION %s state=%s block=%s | mark=%.4f ATR5=%.4f pct=%.0f%% | "
-            "4H=%s conf=%.2f slope=%+.3fATR eff=%.2f struct=%+.0f ATR=%.4f | "
-            "15m=%s conf=%.2f slope=%+.3fATR eff=%.2f struct=%+.0f ATR=%.4f | "
-            "aligned=%s/%s | raid=%s | cost=%s",
-            mode, info.get("state", "SCANNING"), info.get("block_reason", "UNKNOWN"), price,
-            self._decision_num(info, "entry_5m_atr"), 100.0 * self._decision_num(info, "atr_percentile", 0.5),
-            info.get("context_4h", "WAIT"), self._decision_num(info, "context_4h_conf"),
-            self._decision_num(info, "context_4h_slope_atr"), self._decision_num(info, "context_4h_efficiency"),
-            self._decision_num(info, "context_4h_structure"), self._decision_num(info, "context_4h_atr"),
-            info.get("context_15m", "WAIT"), self._decision_num(info, "context_15m_conf"),
-            self._decision_num(info, "context_15m_slope_atr"), self._decision_num(info, "context_15m_efficiency"),
-            self._decision_num(info, "context_15m_structure"), self._decision_num(info, "context_15m_atr"),
-            "Y" if info.get("context_aligned") else "N", info.get("context_direction", "none"), raid, spread_txt,
+            "🧭 ICT_DECISION %s state=%s block=%s | domain=%s mark=%s ATR5=%s pct=%s%% | "
+            "4H=%s score=%s=[slope%s+struct%s] threshold=±%s ATR=%s | "
+            "15m=%s score=%s=[slope%s+struct%s] threshold=±%s ATR=%s | "
+            "aligned=%s/%s raids=fresh:%d aligned:%d opposed:%d invalid:%d accepted=%s | cost=%s",
+            mode, info.get("state", "SCANNING"), info.get("block_reason", "UNKNOWN"), self._analysis_unit(),
+            self._decision_fmt({"v": price}, "v"), self._decision_fmt(info,"entry_5m_atr"),
+            self._decision_fmt({"p": 100.0*self._decision_num(info,"atr_percentile",0.5)},"p",".0f"),
+            info.get("context_4h", "WAIT"), self._decision_fmt(info,"context_4h_score","+.3f"),
+            self._decision_fmt(info,"context_4h_slope_component","+.3f"), self._decision_fmt(info,"context_4h_structure_component","+.3f"),
+            self._decision_fmt(info,"context_direction_threshold",".2f"), self._decision_fmt(info,"context_4h_atr"),
+            info.get("context_15m", "WAIT"), self._decision_fmt(info,"context_15m_score","+.3f"),
+            self._decision_fmt(info,"context_15m_slope_component","+.3f"), self._decision_fmt(info,"context_15m_structure_component","+.3f"),
+            self._decision_fmt(info,"context_direction_threshold",".2f"), self._decision_fmt(info,"context_15m_atr"),
+            "Y" if info.get("context_aligned") else "N", info.get("context_direction", "none"),
+            int(info.get("fresh_5m_raid_count",0) or 0), int(info.get("aligned_5m_raid_count",0) or 0),
+            int(info.get("opposed_5m_raid_count",0) or 0), int(info.get("invalid_5m_raid_count",0) or 0), raid, spread_txt,
         )
-        if changed and any(k in info for k in ("mss_level", "fvg_low", "target_pool_price", "entry")):
-            audit = dict(info.get("target_audit", {}) or {})
-            logger.info(
-                "📐 ICT_GEOMETRY side=%s MSS=%.4f broken=%s disp=%.2fATR | FVG=[%.4f,%.4f] eq=%.4f gap=%.2fATR | "
-                "SL=%.4f clearance=%.2fATR | target=%s@%.4f eligible=%d/%d positive=%d RR=%.2f P=%.2f U=%+.2fR",
-                str(info.get("side", info.get("raid_side", "-"))).upper(), self._decision_num(info, "mss_level"),
-                "Y" if info.get("mss_broken") else "N", self._decision_num(info, "displacement_atr"),
-                self._decision_num(info, "fvg_low"), self._decision_num(info, "fvg_high"),
-                self._decision_num(info, "fvg_equilibrium"), self._decision_num(info, "fvg_distance_atr"),
-                self._decision_num(info, "structural_stop", self._decision_num(info, "sl")),
-                self._decision_num(info, "stop_clearance_atr"), info.get("target_timeframe", "-"),
-                self._decision_num(info, "target_pool_price"), int(audit.get("eligible", 0) or 0),
-                int(audit.get("pool_total", 0) or 0), int(audit.get("positive", 0) or 0),
-                self._decision_num(info, "rr", self._decision_num(info, "target_rr")),
-                self._decision_num(info, "delivery_probability"), self._decision_num(info, "delivery_utility_r"),
+        lineage = dict(quality.get("lineage", {}) or {})
+        frames = dict(quality.get("frames", {}) or {})
+        if quality and (changed or periodic):
+            frame_txt = " | ".join(
+                f"{tf}:n={v.get('bars',0)} age={('N/A' if v.get('last_age_sec') is None else f'{v.get('last_age_sec'):.1f}s')} dup={v.get('duplicates',0)} gap={v.get('gaps',0)} badOHLC={v.get('invalid_ohlc',0)} vol={v.get('volume_status','?')}({v.get('nonzero_volume_bars',0)})"
+                for tf, v in frames.items()
             )
+            native = getattr(getattr(self, "_liq_map", None), "_native_atr_by_tf", {}) or {}
+            native_txt = ",".join(f"{tf}={float(native.get(tf,0.0)):.4f}" for tf in ("5m","15m","4h") if tf in native) or "pending"
+            logger.info(
+                "🔗 DATA_LINEAGE integrity=%s blockers=%s | analysis=%s/%s execution=%s/%s quote_fresh=%s update_age=%s | %s | native_ATR[%s]",
+                "PASS" if quality.get("ok") else "BLOCK", ",".join(quality.get("blockers", [])),
+                lineage.get("analysis_source","?"), lineage.get("analysis_domain","?"),
+                lineage.get("execution_source","?"), lineage.get("execution_domain","?"),
+                "Y" if quality.get("analysis_quote_fresh") else "N",
+                "N/A" if quality.get("last_update_age_sec") is None else f"{float(quality.get('last_update_age_sec')):.2f}s", frame_txt, native_txt,
+            )
+        if changed and info.get("raid_side"):
+            if not info.get("mss_broken"):
+                logger.info(
+                    "📐 ICT_GEOMETRY stage=MSS_WAIT side=%s raid=%s | MSS=%s broken=N displacement=%sATR | "
+                    "FVG=N/A prerequisite=MSS_BREAK | SL=N/A prerequisite=FVG_REPRICE | TP=N/A prerequisite=EXECUTABLE_GEOMETRY",
+                    str(info.get("raid_side")).upper(), raid, self._decision_fmt(info,"mss_level"), self._decision_fmt(info,"displacement_atr",".2f"),
+                )
+            elif not self._decision_has(info, "fvg_low"):
+                logger.info(
+                    "📐 ICT_GEOMETRY stage=FVG_WAIT side=%s MSS=%s broken=Y displacement=%sATR | FVG=N/A prerequisite=VALID_REBALANCE_GAP | SL=N/A | TP=N/A",
+                    str(info.get("raid_side")).upper(), self._decision_fmt(info,"mss_level"), self._decision_fmt(info,"displacement_atr",".2f"),
+                )
+            else:
+                audit = dict(info.get("target_audit", {}) or {})
+                logger.info(
+                    "📐 ICT_GEOMETRY stage=EXECUTABLE side=%s MSS=%s broken=Y disp=%sATR | FVG=[%s,%s] eq=%s gap=%sATR | "
+                    "SL=%s clearance=%sATR model=%s+%s×pct | target=%s@%s eligible=%d/%d positive=%d RR=%s floor=%s P=%s U=%sR",
+                    str(info.get("side", info.get("raid_side", "-"))).upper(), self._decision_fmt(info,"mss_level"),
+                    self._decision_fmt(info,"displacement_atr",".2f"), self._decision_fmt(info,"fvg_low"), self._decision_fmt(info,"fvg_high"),
+                    self._decision_fmt(info,"fvg_equilibrium"), self._decision_fmt(info,"fvg_distance_atr",".2f"),
+                    self._decision_fmt(info,"structural_stop"), self._decision_fmt(info,"stop_clearance_atr",".2f"),
+                    self._decision_fmt(info,"stop_clearance_base_atr",".2f"), self._decision_fmt(info,"stop_clearance_pctile_slope_atr",".2f"),
+                    info.get("target_timeframe", "N/A"), self._decision_fmt(info,"target_pool_price"), int(audit.get("eligible",0) or 0),
+                    int(audit.get("pool_total",0) or 0), int(audit.get("positive",0) or 0), self._decision_fmt(info,"rr",".2f"),
+                    self._decision_fmt(info,"min_structural_rr",".2f"), self._decision_fmt(info,"delivery_probability",".2f"), self._decision_fmt(info,"delivery_utility_r","+.2f"),
+                )
 
     def _evaluate_entry(self, data_manager, order_manager, risk_manager, now):
-        """Evaluate exactly one 4H/15m/5m ICT + Liquidity thesis."""
+        """Evaluate exactly one 4H/15m/5m ICT + Liquidity thesis with data lineage gates."""
         if self._entry_engine is None or self._liq_map is None:
             logger.error("ICT + Liquidity authority unavailable — entries disabled")
             return
@@ -1844,17 +1983,20 @@ class QuantStrategy:
                 logger.info("ICT + Liquidity entries paused: watchdog circuit breaker engaged")
             return
         try:
-            price = float(data_manager.get_last_price() or 0.0)
+            analysis_getter = getattr(data_manager, "get_analysis_price", None)
+            price = float((analysis_getter() if callable(analysis_getter) else data_manager.get_last_price()) or 0.0)
         except Exception:
             return
         if price <= 0:
             return
-        candles_by_tf = {}
+        candles_by_tf: Dict[str, List[Dict]] = {}
         for tf, limit in (("5m", 2100), ("15m", 700), ("1h", 300), ("4h", 120), ("1d", 90)):
             try:
                 candles_by_tf[tf] = data_manager.get_candles(tf, limit=limit) or []
             except Exception:
                 candles_by_tf[tf] = []
+        quality = self._audit_structural_inputs(data_manager, candles_by_tf, price, now)
+        self._last_data_integrity_context = quality
         c5, c15, c4h = candles_by_tf.get("5m", []), candles_by_tf.get("15m", []), candles_by_tf.get("4h", [])
         if len(c5) < QCfg.MIN_5M_BARS() or len(c15) < 20 or len(c4h) < 20:
             if now - self._last_data_warn >= 30.0:
@@ -1864,25 +2006,31 @@ class QuantStrategy:
         self._atr_5m.compute(c5)
         atr = float(self._atr_5m.atr or 0.0)
         if atr <= 1e-10:
+            self._log_ict_decision_snapshot({"state":"SCANNING", "block_reason":"INVALID_5M_ATR", "trigger":"WAIT"}, price, now)
             return
-        # Execution-cost control must use the current completed 5m ATR. Running this
-        # gate before ATR refresh could approve the first setup without a valid
-        # spread/volatility measurement.
+        if not quality.get("ok", False):
+            self._log_ict_decision_snapshot({
+                "state": "SCANNING", "block_reason": "DATA_INTEGRITY_BLOCK:" + ",".join(quality.get("blockers", [])),
+                "trigger": "WAIT", "entry_5m_atr": atr, "atr_percentile": self._atr_5m.get_percentile(),
+                "authority": "STRUCTURAL_ONLY",
+            }, price, now)
+            return
         spread_ok, _ = self._spread_atr_gate(data_manager)
         if not spread_ok:
             self._log_ict_decision_snapshot({
-                "state": self._entry_engine.state, "block_reason": "EXECUTION_SPREAD_HARD_BLOCK",
-                "trigger": "WAIT", "entry_5m_atr": atr,
-                "atr_percentile": self._atr_5m.get_percentile(), "authority": "STRUCTURAL_ONLY",
+                "state": self._entry_engine.state, "block_reason": "EXECUTION_SPREAD_OR_BOOK_BLOCK",
+                "trigger": "WAIT", "entry_5m_atr": atr, "atr_percentile": self._atr_5m.get_percentile(),
+                "authority": "STRUCTURAL_ONLY",
             }, price, now)
             return
-        now_ms = int(now * 1000) if now < 1e12 else int(now)
         try:
             self._liq_map.update(candles_by_tf, price, atr, now)
             snapshot = self._liq_map.get_snapshot(price, atr)
         except Exception as exc:
-            logger.debug("Liquidity map refresh skipped: %s", exc)
+            logger.warning("Liquidity map refresh blocked: %s", exc)
             return
+        pol = active_policy(getattr(self, "_instrument", None))
+        self._entry_engine.set_structural_delivery_policy(float(pol.min_rr), float(pol.max_rr))
         self._entry_engine.set_atr_pctile(self._atr_5m.get_percentile())
         self._entry_engine.update(snapshot, price, atr, now, candles_5m=c5, candles_15m=c15, candles_4h=c4h)
         signal = self._entry_engine.get_signal()
@@ -1894,8 +2042,9 @@ class QuantStrategy:
         entry, sl, tp = float(signal.entry_price), float(signal.sl_price), float(signal.tp_price)
         rr = abs(tp - entry) / max(abs(entry - sl), 1e-12)
         correct_geometry = (side == "long" and sl < entry < tp) or (side == "short" and tp < entry < sl)
-        if not correct_geometry or rr <= 1.0:
-            self._entry_engine.mark_signal_deferred(side, "invalid_structural_geometry", cooldown_sec=30.0)
+        if not correct_geometry or rr < float(pol.min_rr):
+            self._entry_engine.mark_signal_deferred(side, "invalid_structural_geometry_or_policy_rr", cooldown_sec=30.0)
+            logger.info("ICT_LIQUIDITY ticket rejected: geometry=%s RR=%.2f floor=%.2f", correct_geometry, rr, float(pol.min_rr))
             return
         bal_info = risk_manager.get_available_balance()
         total_bal = float((bal_info or {}).get("total", (bal_info or {}).get("available", 0.0)) or 0.0)
@@ -1904,20 +2053,20 @@ class QuantStrategy:
             self._entry_engine.mark_signal_deferred(side, "account_risk_lock", cooldown_sec=30.0)
             logger.info("ICT_LIQUIDITY account control rejected setup: %s", reason)
             return
-        self._force_sl, self._force_tp = sl, tp
-        self._last_entry_signal = signal
+        self._force_sl, self._force_tp, self._last_entry_signal = sl, tp, signal
         sig = StructuralEntrySummary()
         sig.atr = atr
         sig.delivery_probability = float(signal.delivery_probability or 0.0)
         sig.structural_validation = signal.structural_validation
-        cur = str(self._position_accounting_context().get("currency_symbol", "$"))
+        unit = self._analysis_unit()
         logger.info(
-            "✅ ICT_ORDER_THESIS %s entry=%s%.4f SL=%s%.4f TP=%s%.4f | risk=%.4f reward=%.4f RR=%.2f "
-            "deliveryP=%.2f utility=%+.2fR target=%s@%.4f | balance=%s%.2f risk_control=APPROVED | %s",
-            side.upper(), cur, entry, cur, sl, cur, tp, abs(entry - sl), abs(tp - entry), rr,
-            float(signal.delivery_probability or 0.0), self._decision_num(info, "delivery_utility_r"),
-            str(info.get("target_timeframe", "-")), self._decision_num(info, "target_pool_price"),
-            cur, total_bal, signal.reason,
+            "✅ ICT_ORDER_THESIS domain=%s %s entry=%s%.4f SL=%s%.4f TP=%s%.4f | risk=%.4f reward=%.4f RR=%.2f floor=%.2f "
+            "deliveryP=%.2f utility=%+.2fR target=%s@%.4f | account_balance=%s%.2f execution_conversion=%s | %s",
+            "UNDERLYING" if unit == "NIFTYpts" else "EXECUTION_INSTRUMENT", side.upper(), unit, entry, unit, sl, unit, tp,
+            abs(entry-sl), abs(tp-entry), rr, float(pol.min_rr), float(signal.delivery_probability or 0.0),
+            self._decision_num(info,"delivery_utility_r"), str(info.get("target_timeframe","-")), self._decision_num(info,"target_pool_price"),
+            str(self._position_accounting_context().get("currency_symbol", "$")), total_bal,
+            "OPTION_PREMIUM_PENDING" if unit == "NIFTYpts" else "DIRECT", signal.reason,
         )
         self._entry_engine.on_entry_placed(signal)
         self._launch_entry_async(data_manager, order_manager, risk_manager, side, sig, mode="ict_liquidity", setup_grade="STRUCTURAL", prefetched_bal_info=bal_info, entry_now=now)

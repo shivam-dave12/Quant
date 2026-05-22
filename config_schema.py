@@ -189,36 +189,17 @@ class SLConfig(BaseModel):
         le=3.0,
         description="ATR noise floor for entry stops; not an SL ceiling.",
     )
-    SL_SWEEP_WICK_CLEARANCE_MULT: float = Field(
-        default_factory=lambda: _c("SL_SWEEP_WICK_CLEARANCE_MULT", 0.10),
+    ICT_STOP_CLEARANCE_BASE_ATR: float = Field(
+        default_factory=lambda: _c("ICT_STOP_CLEARANCE_BASE_ATR", 0.10),
         ge=0.0,
         le=2.0,
         description="Extra wick-depth clearance beyond swept structure.",
     )
-    SL_REGIME_BUFF_SLOPE: float = Field(
-        default_factory=lambda: _c("SL_REGIME_BUFF_SLOPE", 0.80),
+    ICT_STOP_CLEARANCE_PCTL_SLOPE_ATR: float = Field(
+        default_factory=lambda: _c("ICT_STOP_CLEARANCE_PCTL_SLOPE_ATR", 0.18),
         ge=0.0,
         le=3.0,
         description="ATR-percentile slope for volatility-regime SL buffers.",
-    )
-    SL_ATR_BUFFER_MULT: float = Field(
-        default_factory=lambda: _c("SL_ATR_BUFFER_MULT", 0.75),
-        ge=0.0,
-        le=5.0,
-    )
-    SL_MIN_CLEARANCE_ATR_MULT: float = Field(
-        default_factory=lambda: _c("SL_MIN_CLEARANCE_ATR_MULT", 1.5),
-        ge=0.0,
-        le=10.0,
-    )
-    POOL_GATE_BE_MIN_ATR_DIST: float = Field(
-        default_factory=lambda: _c("POOL_GATE_BE_MIN_ATR_DIST", 0.40),
-        ge=0.0,
-        le=5.0,
-        description=(
-            "Minimum ATR distance from current price required before migrating "
-            "SL to BE.  Prevents the pool-gate BE loop (BUG 1/11/32)."
-        ),
     )
 
 # ---------------------------------------------------------------------------

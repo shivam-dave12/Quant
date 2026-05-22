@@ -448,7 +448,9 @@ class ICICIUnderlyingDataManager:
         return []
 
     def is_price_fresh(self, max_stale_seconds: float = 90.0) -> bool:
-        return self._last_quote_ts > 0
+        with self._lock:
+            ts = float(self._last_quote_ts or 0.0)
+        return ts > 0 and (time.time() - ts) <= float(max_stale_seconds)
 
     @staticmethod
     def _float_first(row: Dict[str, Any], names: tuple[str, ...]) -> float:

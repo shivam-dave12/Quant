@@ -396,10 +396,12 @@ class ICICIOptionDataManager:
         raw["session_contract_book_mode"] = "preselected_call_and_put_live_direction"
         self._session_book_last_refresh_ts = time.time()
         logger.info(
-            "ICICI SESSION CONTRACT BOOK READY [%s] reason=%s spot=%.2f funds=₹%.2f | CE=%s strike=%.2f expiry=%s lot=%.0f prem=₹%.2f | PE=%s strike=%.2f expiry=%s lot=%.0f prem=₹%.2f",
+            "ICICI SESSION CONTRACT BOOK READY [%s] reason=%s spot=%.2f funds=₹%.2f | "
+            "CE=%s strike=%.2f expiry=%s lot=%.0f prem=₹%.2f score=%.3f delta=%+.3f theta/prem=%.4f | "
+            "PE=%s strike=%.2f expiry=%s lot=%.0f prem=₹%.2f score=%.3f delta=%+.3f theta/prem=%.4f",
             book.trade_date_ist, reason, underlying_spot, available_funds,
-            book.call.selected_symbol, book.call.strike, book.call.expiry, float(book.call.raw.get("runtime_lot_size", 0.0) or 0.0), float(book.call.raw.get("selected_entry_premium", 0.0) or 0.0),
-            book.put.selected_symbol, book.put.strike, book.put.expiry, float(book.put.raw.get("runtime_lot_size", 0.0) or 0.0), float(book.put.raw.get("selected_entry_premium", 0.0) or 0.0),
+            book.call.selected_symbol, book.call.strike, book.call.expiry, float(book.call.raw.get("runtime_lot_size", 0.0) or 0.0), float(book.call.raw.get("selected_entry_premium", 0.0) or 0.0), book.call.score, book.call.delta, book.call.theta_to_premium,
+            book.put.selected_symbol, book.put.strike, book.put.expiry, float(book.put.raw.get("runtime_lot_size", 0.0) or 0.0), float(book.put.raw.get("selected_entry_premium", 0.0) or 0.0), book.put.score, book.put.delta, book.put.theta_to_premium,
         )
         return True
 
@@ -489,8 +491,12 @@ class ICICIOptionDataManager:
         raw["selected_live_spread_to_atr"] = metrics["spread_to_atr"]
         self._selected_contract = choice
         logger.info(
-            "ICICI SESSION VEHICLE ACTIVATED %s for %s thesis=%s score=%.2f (selection performed before signal; quote refreshed at execution)",
-            choice.selected_symbol, getattr(self.instrument, "asset_id", "?"), thesis_side, choice.score,
+            "ICICI SESSION VEHICLE ACTIVATED symbol=%s underlying=%s thesis=%s | strike=%.2f expiry=%s DTE=%.1f "
+            "score=%.3f delta=%+.3f theta/prem=%.4f moneyness=%.4f | premium=₹%.2f lot=%.0f cost=₹%.2f/₹%.2f "
+            "spread=%.2fbps spread/ATR1m=%.3f premiumATR1m=₹%.4f visible_depth=%.0f | quote=FRESH execution=APPROVED",
+            choice.selected_symbol, getattr(self.instrument, "asset_id", "?"), thesis_side, choice.strike, choice.expiry, choice.dte,
+            choice.score, choice.delta, choice.theta_to_premium, choice.moneyness, float(self._last_price or 0.0), lot, live_cost, max_cost,
+            metrics["spread_bps"], metrics["spread_to_atr"], metrics["premium_atr"], metrics["visible_depth"],
         )
         return choice
 

@@ -490,26 +490,63 @@ class MarketAggregator:
         """Backward-compatible alias for dashboards/controllers."""
         return self.get_feed_reliability()
 
+    def get_data_lineage(self) -> Dict:
+        """State-domain lineage: analysis candles and executable pricing must not be mixed."""
+        return {
+            "analysis_source": type(self._analysis if self._analysis is not None else self._primary).__name__,
+            "execution_source": type(self._primary).__name__,
+            "analysis_domain": "UNDERLYING" if self._analysis is not None else "EXECUTION_INSTRUMENT",
+            "execution_domain": "OPTION_PREMIUM" if self._analysis is not None else "EXECUTION_INSTRUMENT",
+            "secondary_source": type(self._secondary).__name__ if self._secondary is not None else "none",
+        }
+
+    def is_analysis_price_fresh(self, max_stale_seconds: float = 90.0) -> bool:
+        """Freshness of the price/candles used for the structural decision domain."""
+        dm = self._analysis if self._analysis is not None else self._primary
+        try:
+            return bool(dm.is_price_fresh(max_stale_seconds))
+        except Exception:
+            return False
+
+    def is_execution_price_fresh(self, max_stale_seconds: float = 90.0) -> bool:
+        """Freshness of the instrument that will actually be ordered/fill-reconciled."""
+        try:
+            return bool(self._primary.is_price_fresh(max_stale_seconds))
+        except Exception:
+            return False
+
     def is_price_fresh(self, max_stale_seconds: float = 90.0) -> bool:
-        primary_fresh = self._primary.is_price_fresh(max_stale_seconds)
-        if primary_fresh:
-            return True
-        if self._analysis is not None:
-            try:
-                return bool(self._analysis.is_price_fresh(max_stale_seconds))
-            except Exception:
-                pass
-        return False
+        # Backward-compatible health view; entry authority must call
+        # is_analysis_price_fresh so option-premium freshness cannot conceal a
+        # stale NIFTY-underlying structural feed.
+        return self.is_analysis_price_fresh(max_stale_seconds)
+
+    @staticmethod
+    def _update_timestamp(dm) -> float:
+        if dm is None:
+            return 0.0
+        try:
+            value = dm.get_last_update()
+            if hasattr(value, "timestamp"):
+                value = value.timestamp()
+            return float(value or 0.0)
+        except Exception:
+            return 0.0
+
+    def get_analysis_last_update(self) -> float:
+        return self._update_timestamp(self._analysis if self._analysis is not None else self._primary)
+
+    def get_execution_last_update(self) -> float:
+        return self._update_timestamp(self._primary)
 
     def get_last_update(self) -> float:
         vals = []
         for dm in (self._primary, self._secondary, self._analysis):
             if dm is None:
                 continue
-            try:
-                vals.append(float(dm.get_last_update() or 0.0))
-            except Exception:
-                pass
+            value = self._update_timestamp(dm)
+            if value > 0:
+                vals.append(value)
         return max(vals) if vals else 0.0
 
     # ── Orderbook — fused from both exchanges ─────────────────────────────────

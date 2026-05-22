@@ -135,19 +135,16 @@ PRIMARY_TIMEFRAME    = "15m"
 ENTRY_TIMEFRAME      = "5m"
 HTF_TIMEFRAME        = "4h"
 
-# ── Session config ────────────────────────────────────────────────────────────
-SESSION_ENTRY_QUALITY = {
-    "asia":     "LOW",
-    "london":   "HIGH",
-    "ny":       "HIGH",
-    "late_ny":  "MEDIUM",
-    "off":      "LOW",
-}
 
 # ── Health / Supervisor ───────────────────────────────────────────────────────
 WS_STALE_SECONDS                   = 35.0
 HEALTH_CHECK_INTERVAL_SEC          = 12.0
 PRICE_STALE_SECONDS                = 90.0
+DATA_INTEGRITY_REQUIRE_FRESH_QUOTES = True
+DATA_INTEGRITY_MAX_CLOSED_BAR_AGE_MULT = 3.25
+DATA_INTEGRITY_MAX_GAP_MULT_CONTINUOUS = 2.25
+DATA_INTEGRITY_LOG_SEC = 60.0
+EXECUTION_BOOK_MAX_STALE_SEC = 5.0
 BALANCE_CACHE_TTL_SEC              = 35.0
 STRUCTURE_UPDATE_INTERVAL_SECONDS  = 30
 ENTRY_EVALUATION_INTERVAL_SECONDS  = 0.5    # evaluate more frequently
@@ -210,22 +207,12 @@ def validate_config() -> None:
 
 
 SL_BUFFER_TICKS          = 5
-# ATR-regime noise floor for sweep/momentum entries.
-SL_MIN_ATR_MULT              = 0.20   # SL < 0.20 ATR is inside spread/noise, reject
-# Structural wick clearance: SL must extend at least this fraction of wick_depth
-# PAST the wick tip (not inside the wick body).
-# 0.10 = 10% of wick depth as extra clearance (e.g., 7pt wick → 0.7pt)
-SL_SWEEP_WICK_CLEARANCE_MULT = 0.10
-# ATR-regime adaptation slope: scales SL buffer by current ATR percentile rank.
-# regime_mult = 0.60 + SL_REGIME_BUFF_SLOPE * atr_pctile
-# Low-vol (p=0): mult=0.60 — tight; Normal (p=0.5): mult=1.00; High-vol (p=1): mult=1.40
-SL_REGIME_BUFF_SLOPE         = 0.80
-SL_MIN_IMPROVEMENT_PCT   = 0.001
-SL_RATCHET_ONLY          = True
 SL_ATR_PERIOD            = 14
-SL_ATR_BUFFER_MULT       = 0.75      # trail manager buffer (separate from entry SL)
-SL_MIN_CLEARANCE_ATR_MULT    = 1.5
-SL_MIN_IMPROVEMENT_ATR_MULT  = 0.20   # prevents micro SL updates
+# ICT structural invalidation: the protective stop remains beyond the raided wick.
+# These are risk-model parameters, surfaced in ICT_GEOMETRY logs and used directly
+# by strategy.entry_engine; they are not trailing-stop or alpha filters.
+ICT_STOP_CLEARANCE_BASE_ATR = 0.10
+ICT_STOP_CLEARANCE_PCTL_SLOPE_ATR = 0.18
 
 # ── Aggregator ────────────────────────────────────────────────────────────────
 AGG_PRIMARY_WEIGHT   = 0.55

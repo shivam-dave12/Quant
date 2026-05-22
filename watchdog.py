@@ -1576,8 +1576,6 @@ class ConfigDriftCheck(HealthCheck):
     # (config_key, module_name, attr_path, tolerance)
     _PAIRS: Sequence[Tuple[str, str, str, float]] = (
         ("SL_MIN_ATR_MULT", "entry_engine", "_SL_MIN_ATR_MULT", 1e-12),
-        ("SL_SWEEP_WICK_CLEARANCE_MULT", "entry_engine", "_SL_WICK_CLEARANCE", 1e-12),
-        ("SL_REGIME_BUFF_SLOPE", "entry_engine", "_SL_REGIME_SLOPE", 1e-12),
     )
 
     def check(self) -> HealthResult:

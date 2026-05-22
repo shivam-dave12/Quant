@@ -86,6 +86,7 @@ class DeltaDataManager:
 
         self._last_price:             float = 0.0
         self._last_price_update_time: float = 0.0
+        self._last_orderbook_update_time: float = 0.0
         self._orderbook:              Dict  = {"bids": [], "asks": []}
         self._recent_trades:          deque = deque(maxlen=500)
 
@@ -628,6 +629,7 @@ class DeltaDataManager:
                     "bids": self._normalise_ob_side(raw_bids),
                     "asks": self._normalise_ob_side(raw_asks),
                 }
+                self._last_orderbook_update_time = time.time()
                 bids, asks = self._orderbook["bids"], self._orderbook["asks"]
                 if bids and asks:
                     try:
@@ -714,7 +716,7 @@ class DeltaDataManager:
             return {
                 "bids": list(self._orderbook.get("bids", [])),
                 "asks": list(self._orderbook.get("asks", [])),
-                "timestamp": time.time(),
+                "timestamp": float(self._last_orderbook_update_time or 0.0),
             }
 
     def get_recent_trades_raw(self) -> List[Dict]:

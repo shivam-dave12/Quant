@@ -503,18 +503,14 @@ class QuantBot:
                 logger.error("Bot components not initialised — call initialize() first")
                 return False
 
-            # ── Set leverage on active exchange ───────────────────────────────
+            # Leverage is an execution output, not a startup setting.  The venue
+            # cap remains configured here; the structural funding model computes
+            # and asserts actual leverage only after an approved ICT ticket.
             active_exch = self.execution_router.active_exchange
-            logger.info(f"Setting leverage to {config.LEVERAGE}x on {active_exch}...")
-            try:
-                resp = self.execution_router.set_leverage(leverage=int(config.LEVERAGE))
-                if isinstance(resp, dict):
-                    if resp.get("success") or not resp.get("error"):
-                        logger.info(f"✅ Leverage set to {config.LEVERAGE}x")
-                    else:
-                        logger.warning(f"⚠️  Leverage set: {resp.get('error', resp)}")
-            except Exception as e:
-                logger.warning(f"⚠️  Leverage set failed (non-fatal): {e}")
+            logger.info(
+                "Leverage venue_cap=%sx venue=%s leverage_set=DEFERRED_UNTIL_APPROVED_STRUCTURAL_ENTRY",
+                int(getattr(config, "LEVERAGE", 1)), active_exch,
+            )
 
             # ── Query initial balance ─────────────────────────────────────────
             try:

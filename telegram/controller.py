@@ -554,19 +554,30 @@ class TelegramBotController:
             eng = getattr(strat, "_entry_engine", None)
             info = eng.analysis_info if eng is not None else {}
             pos = getattr(strat, "_pos", None)
+            def _fv(key, fmt=".4f"):
+                try:
+                    value = info.get(key, None)
+                    return format(float(value), fmt) if value is not None else "N/A"
+                except Exception:
+                    return "N/A"
             lines = [
                 "🏛️ <b>ICT + Liquidity Thesis</b>",
                 "<code>4H context → 15m confirmation → 5m raid/MSS/FVG → protected execution</code>",
-                f"State: <b>{_esc(str(info.get('state', 'SCANNING')))}</b>",
-                f"4H context: {_esc(str(info.get('context_4h', 'WAIT')))}",
-                f"15m confirmation: {_esc(str(info.get('context_15m', 'WAIT')))}",
-                f"5m trigger: {_esc(str(info.get('trigger', 'WAITING_FOR_FRESH_RAID')))}",
+                "<i>N/A means the prerequisite structural stage has not evaluated.</i>",
+                f"State: <b>{_esc(str(info.get('state', 'SCANNING')))}</b> | Block: {_esc(str(info.get('block_reason', 'WAIT')))}",
+                f"4H: {_esc(str(info.get('context_4h', 'WAIT')))} score={_fv('context_4h_score','+.3f')} ATR={_fv('context_4h_atr')}",
+                f"15m: {_esc(str(info.get('context_15m', 'WAIT')))} score={_fv('context_15m_score','+.3f')} ATR={_fv('context_15m_atr')} aligned={'Y' if info.get('context_aligned') else 'N'}",
+                f"5m: ATR={_fv('entry_5m_atr')} trigger={_esc(str(info.get('trigger', 'WAITING_FOR_FRESH_RAID')))} minRR={_fv('min_structural_rr','.2f')}",
             ]
             for key, label in (("raid_quality", "Raid quality"), ("displacement_atr", "Displacement ATR"), ("delivery_probability", "Delivery probability"), ("delivery_utility_r", "Delivery utility R")):
                 if key in info and info.get(key) is not None:
                     lines.append(f"{label}: {float(info[key]):.3f}")
-            if info.get("fvg_zone"):
-                lines.append(f"FVG repricing zone: {_esc(str(info['fvg_zone']))}")
+            if info.get("raid_side") and not info.get("mss_broken"):
+                lines.append(f"MSS={_fv('mss_level')} broken=N | FVG=N/A (requires MSS break) | SL/TP=N/A")
+            elif info.get("mss_broken") and info.get("fvg_low") is None:
+                lines.append("MSS broken=Y | FVG=N/A (awaiting valid displacement gap) | SL/TP=N/A")
+            elif info.get("fvg_low") is not None:
+                lines.append(f"FVG=[{_fv('fvg_low')},{_fv('fvg_high')}] SL={_fv('structural_stop')} TP={_fv('target_pool_price')}")
             if pos is not None and str(getattr(pos, 'phase', '')).upper().endswith('ACTIVE'):
                 lines.append("\n🔒 <b>Position protected by venue orders</b>")
             else:
@@ -590,8 +601,10 @@ class TelegramBotController:
             dm = bot_instance.data_manager
             if not strat or not dm:
                 return "Components not ready."
-            cur = _currency_for_strategy(strat)
-            price = float(dm.get_last_price() or 0.0)
+            analysis_unit = getattr(strat, "_analysis_unit", None)
+            cur = analysis_unit() if callable(analysis_unit) else _currency_for_strategy(strat)
+            analysis_price = getattr(dm, "get_analysis_price", None)
+            price = float((analysis_price() if callable(analysis_price) else dm.get_last_price()) or 0.0)
             atr = float(strat._atr_5m.atr or 0.0)
             if not hasattr(strat, '_liq_map') or strat._liq_map is None:
                 return "Structural liquidity map not ready."
@@ -1012,12 +1025,8 @@ class TelegramBotController:
         strategy = getattr(bot_instance, "strategy", None)
         success, message = router.switch(target, strategy=strategy)
 
-        if success and bot_instance.order_manager:
-            try:
-                bot_instance.order_manager.set_leverage(leverage=int(config.LEVERAGE))
-            except Exception as e:
-                message += f"\n⚠️ Leverage set failed: {e}"
-
+        if success:
+            message += "\nLeverage remains unset while flat; it will be computed and applied only for an approved structural entry."
         return message
 
     # ================================================================
@@ -1082,20 +1091,9 @@ class TelegramBotController:
                         f"Close position first, then /set leverage {new_val}."
                     )
             setattr(cfg, attr_name, new_val)
-            if bot_running and bot_instance:
-                om = getattr(bot_instance, 'order_manager', None)
-                if om:
-                    try:
-                        resp = om.set_leverage(leverage=int(new_val))
-                        if isinstance(resp, dict) and resp.get("error"):
-                            setattr(cfg, attr_name, old_val)
-                            return f"❌ Exchange rejected: {resp['error']}\nConfig reverted to {old_val}x."
-                        return (f"✅ <b>Leverage updated</b>: {old_val}x → <b>{new_val}x</b>\n"
-                                f"Config and exchange both updated.")
-                    except Exception as e:
-                        setattr(cfg, attr_name, old_val)
-                        return f"❌ Exchange API error: {e}\nConfig reverted to {old_val}x."
-            return f"✅ <b>LEVERAGE</b>: {old_val} → <b>{new_val}</b>  (exchange not updated — bot not running)"
+            return (f"✅ <b>VENUE LEVERAGE CAP</b>: {old_val}x → <b>{new_val}x</b>\n"
+                    "No exchange leverage is changed while flat. The next approved structural entry "
+                    "computes and sets only the leverage required by its risk/margin geometry.")
 
         # ── Risk per trade validation ─────────────────────────────────────
         if key == "risk":
