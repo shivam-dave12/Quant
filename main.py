@@ -197,13 +197,9 @@ class TerminalBurstFilter(logging.Filter):
     """Suppress repeated tick-level terminal messages while keeping file logs intact."""
 
     _NOISY_MARKERS = (
-        "Trail HOLD",
-        "FibTrail",
-        "POOL-GATE",
-        "POST-SWEEP",
-        "SWEEP REJECTED",
-        "ENTRY REJECTED (R:R)",
-        "FLOW_ADVISORY",
+        "ICT_DECISION SNAPSHOT",
+        "DESK_HEALTH",
+        "Spread cost impairment",
     )
     _NUMBER_RE = re.compile(r"(?<![A-Za-z])[-+]?\$?\d[\d,]*(?:\.\d+)?%?")
 

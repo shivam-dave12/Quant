@@ -138,11 +138,10 @@ def _classify_priority(message: str) -> int:
     if any(kw in message for kw in _CRITICAL_KEYWORDS) or "🚨" in message or "💀" in message:
         return PRIO_CRITICAL
     if any(tag in upper for tag in (
-        "ENTRY", "EXIT", "POOL-GATE", "TRADE OPEN", "TRADE CLOSED",
+        "ENTRY", "EXIT", "TRADE OPEN", "TRADE CLOSED",
         "POSITION ADOPTED", "WATCHDOG HEAL", "WATCHDOG CIRCUIT",
-        "POST-EXIT IMPAIRMENT", "IC EXPOSURE LENS",
-        "LIQUIDITY PATH GATE", "SAFETY / ADVISORY BLOCK", "ADAPTIVE EXIT", "LIQUIDITY DRAW",
-        "QUANT POSTERIOR DECISION",
+        "ICT_DECISION", "ICT_ORDER_THESIS", "ICT / LIQUIDITY",
+        "STRUCTURAL SL", "LIQUIDITY TARGET", "EXACT-FILL",
     )):
         return PRIO_IMPORTANT
     return PRIO_ROUTINE
@@ -323,9 +322,8 @@ def _tg_asset_policy(inst):
 def _tg_asset_header(inst=None, event_type: str = "", context: Optional[Dict[str, Any]] = None) -> str:
     """Build an institutional asset-specific Telegram header.
 
-    This is intentionally centralised so legacy BTC-era messages can still be
-    sent by strategy code while Telegram always receives the correct contract,
-    venue, policy, phase and portfolio context.
+    Centralised formatting ensures Telegram always receives the correct
+    contract, venue, currency, protected-state and portfolio context.
     """
     inst = inst or _tg_current_instrument()
     if inst is None:
@@ -347,8 +345,8 @@ def _tg_asset_header(inst=None, event_type: str = "", context: Optional[Dict[str
         venue_txt = _esc(", ".join(venues) if venues else f"{primary_name}:{symbol}")
         pol = _tg_asset_policy(inst)
         # Prefer actual runtime/entry leverage over policy/config leverage.
-        # Policy leverage is only a cap/default; after dynamic margin-risk sizing
-        # the exchange can be asserted at e.g. 8x/14x while config remains 40x.
+        # Policy leverage is a venue cap; executed leverage is selected from
+        # structural-risk funding and liquidation-safety geometry.
         lev = (context.get("entry_leverage") or context.get("actual_leverage")
                or context.get("leverage") or getattr(pol, "leverage", None)
                or getattr(inst, "max_leverage", 0) or "-")
@@ -394,12 +392,12 @@ def _tg_infer_event_type(message: str) -> str:
     m = str(message or "").upper()
     if "BRACKET" in m or "ENTRY" in m or "POSITION OPEN" in m:
         return "EXECUTION"
-    if "TRAIL" in m or "SL" in m or "STOP" in m:
-        return "RISK / TRAIL"
+    if "SL" in m or "STOP" in m or "PROTECTION" in m:
+        return "PROTECTED RISK"
     if "EXIT" in m or "PNL" in m or "TP HIT" in m:
         return "EXIT"
-    if "POSTERIOR" in m or "P(EDGE)" in m or "EV=" in m:
-        return "POSTERIOR"
+    if "ICT_DECISION" in m or "ICT_ORDER_THESIS" in m or "UTILITY=" in m:
+        return "ICT / LIQUIDITY DECISION"
     if "LIQUIDITY" in m or "SWEEP" in m or "POOL" in m:
         return "LIQUIDITY"
     if "STATUS" in m or "THINK" in m:
@@ -943,24 +941,10 @@ _TELEGRAM_SUPPRESS_PATTERNS: List[str] = [
     # while a position is open. Diagnostic only, no auto-heal path.
     "daily_counter_consistency",
     "daily counter drift",
-    # Pool-gate diagnostic messages — these are downgraded to INFO at source
-    # and a formatted Telegram alert is sent via send_telegram_message()
-    # directly.  Belt-and-braces guard: if any code path accidentally logs
-    # these at WARNING they must NOT produce a second Telegram notification.
-    "POOL-GATE reverse signal: no exit taken",
-    "POOL-GATE BE blocked: desired=",
-    "POOL-GATE BE still blocked: desired=",
-    "POOL-GATE reverse held:",
-    # ── SPAM-FIX 2026-04-26 ──────────────────────────────────────────────
-    # The following patterns were identified from a 32k-line production log
-    # as the dominant Telegram spam sources beyond the post-sweep verdict
-    # itself (which is fixed at the source — see quant_strategy._ps_tg_last_hash).
-    #
-    # 1. SWEEP REJECTED (tf_quality): 113 instances/session. Routine gate
-    #    rejection. Source-downgraded to INFO; this is belt-and-braces.
+    # Structural sweep-quality deferrals are INFO-level decision context and
+    # should never be duplicated as Telegram WARNING notifications.
     "SWEEP QUALITY IMPAIRED [tf_quality]:",
     "SWEEP DEFERRED [tf_quality]:",
-    "SWEEP REJECTED (tf_quality):",  # legacy suppression
     # 2. Telegram API HTTP errors on getUpdates: when Telegram itself
     #    rate-limits the bot, the WARN was being routed BACK into the
     #    Telegram queue, amplifying the burst. Source-downgraded to

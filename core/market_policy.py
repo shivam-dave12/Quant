@@ -297,7 +297,7 @@ def build_instrument_policy(inst: Optional[TradableInstrument]) -> InstrumentPol
             **desk_fields,
         )
 
-    # Crypto/default policy keeps the original aggressive BTC runtime prior.
+    # Crypto/default policy uses instrument-native risk, spread and venue-cap controls.
     return InstrumentPolicy(
         asset_id=asset_id, asset_class=getattr(ac, 'value', str(ac)), leverage=lev,
         margin_pct=_desk_float(desk, "margin_pct", base_margin),

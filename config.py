@@ -4,7 +4,7 @@ config.py — Unified Configuration v10.0
 Single source of truth. All institutional parameters inline.
 No config_overrides.py — everything lives here.
 
-Calibrated for 65-75% WR, 3-6 trades per session.
+Risk-controlled configuration for structural ICT/Liquidity execution.
 """
 import os
 try:
@@ -59,8 +59,6 @@ if not DELTA_API_KEY and not COINSWITCH_API_KEY and not BREEZE_API_KEY:
 # ── Symbol / Leverage ─────────────────────────────────────────────────────────
 SYMBOL                   = "BTCUSDT"
 LEVERAGE                 = 45
-AGGRESSIVE_LEVERAGE_FLOOR = 40
-AGGRESSIVE_LEVERAGE_TARGET = 45
 DELTA_SYMBOL             = "BTCUSD"
 DELTA_CONTRACT_VALUE_BTC = 0.001
 DELTA_BALANCE_CURRENCY   = "USD"
@@ -82,7 +80,7 @@ REMAINDER_MIN_QTY        = 0.001
 #   The inconsistency caused 100× over-sizing (entire balance at risk per trade),
 #   triggering the "required margin > available — scaling down" warnings in logs.
 #   Fix: one convention (fraction), both consumers agree. See risk_manager.py line 266.
-RISK_PER_TRADE           = 0.020  # 2.0% true SL risk; aggressive ROE while staying inside day circuit
+RISK_PER_TRADE           = 0.020  # 2.0% stop-loss risk ceiling applied to allocated margin; never increased by signal strength
 MAX_DAILY_LOSS           = 10000
 MAX_DAILY_LOSS_PCT       = 10.0       # day circuit breaker
 MAX_DRAWDOWN_PCT         = 25.0      # realistic drawdown limit
@@ -367,8 +365,11 @@ EXIT_MANUAL_CONFIRM_MAX_WAIT_SEC = 120.0
 MULTI_ASSET_ENABLED = True
 SCANNER_MAX_ACTIVE_INSTRUMENTS = 14
 SCANNER_TICK_SLEEP_SEC = 0.25
-SCANNER_ASSET_HEARTBEAT_SEC = 60.0
-SCANNER_ASSET_ANALYSIS_LOG_SEC = 15.0  # per-contract proof-of-analysis log cadence
+# Observability cadence: decision transitions log immediately in QuantStrategy; these
+# slow cadences only prove scanner health and suppress repetitive per-tick noise.
+ICT_DECISION_SNAPSHOT_SEC = 60.0
+SCANNER_ASSET_HEARTBEAT_SEC = 300.0
+SCANNER_ASSET_ANALYSIS_LOG_SEC = 60.0  # execution-health audit, not alpha reasoning
 
 # Desk suspension policy.  Suspended desks are excluded before live catalog
 # discovery, so they cannot subscribe, analyse, size, or route orders.

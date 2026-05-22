@@ -166,3 +166,76 @@ def test_full_4h_15m_5m_structural_sequence_emits_one_executable_ticket():
     assert signal.target_pool.pool.timeframe == "15m"
     assert signal.delivery_probability > 0 and signal.rr_ratio > 1.0
     assert engine.state == "EXECUTABLE"
+
+
+def test_context_ready_requires_aligned_four_hour_and_fifteen_minute_direction():
+    now = time.time()
+    c5 = _trend_candles(0.10, 32)
+    c4h = _trend_candles(2.00, 30)
+    c15 = _trend_candles(-1.00, 34)
+    engine = EntryEngine()
+    engine.update(_snap(), price=100.0, atr=1.0, now=now,
+                  candles_5m=c5, candles_15m=c15, candles_4h=c4h)
+    info = engine.analysis_info
+    assert info["context_4h"] == "bullish" and info["context_15m"] == "bearish"
+    assert info["context_aligned"] is False
+    assert info["block_reason"] == "CONTEXT_NOT_ALIGNED"
+    assert engine.state == "SCANNING"
+
+
+def test_decision_snapshot_exposes_native_atr_and_waiting_gate_calculations():
+    now = time.time()
+    engine = EntryEngine()
+    engine.update(_snap(), price=100.0, atr=1.25, now=now,
+                  candles_5m=_trend_candles(0.10, 32),
+                  candles_15m=_trend_candles(0.70, 34),
+                  candles_4h=_trend_candles(2.00, 30))
+    info = engine.analysis_info
+    assert engine.state == "CONTEXT_READY"
+    assert info["block_reason"] == "AWAITING_FRESH_5M_LIQUIDITY_RAID"
+    assert info["context_aligned"] is True and info["context_direction"] == "long"
+    for key in ("context_4h_slope_atr", "context_4h_efficiency", "context_4h_atr",
+                "context_15m_slope_atr", "context_15m_efficiency", "context_15m_atr",
+                "entry_5m_atr", "atr_percentile", "fresh_5m_raid_count"):
+        assert key in info
+
+
+def test_operator_surface_is_portfolio_wide_and_routine_logging_is_throttled():
+    orchestration = (ROOT / "orchestration" / "multi_asset_bot.py").read_text()
+    controller = (ROOT / "telegram" / "controller.py").read_text()
+    cfg = (ROOT / "config.py").read_text()
+    assert "format_portfolio_thinking_report" in orchestration
+    assert "format_portfolio_status_report" in orchestration
+    assert "format_portfolio_thinking_report" in controller
+    assert "DESK_HEALTH" in orchestration and "ANALYSIS_TICK" not in orchestration
+    assert "ICT_DECISION_SNAPSHOT_SEC = 60.0" in cfg
+    assert "SCANNER_ASSET_ANALYSIS_LOG_SEC = 60.0" in cfg
+
+
+def test_no_fixed_leverage_or_retired_telegram_decision_language_remains():
+    root = Path(__file__).resolve().parents[1]
+    active = (root / "strategy" / "quant_strategy.py").read_text()
+    cfg = (root / "config.py").read_text()
+    notifier = (root / "telegram" / "notifier.py").read_text()
+    for retired in ("AGGRESSIVE_LEVERAGE", "_aggressive_leverage", "_roe_leverage", "_ADAPTIVE_PARAM_PROVIDER"):
+        assert retired not in active + cfg
+    for retired in ("QUANT POSTERIOR DECISION", 'return "POSTERIOR"', "ADAPTIVE EXIT", "POOL-GATE"):
+        assert retired not in notifier
+
+
+def test_structural_funding_leverage_selects_minimum_required_not_venue_cap(monkeypatch):
+    from strategy.quant_strategy import QuantStrategy, QCfg
+    qs = QuantStrategy.__new__(QuantStrategy)
+    monkeypatch.setattr(QCfg, "LEVERAGE", staticmethod(lambda: 45))
+    monkeypatch.setattr(qs, "_liquidation_safe_leverage_cap", lambda *a, **k: 45.0)
+    normal = qs._structural_funding_leverage(
+        price=100.0, sl_dist=2.0, configured_leverage=45, side="long", sl_price=98.0,
+        target_margin_budget=10.0, risk_capital=0.20,
+    )
+    tight_stop = qs._structural_funding_leverage(
+        price=100.0, sl_dist=0.1, configured_leverage=45, side="long", sl_price=99.9,
+        target_margin_budget=10.0, risk_capital=0.20,
+    )
+    assert normal == 1.0
+    assert tight_stop == 20.0
+    assert tight_stop < 45.0

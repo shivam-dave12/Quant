@@ -545,6 +545,9 @@ class TelegramBotController:
         if not bot_running or not bot_instance:
             return "Bot not running."
         try:
+            portfolio_report = getattr(bot_instance, "format_portfolio_thinking_report", None)
+            if callable(portfolio_report):
+                return portfolio_report()
             strat = getattr(bot_instance, "strategy", None)
             if strat is None:
                 return "Strategy not ready."
@@ -632,6 +635,11 @@ class TelegramBotController:
                 return f"❌ <b>Bot not running</b>\nLast startup error: <code>{_esc(bot_last_start_error)}</code>"
             return "Bot not running. Use /start"
         try:
+            portfolio_report = getattr(bot_instance, "format_portfolio_status_report", None)
+            if callable(portfolio_report):
+                report = portfolio_report()
+                self.send_message(report)
+                return None
             strat = bot_instance.strategy
             if not strat:
                 return "Strategy not ready."
@@ -1040,8 +1048,8 @@ class TelegramBotController:
 
         allowed = {
             "leverage":         ("LEVERAGE",             int),
-            # CRIT-1 FIX: RISK_PER_TRADE is now the position-sizing lever.
-            # QUANT_MARGIN_PCT is retired — _compute_quantity no longer reads it.
+            # Stop-risk ceiling; margin policy remains desk-specific and visible
+            # in ICT/Liquidity decision and funding logs.
             "risk":             ("RISK_PER_TRADE",       float),
             "cooldown":         ("MIN_TIME_BETWEEN_TRADES_SEC", int),
             "max_daily_trades": ("MAX_DAILY_TRADES",     int),

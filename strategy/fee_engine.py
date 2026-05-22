@@ -7,7 +7,7 @@ Three responsibilities:
   1. Track true round-trip execution cost from live data
      (fee rate + rolling spread + EWMA realized slippage)
 
-  2. Compute a regime-adaptive minimum required gross TP move
+  2. Compute a market-cost-aware minimum required gross TP move
      that scales with ATR percentile and spread/ATR ratio —
      not a fixed multiplier
 
@@ -181,7 +181,7 @@ class SlippageTracker:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REGIME-ADAPTIVE PROFIT FLOOR
+# MEASURED EXECUTION-COST PROFIT FLOOR
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ProfitFloorModel:
@@ -280,7 +280,7 @@ class ProfitFloorModel:
     ) -> float:
         """
         Returns the minimum gross price move (always positive) required
-        for a trade to clear all execution costs with the regime-adaptive buffer.
+        for a trade to clear all execution costs with the measured execution-cost buffer.
 
         ATR CAP: result is capped at FEE_FLOOR_MAX_ATR_MULT × ATR.
         Without this cap, at very low ATR percentiles the mult can demand

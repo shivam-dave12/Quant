@@ -518,3 +518,58 @@ def test_router_switch_to_icici_reports_inr_not_usd():
     router = ExecutionRouter(BalOM(), BalOM(), BalOM(), default="delta")
     ok, text = router.switch("icici")
     assert ok is True and "₹49,310.96" in text and "INR NFO available" in text and "$" not in text
+
+
+def test_decision_tape_emits_transition_and_slow_snapshot_without_tick_spam(caplog):
+    import logging
+    qs = QuantStrategy.__new__(QuantStrategy)
+    qs._last_decision_fingerprint = None
+    qs._last_decision_log = 0.0
+    qs._decision_snapshot_sec = 60.0
+    qs._last_spread_gate_context = {"spread_bps": 1.0, "spread_atr": 0.1, "size_mult": 1.0, "hard_fail": False}
+    info = {
+        "state": "CONTEXT_READY", "block_reason": "AWAITING_FRESH_5M_LIQUIDITY_RAID", "trigger": "WAIT",
+        "context_4h": "bullish", "context_15m": "bullish", "context_aligned": True, "context_direction": "long",
+        "context_4h_conf": 0.7, "context_15m_conf": 0.7, "entry_5m_atr": 1.0,
+    }
+    with caplog.at_level(logging.INFO, logger="strategy.quant_strategy"):
+        qs._log_ict_decision_snapshot(info, 100.0, 100.0)
+        qs._log_ict_decision_snapshot(info, 100.1, 101.0)  # unchanged tick: silent
+        changed = dict(info, block_reason="AWAITING_5M_MSS_DISPLACEMENT", raid_side="long", raid_price=99.0)
+        qs._log_ict_decision_snapshot(changed, 100.2, 102.0)  # state transition: immediate
+        qs._log_ict_decision_snapshot(changed, 100.3, 170.0)  # periodic snapshot
+    decision_lines = [r.message for r in caplog.records if "ICT_DECISION" in r.message]
+    assert len(decision_lines) == 3
+    assert "TRANSITION" in decision_lines[0] and "TRANSITION" in decision_lines[1]
+    assert "SNAPSHOT" in decision_lines[2]
+
+
+def test_execution_cost_gate_observes_current_completed_five_minute_atr_before_signal_approval(monkeypatch):
+    import strategy.quant_strategy as qm
+    now = 1_960_000_000.0
+    snap, c5, c15, c4h = _valid_long_setup(now)
+    class Liquidity:
+        def update(self, candles, price, atr, tick_time):
+            raise AssertionError("liquidity/entry evaluation must not run after a hard spread block")
+        def get_snapshot(self, price, atr):
+            return snap
+    class DM:
+        def get_last_price(self): return 100.50
+        def get_candles(self, tf, limit=None):
+            return {"5m": c5, "15m": c15, "4h": c4h, "1h": [], "1d": []}.get(tf, [])
+    qs = QuantStrategy.__new__(QuantStrategy)
+    qs._entry_engine = EntryEngine(); qs._liq_map = Liquidity()
+    qs.watchdog_trading_frozen = False; qs._last_watchdog_freeze_log = 0.0
+    qs._last_data_warn = 0.0; qs._atr_5m = qm.ATREngine()
+    qs._last_decision_fingerprint = None; qs._last_decision_log = 0.0; qs._decision_snapshot_sec = 60.0
+    qs._last_spread_gate_context = {}
+    seen = []
+    def hard_spread_block(dm):
+        seen.append(float(qs._atr_5m.atr or 0.0))
+        qs._last_spread_gate_context = {"spread_bps": 80.0, "spread_atr": 3.0, "size_mult": 0.0, "hard_fail": True}
+        return False, 3.0
+    qs._spread_atr_gate = hard_spread_block
+    monkeypatch.setattr(qm.QCfg, "MIN_5M_BARS", staticmethod(lambda: 20))
+    qs._evaluate_entry(DM(), SimpleNamespace(), SimpleNamespace(), now)
+    assert seen and seen[0] > 0.0
+    assert qs._entry_engine.get_signal() is None

@@ -215,74 +215,123 @@ class ICTLiquidityEntryEngine:
     def set_atr_pctile(self, pctile: float) -> None:
         self._atr_pctile = max(0.0, min(1.0, _f(pctile, 0.5)))
 
+    def _record_block(self, reason: str, **values: Any) -> None:
+        """Record a transparent structural decision without changing entry geometry."""
+        self._last_scan_skip = {str(reason).lower(): 1}
+        payload = {"block_reason": str(reason), "trigger": "WAIT"}
+        payload.update(values)
+        self._last_analysis.update(payload)
+
     def update(self, liq_snapshot: LiquidityMapSnapshot, price: float, atr: float, now: float,
                candles_5m: Optional[List[Dict]] = None,
                candles_15m: Optional[List[Dict]] = None,
                candles_4h: Optional[List[Dict]] = None) -> None:
+        self._last_scan_skip = {}
         if atr <= _EPS or price <= 0:
+            self._last_analysis = {
+                "model": "ICT_LIQUIDITY_4H_15M_5M", "state": self._state.value,
+                "price": price, "entry_5m_atr": atr, "block_reason": "INVALID_PRICE_OR_5M_ATR",
+                "trigger": "WAIT", "authority": "STRUCTURAL_ONLY",
+            }
+            self._last_scan_skip = {"invalid_price_or_5m_atr": 1}
             return
         self._expire(now)
         c5 = _closed(candles_5m, 24)
         c15 = _closed(candles_15m, 24)
         c4h = _closed(candles_4h, 20)
         if not c5 or not c15 or not c4h:
-            self._last_scan_skip = {"warmup": 1}
+            self._last_analysis = {
+                "model": "ICT_LIQUIDITY_4H_15M_5M", "state": self._state.value,
+                "price": price, "entry_5m_atr": atr, "bars_5m": len(c5),
+                "bars_15m": len(c15), "bars_4h": len(c4h),
+                "block_reason": "TIMEFRAME_WARMUP", "trigger": "WAIT",
+                "authority": "STRUCTURAL_ONLY",
+            }
+            self._last_scan_skip = {"timeframe_warmup": 1}
             return
 
         atr4h = _timeframe_atr(c4h)
         atr15m = _timeframe_atr(c15)
         if atr4h <= _EPS or atr15m <= _EPS:
+            self._last_analysis = {
+                "model": "ICT_LIQUIDITY_4H_15M_5M", "state": self._state.value,
+                "price": price, "entry_5m_atr": atr, "context_4h_atr": atr4h,
+                "context_15m_atr": atr15m, "block_reason": "TIMEFRAME_ATR_WARMUP",
+                "trigger": "WAIT", "authority": "STRUCTURAL_ONLY",
+            }
             self._last_scan_skip = {"timeframe_atr_warmup": 1}
             return
         ctx4 = _robust_trend(c4h, atr4h, min(32, len(c4h)))
         ctx15 = _robust_trend(c15, atr15m, min(56, len(c15)))
+        aligned_side = ctx4.side if ctx4.side != 0 and ctx4.side == ctx15.side else 0
+        aligned_label = "long" if aligned_side > 0 else ("short" if aligned_side < 0 else "none")
         self._last_analysis = {
             "model": "ICT_LIQUIDITY_4H_15M_5M",
             "state": self._state.value,
-            "context_4h": ctx4.label,
-            "context_4h_conf": ctx4.confidence,
-            "context_15m": ctx15.label,
-            "context_15m_conf": ctx15.confidence,
-            "context_4h_atr": atr4h,
-            "context_15m_atr": atr15m,
-            "entry_5m_atr": atr,
-            "authority": "STRUCTURAL_ONLY",
+            "price": price,
+            "context_4h": ctx4.label, "context_4h_conf": ctx4.confidence,
+            "context_4h_slope_atr": ctx4.slope_atr, "context_4h_efficiency": ctx4.efficiency,
+            "context_4h_structure": ctx4.structure, "context_4h_atr": atr4h,
+            "context_15m": ctx15.label, "context_15m_conf": ctx15.confidence,
+            "context_15m_slope_atr": ctx15.slope_atr, "context_15m_efficiency": ctx15.efficiency,
+            "context_15m_structure": ctx15.structure, "context_15m_atr": atr15m,
+            "context_aligned": bool(aligned_side), "context_direction": aligned_label,
+            "entry_5m_atr": atr, "atr_percentile": self._atr_pctile,
+            "bars_5m": len(c5), "bars_15m": len(c15), "bars_4h": len(c4h),
+            "authority": "STRUCTURAL_ONLY", "trigger": "WAIT", "block_reason": "EVALUATING",
         }
         if self._state in (EngineState.ENTERING, EngineState.IN_POSITION):
+            self._record_block("POSITION_LIFECYCLE_ACTIVE", trigger=self._state.value)
             return
         if self._signal is not None:
+            self._last_analysis.update({"state": EngineState.EXECUTABLE.value, "trigger": "SIGNAL_PENDING_EXECUTION", "block_reason": "NONE"})
             return
 
         if self._thesis is not None:
             if now - self._thesis.formed_at > 900.0:
+                self._last_analysis.update({"expired_thesis_age_sec": now - self._thesis.formed_at})
                 self._thesis = None
                 self._state = EngineState.SCANNING
             else:
                 self._try_reprice_thesis(self._thesis, liq_snapshot, price, atr, now)
-                if self._signal is not None:
-                    return
+                return
 
-        self._state = EngineState.CONTEXT_READY if (ctx4.side != 0 and ctx15.side != 0) else EngineState.SCANNING
-        fresh = self._fresh_5m_sweeps(liq_snapshot, now)
-        if not fresh:
-            self._last_scan_skip = {"no_fresh_5m_raid": 1}
+        self._state = EngineState.CONTEXT_READY if aligned_side else EngineState.SCANNING
+        self._last_analysis["state"] = self._state.value
+        if not aligned_side:
+            self._record_block("CONTEXT_NOT_ALIGNED")
             return
-        for sweep in sorted(fresh, key=lambda s: _f(getattr(s, "quality", 0.0)), reverse=True):
+        fresh = self._fresh_5m_sweeps(liq_snapshot, now)
+        self._last_analysis["fresh_5m_raid_count"] = len(fresh)
+        if not fresh:
+            self._record_block("AWAITING_FRESH_5M_LIQUIDITY_RAID")
+            return
+        for sweep in sorted(fresh, key=lambda sw: _f(getattr(sw, "quality", 0.0)), reverse=True):
             side = str(getattr(sweep, "direction", "") or "").lower()
             direction = 1 if side == "long" else (-1 if side == "short" else 0)
+            pool = getattr(sweep, "pool", None)
+            self._last_analysis.update({
+                "raid_side": side or "unknown", "raid_pool_side": str(getattr(getattr(pool, "side", None), "value", "") or ""),
+                "raid_price": _f(getattr(pool, "price", 0.0)), "raid_wick": _f(getattr(sweep, "wick_extreme", 0.0)),
+                "raid_quality": _f(getattr(sweep, "quality", 0.0)),
+                "raid_age_sec": max(0.0, now - _f(getattr(sweep, "detected_at", now))),
+            })
             if direction == 0:
+                self._record_block("INVALID_RAID_DIRECTION")
                 continue
-            # Context is directional permission: 4H and 15m must support delivery.
-            if ctx4.side != direction or ctx15.side != direction:
-                self._last_scan_skip = {"htf_not_aligned": 1}
+            if aligned_side != direction:
+                self._record_block("RAID_DIRECTION_OPPOSES_CONTEXT")
                 continue
             thesis = self._build_thesis(sweep, side, ctx4, ctx15, c5, atr, now)
             if thesis is None:
                 continue
             self._thesis = thesis
             self._state = EngineState.LIQUIDITY_RAID
+            self._last_analysis["state"] = self._state.value
             self._try_reprice_thesis(thesis, liq_snapshot, price, atr, now)
             return
+        if self._last_analysis.get("block_reason") == "EVALUATING":
+            self._record_block("NO_EXECUTABLE_ALIGNED_RAID")
 
     def get_signal(self) -> Optional[EntrySignal]:
         return self._signal
@@ -402,7 +451,7 @@ class ICTLiquidityEntryEngine:
         wick = _f(getattr(sweep, "wick_extreme", 0.0), recent_close)
         pre = candles_5m[max(0, idx - 12):idx]
         if len(pre) < 4:
-            self._last_scan_skip = {"insufficient_pre_raid_structure": 1}
+            self._record_block("INSUFFICIENT_PRE_RAID_STRUCTURE", pre_raid_bars=len(pre))
             return None
         if side == "long":
             mss = max(_f(c.get("h")) for c in pre)
@@ -412,13 +461,21 @@ class ICTLiquidityEntryEngine:
             mss = min(_f(c.get("l")) for c in pre)
             displacement = (wick - recent_close) / max(atr, _EPS)
             mss_broken = recent_close < mss
+        self._last_analysis.update({
+            "mss_level": mss, "mss_broken": bool(mss_broken),
+            "displacement_atr": displacement, "post_raid_close": recent_close,
+        })
         if not mss_broken or displacement <= 0:
-            self._last_scan_skip = {"awaiting_5m_mss_displacement": 1}
+            self._record_block("AWAITING_5M_MSS_DISPLACEMENT")
             return None
         fvg = _find_fvg(candles_5m, side, idx + 1, atr)
         if fvg is None or fvg.displacement_atr <= 0:
-            self._last_scan_skip = {"no_5m_displacement_fvg": 1}
+            self._record_block("AWAITING_5M_DISPLACEMENT_FVG")
             return None
+        self._last_analysis.update({
+            "fvg_low": fvg.low, "fvg_high": fvg.high, "fvg_equilibrium": fvg.equilibrium,
+            "fvg_displacement_atr": fvg.displacement_atr,
+        })
         return _Thesis(
             sweep_key=_sweep_key(sweep), side=side, sweep=sweep, formed_at=now,
             context_4h=ctx4, context_15m=ctx15, mss_level=mss,
@@ -428,26 +485,37 @@ class ICTLiquidityEntryEngine:
     def _try_reprice_thesis(self, thesis: _Thesis, snap: LiquidityMapSnapshot,
                             price: float, atr: float, now: float) -> None:
         zone_tol = 0.08 * atr
-        in_reprice = thesis.fvg.low - zone_tol <= price <= thesis.fvg.high + zone_tol
+        low_bound, high_bound = thesis.fvg.low - zone_tol, thesis.fvg.high + zone_tol
+        in_reprice = low_bound <= price <= high_bound
+        distance_to_zone = 0.0 if in_reprice else min(abs(price - low_bound), abs(price - high_bound))
+        self._last_analysis.update({
+            "state": self._state.value, "side": thesis.side,
+            "fvg_low": thesis.fvg.low, "fvg_high": thesis.fvg.high,
+            "fvg_equilibrium": thesis.fvg.equilibrium, "fvg_tolerance": zone_tol,
+            "fvg_distance_atr": distance_to_zone / max(atr, _EPS),
+            "displacement_atr": thesis.displacement_atr,
+            "thesis_age_sec": max(0.0, now - thesis.formed_at),
+        })
         if not in_reprice:
             thesis.last_reason = "MSS confirmed; awaiting 5m FVG rebalance"
-            self._last_analysis.update({
-                "state": self._state.value,
-                "trigger": "AWAITING_FVG_REBALANCE",
-                "side": thesis.side,
-                "displacement_atr": thesis.displacement_atr,
-                "fvg_low": thesis.fvg.low,
-                "fvg_high": thesis.fvg.high,
-            })
+            self._record_block("AWAITING_FVG_REBALANCE", trigger="AWAITING_FVG_REBALANCE")
             return
         entry = price
         stop = self._structural_stop(thesis, atr)
+        wick = _f(getattr(thesis.sweep, "wick_extreme", 0.0))
+        clearance = abs(stop - wick) if stop is not None else 0.0
+        self._last_analysis.update({
+            "entry": entry, "structural_stop": stop, "stop_clearance": clearance,
+            "stop_clearance_atr": clearance / max(atr, _EPS),
+        })
         if stop is None:
             thesis.last_reason = "invalid structural stop geometry"
+            self._record_block("INVALID_STRUCTURAL_STOP")
             return
         target = self._select_liquidity_target(thesis.side, entry, stop, snap, atr)
         if target is None:
             thesis.last_reason = "no opposing HTF liquidity with positive delivery utility"
+            self._record_block("AWAITING_POSITIVE_UTILITY_HTF_TARGET")
             return
         target_obj, tp, rr, utility, delivery_p = target
         quality = {
@@ -474,10 +542,15 @@ class ICTLiquidityEntryEngine:
         )
         self._state = EngineState.EXECUTABLE
         self._state_entered = now
+        self._last_scan_skip = {}
         self._last_analysis.update({
             "state": self._state.value, "side": thesis.side, "trigger": "EXECUTABLE_FVG_REPRICE",
-            "displacement_atr": thesis.displacement_atr, "entry": entry, "sl": stop, "tp": tp,
-            "rr": rr, "delivery_probability": delivery_p, "delivery_utility_r": utility,
+            "block_reason": "NONE", "displacement_atr": thesis.displacement_atr,
+            "entry": entry, "sl": stop, "tp": tp, "rr": rr,
+            "delivery_probability": delivery_p, "delivery_utility_r": utility,
+            "target_timeframe": str(getattr(target_obj.pool, "timeframe", "")),
+            "target_pool_price": _f(getattr(target_obj.pool, "price", 0.0)),
+            "target_significance": _f(getattr(target_obj, "significance", 0.0)),
         })
         logger.info("ICT_LIQUIDITY ENTRY READY %s @ %.4f | SL=%.4f TP=%.4f RR=%.2f | %s",
                     thesis.side.upper(), entry, stop, tp, rr, explanation)
@@ -498,48 +571,65 @@ class ICTLiquidityEntryEngine:
                                  snap: LiquidityMapSnapshot, atr: float
                                  ) -> Optional[Tuple[PoolTarget, float, float, float, float]]:
         risk = abs(entry - sl)
+        audit = {"pool_total": 0, "wrong_side": 0, "below_timeframe": 0,
+                 "rr_le_one": 0, "non_positive_utility": 0, "eligible": 0, "positive": 0}
         if risk <= _EPS:
+            self._last_analysis.update({"target_audit": audit, "target_block": "ZERO_STRUCTURAL_RISK"})
             return None
         pools = snap.bsl_pools if side == "long" else snap.ssl_pools
+        audit["pool_total"] = len(list(pools or []))
         candidates = []
         for t in list(pools or []):
             pool = getattr(t, "pool", None)
             px = _f(getattr(pool, "price", 0.0))
             if px <= 0 or (side == "long" and px <= entry) or (side == "short" and px >= entry):
+                audit["wrong_side"] += 1
                 continue
-            # Entry is 5m; delivery target must be 15m+ liquidity or promoted confluence.
             tf_rank = TF_HIERARCHY.get(str(getattr(pool, "timeframe", "1m")), 1)
             promoted = int(getattr(pool, "htf_count", 0) or 0) >= 2
             if tf_rank < _TF_15M_RANK and not promoted:
+                audit["below_timeframe"] += 1
                 continue
+            audit["eligible"] += 1
             dist = abs(px - entry)
-            # Rest the TP inside the pool so execution does not require a perfect touch.
             significance = max(0.01, _f(getattr(t, "significance", 0.0), 0.01))
             buffer = min(0.28 * atr, max(0.04 * atr, 0.04 * atr * math.log1p(significance)))
             tp = px - buffer if side == "long" else px + buffer
             reward = abs(tp - entry)
             rr = reward / risk
             if rr <= 1.0:
+                audit["rr_le_one"] += 1
                 continue
             distance_atr = dist / max(atr, _EPS)
-            # Delivery probability is a structural reach model, not an entry vote.
             context = 0.50 * (self._thesis.context_4h.confidence if self._thesis else 0.0) + 0.50 * (self._thesis.context_15m.confidence if self._thesis else 0.0)
             sig_term = math.tanh(significance / 5.0)
             dist_decay = math.exp(-max(0.0, distance_atr - 1.0) / 8.0)
             p = max(0.05, min(0.95, 0.18 + 0.34 * context + 0.30 * sig_term + 0.18 * dist_decay))
             utility = p * rr - (1.0 - p)
             if utility > 0:
-                candidates.append((utility, significance, -distance_atr, t, tp, rr, p))
+                audit["positive"] += 1
+                candidates.append((utility, significance, -distance_atr, t, tp, rr, p, buffer, distance_atr))
+            else:
+                audit["non_positive_utility"] += 1
+        self._last_analysis["target_audit"] = audit
         if not candidates:
             self._last_pool_plan = {"ts": time.time(), "role": "TP", "side": side,
                                     "summary": "no positive-utility opposing 15m+ pool"}
+            self._last_analysis["target_block"] = "NO_POSITIVE_UTILITY_OPPOSING_15M_PLUS_POOL"
             return None
         best = max(candidates, key=lambda x: (x[0], x[1], x[2]))
-        utility, _, _, target, tp, rr, p = best
+        utility, significance, _, target, tp, rr, p, buffer, distance_atr = best
         self._last_pool_plan = {
             "ts": time.time(), "role": "TP", "side": side,
             "summary": f"{target.pool.timeframe} {target.pool.side.value}@{target.pool.price:.4f} RR={rr:.2f} P={p:.2f} U={utility:+.2f}R",
         }
+        self._last_analysis.update({
+            "target_timeframe": str(getattr(target.pool, "timeframe", "")),
+            "target_pool_price": _f(getattr(target.pool, "price", 0.0)),
+            "target_tp_buffer": buffer, "target_distance_atr": distance_atr,
+            "target_significance": significance, "target_rr": rr,
+            "delivery_probability": p, "delivery_utility_r": utility,
+        })
         return target, tp, rr, utility, p
 
 

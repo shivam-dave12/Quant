@@ -80,7 +80,6 @@ def _cfg(name: str, default):
     val = getattr(config, name, None)
     return default if val is None else val
 
-_ADAPTIVE_PARAM_PROVIDER = None
 
 class QCfg:
     """Active venue/risk accessors used by the ICT/Liquidity lifecycle only."""
@@ -951,8 +950,11 @@ class QuantStrategy:
         self._exit_sync_in_progress = False
         self._tp_ladder_sync_in_progress = False
         self._last_exit_side = ""
-        self._last_think_log = 0.0
-        self._think_interval = 120.0
+        # Institutional decision tape: emit on material state/geometry changes and on a
+        # slow audit cadence only. This exposes calculations without per-tick spam.
+        self._last_decision_log = 0.0
+        self._last_decision_fingerprint = None
+        self._decision_snapshot_sec = float(getattr(config, "ICT_DECISION_SNAPSHOT_SEC", 60.0) or 60.0)
         self._last_reconcile_time = 0.0
         self._RECONCILE_SEC = 30.0
         self._reconcile_pending = False
@@ -1102,24 +1104,6 @@ class QuantStrategy:
             return 0.0
         return (risk_pct * price) / max(sl_dist, 1e-12)
 
-    def _aggressive_leverage_target(self, configured_leverage: float = None,
-                                    margin_intensity: float = 1.0) -> float:
-        """Institutional leverage target: press toward 40-45x, capped by venue max."""
-        exchange_max = max(float(QCfg.LEVERAGE() if configured_leverage is None else configured_leverage), 1.0)
-        low = max(1.0, float(_cfg("AGGRESSIVE_LEVERAGE_FLOOR", 40.0) or 40.0))
-        high = max(low, float(_cfg("AGGRESSIVE_LEVERAGE_TARGET", 45.0) or 45.0))
-        if exchange_max <= low:
-            return exchange_max
-        top = min(exchange_max, high)
-        pressure = math.sqrt(self._bounded(margin_intensity, 0.0, 1.0))
-        return self._bounded(low + (top - low) * pressure, 1.0, exchange_max)
-
-    def _aggressive_leverage_floor(self, configured_leverage: float = None) -> float:
-        """Preferred floor for the aggressive-leverage regime; not a trade veto."""
-        exchange_max = max(float(QCfg.LEVERAGE() if configured_leverage is None else configured_leverage), 1.0)
-        floor = max(1.0, float(_cfg("AGGRESSIVE_LEVERAGE_FLOOR", 40.0) or 40.0))
-        return min(exchange_max, floor)
-
     def _liquidation_safe_leverage_cap(self, side: str, entry: float, sl: float,
                                        configured_leverage: float = None) -> float:
         """Highest leverage that leaves the actual SL before the liquidation guard."""
@@ -1145,33 +1129,25 @@ class QuantStrategy:
                 hi = mid
         return max(1.0, lo)
 
-    def _effective_margin_risk_leverage(self, price: float, sl_dist: float,
-                                        risk_pct: float = None,
+    def _structural_funding_leverage(self, price: float, sl_dist: float,
                                         configured_leverage: float = None,
-                                        leverage_pressure: float = 1.0,
                                         side: str = None,
                                         sl_price: float = None,
-                                        margin_intensity: float = None) -> float:
-        """
-        Leverage asserted to the exchange before bracket placement.
+                                        target_margin_budget: float = None,
+                                        risk_capital: float = None) -> float:
+        """Select the minimum funded leverage required by structural risk geometry.
 
-        Dollar risk is controlled by quantity sizing.  Leverage is therefore
-        selected from the aggressive venue-max band first, then clipped only by
-        the actual SL/liquidation geometry.
+        Leverage is not an alpha preference or ROE target.  It is the lowest
+        integer leverage that can fund the approved structural-risk quantity
+        inside the instrument margin allocation, clipped by venue and
+        liquidation-protection limits.  When a preview caller has not yet
+        supplied capital terms, return only the safe liquidation cap.
         """
         configured = max(float(QCfg.LEVERAGE() if configured_leverage is None else configured_leverage), 1.0)
         price = float(price or 0.0)
         sl_dist = abs(float(sl_dist or 0.0))
         if price <= 0.0 or sl_dist <= 0.0:
             return 0.0
-        if margin_intensity is None:
-            margin_intensity = self._bounded((float(leverage_pressure or 1.0) - 1.0) / 0.85, 0.0, 1.0)
-            if abs(float(leverage_pressure or 1.0) - 1.0) <= 1e-9:
-                margin_intensity = 1.0
-        target = self._aggressive_leverage_target(
-            configured_leverage=configured,
-            margin_intensity=margin_intensity,
-        )
         side_l = str(side or "").lower()
         if sl_price is None:
             if side_l == "short":
@@ -1184,58 +1160,23 @@ class QuantStrategy:
             if side_l not in ("long", "short"):
                 side_l = "long" if sl < price else "short"
         liq_cap = self._liquidation_safe_leverage_cap(side_l, price, sl, configured_leverage=configured)
-        if liq_cap <= 0.0:
+        safe_cap = math.floor(min(configured, liq_cap)) if liq_cap > 0.0 else 0
+        if safe_cap < 1:
             return 0.0
-        return max(1.0, min(configured, math.floor(min(target, liq_cap))))
+        margin_budget = float(target_margin_budget or 0.0)
+        risk_budget = float(risk_capital or 0.0)
+        if margin_budget <= 0.0 or risk_budget <= 0.0:
+            return float(safe_cap)
+        qty_at_risk_budget = risk_budget / max(sl_dist, 1e-12)
+        target_notional = qty_at_risk_budget * price
+        min_required = max(1.0, math.ceil(target_notional / max(margin_budget, 1e-12) - 1e-12))
+        return float(min(safe_cap, int(min_required)))
 
-    def _roe_leverage_pressure(self, margin_intensity: float) -> float:
-        """Raise return on equity for approved trades without changing SL dollar risk."""
-        intensity = self._bounded(margin_intensity, 0.0, 1.0)
-        return self._bounded(1.25 + 0.55 * intensity, 1.20, 1.85)
-
-    def _daily_safe_margin_risk_cap(self, base_risk_pct: float) -> float:
-        """Dynamic upper bound for aggressive margin-risk per trade.
-
-        The bot is allowed to be aggressive, but a normal loss streak must still
-        fit inside the daily circuit.  This is derived from existing risk
-        controls instead of introducing another hard dollar cap.
-        """
-        base = max(float(base_risk_pct or 0.0), 0.0)
-        if base <= 0.0:
-            return 0.0
-        try:
-            daily_pct = float(_cfg("MAX_DAILY_LOSS_PCT", 10.0) or 10.0) / 100.0
-        except Exception:
-            daily_pct = 0.10
-        try:
-            max_losses = max(1.0, float(_cfg("MAX_CONSECUTIVE_LOSSES", 3) or 3))
-        except Exception:
-            max_losses = 3.0
-        # Keep a small daily-circuit reserve, while still allowing a strong setup
-        # to use materially more than the base per-margin risk.
-        streak_safe = max(base, daily_pct * 0.90 / max_losses)
-        return max(base, min(base * 3.0, streak_safe, 0.060))
-
-    def _delivery_margin_intensity(self, delivery_probability: float, fee_drag_mult: float = 1.0) -> float:
+    def _capital_allocation_scalar(self, delivery_probability: float, fee_drag_mult: float = 1.0) -> float:
         """Continuous allocation pressure from structural delivery and executable cost."""
         p = self._bounded(float(delivery_probability or 0.0), 0.10, 1.0)
         fee = self._bounded(float(fee_drag_mult or 1.0), 0.20, 1.0)
         return self._bounded((0.35 + 0.65 * p) * fee, 0.10, 1.0)
-
-    def _structural_margin_risk_pct(self, base_risk_pct: float, margin_intensity: float) -> float:
-        """Effective SL-risk as % of deployed margin for aggressive sizing.
-
-        Base RISK_PER_TRADE remains the conservative anchor.  Higher structural delivery probability
-        increases the allowed margin-risk toward the daily-loss-derived ceiling,
-        which permits higher leverage and fuller margin use without becoming
-        unlimited or notional-based.
-        """
-        base = self._risk_pct_fraction(base_risk_pct)
-        cap = self._daily_safe_margin_risk_cap(base)
-        if cap <= base:
-            return base
-        pressure = self._bounded(margin_intensity, 0.0, 1.0)
-        return base + (cap - base) * pressure
 
 
     def _sl_liquidation_sanity(self, side: str, entry: float, sl: float, leverage_override: float = None):
@@ -1814,6 +1755,84 @@ class QuantStrategy:
             target=_bg, daemon=True, name=f"enter-{mode}-{side}"
         ).start()
 
+    @staticmethod
+    def _decision_num(info: Dict[str, Any], key: str, default: float = 0.0) -> float:
+        try:
+            value = float(info.get(key, default) or default)
+            return value if math.isfinite(value) else default
+        except Exception:
+            return default
+
+    def _decision_fingerprint(self, info: Dict[str, Any]) -> tuple:
+        return (
+            str(info.get("state", "SCANNING")), str(info.get("block_reason", "")),
+            str(info.get("context_4h", "")), str(info.get("context_15m", "")),
+            str(info.get("context_direction", "")), str(info.get("trigger", "")),
+            str(info.get("side", info.get("raid_side", ""))),
+            round(self._decision_num(info, "raid_price"), 6),
+            round(self._decision_num(info, "mss_level"), 6),
+            round(self._decision_num(info, "fvg_low"), 6),
+            round(self._decision_num(info, "target_pool_price"), 6),
+        )
+
+    def _log_ict_decision_snapshot(self, info: Dict[str, Any], price: float, now: float, force: bool = False) -> None:
+        """Audit structural reasoning on transition plus periodic snapshot, never every tick."""
+        info = dict(info or {})
+        fp = self._decision_fingerprint(info)
+        changed = fp != getattr(self, "_last_decision_fingerprint", None)
+        base_interval = float(getattr(self, "_decision_snapshot_sec", 60.0) or 60.0)
+        interval = max(10.0, float(getattr(config, "ICT_DECISION_SNAPSHOT_SEC", base_interval) or base_interval))
+        periodic = (now - float(getattr(self, "_last_decision_log", 0.0) or 0.0)) >= interval
+        if not force and not changed and not periodic:
+            return
+        self._last_decision_fingerprint = fp
+        self._last_decision_log = now
+        mode = "TRANSITION" if changed else "SNAPSHOT"
+        spread = dict(getattr(self, "_last_spread_gate_context", {}) or {})
+        raid = "none"
+        if info.get("raid_side"):
+            raid = (f"{str(info.get('raid_side')).upper()}@{self._decision_num(info,'raid_price'):.4f}"
+                    f" wick={self._decision_num(info,'raid_wick'):.4f}"
+                    f" q={self._decision_num(info,'raid_quality'):.2f}"
+                    f" age={self._decision_num(info,'raid_age_sec'):.0f}s")
+        spread_txt = "n/a"
+        if spread:
+            spread_txt = (f"{float(spread.get('spread_bps',0.0) or 0.0):.2f}bps/"
+                          f"{float(spread.get('spread_atr',0.0) or 0.0):.3f}ATR"
+                          f" size×{float(spread.get('size_mult',1.0) or 1.0):.2f}"
+                          f" hard={'Y' if spread.get('hard_fail') else 'N'}")
+        logger.info(
+            "🧭 ICT_DECISION %s state=%s block=%s | mark=%.4f ATR5=%.4f pct=%.0f%% | "
+            "4H=%s conf=%.2f slope=%+.3fATR eff=%.2f struct=%+.0f ATR=%.4f | "
+            "15m=%s conf=%.2f slope=%+.3fATR eff=%.2f struct=%+.0f ATR=%.4f | "
+            "aligned=%s/%s | raid=%s | cost=%s",
+            mode, info.get("state", "SCANNING"), info.get("block_reason", "UNKNOWN"), price,
+            self._decision_num(info, "entry_5m_atr"), 100.0 * self._decision_num(info, "atr_percentile", 0.5),
+            info.get("context_4h", "WAIT"), self._decision_num(info, "context_4h_conf"),
+            self._decision_num(info, "context_4h_slope_atr"), self._decision_num(info, "context_4h_efficiency"),
+            self._decision_num(info, "context_4h_structure"), self._decision_num(info, "context_4h_atr"),
+            info.get("context_15m", "WAIT"), self._decision_num(info, "context_15m_conf"),
+            self._decision_num(info, "context_15m_slope_atr"), self._decision_num(info, "context_15m_efficiency"),
+            self._decision_num(info, "context_15m_structure"), self._decision_num(info, "context_15m_atr"),
+            "Y" if info.get("context_aligned") else "N", info.get("context_direction", "none"), raid, spread_txt,
+        )
+        if changed and any(k in info for k in ("mss_level", "fvg_low", "target_pool_price", "entry")):
+            audit = dict(info.get("target_audit", {}) or {})
+            logger.info(
+                "📐 ICT_GEOMETRY side=%s MSS=%.4f broken=%s disp=%.2fATR | FVG=[%.4f,%.4f] eq=%.4f gap=%.2fATR | "
+                "SL=%.4f clearance=%.2fATR | target=%s@%.4f eligible=%d/%d positive=%d RR=%.2f P=%.2f U=%+.2fR",
+                str(info.get("side", info.get("raid_side", "-"))).upper(), self._decision_num(info, "mss_level"),
+                "Y" if info.get("mss_broken") else "N", self._decision_num(info, "displacement_atr"),
+                self._decision_num(info, "fvg_low"), self._decision_num(info, "fvg_high"),
+                self._decision_num(info, "fvg_equilibrium"), self._decision_num(info, "fvg_distance_atr"),
+                self._decision_num(info, "structural_stop", self._decision_num(info, "sl")),
+                self._decision_num(info, "stop_clearance_atr"), info.get("target_timeframe", "-"),
+                self._decision_num(info, "target_pool_price"), int(audit.get("eligible", 0) or 0),
+                int(audit.get("pool_total", 0) or 0), int(audit.get("positive", 0) or 0),
+                self._decision_num(info, "rr", self._decision_num(info, "target_rr")),
+                self._decision_num(info, "delivery_probability"), self._decision_num(info, "delivery_utility_r"),
+            )
+
     def _evaluate_entry(self, data_manager, order_manager, risk_manager, now):
         """Evaluate exactly one 4H/15m/5m ICT + Liquidity thesis."""
         if self._entry_engine is None or self._liq_map is None:
@@ -1823,9 +1842,6 @@ class QuantStrategy:
             if now - self._last_watchdog_freeze_log >= 60.0:
                 self._last_watchdog_freeze_log = now
                 logger.info("ICT + Liquidity entries paused: watchdog circuit breaker engaged")
-            return
-        spread_ok, _ = self._spread_atr_gate(data_manager)
-        if not spread_ok:
             return
         try:
             price = float(data_manager.get_last_price() or 0.0)
@@ -1849,6 +1865,17 @@ class QuantStrategy:
         atr = float(self._atr_5m.atr or 0.0)
         if atr <= 1e-10:
             return
+        # Execution-cost control must use the current completed 5m ATR. Running this
+        # gate before ATR refresh could approve the first setup without a valid
+        # spread/volatility measurement.
+        spread_ok, _ = self._spread_atr_gate(data_manager)
+        if not spread_ok:
+            self._log_ict_decision_snapshot({
+                "state": self._entry_engine.state, "block_reason": "EXECUTION_SPREAD_HARD_BLOCK",
+                "trigger": "WAIT", "entry_5m_atr": atr,
+                "atr_percentile": self._atr_5m.get_percentile(), "authority": "STRUCTURAL_ONLY",
+            }, price, now)
+            return
         now_ms = int(now * 1000) if now < 1e12 else int(now)
         try:
             self._liq_map.update(candles_by_tf, price, atr, now)
@@ -1859,11 +1886,9 @@ class QuantStrategy:
         self._entry_engine.set_atr_pctile(self._atr_5m.get_percentile())
         self._entry_engine.update(snapshot, price, atr, now, candles_5m=c5, candles_15m=c15, candles_4h=c4h)
         signal = self._entry_engine.get_signal()
+        info = self._entry_engine.analysis_info or {}
+        self._log_ict_decision_snapshot(info, price, now, force=signal is not None)
         if signal is None:
-            if now - self._last_think_log >= self._think_interval:
-                self._last_think_log = now
-                info = self._entry_engine.analysis_info or {}
-                logger.info("ICT_LIQUIDITY SCAN state=%s 4H=%s 15m=%s trigger=%s price=%.4f", info.get("state", "SCANNING"), info.get("context_4h", "-"), info.get("context_15m", "-"), info.get("trigger", "WAIT"), price)
             return
         side = str(signal.side or "").lower()
         entry, sl, tp = float(signal.entry_price), float(signal.sl_price), float(signal.tp_price)
@@ -1886,7 +1911,14 @@ class QuantStrategy:
         sig.delivery_probability = float(signal.delivery_probability or 0.0)
         sig.structural_validation = signal.structural_validation
         cur = str(self._position_accounting_context().get("currency_symbol", "$"))
-        logger.info("ICT_LIQUIDITY APPROVED %s entry=%s%.4f SL=%s%.4f TP=%s%.4f RR=%.2f | %s", side.upper(), cur, entry, cur, sl, cur, tp, rr, signal.reason)
+        logger.info(
+            "✅ ICT_ORDER_THESIS %s entry=%s%.4f SL=%s%.4f TP=%s%.4f | risk=%.4f reward=%.4f RR=%.2f "
+            "deliveryP=%.2f utility=%+.2fR target=%s@%.4f | balance=%s%.2f risk_control=APPROVED | %s",
+            side.upper(), cur, entry, cur, sl, cur, tp, abs(entry - sl), abs(tp - entry), rr,
+            float(signal.delivery_probability or 0.0), self._decision_num(info, "delivery_utility_r"),
+            str(info.get("target_timeframe", "-")), self._decision_num(info, "target_pool_price"),
+            cur, total_bal, signal.reason,
+        )
         self._entry_engine.on_entry_placed(signal)
         self._launch_entry_async(data_manager, order_manager, risk_manager, side, sig, mode="ict_liquidity", setup_grade="STRUCTURAL", prefetched_bal_info=bal_info, entry_now=now)
 
@@ -2698,23 +2730,7 @@ class QuantStrategy:
             _release_icici_vehicle_if_unfilled("zero_stop_distance")
             return
         rr = td / sd
-        if not _icici_mode:
-            _liq_entry_ref = entry_ref
-            _liq_preview_lev = self._effective_margin_risk_leverage(
-                _liq_entry_ref, sd, side=side, sl_price=sl_price) or QCfg.LEVERAGE()
-            _liq_ok, _liq_px, _liq_guard, _liq_reason = self._sl_liquidation_sanity(
-                side, _liq_entry_ref, sl_price, leverage_override=_liq_preview_lev)
-            if not _liq_ok:
-                logger.warning(
-                    f"Entry rejected by liquidation guard: {side.upper()} "
-                    f"entry={_entry_cur}{_liq_entry_ref:,.1f} SL={_entry_cur}{sl_price:,.1f} lev={_liq_preview_lev:.0f}x | {_liq_reason}")
-                with self._lock:
-                    self._last_tp_gate_rejection = time.time()
-                return
-            logger.info(
-                f"Liquidation guard OK: est_liq={_entry_cur}{_liq_px:,.1f} lev={_liq_preview_lev:.0f}x "
-                f"guard={_entry_cur}{_liq_guard:,.1f} SL={_entry_cur}{sl_price:,.1f}")
-        else:
+        if _icici_mode:
             logger.info("ICICI long-premium option: liquidation guard skipped; paid premium is the maximum loss envelope")
 
         # ── Structural order sequence: size from exact invalidation distance ──────────────────────
@@ -2822,12 +2838,12 @@ class QuantStrategy:
                     return
                 _lev_action = "normalized" if _entry_leverage != _configured_leverage else "asserted"
                 logger.info(
-                    f"⚖️ Leverage {_lev_action} for margin-risk sizing: "
+                    f"⚖️ Leverage {_lev_action} for structural-risk funding: "
                     f"configured={_configured_leverage}x effective={_entry_leverage}x "
                     f"(SL risk≈{getattr(self, '_active_margin_risk_pct', 0.0) * 100.0:.2f}% of margin)")
             except Exception as _lev_e:
                 logger.warning(
-                    f"Entry rejected: failed to assert margin-risk leverage "
+                    f"Entry rejected: failed to assert capital-efficient leverage "
                     f"{_entry_leverage}x before order: {_lev_e}")
                 with self._lock:
                     self._last_tp_gate_rejection = time.time()
@@ -2838,7 +2854,7 @@ class QuantStrategy:
         logger.info(
             f"ENTERING {side.upper()} @ {_entry_cur}{entry_ref:,.2f} | qty={qty} | "
             f"SL={_entry_cur}{sl_price:,.2f} TP={_entry_cur}{tp_price:,.2f} payoff/risk=1:{rr:.2f} | "
-            f"lev={_entry_leverage}x margin-risk≈{getattr(self, '_active_margin_risk_pct', 0.0) * 100.0:.2f}% | "
+            f"lev={_entry_leverage}x funded_margin_SL_risk≈{getattr(self, '_active_margin_risk_pct', 0.0) * 100.0:.2f}% | "
             f"{'maker' if use_maker else 'taker'} | {_sig_diag}"
         )
 
@@ -4088,7 +4104,7 @@ class QuantStrategy:
             policy_risk_mult = float(policy_value("risk_multiplier", 1.0))
         except Exception:
             policy_risk_mult = 1.0
-        total_mult = max(0.10, min(1.0, delivery_p * spread_cost_mult * policy_risk_mult))
+        allocation_scalar = max(0.05, min(1.0, delivery_p * spread_cost_mult * policy_risk_mult))
 
         # ── Available balance (reuse prefetched — SIG-8 fix) ─────────────────
         bal = prefetched_bal_info if prefetched_bal_info is not None else risk_manager.get_available_balance()
@@ -4135,8 +4151,8 @@ class QuantStrategy:
                 f"MIN_MARGIN_USDT {QCfg.MIN_MARGIN_USDT():.2f}"
             )
             return None
-        # ── BUG 3 FIX: commission reserve ─────────────────────────────────────
-        # Reserve: we charge an aggressive 2× the live taker rate (entry taker
+        # ── Execution-cost reserve ─────────────────────────────────────
+        # Reserve: charge a conservative 2× the live taker rate (entry taker
         # worst-case + exit taker) plus a 15 % safety margin for slippage
         # variance.  For a 446-unit notional at COMMISSION_RATE=0.00055 this
         # reserves about 0.56 units — enough to clear Delta's internal commission check
@@ -4181,13 +4197,13 @@ class QuantStrategy:
                 0.20,
                 1.0 - ((fee_to_risk - fee_soft) / (fee_no_alloc - fee_soft)) * 0.80,
             )
-            total_mult *= fee_drag_mult
+            allocation_scalar *= fee_drag_mult
             logger.info(
                 f"Execution-cost allocation haircut: fee_to_risk={fee_to_risk:.2f}R "
                 f"soft={fee_soft:.2f} no_alloc={fee_no_alloc:.2f} "
                 f"size_mult*={fee_drag_mult:.2f}")
 
-        # ── Risk-based sizing (CRIT-1 fix) ────────────────────────────────────
+        # ── Structural risk allocation ────────────────────────────────────
         # risk_pct: fraction of allocated margin to risk at SL (e.g. 0.015 = 1.5%)
         raw_risk_pct = float(_cfg("RISK_PER_TRADE", 0.006))
         risk_pct = self._risk_pct_fraction(raw_risk_pct)
@@ -4224,45 +4240,43 @@ class QuantStrategy:
         policy_target_margin = margin_budget_base * policy_margin_frac
         margin_capacity = cash_available
 
-        # Structural delivery allocation maps the thesis into margin usage.
-        margin_intensity = self._delivery_margin_intensity(delivery_p, fee_drag_mult)
-        target_margin_budget = min(margin_capacity, policy_target_margin * margin_intensity)
-        effective_risk_pct = self._structural_margin_risk_pct(risk_pct, margin_intensity)
-        roe_leverage_pressure = self._roe_leverage_pressure(margin_intensity)
+        # Structural delivery and measured execution costs can reduce capital
+        # allocation, but never increase the configured account-risk budget.
+        allocation_intensity = self._capital_allocation_scalar(delivery_p, fee_drag_mult)
+        allocation_intensity = max(0.05, min(1.0, allocation_intensity * spread_cost_mult * policy_risk_mult))
+        allocation_scalar = min(allocation_scalar, allocation_intensity)
+        target_margin_budget = min(margin_capacity, policy_target_margin * allocation_intensity)
+        effective_risk_pct = risk_pct
+        target_risk_base = target_margin_budget
+        risk_capital = target_risk_base * effective_risk_pct
 
-        # ── Margin-risk leverage normalization ───────────────────────────────
-        # Leverage is now selected aggressively from the dynamic margin-risk
-        # allowance and ROE pressure, not from the conservative base risk alone.
-        # This gives the bot higher leverage on approved trades while keeping
-        # the SL loss inside the daily-circuit-derived risk envelope.
+        # ── Capital-efficient structural leverage ────────────────────────────
+        # Select only the leverage required to fund the structural risk quantity
+        # inside allocated margin.  It is then clipped by venue and liquidation
+        # safety caps; there is no fixed leverage floor or ROE target.
         configured_leverage = max(float(QCfg.LEVERAGE()), 1.0)
-        risk_leverage_target = self._aggressive_leverage_target(
-            configured_leverage=configured_leverage,
-            margin_intensity=margin_intensity,
-        )
         liquidation_leverage_cap = self._liquidation_safe_leverage_cap(
             exec_side, price, sl_price, configured_leverage=configured_leverage,
         )
+        required_capital_leverage = max(
+            1.0,
+            ((risk_capital / max(sl_dist, 1e-12)) * price) / max(target_margin_budget, 1e-12),
+        ) if target_margin_budget > 0.0 and risk_capital > 0.0 else 1.0
         if liquidation_leverage_cap <= 0.0:
             logger.warning(
-                f"Sizing rejected: SL is beyond liquidation guard for risk-normalised leverage | "
-                f"base_risk={risk_pct:.3%} effective_risk={effective_risk_pct:.3%} "
-                f"price={price:.2f} SL-dist={sl_dist:.2f}pts "
-                f"exchange_max={configured_leverage:.0f}x")
+                f"Sizing rejected: SL is beyond liquidation guard | "
+                f"risk_budget={risk_capital:.2f} risk_pct={effective_risk_pct:.3%} "
+                f"price={price:.2f} SL-dist={sl_dist:.2f}pts exchange_max={configured_leverage:.0f}x")
             return None
-        effective_leverage = self._effective_margin_risk_leverage(
-            price, sl_dist, risk_pct=effective_risk_pct,
-            configured_leverage=configured_leverage,
-            leverage_pressure=roe_leverage_pressure,
-            side=exec_side,
-            sl_price=sl_price,
-            margin_intensity=margin_intensity,
+        effective_leverage = self._structural_funding_leverage(
+            price, sl_dist, configured_leverage=configured_leverage,
+            side=exec_side, sl_price=sl_price,
+            target_margin_budget=target_margin_budget, risk_capital=risk_capital,
         )
         if not math.isfinite(effective_leverage) or effective_leverage < 1.0:
             logger.warning(
-                f"Sizing rejected: no executable risk-normalised leverage | "
-                f"target={risk_leverage_target:.1f}x "
-                f"liq_cap={liquidation_leverage_cap:.1f}x "
+                f"Sizing rejected: no executable capital-efficient leverage | "
+                f"required={required_capital_leverage:.2f}x liq_cap={liquidation_leverage_cap:.1f}x "
                 f"exchange_max={configured_leverage:.0f}x")
             return None
         leverage = float(effective_leverage)
@@ -4274,7 +4288,7 @@ class QuantStrategy:
                 f"Sizing rejected: dynamic margin target is zero | "
                 f"cash_available={cash_available:.2f} available={available:.2f} "
                 f"policy_margin={policy_margin_frac:.1%} margin_base={margin_budget_base:.2f} "
-                f"margin_intensity={margin_intensity:.2f}")
+                f"allocation_intensity={allocation_intensity:.2f}")
             return None
         if margin_capacity <= 1e-9:
             logger.warning(
@@ -4303,12 +4317,8 @@ class QuantStrategy:
                 f"cash_available={cash_available:.2f} slot_available={available:.2f} step={step:.8f}")
             return None
 
-        # RISK_PER_TRADE is margin-based, not notional/equity based.  The
-        # aggressive allocator does not multiply the risk budget down to dust;
-        # instead it selects a dynamic margin-risk percentage bounded by the
-        # daily circuit and then sizes against the bracket SL.
-        target_risk_base = target_margin_budget
-        risk_capital = target_risk_base * effective_risk_pct
+        # Risk capital is fixed before leverage selection and quantity rounding;
+        # leverage only governs funded margin, never the approved stop-loss budget.
         qty_by_risk = risk_capital / sl_dist
         qty_by_target_margin = target_margin_budget * leverage / price
         qty_raw = min(qty_by_risk, qty_by_target_margin, executable_qty_cap)
@@ -4419,7 +4429,7 @@ class QuantStrategy:
             f"✅ Sizing [ict_liquidity_structural_risk] | "
             f"RISK_BASE={risk_pct:.3%} RISK_EFF={effective_risk_pct:.3%} | "
             f"deliveryP={delivery_p:.2f} "
-            f"raw_mult={total_mult:.2f} margin_intensity={margin_intensity:.2f} "
+            f"allocation_scalar={allocation_scalar:.2f} allocation_intensity={allocation_intensity:.2f} "
             f"(delivery={delivery_p:.2f} fee={fee_drag_mult:.2f}) | "
             f"target_risk={risk_capital:.2f} risk_qty={qty_by_risk:.4f} "
             f"margin_qty={qty_by_target_margin:.4f} raw_qty={qty_raw:.4f} | "
@@ -4427,8 +4437,8 @@ class QuantStrategy:
             f"({risk_pct_act:.2f}% risk-base; {slot_risk_pct:.2f}% slot) | "
             f"margin={margin_used:.2f} target={target_margin_budget:.2f} "
             f"policy_target={policy_target_margin:.2f} min={min_trade_margin:.2f} cap={max_allowed_margin:.2f} | "
-            f"lev={leverage:.0f}x target={risk_leverage_target:.1f}x "
-            f"liq_cap={liquidation_leverage_cap:.1f}x roe_pressure={roe_leverage_pressure:.2f} "
+            f"lev={leverage:.0f}x required={required_capital_leverage:.2f}x "
+            f"liq_cap={liquidation_leverage_cap:.1f}x venue_cap={configured_leverage:.0f}x "
             f"margin_risk={self._active_margin_risk_pct:.2%} | "
             f"fees≈{actual_fees:.3f} ({fee_to_risk:.2f}R) | "
             f"cash={required_cash:.2f}/{cash_available:.2f} | "

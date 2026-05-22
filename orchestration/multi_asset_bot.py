@@ -316,6 +316,57 @@ class MultiAssetQuantBot:
         return "\n".join(lines)
 
 
+    def format_portfolio_status_report(self) -> str:
+        """Multi-desk operator status; do not collapse the portfolio to one asset."""
+        return self.format_assets_report()
+
+    def format_portfolio_thinking_report(self) -> str:
+        """On-demand calculation tape for every desk; rich detail without periodic spam."""
+        lines = [
+            "🏛 <b>ICT + LIQUIDITY DECISION BOOK</b>",
+            "<code>4H context → 15m confirmation → 5m raid/MSS/FVG → protected execution</code>",
+            "<i>Logs emit on transition and one slow audit snapshot; this view is full on-demand detail.</i>",
+        ]
+        for ctx in self.contexts:
+            inst = ctx.instrument
+            cur = self._currency_for_instrument(inst)
+            eng = getattr(ctx.strategy, "_entry_engine", None)
+            info = eng.analysis_info if eng is not None else {}
+            try:
+                mark = float(ctx.data_manager.get_last_price() or info.get("price", 0.0) or 0.0)
+            except Exception:
+                mark = float(info.get("price", 0.0) or 0.0)
+            state = str(info.get("state", "WARMUP" if ctx.ready else "DORMANT"))
+            block = str(info.get("block_reason", "DATA_NOT_STARTED" if not ctx.ready else "WAIT"))
+            if not ctx.ready and self._is_icici_context(ctx):
+                is_open, reason = self._icici_market_open()
+                if not is_open:
+                    state, block = "DORMANT", reason
+            lines.append(f"\n<b>{self._esc(inst.asset_id)} · {self._esc(inst.primary_exchange.value.upper())}:{self._esc(inst.display_symbol)}</b>  <code>{self._esc(state)}</code>")
+            lines.append(f"<code>mark {cur}{mark:,.4f} | block {self._esc(block)}</code>")
+            if info:
+                lines.append(
+                    f"<code>4H {self._esc(info.get('context_4h','-'))} p={float(info.get('context_4h_conf',0) or 0):.2f} "
+                    f"slope={float(info.get('context_4h_slope_atr',0) or 0):+.3f}ATR eff={float(info.get('context_4h_efficiency',0) or 0):.2f} "
+                    f"ATR={float(info.get('context_4h_atr',0) or 0):.4f}</code>"
+                )
+                lines.append(
+                    f"<code>15m {self._esc(info.get('context_15m','-'))} p={float(info.get('context_15m_conf',0) or 0):.2f} "
+                    f"slope={float(info.get('context_15m_slope_atr',0) or 0):+.3f}ATR eff={float(info.get('context_15m_efficiency',0) or 0):.2f} "
+                    f"ATR={float(info.get('context_15m_atr',0) or 0):.4f} | aligned={'Y' if info.get('context_aligned') else 'N'}</code>"
+                )
+                lines.append(f"<code>5m ATR={float(info.get('entry_5m_atr',0) or 0):.4f} pct={100*float(info.get('atr_percentile',0) or 0):.0f}% trigger={self._esc(info.get('trigger','WAIT'))}</code>")
+                if info.get("raid_side"):
+                    lines.append(f"<code>raid {self._esc(str(info.get('raid_side')).upper())} @{float(info.get('raid_price',0) or 0):.4f} wick={float(info.get('raid_wick',0) or 0):.4f} q={float(info.get('raid_quality',0) or 0):.2f} age={float(info.get('raid_age_sec',0) or 0):.0f}s</code>")
+                if info.get("mss_level") is not None:
+                    lines.append(f"<code>MSS={float(info.get('mss_level',0) or 0):.4f} broken={'Y' if info.get('mss_broken') else 'N'} disp={float(info.get('displacement_atr',0) or 0):.2f}ATR | FVG=[{float(info.get('fvg_low',0) or 0):.4f},{float(info.get('fvg_high',0) or 0):.4f}]</code>")
+                if info.get("target_pool_price") is not None:
+                    lines.append(f"<code>target {self._esc(info.get('target_timeframe','-'))}@{float(info.get('target_pool_price',0) or 0):.4f} RR={float(info.get('rr', info.get('target_rr',0)) or 0):.2f} P={float(info.get('delivery_probability',0) or 0):.2f} U={float(info.get('delivery_utility_r',0) or 0):+.2f}R</code>")
+            pos = ctx.strategy.get_position()
+            if pos:
+                lines.append("🔒 <i>Broker-protected position active; exact-fill reconciliation armed.</i>")
+        return "\n".join(lines)
+
     # ---------------------------------------------------------------------
     # Institutional command-center reports used by Telegram commands.
     # Portfolio command-center reports used by Telegram commands.
@@ -1029,14 +1080,9 @@ class MultiAssetQuantBot:
                 logger.info("%s | %s", ctx.instrument.asset_id, msg)
 
     def _maybe_analysis_audit(self, ctx: AssetContext, dt_ms: float) -> None:
-        """Per-contract proof-of-analysis log.
-
-        This is deliberately separate from strategy internals.  It shows the
-        scanner is actually stepping every active contract, even when the
-        contract has no approved structural thesis or protected position to report.
-        """
+        """Slow execution-health proof; structural reasoning is logged by strategy transitions."""
         now = time.time()
-        interval = float(getattr(config, "SCANNER_ASSET_ANALYSIS_LOG_SEC", 15.0))
+        interval = float(getattr(config, "SCANNER_ASSET_ANALYSIS_LOG_SEC", 60.0))
         if interval <= 0 or now - ctx.last_analysis_sec < interval:
             return
         ctx.last_analysis_sec = now
@@ -1044,12 +1090,15 @@ class MultiAssetQuantBot:
             inst = ctx.instrument
             price = ctx.data_manager.get_last_price()
             pos = ctx.strategy.get_position()
-            state = ctx.phase_name if pos else "SCANNING"
+            engine = getattr(ctx.strategy, "_entry_engine", None)
+            info = engine.analysis_info if engine is not None else {}
+            state = ctx.phase_name if pos else str(info.get("state", "WARMUP"))
+            block = str(info.get("block_reason", "WAITING_FOR_FIRST_DECISION"))
             with instrument_scope(inst):
                 logger.info(
-                    "ANALYSIS_TICK asset=%s primary=%s symbol=%s state=%s price=%.4f eval_ms=%.1f slots=%d/%d %s",
+                    "🩺 DESK_HEALTH asset=%s venue=%s symbol=%s state=%s block=%s mark=%.4f eval_ms=%.1f slots=%d/%d %s",
                     inst.asset_id, inst.primary_exchange.value.upper(), inst.display_symbol,
-                    state, price, dt_ms, self.guard.count_open(self.contexts), self.guard.max_open_positions,
+                    state, block, price, dt_ms, self.guard.count_open(self.contexts), self.guard.max_open_positions,
                     self.guard.report_line(ctx),
                 )
         except Exception as e:
