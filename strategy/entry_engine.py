@@ -28,9 +28,9 @@ from enum import Enum
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
-    from strategy.liquidity_map import LiquidityMapSnapshot, PoolTarget, SweepResult, TF_HIERARCHY
+    from strategy.liquidity_map import LiquidityMapSnapshot, PoolTarget, SweepResult, TF_HIERARCHY, _last_closed_candle_idx
 except ImportError:  # pragma: no cover
-    from liquidity_map import LiquidityMapSnapshot, PoolTarget, SweepResult, TF_HIERARCHY  # type: ignore
+    from liquidity_map import LiquidityMapSnapshot, PoolTarget, SweepResult, TF_HIERARCHY, _last_closed_candle_idx  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -137,10 +137,11 @@ def _f(x: Any, default: float = 0.0) -> float:
         return default
 
 
-def _closed(candles: Optional[Sequence[Dict]], minimum: int = 0) -> List[Dict]:
+def _closed(candles: Optional[Sequence[Dict]], minimum: int = 0,
+            timeframe: str = "5m", now: Optional[float] = None) -> List[Dict]:
     rows = list(candles or [])
-    # Data managers deliver the latest still-forming candle; structure never reads it.
-    rows = rows[:-1] if len(rows) > 1 else []
+    idx = _last_closed_candle_idx(rows, timeframe, time.time() if now is None else float(now))
+    rows = rows[:idx + 1] if idx >= 0 else []
     return rows if len(rows) >= minimum else []
 
 
@@ -356,9 +357,9 @@ class ICTLiquidityEntryEngine:
             self._last_scan_skip = {"invalid_price_or_5m_atr": 1}
             return
         self._expire(now)
-        c5 = _closed(candles_5m, 24)
-        c15 = _closed(candles_15m, 24)
-        c4h = _closed(candles_4h, 20)
+        c5 = _closed(candles_5m, 24, "5m", now)
+        c15 = _closed(candles_15m, 24, "15m", now)
+        c4h = _closed(candles_4h, 20, "4h", now)
         if not c5 or not c15 or not c4h:
             self._last_analysis = {
                 "model": "ICT_LIQUIDITY_4H_15M_5M", "state": self._state.value,
@@ -425,12 +426,27 @@ class ICTLiquidityEntryEngine:
                 return
 
         fresh = self._fresh_5m_sweeps(liq_snapshot, now)
+        parent_htf = self._fresh_parent_htf_sweeps(liq_snapshot, now)
+        parent_best = parent_htf[0] if parent_htf else None
+        parent_pool = getattr(parent_best, "pool", None) if parent_best is not None else None
         self._last_analysis.update({"fresh_5m_raid_count": len(fresh), "aligned_5m_raid_count": 0,
-                                    "opposed_5m_raid_count": 0, "invalid_5m_raid_count": 0})
+                                    "opposed_5m_raid_count": 0, "invalid_5m_raid_count": 0,
+                                    "parent_htf_raid_count": len(parent_htf),
+                                    "parent_htf_raid_side": str(getattr(parent_best, "direction", "") or ""),
+                                    "parent_htf_raid_tf": str(getattr(parent_pool, "timeframe", "") or ""),
+                                    "parent_htf_raid_price": _f(getattr(parent_pool, "price", 0.0)),
+                                    "parent_htf_raid_wick": _f(getattr(parent_best, "wick_extreme", 0.0)),
+                                    "parent_htf_raid_quality": _f(getattr(parent_best, "quality", 0.0)),
+                                    "parent_htf_raid_age_sec": (max(0.0, now - _f(getattr(parent_best, "detected_at", now)))
+                                                                if parent_best is not None else 0.0)})
         self._state = EngineState.CONTEXT_READY
         self._last_analysis["state"] = self._state.value
         if not fresh:
-            self._record_block("AWAITING_FRESH_5M_LIQUIDITY_RAID")
+            if parent_htf:
+                self._record_block("AWAITING_FRESH_5M_CONFIRMATION_AFTER_HTF_RAID",
+                                   trigger="WAIT_FOR_5M_RAID_MSS_FVG")
+            else:
+                self._record_block("AWAITING_FRESH_5M_LIQUIDITY_RAID")
             return
         for sweep in sorted(fresh, key=lambda sw: _f(getattr(sw, "quality", 0.0)), reverse=True):
             side = str(getattr(sweep, "direction", "") or "").lower()
@@ -593,12 +609,36 @@ class ICTLiquidityEntryEngine:
             out.append(sw)
         return out
 
+    def _fresh_parent_htf_sweeps(self, snap: LiquidityMapSnapshot, now: float) -> List[SweepResult]:
+        out = []
+        max_age_by_tf = {
+            "15m": 1800.0,
+            "30m": 3600.0,
+            "1h": 7200.0,
+            "2h": 14400.0,
+            "4h": 28800.0,
+            "1d": 86400.0,
+        }
+        for sw in list(getattr(snap, "recent_sweeps", []) or []):
+            pool = getattr(sw, "pool", None)
+            tf = str(getattr(pool, "timeframe", "") or "").lower()
+            max_age = max_age_by_tf.get(tf)
+            if max_age is None:
+                continue
+            age = max(0.0, now - _f(getattr(sw, "detected_at", 0.0)))
+            if age > max_age or _sweep_key(sw) in self._processed:
+                continue
+            out.append(sw)
+        return sorted(out, key=lambda sw: _f(getattr(sw, "quality", 0.0)), reverse=True)
+
     def _build_thesis(self, sweep: SweepResult, side: str, ctx4: _TrendContext,
                       ctx15: _TrendContext, context_decision: _ContextDecision,
                       candles_5m: List[Dict], atr: float,
                       now: float) -> Optional[_Thesis]:
         idx = int(getattr(sweep, "sweep_candle_idx", len(candles_5m) - 4) or 0)
-        idx = max(3, min(idx, len(candles_5m) - 2))
+        if idx >= len(candles_5m):
+            idx = len(candles_5m) - 1
+        idx = max(3, min(idx, len(candles_5m) - 1))
         recent_close = _f(candles_5m[-1].get("c"))
         wick = _f(getattr(sweep, "wick_extreme", 0.0), recent_close)
         pre = candles_5m[max(0, idx - 12):idx]

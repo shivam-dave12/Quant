@@ -2,7 +2,7 @@ from pathlib import Path
 import inspect
 import pytest
 
-from strategy.entry_engine import EntryEngine, EntryType
+from strategy.entry_engine import EntryEngine, EntryType, _closed
 from strategy.quant_strategy import QuantStrategy
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,7 +51,7 @@ def test_structural_tp_cannot_use_external_alpha_overlay():
 
 from types import SimpleNamespace
 import time
-from strategy.liquidity_map import LiquidityPool, PoolSide, PoolStatus, PoolTarget, SweepResult, LiquidityMapSnapshot
+from strategy.liquidity_map import LiquidityPool, PoolSide, PoolStatus, PoolTarget, SweepResult, LiquidityMapSnapshot, _TimeframeRegistry
 
 
 def _snap(*, bsl=None, ssl=None, sweeps=None):
@@ -72,6 +72,24 @@ def test_only_fresh_five_minute_raids_can_trigger_entry():
     stale = SweepResult(old_pool, 5, 96.8, 0.5, 1.0, 0.8, "long", now - 700)
     accepted = EntryEngine()._fresh_5m_sweeps(_snap(sweeps=[fresh, htf, stale]), now)
     assert accepted == [fresh]
+
+
+def test_parent_htf_raid_is_reported_but_waits_for_5m_confirmation():
+    now = time.time()
+    c4h = _ranging_candles(30)
+    c15 = _trend_candles(-0.70, 34)
+    c5 = _ranging_candles(34)
+    parent_pool = LiquidityPool(101.0, PoolSide.BSL, "15m", status=PoolStatus.SWEPT, created_at=now - 40)
+    parent_raid = SweepResult(parent_pool, 20, 102.0, 1.0, 1.5, 0.92, "short", now - 30)
+    engine = EntryEngine()
+    engine.update(_snap(sweeps=[parent_raid]), price=99.50, atr=1.0, now=now,
+                  candles_5m=c5, candles_15m=c15, candles_4h=c4h)
+    info = engine.analysis_info
+    assert engine.get_signal() is None
+    assert info["fresh_5m_raid_count"] == 0
+    assert info["parent_htf_raid_count"] == 1
+    assert info["parent_htf_raid_tf"] == "15m"
+    assert info["block_reason"] == "AWAITING_FRESH_5M_CONFIRMATION_AFTER_HTF_RAID"
 
 
 def test_structural_stop_is_beyond_raided_wick_with_volatility_clearance():
@@ -112,6 +130,37 @@ def _trend_candles(step: float, n: int):
 
 def _ranging_candles(n: int, base: float = 100.0):
     return [{"o": base, "h": base + 1.0, "l": base - 1.0, "c": base + 0.10} for _ in range(n)]
+
+
+def _timestamped_candles(n: int, tf_sec: int, last_start: float, base: float = 100.0):
+    first = int(last_start - (n - 1) * tf_sec)
+    return [
+        {"t": (first + i * tf_sec) * 1000, "o": base, "h": base + 0.4,
+         "l": base - 0.4, "c": base + 0.1, "v": 100.0}
+        for i in range(n)
+    ]
+
+
+def test_closed_bar_selection_uses_feed_timestamp_not_blind_tail_drop():
+    now = 1_900_000_000.0
+    closed_only = _timestamped_candles(30, 300, now - 300)
+    forming_tail = _timestamped_candles(30, 300, now - 60)
+    assert _closed(closed_only, 1, "5m", now) == closed_only
+    assert _closed(forming_tail, 1, "5m", now) == forming_tail[:-1]
+
+
+def test_sweep_detection_uses_latest_closed_bar_when_feed_has_no_forming_tail():
+    now = 1_900_000_000.0
+    candles = _timestamped_candles(30, 300, now - 300)
+    candles[-1] = {"t": int((now - 300) * 1000), "o": 100.2, "h": 100.8,
+                   "l": 99.7, "c": 99.8, "v": 200.0}
+    reg = _TimeframeRegistry("5m")
+    reg._bsl = [LiquidityPool(100.0, PoolSide.BSL, "5m",
+                              status=PoolStatus.DETECTED, created_at=now - 3600)]
+    sweeps = reg.check_sweeps(candles, atr=1.0, now=now)
+    assert len(sweeps) == 1
+    assert sweeps[0].direction == "short"
+    assert sweeps[0].sweep_candle_idx == len(candles) - 1
 
 
 def _short_raid_candles():

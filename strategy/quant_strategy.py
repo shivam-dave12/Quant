@@ -1920,6 +1920,13 @@ class QuantStrategy:
         elif info.get("candidate_raid_side"):
             raid = (f"REJECTED:{str(info.get('candidate_raid_side')).upper()}@{self._decision_fmt(info,'candidate_raid_price')} "
                     f"q={self._decision_fmt(info,'candidate_raid_quality','.2f')}")
+        parent_raid = "none"
+        if int(info.get("parent_htf_raid_count", 0) or 0) > 0:
+            parent_raid = (f"{str(info.get('parent_htf_raid_side') or '').upper() or 'UNK'}"
+                           f"[{info.get('parent_htf_raid_tf') or '?'}]@{self._decision_fmt(info,'parent_htf_raid_price')} "
+                           f"wick={self._decision_fmt(info,'parent_htf_raid_wick')} "
+                           f"q={self._decision_fmt(info,'parent_htf_raid_quality','.2f')} "
+                           f"age={self._decision_fmt(info,'parent_htf_raid_age_sec','.0f')}s")
         if spread:
             age = spread.get("book_age_sec")
             age_txt = f"{float(age):.2f}s" if age is not None else "N/A"
@@ -1932,7 +1939,7 @@ class QuantStrategy:
             "🧭 ICT_DECISION %s state=%s block=%s | domain=%s mark=%s ATR5=%s pct=%s%% | "
             "4H=%s score=%s=[slope%s+struct%s] threshold=±%s ATR=%s | "
             "15m=%s score=%s=[slope%s+struct%s] threshold=±%s ATR=%s | "
-            "bias=%s dir=%s score=%s strict=%s raids=fresh:%d accepted:%d opposed:%d invalid:%d accepted=%s | cost=%s",
+            "bias=%s dir=%s score=%s strict=%s raids=fresh5m:%d parent_htf:%d accepted:%d opposed:%d invalid:%d accepted=%s parent=%s | cost=%s",
             mode, info.get("state", "SCANNING"), info.get("block_reason", "UNKNOWN"), self._analysis_unit(),
             self._decision_fmt({"v": price}, "v"), self._decision_fmt(info,"entry_5m_atr"),
             self._decision_fmt({"p": 100.0*self._decision_num(info,"atr_percentile",0.5)},"p",".0f"),
@@ -1945,8 +1952,9 @@ class QuantStrategy:
             info.get("context_bias_path", "AWAITING_5M_DOL"), info.get("context_direction", "none"),
             self._decision_fmt(info, "context_delivery_score", ".2f"),
             "Y" if info.get("context_aligned") else "N",
-            int(info.get("fresh_5m_raid_count",0) or 0), int(info.get("aligned_5m_raid_count",0) or 0),
-            int(info.get("opposed_5m_raid_count",0) or 0), int(info.get("invalid_5m_raid_count",0) or 0), raid, spread_txt,
+            int(info.get("fresh_5m_raid_count",0) or 0), int(info.get("parent_htf_raid_count",0) or 0),
+            int(info.get("aligned_5m_raid_count",0) or 0), int(info.get("opposed_5m_raid_count",0) or 0),
+            int(info.get("invalid_5m_raid_count",0) or 0), raid, parent_raid, spread_txt,
         )
         lineage = dict(quality.get("lineage", {}) or {})
         frames = dict(quality.get("frames", {}) or {})

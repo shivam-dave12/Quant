@@ -396,6 +396,29 @@ def _ts_to_epoch_seconds(ts: int | float | None) -> float:
     return v
 
 
+def _last_closed_candle_idx(candles: Optional[List[Dict]], timeframe: str, now: float) -> int:
+    """
+    Return the index of the latest fully closed candle.
+
+    Delta REST usually includes the current forming bar, while some websocket
+    candle paths only advance when a bar has closed.  A hard candles[-2] rule
+    therefore lags one whole bar when the deque is close-only.  Use the bar
+    start timestamp versus timeframe length to decide whether the tail is
+    forming or already closed.
+    """
+    rows = list(candles or [])
+    if not rows:
+        return -1
+    tf_sec = float(_TF_SECONDS.get(timeframe, 300))
+    latest_s = _ts_to_epoch_seconds(_candle_ts(rows, len(rows) - 1))
+    if latest_s > 0 and now > 0:
+        age = max(0.0, float(now) - latest_s)
+        if age < tf_sec and len(rows) >= 2:
+            return len(rows) - 2
+        return len(rows) - 1
+    return len(rows) - 2 if len(rows) >= 2 else len(rows) - 1
+
+
 def _source_is_fresh_after_sweep(
     *,
     latest_ts: int,
@@ -614,9 +637,10 @@ class _TimeframeRegistry:
         if len(candles) < 10 or atr < 1e-10:
             return
 
-        # Deduplicate on last CLOSED candle timestamp
+        # Deduplicate on last CLOSED candle timestamp.
         try:
-            _c  = candles[-2] if len(candles) >= 2 else candles[-1]
+            _idx = _last_closed_candle_idx(candles, self.tf, now)
+            _c  = candles[_idx] if _idx >= 0 else candles[-1]
             _ts = int(_c.get('t', 0) or 0) if hasattr(_c, 'get') else 0
         except Exception:
             _ts = 0
@@ -869,14 +893,18 @@ class _TimeframeRegistry:
         if len(candles) < 3 or atr < 1e-10:
             return []
 
-        c   = candles[-2]   # FIX-6: last CLOSED bar
+        closed_idx = _last_closed_candle_idx(candles, self.tf, now)
+        if closed_idx < 1:
+            return []
+
+        c   = candles[closed_idx]
         h   = float(c['h'])
         lo  = float(c['l'])
         cl  = float(c['c'])
         vol = float(c.get('v', 0))
 
-        # 20-bar average volume from closed bars (exclude forming candle)
-        vol_window = candles[max(0, len(candles) - 22):-1]
+        # 20-bar average volume from closed bars ending at the evaluated bar.
+        vol_window = candles[max(0, closed_idx - 20):closed_idx + 1]
         avg_vol    = (sum(float(x.get('v', 0)) for x in vol_window)
                       / max(len(vol_window), 1))
 
@@ -906,7 +934,7 @@ class _TimeframeRegistry:
                 pool.sweep_wick = h
                 newly_swept_bsl.append(pool)
                 results.append(SweepResult(
-                    pool=pool, sweep_candle_idx=len(candles) - 2,
+                    pool=pool, sweep_candle_idx=closed_idx,
                     wick_extreme=h, rejection_pct=rejection / wick_range,
                     volume_ratio=vol_ratio, quality=quality,
                     direction="short", detected_at=now,
@@ -930,7 +958,7 @@ class _TimeframeRegistry:
                 pool.sweep_wick = lo
                 newly_swept_ssl.append(pool)
                 results.append(SweepResult(
-                    pool=pool, sweep_candle_idx=len(candles) - 2,
+                    pool=pool, sweep_candle_idx=closed_idx,
                     wick_extreme=lo, rejection_pct=rejection / wick_range,
                     volume_ratio=vol_ratio, quality=quality,
                     direction="long", detected_at=now,
