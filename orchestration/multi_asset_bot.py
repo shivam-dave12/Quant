@@ -149,6 +149,59 @@ class MultiAssetQuantBot:
         except Exception as exc:
             return False, f"ICICI market session check failed: {exc}"
 
+    def _icici_account_preflight(self, ctx: AssetContext) -> bool:
+        """Verify F&O funds and exact NFO option positions before ICICI analysis starts.
+
+        The desk must never infer an option position from generic portfolio rows.
+        Balance is sourced only through the adapter's FNO funds/NFO margin route;
+        positions are sourced only through exact NFO Options PortfolioPositions rows.
+        """
+        try:
+            balance = ctx.risk_manager.get_available_balance()
+            if not isinstance(balance, dict) or balance.get("error"):
+                logger.error(
+                    "%s ICICI F&O preflight failed: could not verify FNO/NFO funds: %s",
+                    ctx.instrument.asset_id, (balance or {}).get("error") if isinstance(balance, dict) else "no response",
+                )
+                return False
+            if str(balance.get("segment") or "").upper() != "FNO":
+                logger.error("%s ICICI F&O preflight rejected non-FNO balance payload: %s", ctx.instrument.asset_id, balance)
+                return False
+            logger.info(
+                "%s ICICI F&O funds verified: source=%s available=₹%.2f allocated=₹%.2f blocked=₹%.2f nfo_cash_limit=₹%.2f",
+                ctx.instrument.asset_id, balance.get("source", "unknown"),
+                float(balance.get("available", 0.0) or 0.0),
+                float(balance.get("fno_allocated", 0.0) or 0.0),
+                float(balance.get("fno_blocked", 0.0) or 0.0),
+                float(balance.get("nfo_cash_limit", 0.0) or 0.0),
+            )
+            broker_position = ctx.execution_router.get_open_position()
+            if broker_position is None:
+                logger.error("%s ICICI F&O preflight failed: PortfolioPositions could not be verified", ctx.instrument.asset_id)
+                return False
+            qty = float(broker_position.get("size", 0.0) or 0.0)
+            if qty <= 0:
+                logger.info(
+                    "%s ICICI F&O positions verified FLAT: exact NFO option positions=0 ignored_non_option_rows=%d",
+                    ctx.instrument.asset_id, int(broker_position.get("ignored_non_option_rows", 0) or 0),
+                )
+                return True
+            if bool(broker_position.get("unadoptable")):
+                logger.critical(
+                    "%s ICICI F&O preflight blocked unmanaged option exposure: reason=%s qty=%.8g; no new orders permitted",
+                    ctx.instrument.asset_id, broker_position.get("reason", "unknown"), qty,
+                )
+                return False
+            logger.warning(
+                "%s ICICI exact NFO option position found at startup and will be reconciled: %s %s %s qty=%.8g",
+                ctx.instrument.asset_id, broker_position.get("stock_code"), broker_position.get("right"),
+                broker_position.get("strike_price"), qty,
+            )
+            return True
+        except Exception as exc:
+            logger.exception("%s ICICI F&O account preflight failed: %s", ctx.instrument.asset_id, exc)
+            return False
+
     def _cross_asset_contexts(self) -> List[AssetContext]:
         return [c for c in self.contexts if c.ready and self._is_cross_asset_member(c)]
 
@@ -528,6 +581,7 @@ class MultiAssetQuantBot:
                     r.setdefault("desk", pol.desk_id)
                     r.setdefault("desk_name", pol.desk_name)
                     r.setdefault("asset_class", pol.asset_class)
+                    r.setdefault("currency", self._currency_for_instrument(ctx.instrument))
                     r["total_fees"] = self._trade_fees(r)
                     r["gross_pnl"] = self._trade_gross(r)
                     rows.append(r)
@@ -541,117 +595,63 @@ class MultiAssetQuantBot:
         trades = self._all_trade_records()
         desk_cfg = getattr(config, "TRADING_DESKS", {}) or {}
         desk_order = [str(k).upper() for k in desk_cfg.keys()] or ["BTC", "COMMODITIES", "STOCKS"]
-        desk_names = {
-            str(k).upper(): str(v.get("display_name", k)) if isinstance(v, dict) else str(k)
-            for k, v in desk_cfg.items()
-        }
+        desk_names = {str(k).upper(): str(v.get("display_name", k)) if isinstance(v, dict) else str(k) for k, v in desk_cfg.items()}
         desks: Dict[str, Dict[str, Any]] = {d: self._blank_pnl_bucket() for d in desk_order}
         assets: Dict[str, Dict[str, Any]] = {}
-        total_bucket = self._blank_pnl_bucket()
-
+        totals: Dict[str, Dict[str, Any]] = {}
+        def total(cur: str) -> Dict[str, Any]:
+            cur = cur if cur in {"$", "₹"} else "$"
+            totals.setdefault(cur, self._blank_pnl_bucket())
+            return totals[cur]
+        def money(value: float, *, signed: bool = False, currency: str = "$") -> str:
+            try:
+                value = float(value or 0.0)
+                return f"{currency}{value:+,.2f}" if signed else f"{currency}{value:,.2f}"
+            except Exception:
+                return f"{currency}+0.00" if signed else f"{currency}0.00"
         for r in rows:
-            desk_id = str(r.get("desk") or "BTC").upper()
-            if desk_id not in desks:
-                desks[desk_id] = self._blank_pnl_bucket()
-                desk_order.append(desk_id)
-            asset = str(r.get("asset") or "?").upper()
-            if asset not in assets:
-                assets[asset] = self._blank_pnl_bucket()
-                assets[asset]["desk"] = desk_id
-                assets[asset]["symbol"] = r.get("symbol", asset)
+            desk = str(r.get("desk") or "BTC").upper(); cur = str(r.get("currency") or "$"); asset = str(r.get("asset") or "?").upper()
+            if desk not in desks: desks[desk] = self._blank_pnl_bucket(); desk_order.append(desk)
+            desks[desk].setdefault("currency", cur)
+            if asset not in assets: assets[asset] = self._blank_pnl_bucket(); assets[asset].update({"desk": desk, "currency": cur})
             if r.get("position"):
-                upnl = self._float_val(r.get("upnl"), 0.0)
-                open_realized = self._float_val(r.get("open_realized"), 0.0)
-                live_pnl = self._float_val(r.get("lifecycle_pnl"), upnl + open_realized)
-                desks[desk_id]["upnl"] += upnl
-                desks[desk_id]["open_realized"] += open_realized
-                desks[desk_id]["live"] += live_pnl
-                desks[desk_id]["open"] += 1
-                assets[asset]["upnl"] += upnl
-                assets[asset]["open_realized"] += open_realized
-                assets[asset]["live"] += live_pnl
-                assets[asset]["open"] += 1
-                total_bucket["upnl"] += upnl
-                total_bucket["open_realized"] += open_realized
-                total_bucket["live"] += live_pnl
-                total_bucket["open"] += 1
-
+                up = self._float_val(r.get("upnl"), 0.0); realised = self._float_val(r.get("open_realized"), 0.0); live = self._float_val(r.get("lifecycle_pnl"), up + realised)
+                for b in (desks[desk], assets[asset], total(cur)):
+                    b["upnl"] += up; b["open_realized"] += realised; b["live"] += live; b["open"] += 1
         for t in trades:
-            desk_id = str(t.get("desk") or "BTC").upper()
-            if desk_id not in desks:
-                desks[desk_id] = self._blank_pnl_bucket()
-                desk_order.append(desk_id)
-            asset = str(t.get("asset") or "?").upper()
-            if asset not in assets:
-                assets[asset] = self._blank_pnl_bucket()
-                assets[asset]["desk"] = desk_id
-                assets[asset]["symbol"] = t.get("symbol", asset)
-            self._add_trade_to_bucket(desks[desk_id], t)
-            self._add_trade_to_bucket(assets[asset], t)
-            self._add_trade_to_bucket(total_bucket, t)
-
-        total_realised = float(total_bucket["net"])
-        total_gross = float(total_bucket["gross"])
-        total_fees = float(total_bucket["fees"])
-        total_upnl = float(total_bucket["upnl"])
-        total_live = float(total_bucket.get("live", total_upnl))
-        total = int(total_bucket["trades"])
-        wr = self._bucket_wr(total_bucket)
-        icon = "🟢" if total_realised + total_live >= 0 else "🔴"
-        lines = [
-            f"{icon} <b>INSTITUTIONAL PORTFOLIO P&L</b>",
-            "<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>",
-            f"<code>NET {self._fmt_money(total_realised):>12}  UPNL {self._fmt_money(total_upnl):>12}  LIVE {self._fmt_money(total_live):>12}</code>",
-            f"<code>TOTAL {self._fmt_money(total_realised + total_live):>10}  GROSS {self._fmt_money(total_gross):>10}  FEES ${total_fees:>8,.2f}</code>",
-            f"<code>TRADES {total:>4}  WR {wr:>5.1f}%</code>",
-            f"<code>AVG WIN {self._fmt_money(self._bucket_avg_win(total_bucket)):>10}  AVG LOSS {self._fmt_money(self._bucket_avg_loss(total_bucket)):>10}  OPEN {len(open_rows):>2}/{self.guard.max_open_positions:<2}</code>",
-            f"<code>BUDGET {self._esc(self.guard.budget_mode)}</code>",
-            "\n<b>🏛 Desk PnL / P&L</b>",
-        ]
-        for desk_id in desk_order:
-            st = desks.get(desk_id) or self._blank_pnl_bucket()
-            name = self._clip(desk_names.get(desk_id, desk_id), 13)
-            total_desk = self._float_val(st.get("net"), 0.0) + self._float_val(st.get("live", st.get("upnl", 0.0)), 0.0)
-            lines.append(
-                f"<code>{self._esc(name):<13} net {self._fmt_money(st['net']):>10} "
-                f"upnl {self._fmt_money(st['upnl']):>10} live {self._fmt_money(st.get('live', st['upnl'])):>10} "
-                f"tot {self._fmt_money(total_desk):>10} T {int(st['trades']):>3} WR {self._bucket_wr(st):>5.1f}%</code>"
-            )
-
-        lines.append("\n<b>📦 Asset PnL / P&L</b>")
-        for asset, st in sorted(assets.items(), key=lambda kv: (str(kv[1].get("desk", "")), kv[0])):
-            desk_id = self._clip(st.get("desk", ""), 5)
-            asset_label = self._clip(asset, 8)
-            total_asset = self._float_val(st.get("net"), 0.0) + self._float_val(st.get("live", st.get("upnl", 0.0)), 0.0)
-            lines.append(
-                f"<code>{self._esc(asset_label):<8} {self._esc(desk_id):<5} net {self._fmt_money(st['net']):>10} "
-                f"upnl {self._fmt_money(st['upnl']):>10} live {self._fmt_money(st.get('live', st['upnl'])):>10} "
-                f"tot {self._fmt_money(total_asset):>10} T {int(st['trades']):>3} WR {self._bucket_wr(st):>5.1f}%</code>"
-            )
-
+            desk = str(t.get("desk") or "BTC").upper(); cur = str(t.get("currency") or "$"); asset = str(t.get("asset") or "?").upper()
+            if desk not in desks: desks[desk] = self._blank_pnl_bucket(); desk_order.append(desk)
+            desks[desk].setdefault("currency", cur)
+            if asset not in assets: assets[asset] = self._blank_pnl_bucket(); assets[asset].update({"desk": desk, "currency": cur})
+            for b in (desks[desk], assets[asset], total(cur)): self._add_trade_to_bucket(b, t)
+        used = [cur for cur, st in totals.items() if st.get("trades") or st.get("open")] or ["$"]
+        ntrades = sum(int(st.get("trades", 0)) for st in totals.values()); wins = sum(int(st.get("wins", 0)) for st in totals.values())
+        wr = wins / ntrades * 100.0 if ntrades else 0.0
+        lines = ["🏛 <b>INSTITUTIONAL PORTFOLIO P&amp;L</b>", "<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>"]
+        for cur in used:
+            b = totals.get(cur, self._blank_pnl_bucket()); code = "INR" if cur == "₹" else "USD"; icon = "🟢" if b["net"] + b["live"] >= 0 else "🔴"
+            lines.append(f"{icon} <b>{code}</b> <code>NET {money(b['net'], signed=True, currency=cur):>12}  UPNL {money(b['upnl'], signed=True, currency=cur):>12}  LIVE {money(b['live'], signed=True, currency=cur):>12}</code>")
+            lines.append(f"<code>   TOTAL {money(b['net'] + b['live'], signed=True, currency=cur):>12}  GROSS {money(b['gross'], signed=True, currency=cur):>12}  FEES {money(b['fees'], currency=cur):>12}</code>")
+        lines += [f"<code>TRADES {ntrades:>4}  WR {wr:>5.1f}%  OPEN {len(open_rows):>2}/{self.guard.max_open_positions:<2}</code>", f"<code>BUDGET {self._esc(self.guard.budget_mode)}</code>", "\n<b>🏛 Desk PnL / P&amp;L</b>"]
+        for desk in desk_order:
+            b = desks.get(desk) or self._blank_pnl_bucket(); cur = str(b.get("currency") or "$"); name = self._clip(desk_names.get(desk, desk), 13); total_desk = b["net"] + b["live"]
+            lines.append(f"<code>{self._esc(name):<13} net {money(b['net'], signed=True, currency=cur):>10} upnl {money(b['upnl'], signed=True, currency=cur):>10} live {money(b['live'], signed=True, currency=cur):>10} tot {money(total_desk, signed=True, currency=cur):>10} T {int(b['trades']):>3} WR {self._bucket_wr(b):>5.1f}%</code>")
+        lines.append("\n<b>📦 Asset PnL / P&amp;L</b>")
+        for asset, b in sorted(assets.items(), key=lambda kv: (str(kv[1].get("desk", "")), kv[0])):
+            cur = str(b.get("currency") or "$"); desk = self._clip(b.get("desk", ""), 5); total_asset = b["net"] + b["live"]
+            lines.append(f"<code>{self._esc(self._clip(asset,8)):<8} {self._esc(desk):<5} net {money(b['net'], signed=True, currency=cur):>10} upnl {money(b['upnl'], signed=True, currency=cur):>10} live {money(b['live'], signed=True, currency=cur):>10} tot {money(total_asset, signed=True, currency=cur):>10} T {int(b['trades']):>3} WR {self._bucket_wr(b):>5.1f}%</code>")
         if open_rows:
             lines.append("\n<b>📡 Open Positions</b>")
             for r in sorted(open_rows, key=lambda x: (str(x.get("desk")), str(x.get("asset")))):
-                lines.append(
-                    f"<code>{self._esc(r['desk']):<5} {self._esc(r['asset']):<8} {self._esc(r['side']):<5} UPNL {self._fmt_money(r['upnl']):>10} "
-                    f"LIVE {self._fmt_money(r.get('lifecycle_pnl', r['upnl'])):>10} R {float(r['r']):+5.2f} MFE {float(r['mfe_r']):>4.2f}</code>"
-                )
-                lines.append(
-                    f"<code>       lev {float(r.get('entry_leverage', 0.0) or 0.0):>4.0f}x margin {self._fmt_price(r.get('margin_used', 0.0)):>10} px {self._fmt_price(r['price']):>12}</code>"
-                )
-                lines.append(
-                    f"<code>       entry {self._fmt_price(r['entry']):>12} SL {self._fmt_price(r['sl']):>12}</code>"
-                )
+                cur = str(r.get("currency") or "$")
+                lines.append(f"<code>{self._esc(r['desk']):<5} {self._esc(r['asset']):<8} {self._esc(r['side']):<5} UPNL {money(r['upnl'], signed=True, currency=cur):>10} LIVE {money(r.get('lifecycle_pnl', r['upnl']), signed=True, currency=cur):>10} R {float(r['r']):+5.2f} MFE {float(r['mfe_r']):>4.2f}</code>")
+                lines.append(f"<code>       lev {float(r.get('entry_leverage', 0.0) or 0.0):>4.0f}x margin {money(r.get('margin_used', 0.0), currency=cur):>10} px {money(r.get('price', 0.0), currency=cur):>12}</code>")
+                lines.append(f"<code>       entry {money(r.get('entry', 0.0), currency=cur):>12} SL {money(r.get('sl', 0.0), currency=cur):>12}</code>")
         if trades:
             lines.append("\n<b>🧾 Recent Realised Trades</b>")
             for t in sorted(trades, key=self._trade_ts, reverse=True)[:6]:
-                pnl = self._trade_net(t)
-                ok = "✅ WIN" if pnl > 0 else ("❌ LOSS" if pnl < 0 else "➖ FLAT")
-                lines.append(
-                    f"{ok:<4} <code>{self._esc(t.get('desk','?')):<5} {self._esc(t.get('asset','?')):<8} "
-                    f"{self._esc(str(t.get('side','?')).upper()):<5} net {self._fmt_money(pnl):>10} "
-                    f"R {self._trade_r(t):+5.2f} {self._esc(str(t.get('reason',''))[:18]):<18}</code>"
-                )
+                pnl = self._trade_net(t); cur = str(t.get("currency") or "$"); ok = "✅ WIN" if pnl > 0 else ("❌ LOSS" if pnl < 0 else "➖ FLAT")
+                lines.append(f"{ok:<4} <code>{self._esc(t.get('desk','?')):<5} {self._esc(t.get('asset','?')):<8} {self._esc(str(t.get('side','?')).upper()):<5} net {money(pnl, signed=True, currency=cur):>10} R {self._trade_r(t):+5.2f} {self._esc(str(t.get('reason',''))[:18]):<18}</code>")
         return "\n".join(lines)
 
     def format_portfolio_position_report(self) -> str:
@@ -913,6 +913,10 @@ class MultiAssetQuantBot:
                 effective_lev = self._set_leverage_with_backoff(ctx, target_lev)
                 max_txt = f" (cap={inst.max_leverage:g}x)" if getattr(inst, "max_leverage", 0.0) else ""
                 logger.info("%s leverage target=%sx effective=%sx%s", inst.asset_id, target_lev, effective_lev, max_txt)
+                if self._is_icici_context(ctx) and not self._icici_account_preflight(ctx):
+                    ctx.ready = False
+                    logger.error("%s ICICI desk disabled: F&O account verification did not pass", inst.asset_id)
+                    return False
                 if not ctx.data_manager.start():
                     logger.error("%s data stream start failed", inst.asset_id)
                     return False
@@ -921,6 +925,13 @@ class MultiAssetQuantBot:
                 if not ready:
                     logger.error("%s data manager not ready", inst.asset_id)
                     return False
+                if self._is_icici_context(ctx):
+                    balance = ctx.risk_manager.get_available_balance() or {}
+                    preparer = getattr(ctx.data_manager, "prepare_icici_session_contract_book", None)
+                    if not callable(preparer) or not preparer(float(balance.get("available", 0.0) or 0.0)):
+                        ctx.ready = False
+                        logger.error("%s ICICI desk disabled: session CE/PE execution contract book could not be verified", inst.asset_id)
+                        return False
                 venues = ", ".join(f"{ex.value}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items())
                 logger.info("✅ %s ready @ %.4f | venues=%s | %s", inst.asset_id, ctx.data_manager.get_last_price(), venues, self.guard.report_line(ctx))
                 return True

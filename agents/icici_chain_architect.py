@@ -1,17 +1,18 @@
 """Institutional ICICI option-chain architecture.
 
-The Indian options desk owns an *underlying thesis* first.  Individual option
-contracts are execution vehicles selected after the underlying chart produces a
-bullish/bearish thesis.  This module therefore keeps NIFTY/BANKNIFTY/SENSEX or
-large-cap stocks as desk assets, while retaining the complete viable option
-chain for strike/expiry selection.
+The Indian options desk owns an *underlying thesis* for direction, while its
+execution universe is prepared in advance.  At session start the module selects
+one verified CE vehicle and one verified PE vehicle from the current NFO master
+and live quotes; a later bullish/bearish thesis activates only its corresponding
+preselected vehicle.  NIFTY/BANKNIFTY/SENSEX or large-cap stocks remain desk
+assets for structural analysis.
 """
 from __future__ import annotations
 
 import math
 import time
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Iterable, Mapping, Optional
 
 try:
@@ -79,13 +80,25 @@ def _strike(raw: Mapping[str, Any]) -> float:
     return safe_float(raw.get("strike_price") or raw.get("StrikePrice") or raw.get("strike") or raw.get("Strike"), 0.0)
 
 
-def _premium(raw: Mapping[str, Any], quote: Mapping[str, Any] | None = None) -> float:
-    sources = [quote or {}, raw]
-    for src in sources:
-        bid = safe_float(src.get("best_bid") or src.get("bid") or src.get("bid_price") or src.get("bPrice"), 0.0)
-        ask = safe_float(src.get("best_ask") or src.get("ask") or src.get("ask_price") or src.get("sPrice"), 0.0)
+def _bid_ask(raw: Mapping[str, Any], quote: Mapping[str, Any] | None = None) -> tuple[float, float]:
+    """Read a two-sided executable quote, including Breeze OptionChain fields."""
+    for src in (quote or {}, raw):
+        bid = safe_float(
+            src.get("best_bid_price") or src.get("best_bid") or src.get("bid")
+            or src.get("bid_price") or src.get("bPrice"), 0.0)
+        ask = safe_float(
+            src.get("best_offer_price") or src.get("best_ask_price") or src.get("best_ask")
+            or src.get("ask") or src.get("ask_price") or src.get("offer_price") or src.get("sPrice"), 0.0)
         if bid > 0 and ask > 0 and ask >= bid:
-            return (bid + ask) / 2.0
+            return bid, ask
+    return 0.0, 0.0
+
+
+def _premium(raw: Mapping[str, Any], quote: Mapping[str, Any] | None = None) -> float:
+    bid, ask = _bid_ask(raw, quote)
+    if bid > 0 and ask > 0:
+        return (bid + ask) / 2.0
+    for src in (quote or {}, raw):
         for key in ("ltp", "last_price", "lastPrice", "close", "price", "settlement_price"):
             px = safe_float(src.get(key), 0.0)
             if px > 0:
@@ -95,14 +108,18 @@ def _premium(raw: Mapping[str, Any], quote: Mapping[str, Any] | None = None) -> 
 
 def _lot_size(raw: Mapping[str, Any]) -> float:
     for key in (
-        "LotSize", "lot_size", "lotSize", "MinimumLotQty", "minimum_lot_qty",
+        # runtime_lot_size is populated only from the verified daily Security
+        # Master join and must override any lot-like field in a live quote row.
+        "runtime_lot_size", "LotSize", "lot_size", "lotSize", "MinimumLotQty", "minimum_lot_qty",
         "min_qty", "quantity_in_lot", "QuantityInLot",
     ):
         lot = safe_float(raw.get(key), 0.0)
         if lot > 0:
             return lot
-    fallback = safe_float(_cfg("ICICI_OPTION_DEFAULT_LOT_SIZE", 1.0), 1.0)
-    return max(1.0, fallback)
+    # No synthetic default lots for NFO options; exact broker/security-master
+    # lot size is required to price affordability and risk correctly.
+    fallback = safe_float(_cfg("ICICI_OPTION_DEFAULT_LOT_SIZE", 0.0), 0.0)
+    return max(0.0, fallback)
 
 
 @dataclass(frozen=True)
@@ -125,6 +142,215 @@ class ICICIContractChoice:
         d = asdict(self)
         d["raw"] = dict(self.raw)
         return d
+
+
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+@dataclass(frozen=True)
+class ICICISessionContractBook:
+    """Daily NFO execution vehicles selected before intraday alpha decisions.
+
+    The book always holds both directional vehicles: CE for a later bullish
+    underlying thesis and PE for a later bearish underlying thesis.  It is an
+    execution-universe object, never a directional forecast.
+    """
+    trade_date_ist: str
+    built_at: float
+    underlying: str
+    underlying_spot: float
+    available_funds: float
+    call: ICICIContractChoice
+    put: ICICIContractChoice
+    source: str = "session_start_option_chain"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "trade_date_ist": self.trade_date_ist,
+            "built_at": self.built_at,
+            "underlying": self.underlying,
+            "underlying_spot": self.underlying_spot,
+            "available_funds": self.available_funds,
+            "source": self.source,
+            "call": self.call.as_dict(),
+            "put": self.put.as_dict(),
+        }
+
+
+def _session_date_ist(now_ts: Optional[float] = None) -> str:
+    return datetime.fromtimestamp(float(now_ts or time.time()), tz=_IST).date().isoformat()
+
+
+def _choice_from_dict(value: Any) -> Optional[ICICIContractChoice]:
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        return ICICIContractChoice(
+            score=float(value.get("score", 0.0) or 0.0),
+            underlying=str(value.get("underlying") or ""),
+            thesis_side=str(value.get("thesis_side") or ""),
+            selected_symbol=str(value.get("selected_symbol") or ""),
+            right=str(value.get("right") or ""),
+            strike=float(value.get("strike", 0.0) or 0.0),
+            expiry=str(value.get("expiry") or ""),
+            dte=float(value.get("dte", 0.0) or 0.0),
+            delta=float(value.get("delta", 0.0) or 0.0),
+            theta_to_premium=float(value.get("theta_to_premium", 0.0) or 0.0),
+            moneyness=float(value.get("moneyness", 0.0) or 0.0),
+            reasons=tuple(str(x) for x in (value.get("reasons") or ())),
+            raw=dict(value.get("raw") or {}),
+        )
+    except Exception:
+        return None
+
+
+def contract_key(raw: Mapping[str, Any]) -> tuple[str, str, float]:
+    expiry = _expiry_dt(raw.get("expiry_date") or raw.get("ExpiryDate") or raw.get("expiry") or raw.get("Expiry"))
+    exp = expiry.strftime("%Y-%m-%d") if expiry else ""
+    return exp, _right(raw), round(_strike(raw), 6)
+
+
+def eligible_nfo_master_option_rows(rows: Iterable[Mapping[str, Any]], underlying: str) -> list[dict[str, Any]]:
+    """Return only exact, tradable NFO option master rows for an underlying.
+
+    Lot size is intentionally mandatory: a chain quote is market data, while the
+    daily Security Master is the instrument-definition source used for routing and
+    sizing.  Missing identity or lot size fails closed.
+    """
+    target = normalise_symbol(underlying)
+    out: list[dict[str, Any]] = []
+    min_dte = float(_cfg("ICICI_OPTION_MIN_DTE", 1.0))
+    max_dte = float(_cfg("ICICI_OPTION_MAX_DTE", 21.0))
+    for source in rows:
+        if not isinstance(source, Mapping):
+            continue
+        row = dict(source)
+        exchange = normalise_symbol(row.get("exchange_code") or row.get("ExchangeCode") or row.get("Exchange") or row.get("Exch") or "")
+        if exchange != "NFO":
+            continue
+        stock = normalise_symbol(row.get("stock_code") or row.get("StockCode") or row.get("ShortName") or row.get("underlying") or row.get("Underlying") or "")
+        if not stock or stock != target:
+            continue
+        product = normalise_symbol(row.get("product_type") or row.get("ProductType") or row.get("InstrumentType") or row.get("Series") or "")
+        if product and product not in {"OPTION", "OPTIONS", "OPTIDX", "OPTSTK", "CE", "PE"} and not _right(row):
+            continue
+        if not _right(row) or _strike(row) <= 0 or _lot_size(row) <= 0:
+            continue
+        dte = _dte(row)
+        if dte < min_dte or dte > max_dte:
+            continue
+        row.setdefault("stock_code", target)
+        row.setdefault("exchange_code", "NFO")
+        row.setdefault("product_type", "Options")
+        row.setdefault("runtime_lot_size", _lot_size(row))
+        out.append(row)
+    return out
+
+
+def merge_verified_chain_quotes(master_rows: Iterable[Mapping[str, Any]], quote_rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Join live OptionChain quotes to Security Master-defined contracts only."""
+    verified = {contract_key(row): dict(row) for row in master_rows if contract_key(row)[0] and contract_key(row)[1]}
+    merged: list[dict[str, Any]] = []
+    for quote in quote_rows:
+        if not isinstance(quote, Mapping):
+            continue
+        key = contract_key(quote)
+        master = verified.get(key)
+        if master is None:
+            continue
+        row = dict(master)
+        row.update(dict(quote))
+        row["runtime_lot_size"] = _lot_size(master)
+        row["instrument_definition_source"] = "daily_security_master"
+        row["quote_source"] = "breeze_option_chain_filtered"
+        merged.append(row)
+    return merged
+
+
+def build_session_contract_book(
+    instrument: Any,
+    *,
+    underlying_spot: float,
+    available_funds: float,
+    option_quote_by_symbol: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    now_ts: Optional[float] = None,
+    commit: bool = True,
+) -> Optional[ICICISessionContractBook]:
+    """Preselect one executable CE and one executable PE for the session.
+
+    Direction remains entirely with the intraday underlying thesis.  This function
+    reduces execution latency by choosing execution vehicles before a signal rather
+    than rescanning the chain at the moment of entry.
+    """
+    call = select_contract_for_thesis(
+        instrument, "long", underlying_spot=underlying_spot,
+        option_quote_by_symbol=option_quote_by_symbol, available_funds=available_funds)
+    put = select_contract_for_thesis(
+        instrument, "short", underlying_spot=underlying_spot,
+        option_quote_by_symbol=option_quote_by_symbol, available_funds=available_funds)
+    if call is None or put is None:
+        return None
+    raw = getattr(getattr(instrument, "primary", None), "raw", {}) or {}
+    book = ICICISessionContractBook(
+        trade_date_ist=_session_date_ist(now_ts),
+        built_at=float(now_ts or time.time()),
+        underlying=normalise_symbol(raw.get("stock_code") or raw.get("underlying") or getattr(instrument, "asset_id", "")),
+        underlying_spot=float(underlying_spot or 0.0),
+        available_funds=float(available_funds or 0.0),
+        call=call, put=put,
+    )
+    if commit and isinstance(raw, dict):
+        raw["session_contract_book"] = book.as_dict()
+        raw["session_contract_book_status"] = "READY"
+        raw["session_contract_book_mode"] = "preselected_call_and_put_live_direction"
+    return book
+
+
+def select_contract_from_session_book(
+    instrument: Any, thesis_side: str, *, underlying_spot: float, available_funds: float, now_ts: Optional[float] = None
+) -> tuple[Optional[ICICIContractChoice], str]:
+    """Return the preselected direction-specific vehicle or a refresh reason."""
+    raw = getattr(getattr(instrument, "primary", None), "raw", {}) or {}
+    book = raw.get("session_contract_book") if isinstance(raw, dict) else None
+    if not isinstance(book, Mapping):
+        return None, "session_contract_book_missing"
+    if str(book.get("trade_date_ist") or "") != _session_date_ist(now_ts):
+        return None, "session_contract_book_new_trading_day"
+    side = str(thesis_side or "").lower()
+    key = "call" if side == "long" else "put" if side == "short" else ""
+    if not key:
+        return None, "invalid_thesis_side"
+    choice = _choice_from_dict(book.get(key))
+    if choice is None or _lot_size(choice.raw) <= 0 or _premium(choice.raw) <= 0:
+        return None, "session_contract_vehicle_invalid"
+    book_spot = safe_float(book.get("underlying_spot"), 0.0)
+    spot = safe_float(underlying_spot, 0.0)
+    max_drift = max(0.0, safe_float(_cfg("ICICI_SESSION_BOOK_MAX_SPOT_DRIFT_PCT", 0.008), 0.008))
+    if book_spot > 0 and spot > 0 and abs(spot - book_spot) / book_spot > max_drift:
+        return None, "session_contract_spot_drift"
+    # Primary refresh logic: retain a preselected vehicle only while its current
+    # delta remains inside the institutional execution band. This detects a CE/PE
+    # that has become too ITM/OTM as NIFTY moves, instead of relying only on a
+    # static spot percentage.
+    if spot > 0 and choice.strike > 0:
+        dte = _dte(choice.raw) or choice.dte
+        iv = float(_cfg("ICICI_OPTION_IV_STRESS_PRIOR", 0.24))
+        rate = float(_cfg("INDIA_RISK_FREE_RATE", 0.065))
+        premium = _premium(choice.raw)
+        greeks = BlackScholesModel.greeks(choice.right, spot, choice.strike, dte, rate, iv, premium=premium)
+        if greeks is not None:
+            target_delta = float(_cfg("ICICI_INDEX_OPTION_TARGET_ABS_DELTA", 0.45))
+            delta_band = max(0.01, float(_cfg("ICICI_SESSION_BOOK_DELTA_RESELECT_BAND", 0.18)))
+            if abs(abs(greeks.delta) - target_delta) > delta_band:
+                return None, "session_contract_delta_drift"
+    funds = max(0.0, safe_float(available_funds, 0.0))
+    max_fraction = clamp(safe_float(_cfg("ICICI_OPTION_MAX_FUNDS_FRACTION_PER_TRADE", 0.42), 0.42), 0.01, 1.0)
+    cash_buffer = max(0.0, safe_float(_cfg("ICICI_OPTION_MIN_CASH_BUFFER_INR", 0.0), 0.0))
+    max_cost = max(0.0, (funds - cash_buffer) * max_fraction) if funds > 0 else 0.0
+    cost = safe_float(choice.raw.get("selected_contract_cost"), _premium(choice.raw) * _lot_size(choice.raw))
+    if funds <= 0 or max_cost <= 0 or cost <= 0 or cost > max_cost:
+        return None, "session_contract_no_longer_affordable"
+    return choice, "session_contract_ready"
 
 
 def chain_quality(chain: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
@@ -157,7 +383,7 @@ def build_underlying_payload(underlying: str, desk_id: str, rows: list[Any]) -> 
     sample = chain_raw[0] if chain_raw else {}
     return {
         "icici_underlying_desk": True,
-        "contract_selector_mode": "post_thesis",
+        "contract_selector_mode": "session_preselected_execution",
         "underlying": normalise_symbol(underlying),
         "stock_code": normalise_symbol(underlying),
         "desk_id": desk_id,
@@ -173,7 +399,7 @@ def is_chain_instrument(instrument: Any) -> bool:
     raw = getattr(getattr(instrument, "primary", None), "raw", {}) or {}
     return bool(
         raw.get("icici_underlying_desk")
-        and str(raw.get("contract_selector_mode") or "").lower() == "post_thesis"
+        and str(raw.get("contract_selector_mode") or "").lower() == "session_preselected_execution"
     )
 
 
@@ -185,11 +411,11 @@ def select_contract_for_thesis(
     option_quote_by_symbol: Optional[Mapping[str, Mapping[str, Any]]] = None,
     available_funds: float = 0.0,
 ) -> Optional[ICICIContractChoice]:
-    """Select the option contract after the underlying thesis is known.
+    """Score one directional execution vehicle while preparing the session book.
 
-    bullish thesis -> buy call; bearish thesis -> buy put.  Selection balances
-    DTE, strike proximity, Black-Scholes Greeks and theta decay.  No option is
-    shorted and no hardcoded underlying list is used.
+    The function is invoked once for CE and once for PE before live alpha
+    decisions begin.  The intraday thesis only activates the preselected side;
+    it does not rescan the option chain on every signal.
     """
     raw = getattr(getattr(instrument, "primary", None), "raw", {}) or {}
     chain = [dict(x) for x in (raw.get("chain_candidates") or []) if isinstance(x, Mapping)]
@@ -224,7 +450,24 @@ def select_contract_for_thesis(
         q = dict(quotes.get(symbol, {}) or {})
         prem = _premium(c, q)
         lot = _lot_size(c)
-        contract_cost = prem * lot if prem > 0 and lot > 0 else 0.0
+        if lot <= 0:
+            # A contract without verified lot size cannot be safely selected,
+            # sized or routed as an NFO execution vehicle.
+            continue
+        bid, ask = _bid_ask(c, q)
+        require_two_sided = bool(_cfg("ICICI_SESSION_BOOK_REQUIRE_TWO_SIDED_QUOTE", True))
+        if require_two_sided and not (bid > 0 and ask >= bid):
+            continue
+        spread_bps = ((ask - bid) / max((ask + bid) / 2.0, 1e-9) * 10000.0) if bid > 0 and ask > 0 else float("inf")
+        max_spread_bps = max(1.0, safe_float(_cfg("ICICI_OPTION_MAX_SELECTION_SPREAD_BPS", 120.0), 120.0))
+        if require_two_sided and spread_bps > max_spread_bps:
+            continue
+        bid_qty = safe_float(c.get("best_bid_quantity") or q.get("best_bid_quantity") or c.get("bid_quantity") or q.get("bid_quantity"), 0.0)
+        ask_qty = safe_float(c.get("best_offer_quantity") or q.get("best_offer_quantity") or c.get("ask_quantity") or q.get("ask_quantity"), 0.0)
+        min_book_lots = max(0.0, safe_float(_cfg("ICICI_OPTION_MIN_BOOK_LOTS", 1.0), 1.0))
+        if require_two_sided and min(bid_qty, ask_qty) < lot * min_book_lots:
+            continue
+        contract_cost = prem * lot if prem > 0 else 0.0
         if funds > 0 and (contract_cost <= 0 or contract_cost > max_contract_cost):
             continue
         local_spot = safe_float(q.get("underlying_spot_price") or q.get("underlying_ltp"), 0.0) or spot
@@ -235,6 +478,12 @@ def select_contract_for_thesis(
             local_spot = strike
         bs = BlackScholesModel.greeks(desired, local_spot, strike, dte, rate, iv, premium=prem)
         if bs:
+            # A session execution vehicle must already lie within the intended
+            # delta band; do not publish a CE/PE book that immediately fails its
+            # own intraday revalidation at the same underlying spot.
+            session_delta_band = max(0.01, float(_cfg("ICICI_SESSION_BOOK_DELTA_RESELECT_BAND", delta_band)))
+            if abs(abs(bs.delta) - target_delta) > session_delta_band:
+                continue
             delta_score = clamp(1.0 - abs(abs(bs.delta) - target_delta) / max(delta_band, 1e-6))
             theta_score = clamp(1.0 - bs.theta_to_premium / max_theta)
             moneyness_score = clamp(1.0 - abs(bs.moneyness - 1.0) / 0.10)
@@ -252,8 +501,18 @@ def select_contract_for_thesis(
             affordability_score = clamp(1.0 - abs(utilization - 0.58) / 0.58)
         else:
             affordability_score = 0.55 if funds <= 0 else 0.0
-        score = clamp(0.44 * bs_score + 0.20 * dte_score + 0.18 * live_score + 0.18 * affordability_score)
+        if bid > 0 and ask > 0:
+            spread_score = clamp(1.0 - spread_bps / max_spread_bps)
+            depth_score = clamp(min(bid_qty, ask_qty) / max(lot * max(1.0, min_book_lots) * 4.0, 1.0))
+            liquidity_score = 0.70 * spread_score + 0.30 * depth_score
+        else:
+            liquidity_score = 0.0
+        # Executability is a first-class criterion: Greek quality without a
+        # two-sided, adequately deep quote is not a tradable contract.
+        score = clamp(0.36 * bs_score + 0.14 * dte_score + 0.25 * liquidity_score + 0.10 * live_score + 0.15 * affordability_score)
         reasons = [f"thesis={side}", f"buy_{desired}", f"dte={dte:.1f}", f"strike={strike:g}"]
+        if bid > 0 and ask > 0:
+            reasons.extend([f"spread={spread_bps:.1f}bps", f"depth={min(bid_qty, ask_qty):.0f}"])
         if q:
             reasons.append("live_quote")
         if contract_cost > 0:

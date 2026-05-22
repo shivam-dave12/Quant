@@ -14,7 +14,7 @@ import json
 import csv
 import io
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional
 
@@ -25,9 +25,8 @@ from .breeze_auth import BreezeTokenService
 
 class BreezeRestClient:
     BASE_URL = "https://api.icicidirect.com/breezeapi/api/v1"
-    SECURITY_MASTER_URL = "http://directlink.icicidirect.com/NewSecurityMaster/SecurityMaster.zip"
+    SECURITY_MASTER_URL = "https://directlink.icicidirect.com/NewSecurityMaster/SecurityMaster.zip"
     SECURITY_MASTER_FALLBACK_URLS = (
-        "https://directlink.icicidirect.com/NewSecurityMaster/SecurityMaster.zip",
         "https://api.icicidirect.com/breezeapi/documents/securitymaster.zip",
     )
 
@@ -140,12 +139,16 @@ class BreezeRestClient:
             raise RuntimeError(f"Breeze v2 historicalcharts failed HTTP {resp.status_code}: {data.get('Error') or data}")
         return data
 
-    def get_security_master_rows(self, *, url: str | None = None, cache_path: str | Path | None = None, timeout: float = 12.0) -> list[dict[str, str]]:
+    def get_security_master_rows(
+        self, *, url: str | None = None, cache_path: str | Path | None = None,
+        timeout: float = 12.0, require_current_trade_date: bool = False,
+    ) -> list[dict[str, str]]:
         """Download and parse ICICI's daily Security Master file.
 
-        This endpoint is public per Breeze docs.  Startup should prefer a cached
-        master over zero Indian-market coverage when ICICI's directlink endpoint
-        is slow.
+        A session-start option vehicle must use today's instrument definition
+        when ``require_current_trade_date`` is true: stale lots/expiries cannot
+        be used for live NFO routing.  Stale cache fallback remains available
+        only to non-trading discovery callers.
         """
         sources = [url or self.SECURITY_MASTER_URL]
         for fallback in self.SECURITY_MASTER_FALLBACK_URLS:
@@ -153,12 +156,20 @@ class BreezeRestClient:
                 sources.append(fallback)
         data: bytes
         path = Path(cache_path) if cache_path else None
+        ist = timezone(timedelta(hours=5, minutes=30))
+        today_ist = datetime.now(ist).date()
+        cache_is_today = False
         if path and path.exists():
             try:
-                return self._parse_security_master_zip(path.read_bytes())
+                cache_is_today = datetime.fromtimestamp(path.stat().st_mtime, tz=ist).date() == today_ist
             except Exception:
-                # Corrupt cache should not block a fresh attempt.
-                pass
+                cache_is_today = False
+            if cache_is_today or not require_current_trade_date:
+                try:
+                    return self._parse_security_master_zip(path.read_bytes())
+                except Exception:
+                    # Corrupt cache should not block a fresh attempt.
+                    pass
         last_exc: Exception | None = None
         for source in sources:
             try:
@@ -170,8 +181,10 @@ class BreezeRestClient:
             except Exception as exc:
                 last_exc = exc
                 continue
-        if path and path.exists():
+        if path and path.exists() and not require_current_trade_date:
             return self._parse_security_master_zip(path.read_bytes())
+        if require_current_trade_date and path and path.exists() and not cache_is_today:
+            raise RuntimeError("ICICI Security Master is stale for today's NFO session and refresh failed") from last_exc
         if last_exc:
             raise last_exc
         return []
@@ -207,17 +220,27 @@ class BreezeRestClient:
         return self.request("GET", "/portfoliopositions", {})
 
     def place_order(self, **kwargs) -> Dict[str, Any]:
-        order_type = str(kwargs.get("order_type", "")).lower()
-        if order_type != "limit":
-            raise RuntimeError("ICICI Breeze institutional guard: market orders are not permitted; use order_type='limit'")
+        order_type = str(kwargs.get("order_type", "")).strip().lower()
+        if order_type not in {"limit", "stoploss"}:
+            raise RuntimeError("ICICI Breeze institutional guard: market orders are prohibited; only limit or stoploss orders are permitted")
         required = ("stock_code", "exchange_code", "product", "action", "quantity", "price", "validity")
         missing = [k for k in required if kwargs.get(k) in (None, "")]
         if missing:
             raise RuntimeError("ICICI Breeze order missing required fields: " + ", ".join(missing))
+        if str(kwargs.get("exchange_code", "")).upper() == "NFO" and str(kwargs.get("product", "")).lower() == "options":
+            option_required = ("expiry_date", "right", "strike_price")
+            option_missing = [k for k in option_required if kwargs.get(k) in (None, "")]
+            if option_missing:
+                raise RuntimeError("ICICI NFO options order missing exact contract fields: " + ", ".join(option_missing))
+        if order_type == "stoploss" and float(kwargs.get("stoploss", 0.0) or 0.0) <= 0:
+            raise RuntimeError("ICICI Breeze stoploss order requires positive stoploss trigger")
         return self.request("POST", "/order", kwargs)
 
     def get_order(self, **kwargs) -> Dict[str, Any]:
         return self.request("GET", "/order", kwargs)
+
+    def get_order_list(self, *, exchange_code: str = "NFO", from_date: str, to_date: str) -> Dict[str, Any]:
+        return self.request("GET", "/order", {"exchange_code": exchange_code, "from_date": from_date, "to_date": to_date})
 
     def get_order_detail(self, **kwargs) -> Dict[str, Any]:
         return self.get_order(**kwargs)

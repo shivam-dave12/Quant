@@ -357,6 +357,33 @@ class MarketAggregator:
         logger.error("❌ Both data managers not ready — bot cannot trade safely")
         return False
 
+    def prepare_icici_session_contract_book(self, available_funds: float) -> bool:
+        """Preselect CE/PE execution vehicles after underlying warmup.
+
+        This delegates only for the ICICI option-primary manager.  Structural
+        analysis remains on the underlying feed; no direction is forecast here.
+        """
+        preparer = getattr(self._primary, "prepare_session_contract_book", None)
+        if not callable(preparer):
+            return True
+        spot = 0.0
+        if self._analysis is not None:
+            try:
+                spot = float(self._analysis.get_last_price() or 0.0)
+            except Exception:
+                spot = 0.0
+        if spot <= 0:
+            try:
+                spot = float(self._primary.get_last_price() or 0.0)
+            except Exception:
+                spot = 0.0
+        return bool(preparer(spot, float(available_funds or 0.0), reason="session_start"))
+
+    def release_icici_execution_vehicle(self) -> None:
+        releaser = getattr(self._primary, "release_execution_vehicle", None)
+        if callable(releaser):
+            releaser()
+
     def register_strategy(self, strategy) -> None:
         self._strategy_ref = strategy
         self._primary.register_strategy(strategy)

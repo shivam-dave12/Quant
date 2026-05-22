@@ -189,6 +189,11 @@ class ICICIUnderlyingDataManager:
         if not rows and bool(_cfg("ICICI_HISTORICAL_V2_FALLBACK", True)):
             v2_req = dict(base_req)
             v2_req["exch_code"] = v2_req.pop("exchange_code")
+            # Breeze v2 interval vocabulary differs from the v1 signed route.
+            v2_req["interval"] = {
+                "minute": "1minute", "5minute": "5minute",
+                "30minute": "30minute", "day": "1day",
+            }.get(str(v2_req.get("interval") or ""), str(v2_req.get("interval") or ""))
             v2_req["product_type"] = "Cash"
             v2_req["from_date"] = from_dt.strftime("%Y-%m-%d %H:%M:%S")
             v2_req["to_date"] = to_dt.strftime("%Y-%m-%d %H:%M:%S")

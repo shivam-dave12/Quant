@@ -228,7 +228,7 @@ class IndianOptionsDesk:
             reasons = (
                 desk_id.lower(),
                 "underlying_first",
-                "contract_selected_after_thesis",
+                "daily_ce_pe_book_preselected_signal_activates_side",
                 f"underlying={underlying}",
                 f"chain_rows={rows}",
                 f"strikes={strikes}",
@@ -240,7 +240,7 @@ class IndianOptionsDesk:
                 underlying=underlying,
                 option_type="chain",
                 strike=0.0,
-                expiry="post_thesis",
+                expiry="session_preselected",
                 dte=0.0,
                 bs=None,
                 reasons=reasons,

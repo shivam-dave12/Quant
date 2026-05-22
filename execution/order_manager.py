@@ -40,8 +40,9 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import math
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Dict, Optional, Tuple
 
@@ -862,7 +863,8 @@ class _ICICIAdapter:
     """Long-premium ICICI options adapter.
 
     Opening orders are always buy-to-open limit orders. Exits are sell-to-close
-    limit orders. No market entry, no option writing, no leverage.
+    limit or official Breeze stoploss orders. No market orders, no option writing,
+    no leverage. Portfolio state is created only from exact NFO option rows.
     """
 
     def __init__(self, api, exchange_instrument=None) -> None:
@@ -876,6 +878,8 @@ class _ICICIAdapter:
         self.min_qty = float(getattr(exchange_instrument, "min_qty", 1.0) or 1.0) if exchange_instrument is not None else 1.0
         self.max_qty = float(getattr(exchange_instrument, "max_qty", 0.0) or 0.0) if exchange_instrument is not None else 0.0
         self.raw = getattr(exchange_instrument, "raw", {}) or {}
+        self._last_position_filter_signature = ""
+        self._last_position_filter_log_ts = 0.0
 
     @staticmethod
     def _num(value: Any, default: float = 0.0) -> float:
@@ -905,35 +909,140 @@ class _ICICIAdapter:
             return merged
         return self.raw
 
+    @staticmethod
+    def _right_value(value: Any) -> str:
+        right = str(value or "").strip().lower()
+        if right in {"c", "ce", "call"}:
+            return "call"
+        if right in {"p", "pe", "put"}:
+            return "put"
+        return right
+
     def _has_contract_identity(self, raw: Dict[str, Any]) -> bool:
         if not isinstance(raw, dict):
             return False
         strike = self._num(raw.get("strike_price") or raw.get("StrikePrice") or raw.get("strike"), 0.0)
         expiry = str(raw.get("expiry_date") or raw.get("ExpiryDate") or raw.get("expiry") or "").strip()
-        right = str(raw.get("right") or raw.get("option_type") or raw.get("OptionType") or "").strip().lower()
-        return bool(strike > 0 and expiry and right in {"call", "put", "ce", "pe", "c", "p"})
+        right = self._right_value(raw.get("right") or raw.get("option_type") or raw.get("OptionType"))
+        return bool(strike > 0 and expiry and right in {"call", "put"})
 
-    def _position_qty(self, row: Dict[str, Any]) -> float:
+    def _target_stock_code(self) -> str:
+        active = self._active_raw()
+        return str(active.get("stock_code") or active.get("StockCode") or self.symbol or "").strip().upper()
+
+    def _contract_key(self, raw: Dict[str, Any]) -> tuple:
+        stock = str(raw.get("stock_code") or raw.get("StockCode") or "").strip().upper()
+        strike = round(self._num(raw.get("strike_price") or raw.get("StrikePrice") or raw.get("strike"), 0.0), 8)
+        expiry_raw = raw.get("expiry_date") or raw.get("ExpiryDate") or raw.get("expiry") or ""
+        try:
+            expiry = self.api._normalise_expiry(expiry_raw)
+        except Exception:
+            expiry = str(expiry_raw).strip().lower()[:10]
+        right = self._right_value(raw.get("right") or raw.get("option_type") or raw.get("OptionType"))
+        return (stock, strike, str(expiry).strip().lower(), right)
+
+    def _signed_position_qty(self, row: Dict[str, Any]) -> float:
+        # Breeze PortfolioPositions officially returns `quantity`; aliases are
+        # retained only for backward-compatible broker response variants.
         for key in ("quantity", "qty", "open_quantity", "open_qty", "net_quantity", "net_qty"):
-            qty = self._num(row.get(key), 0.0)
-            if abs(qty) > 0:
-                return abs(qty)
+            if key in row and row.get(key) not in (None, ""):
+                return self._num(row.get(key), 0.0)
         return 0.0
 
+    def _position_qty(self, row: Dict[str, Any]) -> float:
+        return abs(self._signed_position_qty(row))
+
+    def _is_exact_nfo_option_position(self, row: Dict[str, Any]) -> tuple[bool, str]:
+        if not isinstance(row, dict):
+            return False, "non_mapping_row"
+        segment = str(row.get("segment") or row.get("Segment") or "").strip().lower()
+        product = str(row.get("product_type") or row.get("product") or row.get("ProductType") or "").strip().lower()
+        exchange = str(row.get("exchange_code") or row.get("ExchangeCode") or "").strip().upper()
+        # Breeze response variants may omit `segment`; never invent a position,
+        # but do not ignore an exact NFO Options contract solely because this
+        # optional discriminator is absent. Explicit non-F&O values still fail.
+        if segment and segment not in {"fno", "nfo"}:
+            return False, "explicit_non_fno_segment"
+        if exchange != "NFO":
+            return False, "not_nfo_exchange"
+        if product not in {"option", "options"}:
+            return False, "not_options_product"
+        if not self._has_contract_identity(row):
+            return False, "missing_exact_contract_identity"
+        target = self._target_stock_code()
+        stock = str(row.get("stock_code") or row.get("StockCode") or "").strip().upper()
+        if target and stock and stock != target:
+            return False, "different_underlying"
+        if target and not stock:
+            return False, "missing_underlying"
+        return True, ""
+
+    def _is_exact_nfo_option_order(self, row: Dict[str, Any]) -> tuple[bool, str]:
+        """Order-list validation; unlike PortfolioPositions, Order responses do not publish `segment`."""
+        if not isinstance(row, dict):
+            return False, "non_mapping_row"
+        product = str(row.get("product_type") or row.get("product") or row.get("ProductType") or "").strip().lower()
+        exchange = str(row.get("exchange_code") or row.get("ExchangeCode") or "").strip().upper()
+        if exchange != "NFO":
+            return False, "not_nfo_exchange"
+        if product not in {"option", "options"}:
+            return False, "not_options_product"
+        if not self._has_contract_identity(row):
+            return False, "missing_exact_contract_identity"
+        target = self._target_stock_code()
+        stock = str(row.get("stock_code") or row.get("StockCode") or "").strip().upper()
+        if target and stock != target:
+            return False, "different_underlying"
+        return True, ""
+
+    def _valid_open_option_rows(self, positions: list[Dict[str, Any]]) -> tuple[list[Dict[str, Any]], list[str]]:
+        valid, ignored = [], []
+        for row in positions:
+            if not isinstance(row, dict):
+                continue
+            signed_qty = self._signed_position_qty(row)
+            if abs(signed_qty) <= 0:
+                continue
+            ok, reason = self._is_exact_nfo_option_position(row)
+            if ok:
+                valid.append(row)
+            else:
+                ignored.append(reason)
+        return valid, ignored
+
+    def _log_filtered_broker_rows(self, ignored: list[str]) -> None:
+        if not ignored:
+            return
+        signature = ",".join(sorted(ignored))
+        now = time.time()
+        if signature == self._last_position_filter_signature and now - self._last_position_filter_log_ts < 300.0:
+            return
+        self._last_position_filter_signature = signature
+        self._last_position_filter_log_ts = now
+        logger.info(
+            "ICICI F&O position filter ignored %d non-executable broker row(s) [%s]; "
+            "only exact NFO Options rows can create position state",
+            len(ignored), ",".join(sorted(set(ignored)))
+        )
+
     def _normalised_position_row(self, row: Dict[str, Any], *, source: str = "matched") -> Dict[str, Any]:
-        qty = self._position_qty(row)
+        signed_qty = self._signed_position_qty(row)
+        qty = abs(signed_qty)
         entry = self._num(row.get("average_price") or row.get("avg_price") or row.get("entry_price"), 0.0)
         upnl = self._num(row.get("unrealized_pnl") or row.get("unrealised_pnl") or row.get("pnl"), 0.0)
-        right = str(row.get("right") or row.get("option_type") or row.get("OptionType") or "").strip()
+        right = self._right_value(row.get("right") or row.get("option_type") or row.get("OptionType"))
         strike = str(row.get("strike_price") or row.get("StrikePrice") or row.get("strike") or "").strip()
         expiry = str(row.get("expiry_date") or row.get("ExpiryDate") or row.get("expiry") or "").strip()
         symbol = str(row.get("TradingSymbol") or row.get("trading_symbol") or row.get("symbol") or "").strip()
         out = {
-            "side": "LONG" if qty > 0 else None,
+            "side": "LONG" if signed_qty > 0 else ("SHORT" if signed_qty < 0 else None),
             "size": qty,
+            "size_signed": signed_qty,
             "entry_price": entry,
             "unrealized_pnl": upnl,
             "currency": "INR",
+            "segment": "FNO",
+            "product_type": "Options",
             "raw": row,
             "contract_identity_source": source,
             "stock_code": row.get("stock_code") or row.get("StockCode"),
@@ -943,11 +1052,11 @@ class _ICICIAdapter:
             "expiry_date": expiry,
             "TradingSymbol": symbol,
         }
-        if source != "matched":
+        if source != "selected_contract_match":
             out["requires_contract_reconstruction"] = True
-        if not self._has_contract_identity(out):
+        if signed_qty < 0:
             out["unadoptable"] = True
-            out["reason"] = "missing_exact_icici_option_identity"
+            out["reason"] = "short_icici_option_outside_long_premium_policy"
         return out
 
     def _lot_size(self) -> float:
@@ -956,7 +1065,9 @@ class _ICICIAdapter:
             val = self._num(raw.get(key), 0.0)
             if val > 0:
                 return val
-        return max(1.0, self.min_qty)
+        # No invented option lot size.  A missing broker/security-master lot
+        # is a routing failure, not permission to trade one unit.
+        return 0.0
 
     def _order_body(self, side: str, order_type: str, quantity: float,
                     price=None, trigger_price=None, reduce_only: bool = False,
@@ -966,21 +1077,35 @@ class _ICICIAdapter:
         if "MARKET" in order_type_u and not reduce_only:
             raise RuntimeError("ICICI options guard: market entries are disabled; use limit orders")
         raw = self._active_raw()
+        if not self._has_contract_identity(raw):
+            raise RuntimeError("ICICI options guard: exact NFO option identity is required before routing an order")
+        exchange_code = str(raw.get("exchange_code") or "NFO").upper()
+        if exchange_code != "NFO":
+            raise RuntimeError(f"ICICI options guard: expected NFO option contract, received exchange={exchange_code}")
         action = "sell" if reduce_only else "buy"
         px = price if price is not None else trigger_price
         if (px is None or float(px or 0.0) <= 0) and reduce_only:
             px = raw.get("selected_entry_premium") or raw.get("ltp") or raw.get("last_price") or raw.get("close")
         if px is None or float(px or 0.0) <= 0:
-            raise RuntimeError("ICICI options guard: limit price is required")
-        lot = int(max(1, round(self._lot_size())))
-        lots = max(1, int(round(float(quantity or 0.0) / max(lot, 1))))
+            raise RuntimeError("ICICI options guard: executable limit price is required")
+        lot_raw = float(self._lot_size() or 0.0)
+        if lot_raw <= 0:
+            raise RuntimeError("ICICI options guard: verified NFO option lot size is required before routing an order")
+        lot = int(round(lot_raw))
+        if lot <= 0 or abs(lot_raw - lot) > 1e-9:
+            raise RuntimeError(f"ICICI options guard: invalid NFO option lot size={lot_raw!r}")
+        requested = float(quantity or 0.0)
+        lots = int(math.floor((requested / lot) + 1e-9))
+        if lots < 1:
+            raise RuntimeError(f"ICICI options guard: requested quantity={requested:g} does not fit one lot={lot}")
         qty = int(lots * lot)
+        is_stop = order_type_u.startswith("STOP") or stop_order_type == "stop_loss_order"
         body = {
             "stock_code": str(raw.get("stock_code") or raw.get("ShortName") or "").upper(),
-            "exchange_code": str(raw.get("exchange_code") or "NFO").upper(),
+            "exchange_code": "NFO",
             "product": "options",
             "action": action,
-            "order_type": "limit",
+            "order_type": "stoploss" if is_stop else "limit",
             "quantity": qty,
             "price": str(px),
             "validity": "day",
@@ -988,7 +1113,9 @@ class _ICICIAdapter:
             "right": self.api._normalise_right(raw.get("right") or raw.get("OptionType") or ""),
             "strike_price": str(raw.get("strike_price") or raw.get("StrikePrice") or ""),
         }
-        if (order_type_u.startswith("STOP") or stop_order_type == "stop_loss_order") and trigger_price is not None:
+        if is_stop:
+            if trigger_price is None or float(trigger_price or 0.0) <= 0:
+                raise RuntimeError("ICICI options guard: stoploss order requires a positive trigger price")
             body["stoploss"] = str(trigger_price)
         return {k: v for k, v in body.items() if v not in (None, "")}
 
@@ -1075,12 +1202,47 @@ class _ICICIAdapter:
         return {"order_id": str(order_id), "status": "PENDING"}
 
     def get_open_orders(self, symbol: str) -> Optional[list]:
-        return []
+        getter = getattr(self.api, "get_order_list", None)
+        if not callable(getter):
+            return []
+        now = datetime.now(timezone.utc)
+        try:
+            self.limiter.wait()
+            resp = getter(
+                exchange_code="NFO",
+                from_date=(now - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                to_date=now.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            )
+        except Exception as exc:
+            logger.warning("ICICI NFO open-order recovery unavailable: %s", exc)
+            return []
+        rows = resp.get("Success") if isinstance(resp, dict) else resp
+        rows = rows if isinstance(rows, list) else []
+        active = self._active_raw()
+        active_key = self._contract_key(active) if self._has_contract_identity(active) else None
+        open_orders = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            ok, _ = self._is_exact_nfo_option_order(row)
+            if not ok or (active_key and self._contract_key(row) != active_key):
+                continue
+            status = str(row.get("status") or row.get("Status") or "").strip().upper()
+            if status in {"EXECUTED", "FILLED", "COMPLETE", "COMPLETED", "CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}:
+                continue
+            order_type = str(row.get("order_type") or "").strip().upper()
+            stoploss = self._num(row.get("stoploss") or row.get("SLTP_price"), 0.0)
+            typ = "STOP_LOSS" if order_type == "STOPLOSS" or stoploss > 0 else "LIMIT"
+            oid = row.get("order_id") or row.get("OrderId")
+            if oid:
+                open_orders.append({"order_id": str(oid), "type": typ, "trigger_price": stoploss, "raw": row})
+        return open_orders
 
     def get_positions(self, symbol: str) -> Optional[Dict]:
         try:
             return self.api.get_portfolio_positions()
-        except Exception:
+        except Exception as exc:
+            logger.error("ICICI NFO PortfolioPositions fetch failed: %s", exc)
             return None
 
     def normalise_position(self, raw) -> Optional[Dict]:
@@ -1088,83 +1250,58 @@ class _ICICIAdapter:
         if isinstance(rows, dict):
             rows = rows.get("positions") or rows.get("data") or [rows]
         positions = rows if isinstance(rows, list) else []
+        valid_rows, ignored = self._valid_open_option_rows(positions)
+        self._log_filtered_broker_rows(ignored)
+        flat = {
+            "side": None, "size": 0.0, "size_signed": 0.0, "entry_price": 0.0,
+            "unrealized_pnl": 0.0, "currency": "INR", "segment": "FNO",
+            "product_type": "Options", "position_scope_verified": True,
+            "ignored_non_option_rows": len(ignored),
+        }
+        if not valid_rows:
+            return flat
+
         active = self._active_raw()
-        if not self._has_contract_identity(active):
-            open_positions = [
-                self._normalised_position_row(pos, source="broker_portfolio")
-                for pos in positions
-                if isinstance(pos, dict) and self._position_qty(pos) > 0
-            ]
-            if not open_positions:
-                return {"side": None, "size": 0.0, "entry_price": 0.0, "unrealized_pnl": 0.0, "currency": "INR"}
-            first = open_positions[0]
-            if len(open_positions) > 1:
-                first = dict(first)
-                first["multiple_broker_positions"] = True
-                first["external_positions"] = open_positions
-                first["size"] = sum(float(p.get("size", 0.0) or 0.0) for p in open_positions)
-                first["unrealized_pnl"] = sum(float(p.get("unrealized_pnl", 0.0) or 0.0) for p in open_positions)
-                first["unadoptable"] = True
-                first["reason"] = "multiple_icici_broker_positions_require_manual_selection"
-            logger.warning(
-                "ICICI broker position detected before a selected option vehicle exists: "
-                "symbol=%s right=%s strike=%s expiry=%s qty=%.8g adoptable=%s",
-                first.get("TradingSymbol") or "-",
-                first.get("right") or "-",
-                first.get("strike_price") or "-",
-                first.get("expiry_date") or "-",
-                float(first.get("size", 0.0) or 0.0),
-                not bool(first.get("unadoptable")),
+        active_key = self._contract_key(active) if self._has_contract_identity(active) else None
+        normalised = [self._normalised_position_row(row, source="broker_portfolio_exact") for row in valid_rows]
+        if active_key:
+            for row, position in zip(valid_rows, normalised):
+                if self._contract_key(row) == active_key:
+                    position["contract_identity_source"] = "selected_contract_match"
+                    position.pop("requires_contract_reconstruction", None)
+                    return position
+            first = dict(normalised[0])
+            first["unadoptable"] = True
+            first["reason"] = "exact_nfo_option_does_not_match_selected_contract"
+            first["external_positions"] = normalised
+            logger.critical(
+                "ICICI exact NFO option position exists but does not match selected vehicle: "
+                "symbol=%s right=%s strike=%s expiry=%s qty=%.8g",
+                first.get("TradingSymbol") or first.get("stock_code") or "-",
+                first.get("right") or "-", first.get("strike_price") or "-",
+                first.get("expiry_date") or "-", float(first.get("size", 0.0) or 0.0),
             )
             return first
-        strike = str(active.get("strike_price") or "").strip().lower()
-        right = str(active.get("right") or active.get("option_type") or "").strip().lower()
-        expiry = str(active.get("expiry_date") or "").strip().lower()
-        for pos in positions:
-            if not isinstance(pos, dict):
-                continue
-            text = " ".join(str(v) for v in pos.values()).lower()
-            if strike and strike not in text:
-                continue
-            if right and right not in text and right[:1] not in text:
-                continue
-            if expiry and expiry[:10] not in text:
-                continue
-            qty = abs(self._num(pos.get("quantity") or pos.get("qty") or pos.get("open_quantity"), 0.0))
-            entry = self._num(pos.get("average_price") or pos.get("avg_price") or pos.get("entry_price"), 0.0)
-            upnl = self._num(pos.get("unrealized_pnl") or pos.get("pnl"), 0.0)
-            if qty > 0:
-                matched = self._normalised_position_row(pos, source="selected_contract_match")
-                matched["entry_price"] = entry
-                matched["unrealized_pnl"] = upnl
-                return matched
-        open_positions = [
-            self._normalised_position_row(pos, source="broker_portfolio_unmatched")
-            for pos in positions
-            if isinstance(pos, dict) and self._position_qty(pos) > 0
-        ]
-        if open_positions:
-            first = open_positions[0]
-            if len(open_positions) > 1:
-                first = dict(first)
-                first["multiple_broker_positions"] = True
-                first["external_positions"] = open_positions
-                first["size"] = sum(float(p.get("size", 0.0) or 0.0) for p in open_positions)
-                first["unrealized_pnl"] = sum(float(p.get("unrealized_pnl", 0.0) or 0.0) for p in open_positions)
-                first["unadoptable"] = True
-                first["reason"] = "multiple_icici_broker_positions_require_manual_selection"
+
+        if len(normalised) == 1:
+            position = normalised[0]
             logger.warning(
-                "ICICI broker position did not match selected contract; reporting actual broker vehicle "
-                "symbol=%s right=%s strike=%s expiry=%s qty=%.8g adoptable=%s",
-                first.get("TradingSymbol") or "-",
-                first.get("right") or "-",
-                first.get("strike_price") or "-",
-                first.get("expiry_date") or "-",
-                float(first.get("size", 0.0) or 0.0),
-                not bool(first.get("unadoptable")),
+                "ICICI exact NFO option position detected before a selected option vehicle exists: "
+                "symbol=%s right=%s strike=%s expiry=%s qty=%.8g",
+                position.get("TradingSymbol") or position.get("stock_code") or "-",
+                position.get("right") or "-", position.get("strike_price") or "-",
+                position.get("expiry_date") or "-", float(position.get("size", 0.0) or 0.0),
             )
-            return first
-        return {"side": None, "size": 0.0, "entry_price": 0.0, "unrealized_pnl": 0.0, "currency": "INR"}
+            return position
+        first = dict(normalised[0])
+        first["multiple_broker_positions"] = True
+        first["external_positions"] = normalised
+        first["size"] = sum(float(p.get("size", 0.0) or 0.0) for p in normalised)
+        first["unrealized_pnl"] = sum(float(p.get("unrealized_pnl", 0.0) or 0.0) for p in normalised)
+        first["unadoptable"] = True
+        first["reason"] = "multiple_exact_nfo_option_positions_require_manual_selection"
+        logger.critical("ICICI multiple exact NFO option positions found; refusing automatic adoption")
+        return first
 
     def _parse_fno_funds(self, resp: Dict[str, Any]) -> Dict[str, Any]:
         data = self._success_payload(resp)
@@ -1624,6 +1761,33 @@ class OrderManager:
             if not self._check_window_rate_limit():
                 return None
             api_side = self._normalize_side(side)
+            if self._exchange_name == "icici":
+                if not reduce_only:
+                    logger.error("ICICI Breeze guard: market entry rejected; NFO options require a priced LIMIT entry")
+                    return None
+                ex_pos = self.get_open_position()
+                if not ex_pos or bool(ex_pos.get("unadoptable")):
+                    logger.critical("ICICI emergency close refused: no exact adoptable NFO option position is available")
+                    return None
+                raw = ex_pos.get("raw") or {}
+                ref = float(raw.get("ltp") or raw.get("LTP") or ex_pos.get("entry_price") or 0.0)
+                if ref <= 0:
+                    logger.critical("ICICI emergency close refused: no reference premium available for priced exit")
+                    return None
+                # Breeze prohibits market orders. For an emergency close, send an
+                # aggressively marketable priced limit while retaining exact contract scope.
+                slippage_pct = float(getattr(config, "ICICI_EMERGENCY_EXIT_LIMIT_BUFFER_PCT", 0.10))
+                tick = max(float(getattr(self._adapter, "tick_size", 0.05) or 0.05), 0.01)
+                if str(api_side).lower() == "sell":
+                    limit_price = math.floor((ref * max(0.01, 1.0 - slippage_pct)) / tick) * tick
+                else:
+                    limit_price = math.ceil((ref * (1.0 + slippage_pct)) / tick) * tick
+                limit_price = max(tick, limit_price)
+                logger.critical(
+                    "ICICI Breeze prohibits MARKET exits; routing emergency %s as aggressive LIMIT qty=%s premium_ref=₹%.2f limit=₹%.2f",
+                    api_side.upper(), quantity, ref, limit_price,
+                )
+                return self.place_limit_order(side=side, quantity=quantity, price=limit_price, reduce_only=True)
             logger.info(f"MARKET {side} qty={quantity} reduce_only={reduce_only}")
             data = self._place_with_retry(
                 side=api_side, order_type="MARKET",

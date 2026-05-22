@@ -563,7 +563,7 @@ def _is_icici_underlying_chain_instrument(instrument: Any = None) -> bool:
     return bool(
         _icici_exchange_name(instrument) == "icici"
         and raw.get("icici_underlying_desk")
-        and str(raw.get("contract_selector_mode") or "").lower() == "post_thesis"
+        and str(raw.get("contract_selector_mode") or "").lower() == "session_preselected_execution"
         and not raw.get("selected_option_contract")
     )
 
@@ -648,7 +648,7 @@ def _icici_runtime_lot_size(instrument: Any = None) -> float:
         lot = _icici_float(raw.get(key), 0.0)
         if lot > 0:
             return lot
-    return max(1.0, _icici_float(_cfg("ICICI_OPTION_DEFAULT_LOT_SIZE", 1.0), 1.0))
+    return max(0.0, _icici_float(_cfg("ICICI_OPTION_DEFAULT_LOT_SIZE", 0.0), 0.0))
 
 
 def _icici_selected_premium(instrument: Any = None, fallback: float = 0.0) -> float:
@@ -729,7 +729,9 @@ def _icici_ensure_adoptable_contract(instrument: Any, ex_pos: Any) -> bool:
         raw["runtime_lot_size"] = lot
     if entry_px > 0:
         raw["selected_entry_premium"] = entry_px
-    return _icici_contract_identity_ok(raw)
+    # Recovery may identify a real broker option position, but automated order
+    # management cannot safely route until its exact NFO lot is known.
+    return _icici_contract_identity_ok(raw) and _icici_runtime_lot_size(instrument) > 0
 
 
 def _icici_select_contract_for_thesis(
@@ -4528,6 +4530,7 @@ class QuantStrategy:
         now = timestamp_ms / 1000.0
         with self._lock:
             self._om = order_manager
+            self._dm = data_manager
             # Bug #10 fix: store risk_manager reference so _record_exchange_exit
             # can call risk_manager.record_trade without a parameter chain change.
             self._risk_manager_ref = risk_manager
@@ -7028,6 +7031,21 @@ class QuantStrategy:
         _icici_thesis_side = str(side or "").lower()
         _icici_underlying_entry = float(getattr(self._last_entry_signal, "entry_price", 0.0) or 0.0)
         _icici_selected_choice = None
+
+        def _release_icici_vehicle_if_unfilled(rejection: str) -> None:
+            # Contract activation switches the primary feed from underlying-mode
+            # to option-premium execution-mode.  If the entry is rejected before
+            # any fill, restore underlying-mode immediately; otherwise later scans
+            # could evaluate NIFTY structure against an option premium.
+            if _icici_selected_choice is None:
+                return
+            releaser = getattr(data_manager, "release_icici_execution_vehicle", None)
+            if callable(releaser):
+                try:
+                    releaser()
+                    logger.info("ICICI preselected vehicle released before fill: %s", rejection)
+                except Exception as exc:
+                    logger.error("ICICI pre-fill vehicle release failed [%s]: %s", rejection, exc)
         if _icici_mode:
             _session_open, _session_reason = _icici_market_session_open()
             if not _session_open:
@@ -7081,6 +7099,13 @@ class QuantStrategy:
                 with self._lock:
                     self._last_tp_gate_rejection = time.time()
                 return
+            _verified_icici_lot = _icici_runtime_lot_size(self._instrument)
+            if _verified_icici_lot <= 0:
+                logger.critical(
+                    "ICICI options entry rejected: selected contract has no verified NFO lot size; refusing unsafe sizing/routing")
+                with self._lock:
+                    self._last_tp_gate_rejection = time.time()
+                return
             side = "long"
             price = _icici_selected_premium(self._instrument, fallback=0.0)
             if price <= max(QCfg.TICK_SIZE(), 1e-6):
@@ -7102,7 +7127,7 @@ class QuantStrategy:
             if exec_atr > 1e-10:
                 atr = exec_atr
             logger.info(
-                "ICICI options execution vehicle selected: %s %s strike=%s expiry=%s premium=%.2f lot=%.0f cost=%.2f funds=%.2f",
+                "ICICI preselected session execution vehicle activated: %s %s strike=%s expiry=%s live_premium=%.2f lot=%.0f live_cost=%.2f funds=%.2f",
                 getattr(_icici_selected_choice, "right", ""),
                 getattr(_icici_selected_choice, "selected_symbol", ""),
                 getattr(_icici_selected_choice, "strike", 0.0),
@@ -7262,6 +7287,7 @@ class QuantStrategy:
                     self._force_tp = None
                     with self._lock:
                         self._last_tp_gate_rejection = time.time()
+                    _release_icici_vehicle_if_unfilled("premium_sltp_conversion_rejected")
                     return
                 _fsl = _round_to_tick(_conv_sl)
                 _ftp = _round_to_tick(_conv_tp)
@@ -7288,6 +7314,7 @@ class QuantStrategy:
                 "liquidity TP + ICT/liquidity SL levels; refusing entry")
             with self._lock:
                 self._last_tp_gate_rejection = time.time()
+            _release_icici_vehicle_if_unfilled("no_executable_structural_levels")
             return
         else:
             # Force levels active; fee/slippage expectancy is a hard execution gate.
@@ -7305,17 +7332,21 @@ class QuantStrategy:
                             f"< required {_min_tp:.0f} after fees/slippage")
                         with self._lock:
                             self._last_tp_gate_rejection = time.time()
+                        _release_icici_vehicle_if_unfilled("fee_floor_rejected")
                         return
                 except Exception:
                     pass
         if sl_price is None:
             with self._lock:
                 self._last_tp_gate_rejection = time.time()
+            _release_icici_vehicle_if_unfilled("sl_missing")
             return
 
         sd = abs(entry_ref - sl_price)
         td = abs(entry_ref - tp_price)
-        if sd < 1e-10: return
+        if sd < 1e-10:
+            _release_icici_vehicle_if_unfilled("zero_stop_distance")
+            return
         rr = td / sd
         if not _icici_mode:
             _liq_entry_ref = entry_ref
@@ -7383,6 +7414,7 @@ class QuantStrategy:
         sd = abs(entry_ref - sl_price)
         td = abs(entry_ref - tp_price)
         if sd < 1e-10:
+            _release_icici_vehicle_if_unfilled("post_surface_zero_stop_distance")
             return
         rr = td / sd
 
@@ -7397,6 +7429,7 @@ class QuantStrategy:
             # evaluation appears to stop after a minimum-lot sizing reject.
             with self._lock:
                 self._last_tp_gate_rejection = time.time()
+            _release_icici_vehicle_if_unfilled("sizing_rejected")
             return
 
         _actual_entry_lev = float(getattr(self, "_active_effective_leverage", QCfg.LEVERAGE()) or QCfg.LEVERAGE())
@@ -7552,6 +7585,7 @@ class QuantStrategy:
         if not entry_data:
             logger.error("❌ Entry order failed")
             self._last_exit_time = time.time()  # engage cooldown — prevents hammer-retrying
+            _release_icici_vehicle_if_unfilled("entry_order_not_filled_or_rejected")
             return
 
         if _delta_requires_native_bracket and not is_bracket:
@@ -7740,24 +7774,41 @@ class QuantStrategy:
                 self._last_exit_time = time.time()
                 return
 
-            tp_data = order_manager.place_take_profit(
-                side=exit_side, quantity=qty, trigger_price=tp_price)
-            if not tp_data:
-                order_manager.cancel_order(sl_data["order_id"])
-                order_manager.place_market_order(side=exit_side, quantity=qty, reduce_only=True)
-                self._last_exit_time = time.time()
-                return
+            if _icici_mode:
+                # Breeze has no verified reduce-only/OCO protection in this
+                # integration. Keep exactly one broker-side exit SELL live: SL.
+                # TP levels are supervised locally and executed only after SL
+                # cancellation has been acknowledged.
+                tp_data = None
+                logger.info(
+                    "ICICI single-live-exit invariant: protective NFO STOPLOSS armed; "
+                    "TP levels are locally supervised (no parallel SELL/OCO assumption)")
+            else:
+                tp_data = order_manager.place_take_profit(
+                    side=exit_side, quantity=qty, trigger_price=tp_price)
+                if not tp_data:
+                    order_manager.cancel_order(sl_data["order_id"])
+                    order_manager.place_market_order(side=exit_side, quantity=qty, reduce_only=True)
+                    self._last_exit_time = time.time()
+                    return
 
         # ── Dynamic TP ladder: internal liquidity TP1..TPn, final TP unchanged ─────
         tp_ladder_plan = self._build_tp_ladder_plan(
             side=side, entry_price=fill_price, sl_price=sl_price,
             final_tp=tp_price, quantity=qty, atr=atr,
             use_maker_entry=(str(actual_fill_type or "").lower() == "maker"))
-        tp_ladder_dicts, tp_ladder_order_ids = self._place_internal_tp_ladder(
-            order_manager=order_manager, side=side, quantity=qty, final_tp=tp_price,
-            native_final_tp_order_id=(tp_data or {}).get("order_id", ""),
-            ladder_plan=tp_ladder_plan,
-        )
+        if _icici_mode:
+            tp_ladder_dicts = [l.as_dict() for l in getattr(tp_ladder_plan, "legs", [])] if tp_ladder_plan is not None else []
+            tp_ladder_order_ids = []
+            logger.info(
+                "ICICI TP_LADDER analytical-only: %d levels computed; no standalone broker TP sells placed while protective SL is live",
+                len(tp_ladder_dicts))
+        else:
+            tp_ladder_dicts, tp_ladder_order_ids = self._place_internal_tp_ladder(
+                order_manager=order_manager, side=side, quantity=qty, final_tp=tp_price,
+                native_final_tp_order_id=(tp_data or {}).get("order_id", ""),
+                ladder_plan=tp_ladder_plan,
+            )
 
         # ── Log execution cost snapshot (PATCH 5g) ────────────────────────────────
         if self._fee_engine is not None:
@@ -8029,7 +8080,11 @@ class QuantStrategy:
         except Exception:
             pass
         _sep = "━━━━━━━━━━━━━━━━━━━━"
-        _fee_line = (f"Delta fee exact ${entry_fee_paid:.4f}" if entry_fee_exact else "Delta fee pending exact commission")
+        _entry_cur = "₹" if _icici_mode else "$"
+        if _icici_mode:
+            _fee_line = (f"Breeze NFO fee exact ₹{entry_fee_paid:.4f}" if entry_fee_exact else "Breeze NFO charges pending broker statement")
+        else:
+            _fee_line = (f"Delta fee exact ${entry_fee_paid:.4f}" if entry_fee_exact else "Delta fee pending exact commission")
         _entry_msg = format_entry_alert(
             side=side,
             entry=fill_price,
@@ -8093,8 +8148,16 @@ class QuantStrategy:
 
     def _manage_active(self, data_manager, order_manager, now):
         pos = self._pos; price = data_manager.get_last_price()
-        if price < 1.0: return
+        _is_icici_active = _icici_exchange_name(getattr(self, "_instrument", None)) == "icici"
+        _min_active_price = max(QCfg.TICK_SIZE(), 1e-6) if _is_icici_active else 1.0
+        if price < _min_active_price: return
         _, _observed_new_extreme = self._observe_position_extremes(pos, price)
+        if _is_icici_active and pos.side == "long" and pos.tp_price > 0 and price >= pos.tp_price:
+            logger.info(
+                "ICICI locally supervised TP reached: premium ₹%.2f >= target ₹%.2f — cancelling SL then routing sell-to-close",
+                price, pos.tp_price)
+            self._exit_trade(order_manager, price, "icici_tp_target_reached")
+            return
 
         # ── Conditionally compute signals — only when trade mode consumes them ──
         # Bug #7/#19 fix: _compute_signals() runs all five signal engines (VWAP,
@@ -8545,6 +8608,74 @@ class QuantStrategy:
         """Disabled: SL price is fixed; TP ladder handles monetisation."""
         return False
 
+
+    def _exit_trade(self, order_manager, reference_price: float, reason: str) -> bool:
+        """Submit a full strategy exit without leaving conflicting exit orders live.
+
+        Any strategy-managed close must first cancel broker-resident exits. P&L
+        is never booked here; reconciliation records the confirmed execution.
+        """
+        pos = self._pos
+        if pos is None or pos.is_flat() or pos.phase != PositionPhase.ACTIVE:
+            return False
+        exit_side = "sell" if pos.side == "long" else "buy"
+        cur = "₹" if _icici_exchange_name(getattr(self, "_instrument", None)) == "icici" else "$"
+        with self._lock:
+            if self._pos.phase != PositionPhase.ACTIVE:
+                return False
+            self._pos.phase = PositionPhase.EXITING
+            self._exiting_since = time.time()
+        try:
+            self._cancel_tp_ladder_orders(order_manager, pos)
+            sl_result, tp_result = order_manager.cancel_all_exit_orders(
+                getattr(pos, "sl_order_id", ""), getattr(pos, "tp_order_id", ""))
+            terminal = {CancelResult.ALREADY_FILLED, CancelResult.PARTIAL_FILL}
+            if sl_result in terminal or tp_result in terminal:
+                logger.warning(
+                    "Exit request %s deferred: existing exit order filled/partially filled; reconciliation owns final state", reason)
+                with self._lock:
+                    self._pos.phase = PositionPhase.ACTIVE
+                self._last_reconcile_time = 0.0
+                return False
+            if sl_result == CancelResult.FAILED or tp_result == CancelResult.FAILED:
+                logger.critical(
+                    "Exit request %s refused: live exit cancellation unverified; no conflicting close submitted", reason)
+                with self._lock:
+                    self._pos.phase = PositionPhase.ACTIVE
+                return False
+            close = order_manager.place_market_order(
+                side=exit_side, quantity=pos.quantity, reduce_only=True)
+            oid = str((close or {}).get("order_id") or "") if isinstance(close, dict) else ""
+            if oid:
+                with self._lock:
+                    pos.manual_exit_order_id = oid
+                    pos.manual_exit_reason = str(reason or "manual_exit")
+                    pos.manual_exit_requested_at = time.time()
+                    pos.manual_exit_reference_price = float(reference_price or 0.0)
+                    pos.sl_order_id = ""; pos.tp_order_id = ""
+                logger.info(
+                    "Protected strategy exit submitted [%s]: %s qty=%.8g reference=%s%.4f order=%s",
+                    reason, exit_side.upper(), float(pos.quantity or 0.0), cur, float(reference_price or 0.0), oid[:12])
+                return True
+            restore = order_manager.place_stop_loss(
+                side=exit_side, quantity=pos.quantity, trigger_price=pos.sl_price)
+            restore_id = str((restore or {}).get("order_id") or "") if isinstance(restore, dict) else ""
+            if restore_id:
+                with self._lock:
+                    pos.phase = PositionPhase.ACTIVE; pos.sl_order_id = restore_id
+                logger.critical(
+                    "Exit submission failed [%s]; protective SL restored at %s%.4f order=%s",
+                    reason, cur, float(pos.sl_price or 0.0), restore_id[:12])
+                return False
+            logger.critical(
+                "UNPROTECTED EXIT FAILURE [%s]: close not submitted and SL restore failed — manual intervention required", reason)
+            return False
+        except Exception as exc:
+            logger.critical("Protected strategy exit exception [%s]: %s", reason, exc, exc_info=True)
+            with self._lock:
+                if not str(getattr(pos, "manual_exit_order_id", "") or ""):
+                    pos.phase = PositionPhase.ACTIVE
+            return False
 
     def _record_exchange_exit(self, ex_pos):
         """
@@ -9006,9 +9137,10 @@ class QuantStrategy:
         _lifecycle_qty = float(getattr(pos, "tp_ladder_initial_qty", 0.0) or getattr(pos, "quantity", 0.0) or 0.0)
         _residual_qty = float(getattr(pos, "quantity", 0.0) or 0.0)
         _partial_qty = max(0.0, _lifecycle_qty - _residual_qty)
+        _exit_cur = "₹" if _icici_exchange_name(getattr(self, "_instrument", None)) == "icici" else "$"
         _fee_source = (
-            f"entry total {_entry_tag} ${entry_fee:.4f} · residual entry ${residual_entry_fee:.4f} · "
-            f"ladder fees ${ladder_fees:.4f} · final exit {_exit_tag} ${exit_fee:.4f}"
+            f"entry total {_entry_tag} {_exit_cur}{entry_fee:.4f} · residual entry {_exit_cur}{residual_entry_fee:.4f} · "
+            f"ladder fees {_exit_cur}{ladder_fees:.4f} · final exit {_exit_tag} {_exit_cur}{exit_fee:.4f}"
         )
         self._send_telegram(
             format_exit_alert(
@@ -9038,6 +9170,7 @@ class QuantStrategy:
                 tp_ladder_gross=ladder_gross,
                 tp_ladder_fees=ladder_fees,
                 residual_net=residual_pnl,
+                instrument=getattr(self, "_instrument", None),
             ),
             event_type="exit",
         )
@@ -9145,6 +9278,8 @@ class QuantStrategy:
         self._trade_history.append({
             # ── Core trade data ────────────────────────────────────────────
             "timestamp":    _trade_ts,
+            "currency":     "₹" if _icici_exchange_name(_inst) == "icici" else "$",
+            "currency_code": "INR" if _icici_exchange_name(_inst) == "icici" else "USD",
             "asset":        getattr(_inst, "asset_id", getattr(self, "_asset_id", "")),
             "symbol":       getattr(_inst, "display_symbol", QCfg.SYMBOL()),
             "desk":         _desk_id,
@@ -9351,6 +9486,13 @@ class QuantStrategy:
         except Exception as _rm_flat_e:
             logger.debug(f"risk_manager.set_position_open(False) error (non-fatal): {_rm_flat_e}")
 
+        if _icici_exchange_name(getattr(self, "_instrument", None)) == "icici":
+            try:
+                releaser = getattr(getattr(self, "_dm", None), "release_icici_execution_vehicle", None)
+                if callable(releaser):
+                    releaser()
+            except Exception as _icici_release_exc:
+                logger.exception("ICICI session vehicle release after flat failed: %s", _icici_release_exc)
         self._pos = PositionState(); self._last_exit_time = time.time()
         self.current_sl_price = 0.0; self.current_tp_price = 0.0
         self._last_structure_fingerprint = None
@@ -9747,7 +9889,10 @@ class QuantStrategy:
         _inst_for_sizing = getattr(self, "_instrument", None)
         is_icici_option = _is_icici_option_instrument(_inst_for_sizing) or _is_icici_underlying_chain_instrument(_inst_for_sizing)
         if is_icici_option:
-            lot = max(1.0, _icici_runtime_lot_size(_inst_for_sizing))
+            lot = _icici_runtime_lot_size(_inst_for_sizing)
+            if lot <= 0:
+                logger.critical("_compute_quantity: ICICI option contract lacks verified NFO lot size — no allocation")
+                return None
             step = max(step, lot)
             min_qty = max(min_qty, lot)
             max_qty = max(min_qty, float(_cfg("ICICI_OPTION_MAX_QTY", 1000000.0)))
@@ -10617,6 +10762,12 @@ class QuantStrategy:
             return (ot in ("TAKE_PROFIT_MARKET","TAKE_PROFIT",
                            "TAKE_PROFIT_MARKET_ORDER","TAKE_PROFIT_ORDER") or
                     ("PROFIT" in ot or "TAKE_PROFIT" in ot))
+        if (phase == PositionPhase.FLAT and ex_size < QCfg.MIN_QTY()
+                and _icici_exchange_name(getattr(self, "_instrument", None)) == "icici"
+                and bool(ex_pos.get("position_scope_verified"))):
+            # A strict NFO PortfolioPositions verification supersedes any stale
+            # ghost/unmanaged alarm retained from an earlier malformed response.
+            self._last_unmanaged_external_position = None
         if phase==PositionPhase.FLAT and ex_size>=QCfg.MIN_QTY():
             settle_sec = float(getattr(config, "RECONCILE_POST_EXIT_SETTLE_SEC", 15.0))
             last_exit = float(getattr(self, "_last_exit_time", 0.0) or 0.0)
@@ -10807,7 +10958,7 @@ class QuantStrategy:
             # from the recovered SL/TP.  SL price remains fixed; internal legs
             # are reduce-only monetisation orders only.
             try:
-                if sl_oid and tp_oid and sl_p > 0.0 and tp_p > 0.0 and _adopt_atr > 0.0:
+                if (not _is_icici_reconcile) and sl_oid and tp_oid and sl_p > 0.0 and tp_p > 0.0 and _adopt_atr > 0.0:
                     _adopt_ladder = self._build_tp_ladder_plan(
                         side=iside,
                         entry_price=ex_entry,
@@ -10923,7 +11074,7 @@ class QuantStrategy:
                             if self._pos.initial_sl_dist == 0 and _ep > 0:
                                 self._pos.initial_sl_dist = abs(_ep - trig)
                         logger.info(f"Reconcile: recovered SL order {o['order_id'][:8]}… @ ${trig:.2f}")
-                    elif not self._pos.tp_order_id and _is_tp(ot):
+                    elif (not _is_icici_reconcile) and not self._pos.tp_order_id and _is_tp(ot):
                         # Bug #8 fix: same atomic write for TP fields.
                         with self._lock:
                             self._pos.tp_order_id  = o["order_id"]

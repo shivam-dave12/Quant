@@ -75,6 +75,8 @@ class RiskManager:
         self.balance_cache_ttl     = config.BALANCE_CACHE_TTL_SEC
         self._balance_fetch_in_progress = False
         self._balance_fetch_started_at = 0.0
+        self._balance_metadata: Dict = {}
+        self._initial_balance_loaded = False
 
         # Daily reset (IST UTC+5:30)
         self._IST = timezone(timedelta(hours=5, minutes=30))
@@ -128,12 +130,14 @@ class RiskManager:
                     "available": self.available_balance,
                     "total":     self.current_balance,
                     "cached":    True,
+                    **self._balance_metadata,
                 }
             if self._balance_fetch_in_progress:
                 return {
                     "available": self.available_balance,
                     "total":     self.current_balance,
                     "cached":    True,
+                    **self._balance_metadata,
                 }
             if self.api is None:
                 return None
@@ -161,21 +165,29 @@ class RiskManager:
                 return {"available": _fallback_avail, "total": _fallback_total,
                         "cached": True, "error": balance_data["error"]}
 
-            available = float(balance_data.get("available", 0.0))
-            locked    = float(balance_data.get("locked",    0.0))
-            total     = available + locked
+            available = float(balance_data.get("available", 0.0) or 0.0)
+            locked    = float(balance_data.get("locked",    0.0) or 0.0)
+            total     = float(balance_data.get("total", available + locked) or (available + locked))
+            metadata = {
+                k: v for k, v in balance_data.items()
+                if k not in {"available", "total", "cached", "raw"}
+            }
+            metadata["locked"] = locked
 
             with self._lock:
                 self.available_balance = available
                 self.current_balance   = total
+                self._balance_metadata = metadata
                 self.balance_cache_time = time.time()
                 self._balance_fetch_in_progress = False
                 self._balance_fetch_started_at = 0.0
-                if self.initial_balance == 0.0:
+                if not self._initial_balance_loaded:
+                    self._initial_balance_loaded = True
                     self.initial_balance = total
-                    logger.info(f"💰 Initial balance set: ${self.initial_balance:.2f}")
+                    symbol = "₹" if str(metadata.get("currency", "USD")).upper() == "INR" else "$"
+                    logger.info(f"💰 Initial balance set: {symbol}{self.initial_balance:.2f}")
 
-            return {"available": available, "total": total, "cached": False}
+            return {"available": available, "total": total, "cached": False, **metadata}
 
         except Exception as e:
             logger.error(f"Error fetching balance: {e}", exc_info=True)

@@ -390,9 +390,10 @@ class InstrumentRegistry:
     def load_icici(self, api, *, security_master_url: str | None = None) -> Dict[str, ExchangeInstrument]:
         """Load configured ICICI index-option desk instruments.
 
-        v508 uses the underlying-first path for NIFTY: one desk instrument is
-        discovered now, and the exact CE/PE strike/expiry is selected after the
-        strategy produces a bullish/bearish NIFTY thesis.
+        v508 uses the underlying-thesis path for NIFTY: one desk instrument is
+        discovered now; after session/F&O preflight, one executable CE and one
+        executable PE vehicle are prepared before scanning.  A later bullish or
+        bearish NIFTY thesis activates the matching preselected vehicle.
 
         This discovery stage is intentionally auth-free.  Breeze protected
         endpoints are touched only when the ICICI data managers start, so NIFTY

@@ -654,7 +654,7 @@ ICICI_ANALYZE_ONLY_DURING_MARKET_SESSION = os.getenv("ICICI_ANALYZE_ONLY_DURING_
 ICICI_BREEZE_THROTTLE_ENABLED = True
 ICICI_BREEZE_MIN_CALL_GAP_SEC = 0.35
 ICICI_SECURITY_MASTER_CACHE_PATH = os.getenv("ICICI_SECURITY_MASTER_CACHE_PATH", "data/icici_security_master.zip")
-ICICI_SECURITY_MASTER_URL = os.getenv("ICICI_SECURITY_MASTER_URL", "http://directlink.icicidirect.com/NewSecurityMaster/SecurityMaster.zip")
+ICICI_SECURITY_MASTER_URL = os.getenv("ICICI_SECURITY_MASTER_URL", "https://directlink.icicidirect.com/NewSecurityMaster/SecurityMaster.zip")
 ICICI_ALLOW_CLOSED_MARKET_HISTORICAL_WARMUP = True
 ICICI_ALLOW_CLOSED_MARKET_WARMUP = False
 ICICI_CLOSED_MARKET_QUOTE_PROBE = False
@@ -664,7 +664,9 @@ ICICI_INDEX_WEBSOCKET_REQUIRED = False
 ICICI_INDEX_STREAM_CHANNELS = "1MIN,5MIN"
 ICICI_INDEX_STREAM_SCRIPT_CODES = {}
 ICICI_OPTION_TICK_SIZE = 0.05
-ICICI_OPTION_DEFAULT_LOT_SIZE = 1.0
+# Safety invariant: never assume a one-unit NFO option lot.  Contract routing
+# is disabled until Breeze/security-master supplies the exact current lot size.
+ICICI_OPTION_DEFAULT_LOT_SIZE = 0.0
 ICICI_OPTION_MIN_DTE = 1.0
 ICICI_OPTION_MAX_DTE = 21.0
 ICICI_INDEX_OPTION_TARGET_ABS_DELTA = 0.45
@@ -678,6 +680,27 @@ ICICI_OPTION_MIN_CASH_BUFFER_INR = 0.0
 ICICI_OPTION_MIN_READY_1M_BARS = 20
 ICICI_UNDERLYING_MIN_READY_1M_BARS = 20
 ICICI_OPTION_QUOTE_POLL_SEC = 2.0
+# Session-start execution universe: preselect one verified CE and one verified PE
+# after F&O funds + NIFTY underlying warmup.  Direction remains live-thesis driven.
+ICICI_SESSION_CONTRACT_BOOK_ENABLED = True
+ICICI_SESSION_BOOK_MAX_EXPIRIES = 2
+ICICI_SESSION_BOOK_PREWARM_EXECUTION_DATA = True
+# Circuit-breaker only; normal intraday reselection is delta-band driven.
+ICICI_SESSION_BOOK_MAX_SPOT_DRIFT_PCT = 0.008
+ICICI_SESSION_BOOK_DELTA_RESELECT_BAND = 0.18
+ICICI_SESSION_BOOK_MIN_REFRESH_SEC = 900.0
+# Delta/spot-invalidated vehicles may refresh sooner, with anti-thrash protection.
+ICICI_SESSION_BOOK_URGENT_REFRESH_COOLDOWN_SEC = 30.0
+# A session-book vehicle must be executable now, not just theoretically cheap.
+ICICI_SESSION_BOOK_REQUIRE_TWO_SIDED_QUOTE = True
+ICICI_OPTION_MAX_SELECTION_SPREAD_BPS = 120.0
+ICICI_OPTION_MIN_BOOK_LOTS = 1.0
+# Dynamic execution-cost guard: the live spread cannot consume more than this
+# share of the vehicle's observed 1-minute premium ATR.
+ICICI_OPTION_EXECUTION_ATR_PERIOD = 14
+ICICI_OPTION_MAX_SPREAD_TO_1M_ATR = 0.35
+ICICI_SECURITY_MASTER_REQUIRE_TODAY = True
+ICICI_OPTION_MAX_QUOTE_STALE_SEC = 10.0
 ICICI_UNDERLYING_REST_REFRESH_SEC = 30.0
 ICICI_OPTION_SLTP_DELTA_MULT = 1.00
 ICICI_OPTION_MIN_PREMIUM_RISK_PCT = 0.14
