@@ -6,6 +6,7 @@ import time
 import pytest
 
 from strategy.entry_engine import EntryEngine, _timeframe_atr
+from strategy.fee_engine import ExecutionCostEngine
 from strategy.liquidity_map import LiquidityMapSnapshot, LiquidityPool, PoolSide, PoolStatus, PoolTarget, _native_closed_atr
 from strategy.quant_strategy import ATREngine, _round_structural_levels
 from strategy.tp_ladder import build_tp_ladder
@@ -62,6 +63,20 @@ def test_target_utility_is_net_of_venue_cost_and_rejects_negative_expected_value
     engine.set_execution_cost_model(2.0, 200.0)
     assert engine._select_liquidity_target('long', 100.0, 98.0, _snap([t]), 1.0) is None
     assert engine.analysis_info['target_audit']['non_positive_net_utility'] >= 1
+
+
+def test_delta_fee_engine_uses_exchange_specific_maker_rebate(monkeypatch):
+    import strategy.fee_engine as fe
+    monkeypatch.setattr(fe.config, "EXECUTION_EXCHANGE", "delta", raising=False)
+    monkeypatch.setattr(fe.config, "COMMISSION_RATE_MAKER", 0.00020, raising=False)
+    monkeypatch.setattr(fe.config, "DELTA_COMMISSION_RATE_MAKER", -0.00020, raising=False)
+    monkeypatch.setattr(fe.config, "DELTA_COMMISSION_RATE", 0.00050, raising=False)
+    engine = ExecutionCostEngine()
+    maker_cost = engine.effective_roundtrip_cost_bps(use_maker_entry=True)
+    taker_cost = engine.effective_roundtrip_cost_bps(use_maker_entry=False)
+    assert engine.MAKER_RATE == pytest.approx(-0.00020)
+    assert maker_cost < taker_cost
+    assert maker_cost < 6.0
 
 
 def test_tp_ladder_cannot_generate_fibonacci_fallback_or_gap_filler_targets():

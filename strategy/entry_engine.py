@@ -519,12 +519,20 @@ class ICTLiquidityEntryEngine:
         self._state = EngineState.IN_POSITION
         self._state_entered = time.time()
 
-    def on_entry_failed(self) -> None:
+    def on_entry_failed(self, reason: str = "ENTRY_FAILED_RESET") -> None:
         self._active_signal = None
         self._signal = None
         self._thesis = None
         self._state = EngineState.SCANNING
         self._state_entered = time.time()
+        current_reason = str(self._last_analysis.get("block_reason", "") or "")
+        final_reason = current_reason if current_reason.startswith("PRE_ORDER_") else reason
+        self._last_analysis.update({
+            "state": self._state.value,
+            "trigger": "WAIT",
+            "block_reason": final_reason,
+            "context_permission": False,
+        })
 
     def on_entry_cancelled(self) -> None:
         self.on_entry_failed()
@@ -545,6 +553,11 @@ class ICTLiquidityEntryEngine:
         sw = getattr(sig, "sweep_result", None) if sig is not None else None
         if sw is not None:
             self._processed[_sweep_key(sw)] = time.time() + max(5.0, float(cooldown_sec))
+        self._last_analysis.update({
+            "state": EngineState.SCANNING.value,
+            "trigger": "WAIT",
+            "block_reason": "PRE_ORDER_EXECUTION_REJECTED",
+        })
 
     def mark_signal_deferred(self, side: str, reason_prefix: str,
                              cooldown_sec: float = 30.0) -> None:

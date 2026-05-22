@@ -43,6 +43,10 @@ def _cfg(name: str, default):
     return default if val is None else val
 
 
+def _is_delta_execution() -> bool:
+    return str(_cfg("EXECUTION_EXCHANGE", "") or "").lower() == "delta"
+
+
 def _ob_px(lvl) -> float:
     """Extract price from an orderbook level (list or Delta dict format)."""
     if isinstance(lvl, (list, tuple)): return float(lvl[0])
@@ -520,11 +524,15 @@ class ExecutionCostEngine:
 
     @property
     def TAKER_RATE(self) -> float:
+        if _is_delta_execution():
+            return float(_cfg("DELTA_COMMISSION_RATE", _cfg("COMMISSION_RATE", 0.00055)))
         return float(_cfg("COMMISSION_RATE", 0.00055))
 
     @property
     def MAKER_RATE(self) -> float:
         # Bug #26 fix: Delta maker rebate is negative (see MakerTakerDecision above).
+        if _is_delta_execution():
+            return float(_cfg("DELTA_COMMISSION_RATE_MAKER", -0.00020))
         return float(_cfg("COMMISSION_RATE_MAKER", -0.00020))
 
     def __init__(self):

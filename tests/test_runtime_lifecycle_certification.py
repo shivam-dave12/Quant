@@ -575,6 +575,18 @@ def test_execution_cost_gate_observes_current_completed_five_minute_atr_before_s
     assert qs._entry_engine.get_signal() is None
 
 
+def test_pre_order_rejection_clears_stale_executable_decision_state():
+    engine = EntryEngine()
+    engine._last_analysis.update({"state": "EXECUTABLE", "block_reason": "NONE", "trigger": "EXECUTABLE_FVG_REPRICE"})
+    engine.mark_pre_order_rejected(None)
+    engine.on_entry_failed()
+    info = engine.analysis_info
+    assert engine.state == "SCANNING"
+    assert info["state"] == "SCANNING"
+    assert info["trigger"] == "WAIT"
+    assert info["block_reason"] == "PRE_ORDER_EXECUTION_REJECTED"
+
+
 def test_data_lineage_snapshot_formats_frame_age_at_runtime_without_parser_sensitive_nested_fstrings(caplog):
     import logging
     qs = QuantStrategy.__new__(QuantStrategy)
