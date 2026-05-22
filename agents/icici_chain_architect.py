@@ -320,7 +320,7 @@ def merge_verified_chain_quotes(master_rows: Iterable[Mapping[str, Any]], quote_
         row.update(dict(quote))
         row["runtime_lot_size"] = _lot_size(master)
         row["instrument_definition_source"] = "daily_security_master"
-        row["quote_source"] = "breeze_option_chain_filtered"
+        row["quote_source"] = quote.get("quote_source") or "breeze_option_chain_filtered"
         merged.append(row)
     return merged
 

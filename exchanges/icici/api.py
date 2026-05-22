@@ -40,6 +40,14 @@ class BreezeRestClient:
     def _payload(self, body: Optional[Dict[str, Any]]) -> str:
         return json.dumps(body or {}, separators=(",", ":"))
 
+    @staticmethod
+    def _compact_body(body: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+        return {str(k): v for k, v in (body or {}).items() if v not in (None, "")}
+
+    @classmethod
+    def _ordered_body(cls, source: Mapping[str, Any], keys: Iterable[str]) -> Dict[str, Any]:
+        return cls._compact_body({key: source.get(key) for key in keys})
+
     def _headers(self, payload: str, *, force_refresh: bool = False) -> Dict[str, str]:
         session = self.auth.get_session(force_refresh=force_refresh)
         ts = self._timestamp()
@@ -50,6 +58,10 @@ class BreezeRestClient:
             "X-Timestamp": ts,
             "X-AppKey": self.auth.api_key,
             "X-SessionToken": session.session_token,
+            # Match the official Breeze Python SDK.  Some Breeze market-data
+            # endpoints are unexpectedly sensitive to this header and can
+            # reject otherwise valid signed requests with misleading 401 text.
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_5_8) AppleWebKit/534.50.2 (KHTML, like Gecko) Version/5.0.6 Safari/533.22.3",
         }
 
     def preflight_session(self, *, force_refresh: bool = False) -> dict:
@@ -110,13 +122,32 @@ class BreezeRestClient:
         return self.request("GET", "/margin", {"exchange_code": exchange_code})
 
     def get_quotes(self, **kwargs) -> Dict[str, Any]:
-        return self.request("GET", "/quotes", kwargs)
+        body = self._ordered_body(
+            kwargs,
+            ("stock_code", "exchange_code", "expiry_date", "product_type", "right", "strike_price"),
+        )
+        return self.request("GET", "/quotes", body)
 
     def get_option_chain_quotes(self, **kwargs) -> Dict[str, Any]:
-        return self.request("GET", "/OptionChain", kwargs)
+        # The official Breeze Python SDK uses the lower-case endpoint
+        # ``optionchain``.  The static REST docs also show ``OptionChain`` in
+        # places, but the SDK route is the most reliable production contract.
+        body = self._ordered_body(
+            kwargs,
+            ("stock_code", "exchange_code", "expiry_date", "product_type", "right", "strike_price"),
+        )
+        return self.request("GET", "/optionchain", body)
 
     def get_historical_charts(self, **kwargs) -> Dict[str, Any]:
-        return self.request("GET", "/historicalcharts", kwargs)
+        body = self._ordered_body(
+            kwargs,
+            ("interval", "from_date", "to_date", "stock_code", "exchange_code", "product_type", "expiry_date", "right", "strike_price"),
+        )
+        if body.get("interval") == "1minute":
+            body["interval"] = "minute"
+        elif body.get("interval") == "1day":
+            body["interval"] = "day"
+        return self.request("GET", "/historicalcharts", body)
 
     def get_historical_charts_v2(self, **kwargs) -> Dict[str, Any]:
         """Breeze v2 historicalcharts fallback.
@@ -127,11 +158,19 @@ class BreezeRestClient:
         as a read-only fallback only; orders still go through signed v1 routes.
         """
         session = self.auth.get_session(force_refresh=False)
-        headers = {"X-SessionToken": session.session_token, "apikey": self.auth.api_key}
+        params = self._compact_body(kwargs)
+        if "exchange_code" in params and "exch_code" not in params:
+            params["exch_code"] = params.pop("exchange_code")
+        headers = {
+            "Content-Type": "application/json",
+            "X-SessionToken": session.session_token,
+            "apikey": self.auth.api_key,
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_5_8) AppleWebKit/534.50.2 (KHTML, like Gecko) Version/5.0.6 Safari/533.22.3",
+        }
         resp = self.http.get(
             "https://breezeapi.icicidirect.com/api/v2/historicalcharts",
             headers=headers,
-            params=kwargs,
+            params=params,
             timeout=20.0,
         )
         data = self._json_or_raise(resp, "/api/v2/historicalcharts")
@@ -214,7 +253,8 @@ class BreezeRestClient:
         return self.get_quotes(**{k: v for k, v in body.items() if v not in (None, "")})
 
     def get_portfolio_holdings(self, **kwargs) -> Dict[str, Any]:
-        return self.request("GET", "/portfolioholdings", kwargs)
+        body = self._ordered_body(kwargs, ("exchange_code", "from_date", "to_date", "stock_code", "portfolio_type"))
+        return self.request("GET", "/portfolioholdings", body)
 
     def get_portfolio_positions(self) -> Dict[str, Any]:
         return self.request("GET", "/portfoliopositions", {})
@@ -223,36 +263,105 @@ class BreezeRestClient:
         order_type = str(kwargs.get("order_type", "")).strip().lower()
         if order_type not in {"limit", "stoploss"}:
             raise RuntimeError("ICICI Breeze institutional guard: market orders are prohibited; only limit or stoploss orders are permitted")
-        required = ("stock_code", "exchange_code", "product", "action", "quantity", "price", "validity")
+        required = ("stock_code", "exchange_code", "product", "action", "order_type", "quantity", "price", "validity")
         missing = [k for k in required if kwargs.get(k) in (None, "")]
         if missing:
             raise RuntimeError("ICICI Breeze order missing required fields: " + ", ".join(missing))
-        if str(kwargs.get("exchange_code", "")).upper() == "NFO" and str(kwargs.get("product", "")).lower() == "options":
+        action = str(kwargs.get("action", "")).strip().lower()
+        if action not in {"buy", "sell"}:
+            raise RuntimeError("ICICI Breeze order action must be buy or sell")
+        product = str(kwargs.get("product", "")).strip().lower()
+        if str(kwargs.get("exchange_code", "")).upper() == "NFO" and product == "options":
             option_required = ("expiry_date", "right", "strike_price")
             option_missing = [k for k in option_required if kwargs.get(k) in (None, "")]
             if option_missing:
                 raise RuntimeError("ICICI NFO options order missing exact contract fields: " + ", ".join(option_missing))
         if order_type == "stoploss" and float(kwargs.get("stoploss", 0.0) or 0.0) <= 0:
             raise RuntimeError("ICICI Breeze stoploss order requires positive stoploss trigger")
-        return self.request("POST", "/order", kwargs)
+        body = {
+            "stock_code": str(kwargs.get("stock_code") or "").strip().upper(),
+            "exchange_code": str(kwargs.get("exchange_code") or "").strip().upper(),
+            "product": product,
+            "action": action,
+            "order_type": order_type,
+            "quantity": kwargs.get("quantity"),
+            "price": kwargs.get("price"),
+            "validity": str(kwargs.get("validity") or "").strip().lower(),
+            "settlement_id": kwargs.get("settlement_id"),
+            "order_segment_code": kwargs.get("order_segment_code"),
+            "lots": kwargs.get("lots"),
+            "user_remark": kwargs.get("user_remark"),
+            "stoploss": kwargs.get("stoploss"),
+            "validity_date": kwargs.get("validity_date"),
+            "disclosed_quantity": kwargs.get("disclosed_quantity"),
+            "expiry_date": self._normalise_expiry(kwargs.get("expiry_date")),
+            "right": self._normalise_right(kwargs.get("right")),
+            "strike_price": kwargs.get("strike_price"),
+            "order_type_fresh": kwargs.get("order_type_fresh"),
+            "order_rate_fresh": kwargs.get("order_rate_fresh"),
+        }
+        return self.request("POST", "/order", self._compact_body(body))
 
     def get_order(self, **kwargs) -> Dict[str, Any]:
-        return self.request("GET", "/order", kwargs)
+        if kwargs.get("order_id"):
+            body = self._ordered_body(kwargs, ("exchange_code", "order_id"))
+        else:
+            body = self._ordered_body(kwargs, ("exchange_code", "from_date", "to_date"))
+        return self.request("GET", "/order", body)
 
     def get_order_list(self, *, exchange_code: str = "NFO", from_date: str, to_date: str) -> Dict[str, Any]:
         return self.request("GET", "/order", {"exchange_code": exchange_code, "from_date": from_date, "to_date": to_date})
 
     def get_order_detail(self, **kwargs) -> Dict[str, Any]:
-        return self.get_order(**kwargs)
+        return self.request("GET", "/order", self._ordered_body(kwargs, ("exchange_code", "order_id")))
 
     def cancel_order(self, **kwargs) -> Dict[str, Any]:
-        return self.request("DELETE", "/order", kwargs)
+        return self.request("DELETE", "/order", self._ordered_body(kwargs, ("exchange_code", "order_id")))
 
     def modify_order(self, **kwargs) -> Dict[str, Any]:
-        return self.request("PUT", "/order", kwargs)
+        body = self._ordered_body(
+            kwargs,
+            ("order_id", "exchange_code", "order_type", "stoploss", "quantity", "price", "validity", "disclosed_quantity", "validity_date"),
+        )
+        return self.request("PUT", "/order", body)
 
     def square_off(self, **kwargs) -> Dict[str, Any]:
-        return self.request("POST", "/squareoff", kwargs)
+        product_type = kwargs.get("product_type", kwargs.get("product"))
+        body = {
+            "source_flag": kwargs.get("source_flag"),
+            "stock_code": kwargs.get("stock_code"),
+            "exchange_code": kwargs.get("exchange_code"),
+            "quantity": kwargs.get("quantity"),
+            "price": kwargs.get("price"),
+            "action": kwargs.get("action"),
+            "order_type": kwargs.get("order_type"),
+            "validity": kwargs.get("validity"),
+            "stoploss_price": kwargs.get("stoploss_price", kwargs.get("stoploss")),
+            "disclosed_quantity": kwargs.get("disclosed_quantity"),
+            "protection_percentage": kwargs.get("protection_percentage"),
+            "settlement_id": kwargs.get("settlement_id"),
+            "margin_amount": kwargs.get("margin_amount"),
+            "open_quantity": kwargs.get("open_quantity"),
+            "cover_quantity": kwargs.get("cover_quantity"),
+            "product_type": product_type,
+            "expiry_date": kwargs.get("expiry_date"),
+            "right": kwargs.get("right"),
+            "strike_price": kwargs.get("strike_price"),
+            "validity_date": kwargs.get("validity_date"),
+            "alias_name": kwargs.get("alias_name"),
+            "trade_password": kwargs.get("trade_password"),
+            "order_reference": kwargs.get("order_reference"),
+            "position_exchange_code": kwargs.get("position_exchange_code"),
+            "lots": kwargs.get("lots"),
+        }
+        return self.request("POST", "/squareoff", self._compact_body(body))
+
+    def get_trade_list(self, **kwargs) -> Dict[str, Any]:
+        body = self._ordered_body(kwargs, ("exchange_code", "from_date", "to_date", "product_type", "action", "stock_code"))
+        return self.request("GET", "/trades", body)
+
+    def get_trade_detail(self, **kwargs) -> Dict[str, Any]:
+        return self.request("GET", "/trades", self._ordered_body(kwargs, ("exchange_code", "order_id")))
 
     @staticmethod
     def _download_security_master(url: str, timeout: float) -> bytes:

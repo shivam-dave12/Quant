@@ -1,3 +1,4 @@
+import json
 import os
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -50,6 +51,46 @@ def _chain():
         {"TradingSymbol": "NIFTY30JUN30CE23200", "right": "Call", "strike_price": 23200, "expiry_date": expiry, "ltp": 72.0, "best_bid_price": 71.75, "best_offer_price": 72.25, "best_bid_quantity": 200, "best_offer_quantity": 200, "LotSize": 50, "stock_code": "NIFTY", "exchange_code": "NFO", "product_type": "Options"},
         {"TradingSymbol": "NIFTY30JUN30PE23000", "right": "Put", "strike_price": 23000, "expiry_date": expiry, "ltp": 78.0, "best_bid_price": 77.75, "best_offer_price": 78.25, "best_bid_quantity": 200, "best_offer_quantity": 200, "LotSize": 50, "stock_code": "NIFTY", "exchange_code": "NFO", "product_type": "Options"},
     ]
+
+
+class _BreezeFakeAuth:
+    api_key = "app-key"
+    secret_key = "secret"
+
+    def get_session(self, force_refresh=False):
+        return SimpleNamespace(session_token="session-token")
+
+    def can_refresh_without_operator(self):
+        return False
+
+
+class _BreezeFakeResponse:
+    status_code = 200
+
+    def json(self):
+        return {"Success": [], "Status": 200, "Error": None}
+
+
+class _BreezeRecordingHTTP:
+    def __init__(self):
+        self.calls = []
+        self.get_calls = []
+
+    def request(self, method, url, headers=None, data=None, timeout=None):
+        self.calls.append({"method": method, "url": url, "headers": headers, "data": data, "timeout": timeout})
+        return _BreezeFakeResponse()
+
+    def get(self, url, headers=None, params=None, timeout=None):
+        self.get_calls.append({"method": "GET", "url": url, "headers": headers, "params": params, "timeout": timeout})
+        return _BreezeFakeResponse()
+
+
+def _breeze_test_client():
+    from exchanges.icici.api import BreezeRestClient
+
+    client = BreezeRestClient(auth=_BreezeFakeAuth())
+    client.http = _BreezeRecordingHTTP()
+    return client
 
 
 def test_icici_selector_uses_available_funds_and_thesis_side():
@@ -794,6 +835,238 @@ def test_icici_filtered_chain_requests_use_expiry_and_right_and_master_lot(monke
     assert all(x["instrument_definition_source"] == "daily_security_master" for x in inst.primary.raw["chain_candidates"])
 
 
+def test_breeze_option_chain_uses_official_sdk_route_payload_and_headers():
+    client = _breeze_test_client()
+    client.get_option_chain_quotes(
+        stock_code="NIFTY",
+        exchange_code="NFO",
+        product_type="options",
+        expiry_date="2026-05-26T06:00:00.000Z",
+        right="call",
+        strike_price="",
+    )
+    call = client.http.calls[0]
+    assert call["method"] == "GET"
+    assert call["url"].endswith("/api/v1/optionchain")
+    assert not call["url"].endswith("/api/v1/OptionChain")
+    body = json.loads(call["data"])
+    assert body == {
+        "stock_code": "NIFTY",
+        "exchange_code": "NFO",
+        "product_type": "options",
+        "expiry_date": "2026-05-26T06:00:00.000Z",
+        "right": "call",
+    }
+    assert call["headers"].get("User-Agent", "").startswith("Mozilla/5.0")
+
+
+def test_breeze_rest_market_data_routes_match_official_sdk_payloads():
+    client = _breeze_test_client()
+    client.get_quotes(
+        stock_code="NIFTY",
+        exchange_code="NFO",
+        expiry_date="2026-05-26T06:00:00.000Z",
+        product_type="options",
+        right="call",
+        strike_price="",
+    )
+    client.get_historical_charts(
+        interval="1minute",
+        from_date="2026-05-22T09:15:00.000Z",
+        to_date="2026-05-22T10:15:00.000Z",
+        stock_code="NIFTY",
+        exchange_code="NFO",
+        product_type="options",
+        expiry_date="2026-05-26T06:00:00.000Z",
+        right="put",
+        strike_price="23000",
+    )
+    client.get_historical_charts_v2(
+        interval="1minute",
+        from_date="2026-05-22 09:15:00",
+        to_date="2026-05-22 10:15:00",
+        stock_code="NIFTY",
+        exchange_code="NFO",
+        product_type="Options",
+        right="",
+    )
+
+    quote_call, hist_call = client.http.calls
+    assert quote_call["url"].endswith("/api/v1/quotes")
+    assert json.loads(quote_call["data"]) == {
+        "stock_code": "NIFTY",
+        "exchange_code": "NFO",
+        "expiry_date": "2026-05-26T06:00:00.000Z",
+        "product_type": "options",
+        "right": "call",
+    }
+    assert hist_call["url"].endswith("/api/v1/historicalcharts")
+    assert json.loads(hist_call["data"]) == {
+        "interval": "minute",
+        "from_date": "2026-05-22T09:15:00.000Z",
+        "to_date": "2026-05-22T10:15:00.000Z",
+        "stock_code": "NIFTY",
+        "exchange_code": "NFO",
+        "product_type": "options",
+        "expiry_date": "2026-05-26T06:00:00.000Z",
+        "right": "put",
+        "strike_price": "23000",
+    }
+    assert client.http.get_calls[0]["url"].endswith("/api/v2/historicalcharts")
+    assert client.http.get_calls[0]["params"] == {
+        "interval": "1minute",
+        "from_date": "2026-05-22 09:15:00",
+        "to_date": "2026-05-22 10:15:00",
+        "stock_code": "NIFTY",
+        "product_type": "Options",
+        "exch_code": "NFO",
+    }
+
+
+def test_breeze_order_and_position_management_routes_match_official_sdk_payloads():
+    client = _breeze_test_client()
+    client.place_order(
+        stock_code="nifty",
+        exchange_code="nfo",
+        product="Options",
+        action="BUY",
+        order_type="LIMIT",
+        quantity=65,
+        price="72.10",
+        validity="DAY",
+        expiry_date="2026-05-26",
+        right="CE",
+        strike_price="23000",
+        user_remark="",
+    )
+    client.get_order_detail(exchange_code="NFO", order_id="OID123")
+    client.get_order_list(exchange_code="NFO", from_date="2026-05-22T00:00:00.000Z", to_date="2026-05-22T23:59:59.000Z")
+    client.cancel_order(order_id="OID123", exchange_code="NFO")
+    client.modify_order(order_id="OID123", exchange_code="NFO", order_type="limit", price="72.25", validity="day", stoploss="")
+    client.square_off(
+        stock_code="NIFTY",
+        exchange_code="NFO",
+        quantity=65,
+        price="71.50",
+        action="sell",
+        order_type="limit",
+        validity="day",
+        product="options",
+        expiry_date="2026-05-26T06:00:00.000Z",
+        right="put",
+        strike_price="23000",
+        stoploss="70.00",
+    )
+    client.get_trade_list(
+        exchange_code="NFO",
+        from_date="2026-05-22T00:00:00.000Z",
+        to_date="2026-05-22T23:59:59.000Z",
+        product_type="options",
+        action="",
+        stock_code="NIFTY",
+    )
+    client.get_trade_detail(exchange_code="NFO", order_id="OID123")
+
+    calls = client.http.calls
+    assert calls[0]["method"] == "POST" and calls[0]["url"].endswith("/api/v1/order")
+    assert json.loads(calls[0]["data"]) == {
+        "stock_code": "NIFTY",
+        "exchange_code": "NFO",
+        "product": "options",
+        "action": "buy",
+        "order_type": "limit",
+        "quantity": 65,
+        "price": "72.10",
+        "validity": "day",
+        "expiry_date": "2026-05-26T06:00:00.000Z",
+        "right": "call",
+        "strike_price": "23000",
+    }
+    assert json.loads(calls[1]["data"]) == {"exchange_code": "NFO", "order_id": "OID123"}
+    assert json.loads(calls[2]["data"]) == {
+        "exchange_code": "NFO",
+        "from_date": "2026-05-22T00:00:00.000Z",
+        "to_date": "2026-05-22T23:59:59.000Z",
+    }
+    assert calls[3]["method"] == "DELETE"
+    assert json.loads(calls[3]["data"]) == {"exchange_code": "NFO", "order_id": "OID123"}
+    assert calls[4]["method"] == "PUT"
+    assert json.loads(calls[4]["data"]) == {
+        "order_id": "OID123",
+        "exchange_code": "NFO",
+        "order_type": "limit",
+        "price": "72.25",
+        "validity": "day",
+    }
+    assert calls[5]["url"].endswith("/api/v1/squareoff")
+    assert json.loads(calls[5]["data"]) == {
+        "stock_code": "NIFTY",
+        "exchange_code": "NFO",
+        "quantity": 65,
+        "price": "71.50",
+        "action": "sell",
+        "order_type": "limit",
+        "validity": "day",
+        "stoploss_price": "70.00",
+        "product_type": "options",
+        "expiry_date": "2026-05-26T06:00:00.000Z",
+        "right": "put",
+        "strike_price": "23000",
+    }
+    assert calls[6]["url"].endswith("/api/v1/trades")
+    assert json.loads(calls[6]["data"]) == {
+        "exchange_code": "NFO",
+        "from_date": "2026-05-22T00:00:00.000Z",
+        "to_date": "2026-05-22T23:59:59.000Z",
+        "product_type": "options",
+        "stock_code": "NIFTY",
+    }
+    assert json.loads(calls[7]["data"]) == {"exchange_code": "NFO", "order_id": "OID123"}
+
+
+def test_icici_breeze_throttle_default_stays_below_official_call_rate_limit():
+    import config
+
+    assert config.ICICI_BREEZE_MIN_CALL_GAP_SEC >= 0.60
+
+
+def test_icici_quotes_fallback_hydrates_when_option_chain_facility_disabled(monkeypatch):
+    import exchanges.icici.data_manager as dm_module
+    from exchanges.icici.data_manager import ICICIOptionDataManager
+    monkeypatch.setattr(dm_module, "breeze_throttle", lambda *args, **kwargs: None)
+    inst = _nifty_inst([])
+    expiry = (datetime.now(timezone.utc) + timedelta(days=10)).strftime("%Y-%m-%d")
+    master = [
+        {"TradingSymbol": "NIFTY_C_ATM", "right": "Call", "strike_price": 23200, "expiry_date": expiry, "LotSize": 50, "stock_code": "NIFTY", "exchange_code": "NFO", "product_type": "Options"},
+        {"TradingSymbol": "NIFTY_C_FAR", "right": "Call", "strike_price": 24000, "expiry_date": expiry, "LotSize": 50, "stock_code": "NIFTY", "exchange_code": "NFO", "product_type": "Options"},
+        {"TradingSymbol": "NIFTY_P_ATM", "right": "Put", "strike_price": 23000, "expiry_date": expiry, "LotSize": 50, "stock_code": "NIFTY", "exchange_code": "NFO", "product_type": "Options"},
+        {"TradingSymbol": "NIFTY_P_FAR", "right": "Put", "strike_price": 22000, "expiry_date": expiry, "LotSize": 50, "stock_code": "NIFTY", "exchange_code": "NFO", "product_type": "Options"},
+    ]
+    class API:
+        def __init__(self):
+            self.option_chain_calls = 0
+            self.quote_calls = []
+        def preflight_session(self): return {}
+        def get_security_master_rows(self, **kwargs): return master
+        @staticmethod
+        def _normalise_expiry(value): return value
+        def get_option_chain_quotes(self, **kwargs):
+            self.option_chain_calls += 1
+            raise RuntimeError("Breeze /OptionChain failed HTTP 401: This facility is not Enable for the User")
+        def get_quote_for_instrument(self, instrument):
+            raw = instrument.raw
+            self.quote_calls.append((raw["right"], float(raw["strike_price"])))
+            px = 72.0 if str(raw["right"]).lower() == "call" else 78.0
+            return {"Success": [{"ltp": px, "best_bid_price": px - 0.25, "best_offer_price": px + 0.25, "best_bid_quantity": 200, "best_offer_quantity": 200}]}
+    api = API(); dm = ICICIOptionDataManager(inst, api=api)
+    assert dm._hydrate_chain_candidates(force_refresh=True, underlying_spot=23100) is True
+    assert api.option_chain_calls == 2
+    assert api.quote_calls
+    assert inst.primary.raw["chain_source"] == "daily_security_master_plus_quotes_fallback"
+    assert {x["quote_source"] for x in inst.primary.raw["chain_candidates"]} == {"breeze_quotes_contract_fallback"}
+    assert all(x["runtime_lot_size"] == 50 for x in inst.primary.raw["chain_candidates"])
+
+
 def test_icici_release_execution_vehicle_allows_opposite_second_entry():
     from exchanges.icici.data_manager import ICICIOptionDataManager
     inst = _nifty_inst(_chain())
@@ -872,7 +1145,7 @@ def test_icici_day_start_prewarms_both_vehicles_with_minute_data_and_opposite_se
     from exchanges.icici.data_manager import ICICIOptionDataManager
     inst = _nifty_inst(_chain())
     dm = ICICIOptionDataManager(inst, api=SimpleNamespace())
-    monkeypatch.setattr(dm, "_hydrate_chain_candidates", lambda force_refresh=False: True)
+    monkeypatch.setattr(dm, "_hydrate_chain_candidates", lambda force_refresh=False, **kwargs: True)
     def emit_live_state():
         right = str(inst.primary.raw.get("right") or "").lower()
         px = 72.0 if right == "call" else 78.0
@@ -923,7 +1196,7 @@ def test_icici_failed_session_refresh_never_publishes_unverified_replacement(mon
     from exchanges.icici.data_manager import ICICIOptionDataManager
     inst = _nifty_inst(_chain())
     dm = ICICIOptionDataManager(inst, api=SimpleNamespace())
-    monkeypatch.setattr(dm, "_hydrate_chain_candidates", lambda force_refresh=False: True)
+    monkeypatch.setattr(dm, "_hydrate_chain_candidates", lambda force_refresh=False, **kwargs: True)
     # Establish previously verified book directly; refresh must not overwrite it before validation.
     initial = build_session_contract_book(inst, underlying_spot=23100, available_funds=10_000)
     old_book = dict(inst.primary.raw["session_contract_book"])

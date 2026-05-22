@@ -652,7 +652,10 @@ ICICI_MARKET_CLOSE_TIME = "15:30"
 ICICI_MARKET_HOLIDAYS = tuple(x.strip() for x in os.getenv("ICICI_MARKET_HOLIDAYS", "").split(",") if x.strip())
 ICICI_ANALYZE_ONLY_DURING_MARKET_SESSION = os.getenv("ICICI_ANALYZE_ONLY_DURING_MARKET_SESSION", "true").lower() in ("1", "true", "yes", "on")
 ICICI_BREEZE_THROTTLE_ENABLED = True
-ICICI_BREEZE_MIN_CALL_GAP_SEC = 0.35
+# Breeze docs publish 100 calls/minute account-wide; keep a small buffer under
+# that ceiling because option-chain, quote fallback and historical warmups share
+# the same API key.
+ICICI_BREEZE_MIN_CALL_GAP_SEC = 0.65
 ICICI_SECURITY_MASTER_CACHE_PATH = os.getenv("ICICI_SECURITY_MASTER_CACHE_PATH", "data/icici_security_master.zip")
 ICICI_SECURITY_MASTER_URL = os.getenv("ICICI_SECURITY_MASTER_URL", "https://directlink.icicidirect.com/NewSecurityMaster/SecurityMaster.zip")
 ICICI_ALLOW_CLOSED_MARKET_HISTORICAL_WARMUP = True
@@ -695,6 +698,9 @@ ICICI_SESSION_BOOK_URGENT_REFRESH_COOLDOWN_SEC = 30.0
 ICICI_SESSION_BOOK_REQUIRE_TWO_SIDED_QUOTE = True
 ICICI_OPTION_MAX_SELECTION_SPREAD_BPS = 120.0
 ICICI_OPTION_MIN_BOOK_LOTS = 1.0
+ICICI_SESSION_BOOK_QUOTES_FALLBACK_ENABLED = True
+ICICI_SESSION_BOOK_QUOTE_FALLBACK_STRIKES_PER_SIDE = 10
+ICICI_SESSION_BOOK_QUOTE_FALLBACK_MAX_CONTRACTS = 60
 # Dynamic execution-cost guard: the live spread cannot consume more than this
 # share of the vehicle's observed 1-minute premium ATR.
 ICICI_OPTION_EXECUTION_ATR_PERIOD = 14

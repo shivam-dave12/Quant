@@ -31,7 +31,7 @@ def breeze_throttle(reason: str = "breeze") -> None:
     enabled = bool(_cfg("ICICI_BREEZE_THROTTLE_ENABLED", True))
     if not enabled:
         return
-    min_gap = float(_cfg("ICICI_BREEZE_MIN_CALL_GAP_SEC", 0.35))
+    min_gap = float(_cfg("ICICI_BREEZE_MIN_CALL_GAP_SEC", 0.65))
     min_gap = max(0.0, min_gap)
     if min_gap <= 0:
         return

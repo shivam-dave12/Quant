@@ -11,6 +11,7 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 try:
     from zoneinfo import ZoneInfo
 except Exception:  # pragma: no cover
@@ -73,14 +74,16 @@ class ICICIOptionDataManager:
     def _is_chain_mode(self) -> bool:
         return is_chain_instrument(self.instrument)
 
-    def _hydrate_chain_candidates(self, *, force_refresh: bool = False) -> bool:
+    def _hydrate_chain_candidates(self, *, force_refresh: bool = False, underlying_spot: float = 0.0) -> bool:
         """Populate the session option universe from verified NFO definitions.
 
         Breeze OptionChain does not support a blind entire-chain call: the
         official contract requires at least two filters among expiry/right/strike.
         We therefore obtain exact contract definitions and lot sizes from the
         daily Security Master, then request filtered CE/PE quotes for eligible
-        expiries only.
+        expiries only.  Some Breeze accounts do not have the OptionChain facility
+        enabled; those accounts fall back to exact-contract /quotes probes around
+        the live underlying spot.
         """
         raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
         if not isinstance(raw, dict):
@@ -120,18 +123,122 @@ class ICICIOptionDataManager:
                 except Exception as exc:
                     logger.warning("ICICI filtered option-chain fetch failed %s %s %s: %s", stock_code, expiry, right, exc)
         candidates = merge_verified_chain_quotes(verified, quote_rows)
+        chain_source = "daily_security_master_plus_filtered_option_chain"
         if not candidates:
-            logger.error("ICICI session contract book failed: filtered OptionChain returned no verified executable quotes for %s", stock_code)
+            fallback_rows = self._quote_verified_contracts_fallback(
+                verified,
+                stock_code=stock_code,
+                expiries=expiries,
+                underlying_spot=float(underlying_spot or raw.get("underlying_spot_price") or raw.get("spot_price") or 0.0),
+            )
+            candidates = merge_verified_chain_quotes(verified, fallback_rows)
+            if candidates:
+                chain_source = "daily_security_master_plus_quotes_fallback"
+        if not candidates:
+            logger.error("ICICI session contract book failed: filtered OptionChain and quotes fallback returned no verified executable quotes for %s", stock_code)
             return False
         raw["chain_candidates"] = candidates
         raw["chain_candidates_deferred"] = False
         raw["chain_quality"] = chain_quality(candidates)
-        raw["chain_source"] = "daily_security_master_plus_filtered_option_chain"
+        raw["chain_source"] = chain_source
         logger.info(
-            "ICICI verified option-chain hydrated for %s: rows=%d expiries=%s source=daily_security_master+filtered_OptionChain",
-            stock_code, len(candidates), ",".join(expiries),
+            "ICICI verified option-chain hydrated for %s: rows=%d expiries=%s source=%s",
+            stock_code, len(candidates), ",".join(expiries), chain_source,
         )
         return True
+
+    def _quote_verified_contracts_fallback(
+        self,
+        verified: list[dict[str, Any]],
+        *,
+        stock_code: str,
+        expiries: list[str],
+        underlying_spot: float,
+    ) -> list[dict[str, Any]]:
+        """Hydrate exact master contracts with /quotes when /OptionChain is unavailable."""
+        if not bool(_cfg("ICICI_SESSION_BOOK_QUOTES_FALLBACK_ENABLED", True)):
+            return []
+        spot = float(underlying_spot or 0.0)
+        per_side = max(1, int(_cfg("ICICI_SESSION_BOOK_QUOTE_FALLBACK_STRIKES_PER_SIDE", 10)))
+        max_contracts = max(4, int(_cfg("ICICI_SESSION_BOOK_QUOTE_FALLBACK_MAX_CONTRACTS", 60)))
+        expiry_rank = {exp: i for i, exp in enumerate(expiries)}
+
+        def right_of(row: dict[str, Any]) -> str:
+            return str(contract_key(row)[1] or "").lower()
+
+        def strike_of(row: dict[str, Any]) -> float:
+            try:
+                return float(contract_key(row)[2] or 0.0)
+            except Exception:
+                return 0.0
+
+        def sort_key(row: dict[str, Any]) -> tuple[float, float, float]:
+            exp = contract_key(row)[0]
+            right = right_of(row)
+            strike = strike_of(row)
+            dist = abs(strike - spot) if spot > 0 and strike > 0 else 0.0
+            # Target-delta index options are usually near-ATM/slightly OTM.
+            # Penalize ITM contracts a little so fallback probes do not waste
+            # quote calls on expensive vehicles when spot sits between strikes.
+            itm_penalty = 0.0
+            if spot > 0:
+                if right == "call" and strike < spot:
+                    itm_penalty = 0.15 * abs(strike - spot)
+                elif right == "put" and strike > spot:
+                    itm_penalty = 0.15 * abs(strike - spot)
+            return (float(expiry_rank.get(exp, 999)), dist + itm_penalty, strike)
+
+        selected: list[dict[str, Any]] = []
+        for exp in expiries:
+            exp_rows = [dict(row) for row in verified if contract_key(row)[0] == exp]
+            for right in ("call", "put"):
+                side_rows = [row for row in exp_rows if right_of(row) == right and strike_of(row) > 0]
+                side_rows.sort(key=sort_key)
+                selected.extend(side_rows[:per_side])
+        selected.sort(key=sort_key)
+        selected = selected[:max_contracts]
+        if not selected:
+            return []
+
+        quote_rows: list[dict[str, Any]] = []
+        failures = 0
+        for row in selected:
+            exp, right, strike = contract_key(row)
+            route = dict(row)
+            route["stock_code"] = stock_code
+            route["exchange_code"] = "NFO"
+            route["product_type"] = "Options"
+            route["expiry_date"] = row.get("expiry_date") or row.get("ExpiryDate") or exp
+            route["right"] = "Call" if right == "call" else "Put"
+            route["strike_price"] = strike
+            try:
+                breeze_throttle(f"quote_fallback:{stock_code}:{exp}:{right}:{strike:g}")
+                resp = self.api.get_quote_for_instrument(SimpleNamespace(raw=route, asset_id=stock_code))
+                quote = self._first_response_row(resp)
+                if not quote:
+                    continue
+                out = dict(route)
+                out.update(quote)
+                out["stock_code"] = stock_code
+                out["exchange_code"] = "NFO"
+                out["product_type"] = "Options"
+                out["expiry_date"] = route["expiry_date"]
+                out["right"] = route["right"]
+                out["strike_price"] = strike
+                out["runtime_lot_size"] = route.get("runtime_lot_size") or route.get("LotSize")
+                out["quote_source"] = "breeze_quotes_contract_fallback"
+                quote_rows.append(out)
+            except Exception as exc:
+                failures += 1
+                logger.debug(
+                    "ICICI exact-contract quote fallback failed %s %s %.0f %s: %s",
+                    stock_code, exp, strike, right, exc,
+                )
+        logger.info(
+            "ICICI exact-contract quote fallback for %s: probed=%d quotes=%d failures=%d spot=%.2f",
+            stock_code, len(selected), len(quote_rows), failures, spot,
+        )
+        return quote_rows
 
     @staticmethod
     def _chain_rows(resp: Dict[str, Any]) -> list[Any]:
@@ -143,6 +250,17 @@ class ICICIOptionDataManager:
                     return value
             rows = list(rows.values())
         return rows if isinstance(rows, list) else []
+
+    @staticmethod
+    def _first_response_row(resp: Dict[str, Any]) -> dict[str, Any]:
+        rows = ICICIOptionDataManager._chain_rows(resp)
+        if rows and isinstance(rows[0], dict):
+            return dict(rows[0])
+        if isinstance(resp, dict):
+            row = resp.get("Success") or resp.get("data") or resp.get("result") or resp
+            if isinstance(row, dict):
+                return dict(row)
+        return {}
 
     @staticmethod
     def _snapshot_key(choice) -> tuple[str, str, float]:
@@ -258,7 +376,7 @@ class ICICIOptionDataManager:
         if underlying_spot <= 0 or available_funds <= 0:
             logger.error("ICICI session contract book rejected: underlying spot/funds not ready spot=%.4f funds=%.2f", underlying_spot, available_funds)
             return False
-        if not self._hydrate_chain_candidates(force_refresh=force_refresh):
+        if not self._hydrate_chain_candidates(force_refresh=force_refresh, underlying_spot=underlying_spot):
             return False
         # Build provisionally: publish a session book only after both vehicles
         # pass premium-history and executable-liquidity prewarm.
