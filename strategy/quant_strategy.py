@@ -4763,6 +4763,7 @@ class QuantStrategy:
 
         def _bg():
             with instrument_scope(getattr(self, "_instrument", None)):
+              _gate_reject = False
               try:
                 self._enter_trade(_dm, _om, _rm, side, sig, mode=mode,
                                   ict_tier=ict_tier,
@@ -6482,6 +6483,9 @@ class QuantStrategy:
                     rs = _sa.get('rev_score', 0)
                     cs = _sa.get('cont_score', 0)
                     parts.append(f"SweepScore=R{rs:.0f}/C{cs:.0f}")
+                    _wait = str(_sa.get('last_wait_reason', '') or '')
+                    if _wait:
+                        parts.append(f"Wait={_wait[:90]}")
 
             # ── Scan-skip diagnostics (observability fix) ──────────────────
             # When the engine is in SCANNING and not transitioning, surface

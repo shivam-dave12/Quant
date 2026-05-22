@@ -550,6 +550,18 @@ def evaluate_post_sweep_quant(*, action: str, side: str, rev_score: float, cont_
             + outcome_w * logit(float(outcome.get("outcome_p", 0.50) or 0.50))
         )
 
+    raw_displacement_atr = max(float(displacement_atr or 0.0), 0.0)
+    exceptional_delivery = bool(
+        dol_valid
+        and raw_displacement_atr >= (1.75 if action == "reverse" else 2.25)
+        and auction_information >= dynamic_evidence_floor + 0.06
+        and evidence_consensus >= (0.70 if action == "reverse" else 0.76)
+        and dol_signal >= 0.52
+        and flow_term >= (0.30 if action == "reverse" else 0.42)
+        and st.liquidity_quality >= 0.55
+        and st.toxicity <= 0.45
+    )
+
     # Institutional calibration cap: the model must not print 0.85+ confidence
     # from score imbalance/flow alone when structure and HTF are both missing.
     # This is the failure mode observed in live logs (struct=0.00, htf=0.00,
@@ -560,7 +572,6 @@ def evaluate_post_sweep_quant(*, action: str, side: str, rev_score: float, cont_
     posterior_cap = 0.95
     cap_reasons = []
     if structure_void:
-        exceptional_delivery = bool(disp_info >= 0.92 and evidence_consensus >= 0.72 and st.liquidity_quality >= 0.70)
         posterior_cap = min(posterior_cap, 0.74 if exceptional_delivery else 0.66)
         cap_reasons.append("structure_void")
     if uncalibrated:
@@ -622,10 +633,13 @@ def evaluate_post_sweep_quant(*, action: str, side: str, rev_score: float, cont_
         0.60, 0.78,
     )
     cold_start_delivery = bool(
-        structural >= 0.40
-        and dol_signal >= 0.38
-        and evidence_consensus >= 0.52
-        and not structure_void
+        (
+            structural >= 0.40
+            and dol_signal >= 0.38
+            and evidence_consensus >= 0.52
+            and not structure_void
+        )
+        or exceptional_delivery
     )
     if provisional_dol:
         accept = bool(
@@ -662,6 +676,8 @@ def evaluate_post_sweep_quant(*, action: str, side: str, rev_score: float, cont_
                           "admission_mode": admission,
                           "cold_start_floor": cold_start_floor,
                           "cold_start_delivery": 1.0 if cold_start_delivery else 0.0,
+                          "exceptional_delivery": 1.0 if exceptional_delivery else 0.0,
+                          "raw_displacement_atr": raw_displacement_atr,
                           "outcome_p": float(outcome.get("outcome_p", 0.50) or 0.50),
                           "outcome_n": float(outcome.get("outcome_n", 0.0) or 0.0),
                           "outcome_r": float(outcome.get("outcome_r", 0.0) or 0.0),

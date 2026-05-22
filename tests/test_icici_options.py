@@ -342,6 +342,34 @@ def test_icici_configured_nifty_discovery_is_auth_independent():
     assert icici_inst.raw["underlying_exchange_code"] == "NSE"
 
 
+def test_icici_security_master_fonse_nifty_rows_are_eligible():
+    expiry = (datetime.now(timezone.utc) + timedelta(days=4)).strftime("%d-%b-%Y")
+    rows = [{
+        "Token": "35036",
+        "InstrumentName": "OPTIDX",
+        "ShortName": "NIFTY",
+        "Series": "OPTION",
+        "ExpiryDate": expiry,
+        "StrikePrice": "23100",
+        "OptionType": "CE",
+        "LotSize": "65",
+        "MinimumLotQty": "0",
+        "CompanyName": "NIFTY 50",
+        "ExchangeCode": "NIFTY 50",
+        "ExAllowed": "NFO",
+        "_source_file": "FONSEScripMaster.txt",
+    }]
+
+    eligible = eligible_nfo_master_option_rows(rows, "NIFTY")
+
+    assert len(eligible) == 1
+    assert eligible[0]["exchange_code"] == "NFO"
+    assert eligible[0]["stock_code"] == "NIFTY"
+    assert eligible[0]["runtime_lot_size"] == 65
+    assert eligible[0]["right"] == "Call"
+    assert eligible[0]["strike_price"] == 23100
+
+
 
 def test_telegram_start_preflights_icici_token_before_bot_start(monkeypatch, tmp_path):
     import sys
@@ -678,7 +706,7 @@ def test_strategy_exit_path_cancels_protection_then_records_manual_exit_order():
 
 def test_icici_entry_source_does_not_place_parallel_tp_sells_with_broker_sl():
     from pathlib import Path
-    src = Path(__file__).parents[1].joinpath("strategy", "quant_strategy.py").read_text()
+    src = Path(__file__).parents[1].joinpath("strategy", "quant_strategy.py").read_text(encoding="utf-8")
     assert "ICICI single-live-exit invariant" in src
     assert "ICICI TP_LADDER analytical-only" in src
 
@@ -828,7 +856,7 @@ def test_icici_session_vehicle_rechecks_live_affordability_before_entry(monkeypa
 
 def test_icici_unfilled_entry_paths_are_required_to_release_option_vehicle():
     from pathlib import Path
-    src = Path(__file__).parents[1].joinpath("strategy", "quant_strategy.py").read_text()
+    src = Path(__file__).parents[1].joinpath("strategy", "quant_strategy.py").read_text(encoding="utf-8")
     required = [
         "premium_sltp_conversion_rejected", "no_executable_structural_levels", "fee_floor_rejected",
         "sl_missing", "zero_stop_distance", "post_surface_zero_stop_distance", "sizing_rejected",

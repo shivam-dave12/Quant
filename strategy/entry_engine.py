@@ -506,6 +506,8 @@ class EntryEngine:
         self._last_accept_log_ts: float = 0.0
         self._last_dol_log_key: tuple = ()
         self._last_dol_log_ts: float = 0.0
+        self._last_wait_log_key: tuple = ()
+        self._last_wait_log_ts: float = 0.0
 
         # BUG-1 FIX: Processed-sweeps registry (SWEEP-LOOP root cause).
         # After a verdict fires, _handle_reversal/_handle_continuation previously
@@ -1294,6 +1296,22 @@ class EntryEngine:
             decision = self._evaluate_evidence(ps, snap, flow, ict, price, atr, now)
         finally:
             self._suppress_posterior_accept_log = False
+
+        if decision.action == "wait":
+            wait_reason = str(getattr(decision, "reason", "") or "waiting")
+            try:
+                self._last_sweep_analysis["last_wait_reason"] = wait_reason
+            except Exception:
+                pass
+            wait_key = (
+                wait_reason[:80],
+                round(float(getattr(ps.sweep.pool, "price", 0.0) or 0.0), 1),
+                int(ps.entered_at),
+            )
+            if wait_key != self._last_wait_log_key or (now - self._last_wait_log_ts) >= _ENTRY_GATE_LOG_SEC:
+                self._last_wait_log_key = wait_key
+                self._last_wait_log_ts = now
+                logger.info("POST_SWEEP WAIT: %s", wait_reason[:320])
 
         # BUG-B2 FIX: If deferred, allow evidence to accumulate but do not
         # present a new signal yet. Log remaining cooldown at debug level.

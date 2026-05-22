@@ -2679,7 +2679,7 @@ def test_tp_ladder_planner_does_not_create_internal_legs_when_lot_capacity_zero(
 
 def test_reconcile_adoption_marks_risk_manager_position_open():
     from pathlib import Path
-    src = Path('strategy/quant_strategy.py').read_text()
+    src = Path('strategy/quant_strategy.py').read_text(encoding="utf-8")
     assert "adoption means the exchange is already carrying risk" in src
     assert "set_position_open(True) adoption" in src
 
@@ -3272,7 +3272,7 @@ def test_quant_posterior_is_conditioned_on_valid_dol_context():
 
 def test_entry_engine_calls_dol_context_before_posterior_evaluation():
     from pathlib import Path
-    source = (Path(__file__).resolve().parents[1] / "strategy" / "entry_engine.py").read_text()
+    source = (Path(__file__).resolve().parents[1] / "strategy" / "entry_engine.py").read_text(encoding="utf-8")
     reverse = source[source.index("if rev_total >= threshold"):source.index("elif cont_total >= threshold")]
     continuation = source[source.index("elif cont_total >= threshold"):source.index("cont_target = self._find_opposing_target")]
     assert reverse.index('label="DOL_CONTEXT"') < reverse.index("evaluate_post_sweep_quant(")
@@ -3309,9 +3309,39 @@ def test_quant_cold_start_dol_cannot_replace_delivery_confirmation():
         qm.GLOBAL_QUANT_CALIBRATOR = old_calibrator
 
 
+def test_quant_cold_start_allows_exceptional_dol_displacement_delivery():
+    from strategy import quantitative_models as qm
+    from strategy.dol_engine import assess_trade_thesis
+
+    old_calibrator = qm.GLOBAL_QUANT_CALIBRATOR
+    qm.GLOBAL_QUANT_CALIBRATOR = qm.AdaptiveQuantCalibrator()
+    try:
+        snap = SimpleNamespace(
+            bsl_pools=[_dol_pool(104.0, "BSL", "1h", 22.0)],
+            ssl_pools=[_dol_pool(98.0, "SSL", "15m", 3.0)],
+        )
+        flow = SimpleNamespace(direction="long", conviction=0.72, cvd_trend=0.65)
+        ict = SimpleNamespace(structure_15m="ranging", structure_4h="ranging", dealing_range_pd=0.30)
+        ctx = assess_trade_thesis(
+            snap=snap, side="long", entry=100.0, atr=1.0, ict=ict, flow=flow,
+            action="reverse", stage="context",
+        )
+        assert ctx.accepted
+        qd = qm.evaluate_post_sweep_quant(
+            action="reverse", side="long", rev_score=150.0, cont_score=10.0,
+            displacement_atr=2.20, cisd=False, ote=False, phase="DISPLACEMENT",
+            price=100.0, atr=1.0, snap=snap, flow=flow, ict=ict, dol_context=ctx,
+        )
+        assert qd.accept
+        assert qd.components.get("cold_start_delivery") == 1.0
+        assert qd.components.get("exceptional_delivery") == 1.0
+    finally:
+        qm.GLOBAL_QUANT_CALIBRATOR = old_calibrator
+
+
 def test_refined_and_both_entry_paths_require_final_executable_dol_validation():
     from pathlib import Path
-    source = (Path(__file__).resolve().parents[1] / "strategy" / "entry_engine.py").read_text()
+    source = (Path(__file__).resolve().parents[1] / "strategy" / "entry_engine.py").read_text(encoding="utf-8")
     refined = source[source.index("def _evaluate_pending_refined_entry"):source.index("def _handle_reversal")]
     reversal = source[source.index("def _handle_reversal"):source.index("def _handle_continuation")]
     continuation = source[source.index("def _handle_continuation"):source.index("# ── Helpers")]

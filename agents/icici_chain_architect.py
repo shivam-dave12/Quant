@@ -59,6 +59,56 @@ def _right(raw: Mapping[str, Any]) -> str:
     return ""
 
 
+def _exchange_segment(raw: Mapping[str, Any]) -> str:
+    """Return the executable exchange segment for mixed ICICI master schemas.
+
+    FONSEScripMaster uses ``ExchangeCode`` for the underlying display name
+    (for example ``NIFTY 50``) and ``ExAllowed`` for the actual segment
+    (``NFO``).  Older/test payloads use ``exchange_code``/``ExchangeCode`` as
+    the segment directly.
+    """
+    for key in (
+        "exchange_code", "exchange", "segment", "ExchangeSegment",
+        "ExAllowed", "ex_allowed", "AllowedExchange",
+        "ExchangeCode", "Exchange", "Exch",
+    ):
+        val = normalise_symbol(raw.get(key) or "")
+        if val in {"NFO", "BFO", "NSE", "BSE"}:
+            return val
+    source = normalise_symbol(raw.get("_source_file") or "")
+    if source.startswith("FONSE"):
+        return "NFO"
+    if source.startswith("FOBSE"):
+        return "BFO"
+    return ""
+
+
+def _stock_code(raw: Mapping[str, Any]) -> str:
+    for key in (
+        "stock_code", "StockCode", "ShortName", "underlying", "Underlying",
+        "AssetName", "Symbol",
+    ):
+        val = normalise_symbol(raw.get(key) or "")
+        if val:
+            return val
+    company = normalise_symbol(raw.get("CompanyName") or raw.get("ExchangeCode") or "")
+    aliases = {
+        "NIFTY50": "NIFTY",
+        "NIFTYFIFTY": "NIFTY",
+        "NIFTYBANK": "BANKNIFTY",
+        "NIFTYBANKINDEX": "BANKNIFTY",
+    }
+    return aliases.get(company, company)
+
+
+def _product_kind(raw: Mapping[str, Any]) -> str:
+    return normalise_symbol(
+        raw.get("product_type") or raw.get("ProductType")
+        or raw.get("InstrumentType") or raw.get("InstrumentName")
+        or raw.get("Series") or ""
+    )
+
+
 def _expiry_dt(value: Any) -> Optional[datetime]:
     txt = str(value or "").strip()
     if not txt:
@@ -225,13 +275,13 @@ def eligible_nfo_master_option_rows(rows: Iterable[Mapping[str, Any]], underlyin
         if not isinstance(source, Mapping):
             continue
         row = dict(source)
-        exchange = normalise_symbol(row.get("exchange_code") or row.get("ExchangeCode") or row.get("Exchange") or row.get("Exch") or "")
+        exchange = _exchange_segment(row)
         if exchange != "NFO":
             continue
-        stock = normalise_symbol(row.get("stock_code") or row.get("StockCode") or row.get("ShortName") or row.get("underlying") or row.get("Underlying") or "")
+        stock = _stock_code(row)
         if not stock or stock != target:
             continue
-        product = normalise_symbol(row.get("product_type") or row.get("ProductType") or row.get("InstrumentType") or row.get("Series") or "")
+        product = _product_kind(row)
         if product and product not in {"OPTION", "OPTIONS", "OPTIDX", "OPTSTK", "CE", "PE"} and not _right(row):
             continue
         if not _right(row) or _strike(row) <= 0 or _lot_size(row) <= 0:
@@ -239,10 +289,18 @@ def eligible_nfo_master_option_rows(rows: Iterable[Mapping[str, Any]], underlyin
         dte = _dte(row)
         if dte < min_dte or dte > max_dte:
             continue
-        row.setdefault("stock_code", target)
-        row.setdefault("exchange_code", "NFO")
+        expiry = row.get("expiry_date") or row.get("ExpiryDate") or row.get("expiry") or row.get("Expiry")
+        strike = _strike(row)
+        right = _right(row)
+        row["stock_code"] = target
+        row["exchange_code"] = "NFO"
         row.setdefault("product_type", "Options")
+        row.setdefault("expiry_date", expiry)
+        row.setdefault("strike_price", strike)
+        row.setdefault("right", "Call" if right == "call" else "Put")
+        row.setdefault("TradingSymbol", f"{target}_{expiry}_{strike:g}_{'CE' if right == 'call' else 'PE'}")
         row.setdefault("runtime_lot_size", _lot_size(row))
+        row.setdefault("instrument_definition_source", "daily_security_master")
         out.append(row)
     return out
 
