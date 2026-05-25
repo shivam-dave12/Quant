@@ -438,21 +438,10 @@ ICICI_ALLOW_CLOSED_MARKET_HISTORICAL_WARMUP = True
 ICICI_ALLOW_CLOSED_MARKET_WARMUP = False
 ICICI_CLOSED_MARKET_QUOTE_PROBE = False
 ICICI_HISTORICAL_V2_FALLBACK = True
-# Live NIFTY data is mandatory for the ICICI options desk.  Breeze WebSocket is
-# the primary signal transport; REST remains startup/reconciliation only.
-ICICI_INDEX_STREAM_ENABLED = os.getenv("ICICI_INDEX_STREAM_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-ICICI_INDEX_WEBSOCKET_REQUIRED = os.getenv("ICICI_INDEX_WEBSOCKET_REQUIRED", "true").lower() in ("1", "true", "yes", "on")
-ICICI_INDEX_STREAM_FIRST_TICK_TIMEOUT_SEC = float(os.getenv("ICICI_INDEX_STREAM_FIRST_TICK_TIMEOUT_SEC", "12.0"))
-ICICI_INDEX_STREAM_MAX_STALE_SEC = float(os.getenv("ICICI_INDEX_STREAM_MAX_STALE_SEC", "15.0"))
-ICICI_REQUIRE_UNDERLYING_ANALYSIS_FEED = True
-# Official Breeze SDK resolves tokens dynamically from exchange/stock descriptors;
-# static script-code maps are deliberately not used.
-ICICI_INDEX_STREAM_CHANNELS = "LIVE_QUOTE"
+ICICI_INDEX_STREAM_ENABLED = os.getenv("ICICI_INDEX_STREAM_ENABLED", "false").lower() == "true"
+ICICI_INDEX_WEBSOCKET_REQUIRED = False
+ICICI_INDEX_STREAM_CHANNELS = "1MIN,5MIN"
 ICICI_INDEX_STREAM_SCRIPT_CODES = {}
-ICICI_OPTION_STREAM_ENABLED = os.getenv("ICICI_OPTION_STREAM_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-ICICI_OPTION_WEBSOCKET_REQUIRED = os.getenv("ICICI_OPTION_WEBSOCKET_REQUIRED", "true").lower() in ("1", "true", "yes", "on")
-ICICI_OPTION_STREAM_FIRST_TICK_TIMEOUT_SEC = float(os.getenv("ICICI_OPTION_STREAM_FIRST_TICK_TIMEOUT_SEC", "12.0"))
-ICICI_OPTION_STREAM_MAX_STALE_SEC = float(os.getenv("ICICI_OPTION_STREAM_MAX_STALE_SEC", "15.0"))
 ICICI_OPTION_TICK_SIZE = 0.05
 # Safety invariant: never assume a one-unit NFO option lot.  Contract routing
 # is disabled until Breeze/security-master supplies the exact current lot size.
@@ -471,8 +460,7 @@ ICICI_OPTION_MAX_FUNDS_FRACTION_PER_TRADE = 0.42
 ICICI_OPTION_MIN_CASH_BUFFER_INR = 0.0
 ICICI_OPTION_MIN_READY_1M_BARS = 20
 ICICI_UNDERLYING_MIN_READY_1M_BARS = 20
-# REST quote pull is reconciliation only; websocket supplies live option prices.
-ICICI_OPTION_QUOTE_POLL_SEC = 30.0
+ICICI_OPTION_QUOTE_POLL_SEC = 2.0
 # Session-start execution universe: preselect one verified CE and one verified PE
 # after F&O funds + NIFTY underlying warmup.  Direction remains live-thesis driven.
 ICICI_SESSION_CONTRACT_BOOK_ENABLED = True
@@ -498,8 +486,6 @@ ICICI_OPTION_MAX_SPREAD_TO_1M_ATR = 0.35
 ICICI_SECURITY_MASTER_REQUIRE_TODAY = True
 ICICI_OPTION_MAX_QUOTE_STALE_SEC = 10.0
 ICICI_UNDERLYING_REST_REFRESH_SEC = 30.0
-# Slow authoritative REST reconciliation while Breeze websocket is healthy; faster REST repair runs only during faults.
-ICICI_UNDERLYING_REST_RECONCILE_SEC = 900.0
 ICICI_OPTION_SLTP_DELTA_MULT = 1.00
 ICICI_OPTION_MIN_PREMIUM_RISK_PCT = 0.14
 ICICI_OPTION_MAX_PREMIUM_RISK_PCT = 0.58

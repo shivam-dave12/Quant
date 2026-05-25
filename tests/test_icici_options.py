@@ -1188,14 +1188,6 @@ def test_icici_day_start_prewarms_both_vehicles_with_minute_data_and_opposite_se
         dm._candles["5m"] = deque([{"c": dm._last_price, "h": dm._last_price + 0.8, "l": dm._last_price - 0.8} for _ in range(25)], maxlen=600)
     monkeypatch.setattr(dm, "_warmup", warmup)
     monkeypatch.setattr(dm, "_refresh_quote", emit_live_state)
-    # Activation now requires the selected CE/PE websocket; simulate its first
-    # live tick so this deterministic session-book test remains network-free.
-    def stream_live():
-        dm._stream_subscription_ids = ["test-live-option"]
-        dm._last_stream_tick_ts = time.time()
-        return True
-    monkeypatch.setattr(dm, "_start_selected_contract_stream", stream_live)
-    monkeypatch.setattr(dm, "_arm_session_book_streams", lambda book: True)
     assert dm.prepare_session_contract_book(23100.0, 10_000.0, reason="test_open") is True
     assert len(dm._contract_snapshots) == 2
     assert all(len(snapshot["candles"]["1m"]) >= 20 for snapshot in dm._contract_snapshots.values())

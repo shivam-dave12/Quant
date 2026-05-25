@@ -142,13 +142,6 @@ class MarketAggregator:
             f"analysis={'none' if analysis_dm is None else type(analysis_dm).__name__})"
         )
 
-    def _requires_analysis_feed(self) -> bool:
-        """ICICI options must never infer NIFTY structure from option premium candles."""
-        exchange = getattr(getattr(self.instrument, "primary_exchange", None), "value", None)
-        if exchange is None:
-            exchange = getattr(self.instrument, "primary_exchange", "")
-        return str(exchange or "").lower() == "icici" and bool(getattr(config, "ICICI_REQUIRE_UNDERLYING_ANALYSIS_FEED", True))
-
     # ── Internal: secondary trade tap ────────────────────────────────────────
 
     def _install_secondary_trade_tap(self) -> None:
@@ -258,9 +251,6 @@ class MarketAggregator:
             logger.info("✅ Both exchanges live — dual-feed aggregation active")
 
         if self._analysis and not analysis_ok[0]:
-            if self._requires_analysis_feed():
-                logger.error("ICICI analysis websocket unavailable; desk is fail-closed because underlying structural feed is mandatory")
-                return False
             logger.warning("Analysis DM unavailable; primary candles will be used for structure")
 
         return True
@@ -304,14 +294,9 @@ class MarketAggregator:
         if self._primary.is_ready:
             if self._analysis is not None:
                 try:
-                    analysis_ready = bool(self._analysis.wait_until_ready(min(timeout_sec, 30.0)))
-                    if self._requires_analysis_feed() and not analysis_ready:
-                        logger.error("ICICI mandatory underlying analysis feed did not become ready")
-                        return False
-                except Exception as exc:
-                    if self._requires_analysis_feed():
-                        logger.error("ICICI mandatory underlying analysis readiness failed: %s", exc)
-                        return False
+                    self._analysis.wait_until_ready(min(timeout_sec, 30.0))
+                except Exception:
+                    pass
             return True
 
         # Wait for primary
@@ -319,14 +304,9 @@ class MarketAggregator:
         if ready:
             if self._analysis is not None:
                 try:
-                    analysis_ready = bool(self._analysis.wait_until_ready(min(timeout_sec, 30.0)))
-                    if self._requires_analysis_feed() and not analysis_ready:
-                        logger.error("ICICI mandatory underlying analysis feed did not become ready")
-                        return False
-                except Exception as exc:
-                    if self._requires_analysis_feed():
-                        logger.error("ICICI mandatory underlying analysis readiness failed: %s", exc)
-                        return False
+                    self._analysis.wait_until_ready(min(timeout_sec, 30.0))
+                except Exception:
+                    pass
             return True
 
         # Primary timed out — check if secondary can take over
