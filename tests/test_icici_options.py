@@ -456,6 +456,53 @@ def test_breeze_token_service_refreshes_stale_daily_session_cache(tmp_path):
     assert svc.session_status(session)["same_trading_day"] is True
 
 
+def test_breeze_token_service_rejects_manual_session_token_by_default(monkeypatch, tmp_path):
+    from exchanges.icici import breeze_auth
+    from exchanges.icici.breeze_auth import BreezeTokenService
+
+    monkeypatch.setattr(breeze_auth.config, "ICICI_ALLOW_MANUAL_SESSION_TOKEN_OVERRIDE", False, raising=False)
+    monkeypatch.setattr(breeze_auth.config, "ICICI_API_SESSION_FILE_MUST_BE_TODAY", True, raising=False)
+    svc = BreezeTokenService(
+        api_key="app-key",
+        secret_key="secret",
+        session_token="manual-session-token",
+        api_session_path=tmp_path / "missing_api_session.txt",
+        cache_path=tmp_path / "cache.json",
+    )
+
+    try:
+        svc.refresh()
+    except RuntimeError as exc:
+        msg = str(exc)
+    else:
+        raise AssertionError("manual session token should not bypass daily API_Session generation")
+
+    assert "BREEZE_SESSION_TOKEN" in msg
+    assert "API_Session -> CustomerDetails" in msg
+    assert svc.can_refresh_without_operator() is False
+
+
+def test_breeze_token_service_ignores_stale_api_session_file_for_daily_generation(monkeypatch, tmp_path):
+    import time
+    from exchanges.icici import breeze_auth
+    from exchanges.icici.breeze_auth import BreezeTokenService
+
+    monkeypatch.setattr(breeze_auth.config, "ICICI_API_SESSION_FILE_MUST_BE_TODAY", True, raising=False)
+    api_session_file = tmp_path / "icici_api_session.txt"
+    api_session_file.write_text("stale-api-session\n", encoding="utf-8")
+    stale_mtime = time.time() - 2 * 86400
+    os.utime(api_session_file, (stale_mtime, stale_mtime))
+    svc = BreezeTokenService(
+        api_key="app-key",
+        secret_key="secret",
+        api_session_path=api_session_file,
+        cache_path=tmp_path / "cache.json",
+    )
+
+    assert svc._configured_api_session() == ""
+    assert svc.can_refresh_without_operator() is False
+
+
 def test_telegram_plain_six_digit_otp_is_consumed_when_waiting(monkeypatch):
     import telegram.controller as ctl
     c = ctl.TelegramBotController.__new__(ctl.TelegramBotController)
@@ -1188,6 +1235,14 @@ def test_icici_day_start_prewarms_both_vehicles_with_minute_data_and_opposite_se
         dm._candles["5m"] = deque([{"c": dm._last_price, "h": dm._last_price + 0.8, "l": dm._last_price - 0.8} for _ in range(25)], maxlen=600)
     monkeypatch.setattr(dm, "_warmup", warmup)
     monkeypatch.setattr(dm, "_refresh_quote", emit_live_state)
+    # Activation now requires the selected CE/PE websocket; simulate its first
+    # live tick so this deterministic session-book test remains network-free.
+    def stream_live():
+        dm._stream_subscription_ids = ["test-live-option"]
+        dm._last_stream_tick_ts = time.time()
+        return True
+    monkeypatch.setattr(dm, "_start_selected_contract_stream", stream_live)
+    monkeypatch.setattr(dm, "_arm_session_book_streams", lambda book: True)
     assert dm.prepare_session_contract_book(23100.0, 10_000.0, reason="test_open") is True
     assert len(dm._contract_snapshots) == 2
     assert all(len(snapshot["candles"]["1m"]) >= 20 for snapshot in dm._contract_snapshots.values())

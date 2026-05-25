@@ -262,20 +262,47 @@ QUANT_SPREAD_MIN_SIZE_MULT            = 0.70
 QUANT_SPREAD_SIZE_HAIRCUT_MAX         = 0.30
 
 # Institutional selectivity mode:
-# The engine still waits for actual raid/MSS/FVG/liquidity structure, but it no
-# longer allocates to weak continuation, counter-delivery, or low-rank targets.
-ICT_SELECTIVITY_MODE = False
-ICT_ALLOW_COUNTER_DELIVERY_RAIDS = True
-ICT_ENTRY_MIN_CONTEXT_DELIVERY_SCORE = 0.10
-ICT_ENTRY_MIN_DELIVERY_SCORE = 0.35
-ICT_ENTRY_MIN_TARGET_RANK_SCORE = 0.75
-ICT_ENTRY_MIN_DISPLACEMENT_ATR_RAID = 1.20
-ICT_ENTRY_MIN_DISPLACEMENT_ATR_CONTINUATION = 1.25
-ICT_CONTINUATION_MIN_CONTEXT_SCORE = 0.25
-ICT_CONTINUATION_MIN_DELIVERY_SCORE = 0.58
-ICT_CONTINUATION_MIN_TARGET_RANK_SCORE = 2.40
-ICT_PARTIAL_HTF_MIN_DELIVERY_SCORE = 0.70
+# The engine still waits for actual raid/MSS/FVG/liquidity structure, but weak
+# context, counter-delivery raids, adverse fresh flow and low-rank targets do
+# not receive capital. These are execution gates, not win-rate guarantees.
+ICT_SELECTIVITY_MODE = True
+ICT_ALLOW_COUNTER_DELIVERY_RAIDS = False
+ICT_ENTRY_MIN_CONTEXT_DELIVERY_SCORE = 0.25
+ICT_ENTRY_MIN_DELIVERY_SCORE = 0.50
+ICT_ENTRY_MIN_TARGET_RANK_SCORE = 1.25
+ICT_ENTRY_MIN_DISPLACEMENT_ATR_RAID = 1.35
+ICT_ENTRY_MIN_DISPLACEMENT_ATR_CONTINUATION = 1.50
+ICT_CONTINUATION_MIN_CONTEXT_SCORE = 0.35
+ICT_CONTINUATION_MIN_DELIVERY_SCORE = 0.60
+ICT_CONTINUATION_MIN_TARGET_RANK_SCORE = 2.60
+ICT_PARTIAL_HTF_MIN_DELIVERY_SCORE = 0.62
 ICT_PARTIAL_HTF_MIN_DISPLACEMENT_ATR = 2.00
+ICT_MICROSTRUCTURE_GUARD_ENABLED = True
+ICT_MIN_FRESH_MICROSTRUCTURE_SCORE = -0.20
+ICT_MIN_TARGET_REALISM_SCORE = 0.60
+ICT_SETUP_DOSSIER_ENABLED = True
+ICT_SETUP_DOSSIER_MIN_SCORE = 0.60
+ICT_SETUP_DOSSIER_RANK_NORM = 3.0
+ICT_THESIS_MAX_AGE_SEC = 900.0
+ICT_CONTINUATION_THESIS_MAX_AGE_SEC = 600.0
+ICT_MAX_FVG_EXTENSION_BEFORE_REPRICE_ATR = 3.25
+ICT_PD_ARRAY_GUARD_ENABLED = True
+ICT_PD_ARRAY_MIN_SCORE = 0.58
+ICT_PD_ARRAY_STRICT_PREMIUM_DISCOUNT = True
+ICT_DEALING_RANGE_LOOKBACK_15M = 48
+ICT_OTE_MIN_RETRACEMENT = 0.50
+ICT_OTE_MAX_RETRACEMENT = 0.79
+ICT_PD_KILLZONE_WEIGHT_ENABLED = True
+
+# Time-decay exit: use the configured desk max-hold as a thesis half-life.
+# Healthy winners can still reach exchange targets; dead auctions are flattened
+# before they burn the full structural stop by time alone.
+QUANT_TIME_STOP_ENABLED = True
+QUANT_TIME_STOP_EARLY_FRACTION = 0.55
+QUANT_TIME_STOP_FAILED_AUCTION_R = -0.35
+QUANT_TIME_STOP_FAILED_AUCTION_MAX_MFE_R = 0.50
+QUANT_TIME_STOP_MIN_PROGRESS_R = 0.20
+QUANT_TIME_STOP_HARD_MAX_MULT = 1.35
 
 # ── Fee engine ────────────────────────────────────────────────────────────────
 FEE_SPREAD_HIST_MAXLEN      = 500
@@ -407,6 +434,8 @@ ICICI_INDEX_BREEZE_STOCK_CODE_BY_UNDERLYING = {
 ICICI_API_SESSION_PATH = os.getenv("ICICI_API_SESSION_PATH", "data/icici_api_session.txt")
 BREEZE_API_SESSION = os.getenv("BREEZE_API_SESSION", os.getenv("ICICI_API_SESSION", ""))
 BREEZE_SESSION_TOKEN = os.getenv("BREEZE_SESSION_TOKEN", "")
+ICICI_ALLOW_MANUAL_SESSION_TOKEN_OVERRIDE = os.getenv("ICICI_ALLOW_MANUAL_SESSION_TOKEN_OVERRIDE", "false").lower() in ("1", "true", "yes", "on")
+ICICI_API_SESSION_FILE_MUST_BE_TODAY = os.getenv("ICICI_API_SESSION_FILE_MUST_BE_TODAY", "true").lower() in ("1", "true", "yes", "on")
 ICICI_SESSION_CACHE_PATH = os.getenv("ICICI_SESSION_CACHE_PATH", "data/icici_breeze_session.json")
 ICICI_SESSION_TTL_SEC = 6 * 60 * 60
 ICICI_SESSION_EXPIRES_DAILY = True
@@ -438,10 +467,22 @@ ICICI_ALLOW_CLOSED_MARKET_HISTORICAL_WARMUP = True
 ICICI_ALLOW_CLOSED_MARKET_WARMUP = False
 ICICI_CLOSED_MARKET_QUOTE_PROBE = False
 ICICI_HISTORICAL_V2_FALLBACK = True
-ICICI_INDEX_STREAM_ENABLED = os.getenv("ICICI_INDEX_STREAM_ENABLED", "false").lower() == "true"
-ICICI_INDEX_WEBSOCKET_REQUIRED = False
-ICICI_INDEX_STREAM_CHANNELS = "1MIN,5MIN"
+# Live NIFTY data is mandatory for the ICICI options desk.  Breeze WebSocket is
+# the primary signal transport; REST remains startup/reconciliation only.
+ICICI_INDEX_STREAM_ENABLED = os.getenv("ICICI_INDEX_STREAM_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+ICICI_INDEX_WEBSOCKET_REQUIRED = os.getenv("ICICI_INDEX_WEBSOCKET_REQUIRED", "true").lower() in ("1", "true", "yes", "on")
+ICICI_INDEX_STREAM_FIRST_TICK_TIMEOUT_SEC = float(os.getenv("ICICI_INDEX_STREAM_FIRST_TICK_TIMEOUT_SEC", "12.0"))
+ICICI_INDEX_STREAM_MAX_STALE_SEC = float(os.getenv("ICICI_INDEX_STREAM_MAX_STALE_SEC", "15.0"))
+ICICI_WEBSOCKET_RECONNECT_COOLDOWN_SEC = float(os.getenv("ICICI_WEBSOCKET_RECONNECT_COOLDOWN_SEC", "5.0"))
+ICICI_REQUIRE_UNDERLYING_ANALYSIS_FEED = True
+# Official Breeze SDK resolves tokens dynamically from exchange/stock descriptors;
+# static script-code maps are deliberately not used.
+ICICI_INDEX_STREAM_CHANNELS = "LIVE_QUOTE"
 ICICI_INDEX_STREAM_SCRIPT_CODES = {}
+ICICI_OPTION_STREAM_ENABLED = os.getenv("ICICI_OPTION_STREAM_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+ICICI_OPTION_WEBSOCKET_REQUIRED = os.getenv("ICICI_OPTION_WEBSOCKET_REQUIRED", "true").lower() in ("1", "true", "yes", "on")
+ICICI_OPTION_STREAM_FIRST_TICK_TIMEOUT_SEC = float(os.getenv("ICICI_OPTION_STREAM_FIRST_TICK_TIMEOUT_SEC", "12.0"))
+ICICI_OPTION_STREAM_MAX_STALE_SEC = float(os.getenv("ICICI_OPTION_STREAM_MAX_STALE_SEC", "15.0"))
 ICICI_OPTION_TICK_SIZE = 0.05
 # Safety invariant: never assume a one-unit NFO option lot.  Contract routing
 # is disabled until Breeze/security-master supplies the exact current lot size.
@@ -460,7 +501,8 @@ ICICI_OPTION_MAX_FUNDS_FRACTION_PER_TRADE = 0.42
 ICICI_OPTION_MIN_CASH_BUFFER_INR = 0.0
 ICICI_OPTION_MIN_READY_1M_BARS = 20
 ICICI_UNDERLYING_MIN_READY_1M_BARS = 20
-ICICI_OPTION_QUOTE_POLL_SEC = 2.0
+# REST quote pull is reconciliation only; websocket supplies live option prices.
+ICICI_OPTION_QUOTE_POLL_SEC = 30.0
 # Session-start execution universe: preselect one verified CE and one verified PE
 # after F&O funds + NIFTY underlying warmup.  Direction remains live-thesis driven.
 ICICI_SESSION_CONTRACT_BOOK_ENABLED = True
@@ -486,6 +528,8 @@ ICICI_OPTION_MAX_SPREAD_TO_1M_ATR = 0.35
 ICICI_SECURITY_MASTER_REQUIRE_TODAY = True
 ICICI_OPTION_MAX_QUOTE_STALE_SEC = 10.0
 ICICI_UNDERLYING_REST_REFRESH_SEC = 30.0
+# Slow authoritative REST reconciliation while Breeze websocket is healthy; faster REST repair runs only during faults.
+ICICI_UNDERLYING_REST_RECONCILE_SEC = 900.0
 ICICI_OPTION_SLTP_DELTA_MULT = 1.00
 ICICI_OPTION_MIN_PREMIUM_RISK_PCT = 0.14
 ICICI_OPTION_MAX_PREMIUM_RISK_PCT = 0.58

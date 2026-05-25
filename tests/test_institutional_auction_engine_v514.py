@@ -2,6 +2,7 @@ import inspect
 from pathlib import Path
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -104,6 +105,45 @@ def test_execution_viability_computes_net_r_without_false_expected_value():
     result = qs._execution_viability_model(side="long", price=100.0, sl_price=98.0, tp_price=106.0, use_maker_entry=True, delivery_probability=None)
     assert result.net_win_r > 0.0 and result.net_loss_r > 0.0
     assert result.utility_known is False and result.delivery_probability is None
+
+
+def test_execution_viability_no_alloc_band_blocks_orders():
+    qs = QuantStrategy.__new__(QuantStrategy)
+    qs._roundtrip_cost_points = lambda price, use_maker_entry: (3.0, 300.0)
+    result = qs._execution_viability_model(
+        side="long", price=100.0, sl_price=98.0, tp_price=106.0,
+        use_maker_entry=False, delivery_probability=None,
+    )
+    assert result.allocation_allowed is False
+    assert result.fee_to_risk > result.fee_no_alloc
+    assert result.reason == "extreme execution-cost drag; no allocation"
+
+
+def test_target_selection_exports_candidate_ladder_surface():
+    now = time.time()
+    engine = EntryEngine()
+    engine.set_structural_delivery_policy(min_rr=1.5, max_rr_reference=6.0)
+    engine._thesis = SimpleNamespace(
+        context_path="STRICT_4H_15M_DOL",
+        context_delivery_score=0.75,
+        context_4h=SimpleNamespace(confidence=0.80),
+        context_15m=SimpleNamespace(confidence=0.70),
+    )
+    near = PoolTarget(
+        LiquidityPool(104.0, PoolSide.BSL, "15m", status=PoolStatus.DETECTED, created_at=now, htf_count=1),
+        4.0, "long", 4.0, ["15m"],
+    )
+    final = PoolTarget(
+        LiquidityPool(110.0, PoolSide.BSL, "1h", status=PoolStatus.DETECTED, created_at=now, htf_count=1),
+        10.0, "long", 6.0, ["1h"],
+    )
+    selected = engine._select_liquidity_target("long", 100.0, 98.0, _snapshot(bsl=[near, final]), atr=1.0)
+    assert selected is not None
+    plan = engine.pool_plan_info
+    assert plan is not None
+    assert plan["selected"]["selected"] is True
+    assert len(plan["candidates"]) == 2
+    assert all("net_win_r" in row and "gauntlet_penalty" in row for row in plan["candidates"])
 
 
 def test_websocket_event_bridge_wakes_candidate_monitor_without_order_work():

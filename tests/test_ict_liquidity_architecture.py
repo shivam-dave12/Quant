@@ -186,6 +186,14 @@ def _ranging_candles(n: int, base: float = 100.0):
     return [{"o": base, "h": base + 1.0, "l": base - 1.0, "c": base + 0.10} for _ in range(n)]
 
 
+def _bounded_up_candles(n: int, start: float = 88.0, step: float = 0.24):
+    rows = []
+    for i in range(n):
+        base = start + i * step
+        rows.append({"o": base, "h": base + 0.45, "l": base - 0.45, "c": base + 0.30})
+    return rows
+
+
 def _timestamped_candles(n: int, tf_sec: int, last_start: float, base: float = 100.0):
     first = int(last_start - (n - 1) * tf_sec)
     return [
@@ -281,6 +289,7 @@ def test_full_4h_15m_5m_structural_sequence_emits_one_executable_ticket():
     engine = EntryEngine()
     engine.update(_snap(bsl=[target], sweeps=[raid]), price=100.50, atr=1.0, now=now, candles_5m=c5, candles_15m=c15, candles_4h=c4h)
     signal = engine.get_signal()
+    info = engine.analysis_info
     assert signal is not None
     assert signal.entry_type is EntryType.ICT_LIQUIDITY
     assert signal.side == "long" and signal.entry_price == pytest.approx(100.50)
@@ -288,7 +297,70 @@ def test_full_4h_15m_5m_structural_sequence_emits_one_executable_ticket():
     assert signal.target_pool.pool.timeframe == "15m"
     assert signal.delivery_score > 0 and signal.rr_ratio > 1.0
     assert signal.delivery_probability == 0.0 and signal.probability_calibrated is False
+    assert info["pd_array_model"] == "PREMIUM_DISCOUNT_OTE_FVG_CE_OB_KILLZONE"
+    assert info["pd_array_block"] == "NONE"
+    assert info["pd_array_zone"] == "DISCOUNT"
+    assert 0.50 <= info["pd_ote_retracement"] <= 0.79
+    assert signal.quality["pd_array_score"] >= 0.58
+    assert info["setup_dossier_model"] == "STRUCTURE_PD_ARRAY_LIQUIDITY_NETR_GAUNTLET_FLOW"
+    assert info["setup_dossier_block"] == "NONE"
+    assert signal.quality["setup_grade"] in {"S", "A", "B"}
+    assert signal.quality["setup_dossier_score"] >= 0.60
     assert engine.state == "EXECUTABLE"
+
+
+def test_setup_dossier_blocks_low_combined_quality_before_ticket(monkeypatch):
+    import strategy.entry_engine as entry_module
+
+    monkeypatch.setattr(entry_module.config, "ICT_SETUP_DOSSIER_MIN_SCORE", 0.90, raising=False)
+    engine = EntryEngine()
+    engine._last_analysis = {
+        "target_net_win_r": 1.05,
+        "target_gauntlet_penalty": 0.45,
+        "target_cost_r": 0.25,
+    }
+    thesis = SimpleNamespace(
+        entry_type=EntryType.LIQUIDITY_RAID_REVERSAL,
+        context_delivery_score=0.26,
+        displacement_atr=1.36,
+        side="long",
+    )
+    dossier = engine._setup_quality_dossier(
+        thesis, rr=1.10, rank_score=1.25, delivery_score=0.52,
+        pd_confluence=SimpleNamespace(score=0.58),
+    )
+
+    assert dossier.block == "SETUP_DOSSIER_BELOW_FLOOR"
+    assert dossier.grade in {"C", "D"}
+    assert dossier.as_payload()["setup_dossier_model"] == "STRUCTURE_PD_ARRAY_LIQUIDITY_NETR_GAUNTLET_FLOW"
+
+
+def test_pd_array_guard_blocks_long_entry_chasing_premium_after_raid():
+    now = time.time()
+    c15 = _bounded_up_candles(33, start=88.0, step=0.24)
+    c4h = _trend_candles(1.40, 28)
+    c5 = [{"o": 99.20, "h": 99.70, "l": 99.00, "c": 99.45} for _ in range(34)]
+    for i in range(8, 20):
+        c5[i] = {"o": 99.30, "h": 100.00, "l": 99.10, "c": 99.60}
+    c5[20] = {"o": 99.40, "h": 99.70, "l": 98.00, "c": 99.30}
+    c5[21] = {"o": 99.40, "h": 100.00, "l": 99.30, "c": 99.80}
+    c5[22] = {"o": 100.20, "h": 103.20, "l": 100.10, "c": 103.00}
+    c5[23] = {"o": 101.30, "h": 103.40, "l": 101.00, "c": 103.10}
+    for i in range(24, 33):
+        c5[i] = {"o": 103.00, "h": 104.30, "l": 102.90, "c": 104.00}
+    c5[33] = {"o": 100.60, "h": 100.80, "l": 100.30, "c": 100.50}
+    raid_pool = LiquidityPool(99.0, PoolSide.SSL, "5m", status=PoolStatus.SWEPT, created_at=now - 40)
+    raid = SweepResult(raid_pool, 20, 98.0, 1.0, 1.4, 0.91, "long", now - 30)
+    bsl_pool = LiquidityPool(110.0, PoolSide.BSL, "15m", status=PoolStatus.DETECTED, created_at=now - 90, htf_count=1)
+    target = PoolTarget(bsl_pool, 9.50, "long", 5.0, ["15m"])
+    engine = EntryEngine()
+    engine.update(_snap(bsl=[target], sweeps=[raid]), price=100.50, atr=1.0, now=now,
+                  candles_5m=c5, candles_15m=c15, candles_4h=c4h)
+    info = engine.analysis_info
+    assert engine.get_signal() is None
+    assert info["block_reason"] == "LONG_NOT_IN_DISCOUNT_PD_ARRAY"
+    assert info["pd_array_zone"] == "PREMIUM"
+    assert info["pd_array_model"] == "PREMIUM_DISCOUNT_OTE_FVG_CE_OB_KILLZONE"
 
 
 def test_long_entry_waits_for_fvg_equilibrium_not_upper_gap_touch():
@@ -356,7 +428,7 @@ def test_ranging_4h_with_15m_dol_can_approve_short_external_liquidity_raid():
     assert info["block_reason"] == "NONE"
 
 
-def test_counter_delivery_raid_can_trade_when_5m_proof_completes():
+def test_counter_delivery_raid_is_blocked_by_institutional_selectivity():
     now = time.time()
     c4h = _ranging_candles(30)
     c15 = _trend_candles(0.70, 34)
@@ -370,11 +442,10 @@ def test_counter_delivery_raid_can_trade_when_5m_proof_completes():
                   candles_5m=c5, candles_15m=c15, candles_4h=c4h)
     signal = engine.get_signal()
     info = engine.analysis_info
-    assert signal is not None
-    assert signal.side == "short"
     assert info["context_bias_path"] == "COUNTER_DELIVERY_RAID_REQUIRES_5M_PROOF"
-    assert info["block_reason"] == "NONE"
-    assert info["context_permission"] is True
+    assert signal is None
+    assert info["block_reason"] == "COUNTER_DELIVERY_RAID_BLOCKED_BY_SELECTIVITY"
+    assert info["context_permission"] is False
 
 
 def test_unanimous_htf_delivery_against_raid_is_rejected_before_execution():

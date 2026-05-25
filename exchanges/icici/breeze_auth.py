@@ -144,11 +144,13 @@ class BreezeTokenService:
         with self._lock:
             self.require_configured(for_login=False)
 
-            # Accept an already exchanged session_token only when deliberately
-            # supplied.  This is useful for emergency manual preflight but the
-            # normal compliant path remains API_Session -> CustomerDetails.
             direct_session_token = self._configured_session_token()
-            if direct_session_token:
+            api_session = self._configured_api_session()
+
+            # Manual session_token injection is deliberately opt-in.  A pasted
+            # session token has no reliable generation timestamp, so treating it
+            # as "fresh now" can silently bypass the daily ICICI login flow.
+            if direct_session_token and self._manual_session_token_allowed():
                 session = BreezeSession(
                     api_session="",
                     session_token=direct_session_token,
@@ -159,7 +161,19 @@ class BreezeTokenService:
                 self._save_cache(session)
                 return session
 
-            api_session = self._configured_api_session()
+            if direct_session_token and not api_session:
+                raise RuntimeError(
+                    "BREEZE_SESSION_TOKEN/ICICI_SESSION_TOKEN is disabled by policy because "
+                    "it cannot prove today's API_Session -> CustomerDetails generation. "
+                    "Generate today's API_Session or set ICICI_ALLOW_MANUAL_SESSION_TOKEN_OVERRIDE=true "
+                    "only for an explicit emergency override."
+                )
+            if direct_session_token and api_session:
+                logger.warning(
+                    "Ignoring configured BREEZE_SESSION_TOKEN/ICICI_SESSION_TOKEN; "
+                    "using API_Session -> CustomerDetails daily generation instead."
+                )
+
             if api_session:
                 try:
                     session = self.exchange_api_session(api_session)
@@ -225,7 +239,7 @@ class BreezeTokenService:
         return bool(self.session_status(session)["valid"])
 
     def can_refresh_without_operator(self) -> bool:
-        return bool(self._configured_session_token() or self._configured_api_session())
+        return bool(self._configured_api_session() or (self._manual_session_token_allowed() and self._configured_session_token()))
 
     def cached_session(self) -> Optional[BreezeSession]:
         with self._lock:
@@ -267,6 +281,8 @@ class BreezeTokenService:
             "now_local": self._now_local().isoformat(timespec="seconds"),
             "expires_daily": self._expires_daily(),
             "ttl_sec": self.ttl_sec,
+            "manual_session_token_allowed": self._manual_session_token_allowed(),
+            "api_session_file_must_be_today": self._api_session_file_must_be_today(),
         }
 
     def _is_fresh(self, session: BreezeSession) -> bool:
@@ -297,6 +313,12 @@ class BreezeTokenService:
             return self._session_token_override
         return _env_first("BREEZE_SESSION_TOKEN", "ICICI_SESSION_TOKEN")
 
+    def _manual_session_token_allowed(self) -> bool:
+        return bool(_cfg("ICICI_ALLOW_MANUAL_SESSION_TOKEN_OVERRIDE", False))
+
+    def _api_session_file_must_be_today(self) -> bool:
+        return bool(_cfg("ICICI_API_SESSION_FILE_MUST_BE_TODAY", True))
+
     def _configured_api_session(self) -> str:
         if self._api_session_override:
             return self._api_session_override
@@ -305,6 +327,16 @@ class BreezeTokenService:
             return env_token
         try:
             if self.api_session_path.exists():
+                if self._api_session_file_must_be_today():
+                    mtime = self.api_session_path.stat().st_mtime
+                    if self._local_dt(mtime).date() != self._now_local().date():
+                        logger.warning(
+                            "Ignoring stale ICICI API_Session file %s; file date is %s and today is %s.",
+                            self.api_session_path,
+                            self._local_dt(mtime).date(),
+                            self._now_local().date(),
+                        )
+                        return ""
                 return self.api_session_path.read_text(encoding="utf-8").strip()
         except Exception:
             return ""

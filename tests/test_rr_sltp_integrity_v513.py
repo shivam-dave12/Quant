@@ -91,9 +91,10 @@ def test_tp_ladder_cannot_generate_fibonacci_fallback_or_gap_filler_targets():
     assert plan.legs[0].price == pytest.approx(110.0)
 
 
-def test_orderbook_staleness_is_execution_block_not_structural_state_erasure():
+def test_orderbook_staleness_blocks_before_structural_signal_generation():
     src=inspect.getsource(__import__('strategy.quant_strategy', fromlist=['QuantStrategy']).QuantStrategy._evaluate_entry)
-    assert src.index('self._entry_engine.update') < src.index('signal is not None and not spread_ok')
+    assert src.index('if not spread_ok:') < src.index('self._liq_map.update')
+    assert src.index('self._liq_map.update') < src.index('self._entry_engine.update')
     assert 'WAIT_FOR_EXECUTABLE_BOOK' in src
 
 

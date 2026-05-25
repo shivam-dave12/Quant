@@ -39,11 +39,12 @@ class BreezeLiveFeedHub:
         self._subscriptions: dict[str, _Subscription] = {}
         self._connected_at = 0.0
         self._last_tick_ts = 0.0
+        self._last_reconnect_ts = 0.0
 
     @property
     def connected(self) -> bool:
         with self._lock:
-            return self._client is not None
+            return self._client is not None and self._sdk_connected(self._client)
 
     @property
     def last_tick_ts(self) -> float:
@@ -99,17 +100,23 @@ class BreezeLiveFeedHub:
             "strike_price": str(strike_price),
             "right": str(right).lower(),
             "product_type": "options",
-            "get_market_depth": True,
+            "get_market_depth": False,
             "get_exchange_quotes": True,
         }
         quote_id = self._subscribe("option_quote", dict(base), callback)
+        depth = dict(base)
+        # Breeze publishes option top-of-book depth on the market-depth channel,
+        # separate from exchange quotes. Combining both flags is not the
+        # documented SDK methodology and can silently degrade book data.
+        depth["get_market_depth"] = True
+        depth["get_exchange_quotes"] = False
+        depth_id = self._subscribe("option_depth", depth, callback)
         ohlcv = dict(base)
-        # Official OHLCV interval stream does not need market depth; executable
-        # bid/ask depth is sourced only from the accompanying quote stream.
-        ohlcv["get_market_depth"] = False
+        # Official OHLCV interval stream is a quote interval feed; executable
+        # bid/ask depth is sourced only from the separate depth subscription.
         ohlcv["interval"] = "1minute"
         ohlcv_id = self._subscribe("option_ohlcv", ohlcv, callback)
-        return [quote_id, ohlcv_id]
+        return [quote_id, depth_id, ohlcv_id]
 
     def _subscribe(self, kind: str, args: dict[str, Any], callback: Callable[[Any], None]) -> str:
         self.connect()
@@ -120,6 +127,56 @@ class BreezeLiveFeedHub:
             self._subscriptions[subscription_id] = _Subscription(subscription_id, kind, dict(args), callback)
             logger.info("ICICI websocket subscribed kind=%s contract=%s response=%s", kind, self._safe_descriptor(args), response)
             return subscription_id
+
+    def reconnect_and_resubscribe(self, *, reason: str = "stale_stream") -> bool:
+        """Reconnect the official SDK socket and replay all active subscriptions."""
+        with self._lock:
+            if not self._subscriptions:
+                return self.connected
+            old_client = self._client
+            self._client = None
+            self._connected_at = 0.0
+            self._last_tick_ts = 0.0
+            subscriptions = list(self._subscriptions.values())
+        if old_client is not None:
+            try:
+                old_client.ws_disconnect()
+            except Exception as exc:
+                logger.debug("ICICI websocket disconnect before reconnect failed: %s", exc)
+        try:
+            self.connect()
+            with self._lock:
+                client = self._client
+                subscriptions = list(self._subscriptions.values())
+            if client is None:
+                raise RuntimeError("official Breeze websocket client did not reconnect")
+            for sub in subscriptions:
+                response = client.subscribe_feeds(**sub.args)
+                logger.info(
+                    "ICICI websocket resubscribed kind=%s contract=%s reason=%s response=%s",
+                    sub.kind, self._safe_descriptor(sub.args), reason, response,
+                )
+            with self._lock:
+                self._last_reconnect_ts = time.time()
+            return True
+        except Exception as exc:
+            logger.error("ICICI websocket reconnect/resubscribe failed reason=%s: %s", reason, exc)
+            return False
+
+    def ensure_live(self, *, max_stale_sec: float, reason: str = "stale_stream") -> bool:
+        """Best-effort health check for the shared socket transport."""
+        now = time.time()
+        with self._lock:
+            if not self._subscriptions:
+                return self.connected
+            client_missing = self._client is None or not self._sdk_connected(self._client)
+            last_tick = float(self._last_tick_ts or 0.0)
+            connected_at = float(self._connected_at or 0.0)
+            stale = bool(last_tick and now - last_tick > max_stale_sec)
+            silent_after_connect = bool(not last_tick and connected_at and now - connected_at > max_stale_sec)
+        if client_missing or stale or silent_after_connect:
+            return self.reconnect_and_resubscribe(reason=reason)
+        return True
 
     def unsubscribe(self, subscription_ids: list[str] | tuple[str, ...]) -> None:
         with self._lock:
@@ -160,6 +217,15 @@ class BreezeLiveFeedHub:
     @staticmethod
     def _safe_descriptor(args: dict[str, Any]) -> str:
         return "/".join(str(args.get(k, "")) for k in ("exchange_code", "stock_code", "expiry_date", "strike_price", "right", "interval") if args.get(k, "") not in (None, ""))
+
+    @staticmethod
+    def _sdk_connected(client: Any) -> bool:
+        for attr in ("sio", "_sio", "socketio", "_socketio"):
+            endpoint = getattr(client, attr, None)
+            connected = getattr(endpoint, "connected", None)
+            if connected is not None:
+                return bool(connected)
+        return client is not None
 
 
 def hub_for_api(api) -> BreezeLiveFeedHub:

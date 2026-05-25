@@ -10,6 +10,7 @@ os.environ.setdefault("BREEZE_SECRET_KEY", "test")
 import config
 from aggregator.market_aggregator import MarketAggregator
 from exchanges.icici.data_manager import ICICIOptionDataManager
+from exchanges.icici.live_feed import BreezeLiveFeedHub
 from exchanges.icici.underlying_data_manager import ICICIUnderlyingDataManager
 
 
@@ -61,6 +62,46 @@ def test_option_quotes_refresh_execution_price_but_only_ohlcv_ticks_build_premiu
     one = dm.get_candles("1m", 1)[-1]
     assert one["o"] == 155.0 and one["h"] == 156.0 and one["l"] == 154.75 and one["c"] == 155.5
     assert dm.is_price_fresh(30.0) is True
+
+
+def test_option_market_depth_tick_updates_executable_book_without_ltp():
+    api = SimpleNamespace(_normalise_right=lambda value: str(value).lower())
+    dm = ICICIOptionDataManager(_nifty_instrument(), api=api)
+    dm._active_stream_contract = {"stock_code": "NIFTY", "expiry": "02-Jun-2026", "right": "call", "strike": 24100.0}
+    dm._stream_subscription_ids = ["test-option-depth"]
+    dm._on_option_stream_tick({
+        "exchange_code": "NFO", "stock_code": "NIFTY", "right": "call", "strike_price": 24100.0,
+        "depth": [{
+            "BestBuyRate-1": 154.9, "BestBuyQty-1": 1800,
+            "BestSellRate-1": 155.1, "BestSellQty-1": 1650,
+        }],
+    })
+    book = dm.get_orderbook()
+    assert dm.get_last_price() == 0.0
+    assert book["bids"] == [[154.9, 1800.0]]
+    assert book["asks"] == [[155.1, 1650.0]]
+    assert book["_executable_source"] == "icici_breeze_websocket"
+
+
+def test_breeze_option_subscription_uses_documented_quote_depth_and_ohlcv_channels():
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def subscribe_feeds(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"message": "ok"}
+
+    client = Client()
+    hub = BreezeLiveFeedHub(api=SimpleNamespace())
+    hub._client = client
+    ids = hub.subscribe_option_quotes_and_ohlcv(
+        stock_code="NIFTY", expiry_date="02-Jun-2026", strike_price="24100", right="call", callback=lambda tick: None)
+    assert len(ids) == 3
+    quote, depth, ohlcv = client.calls
+    assert quote["get_market_depth"] is False and quote["get_exchange_quotes"] is True and "interval" not in quote
+    assert depth["get_market_depth"] is True and depth["get_exchange_quotes"] is False and "interval" not in depth
+    assert ohlcv["get_market_depth"] is False and ohlcv["get_exchange_quotes"] is True and ohlcv["interval"] == "1minute"
 
 
 def test_icici_aggregator_fails_closed_when_underlying_websocket_analysis_is_unavailable():

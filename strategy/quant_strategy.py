@@ -2187,10 +2187,18 @@ class QuantStrategy:
                 "authority": "UNIFIED_STRUCTURAL_AUCTION",
             }, price, now)
             return
-        # Book/spread is execution evidence, not structural alpha.  Measure it
-        # every decision pass for transparency, but do not erase valid 4H/15m/5m
-        # analysis merely because an orderbook update is temporarily stale.
+        # Book/spread is execution evidence, not structural alpha.  A hard
+        # integrity failure blocks the whole signal path because an entry that
+        # cannot be priced safely is not an executable thesis.
         spread_ok, _ = self._spread_atr_gate(data_manager)
+        if not spread_ok:
+            self._log_ict_decision_snapshot({
+                "state": "SCANNING", "block_reason": "EXECUTION_SPREAD_OR_BOOK_BLOCK",
+                "trigger": "WAIT_FOR_EXECUTABLE_BOOK", "entry_5m_atr": atr,
+                "atr_percentile": self._atr_5m.get_percentile(),
+                "authority": "UNIFIED_STRUCTURAL_AUCTION",
+            }, price, now, force=True)
+            return
         try:
             self._liq_map.update(candles_by_tf, price, atr, now)
             snapshot = self._liq_map.get_snapshot(price, atr)
@@ -2220,11 +2228,6 @@ class QuantStrategy:
         )
         signal = self._entry_engine.get_signal()
         info = self._entry_engine.analysis_info or {}
-        if signal is not None and not spread_ok:
-            blocked = dict(info)
-            blocked.update({"state": "EXECUTABLE", "block_reason": "EXECUTION_SPREAD_OR_BOOK_BLOCK", "trigger": "WAIT_FOR_EXECUTABLE_BOOK"})
-            self._log_ict_decision_snapshot(blocked, price, now, force=True)
-            return
         self._log_ict_decision_snapshot(info, price, now, force=signal is not None)
         if signal is None:
             return
@@ -2235,6 +2238,15 @@ class QuantStrategy:
         if not correct_geometry or rr < float(pol.min_rr):
             self._entry_engine.mark_signal_deferred(side, "invalid_structural_geometry_or_policy_rr", cooldown_sec=30.0)
             logger.info("ICT_LIQUIDITY ticket rejected: geometry=%s RR=%.2f floor=%.2f", correct_geometry, rr, float(pol.min_rr))
+            return
+        realism, realism_notes, realism_rejects = self._target_pool_realism(signal, snapshot, side, entry, tp, sl, atr)
+        min_realism = float(getattr(config, "ICT_MIN_TARGET_REALISM_SCORE", 0.58) or 0.58)
+        if realism_rejects or realism < min_realism:
+            self._entry_engine.mark_signal_deferred(side, "target_realism_rejected", cooldown_sec=45.0)
+            logger.info(
+                "ICT_LIQUIDITY ticket rejected: target realism %.2f < %.2f rejects=%s notes=%s",
+                realism, min_realism, "; ".join(realism_rejects) or "none", "; ".join(realism_notes) or "none",
+            )
             return
         bal_info = risk_manager.get_available_balance()
         total_bal = float((bal_info or {}).get("total", (bal_info or {}).get("available", 0.0)) or 0.0)
@@ -3726,6 +3738,43 @@ class QuantStrategy:
                     new_extreme = True
         return profit, new_extreme
 
+    def _time_decay_exit_reason(self, pos, price: float, now: float) -> str:
+        if not bool(getattr(config, "QUANT_TIME_STOP_ENABLED", True)):
+            return ""
+        entry_time = float(getattr(pos, "entry_time", 0.0) or 0.0)
+        if entry_time <= 0.0 or price <= 0.0:
+            return ""
+        try:
+            max_hold = float(policy_value("max_hold_sec", getattr(config, "QUANT_MAX_HOLD_SEC", 3600)) or 0.0)
+        except Exception:
+            max_hold = float(getattr(config, "QUANT_MAX_HOLD_SEC", 3600) or 0.0)
+        if max_hold <= 0.0:
+            return ""
+        init_r = float(getattr(pos, "initial_sl_dist", 0.0) or 0.0)
+        if init_r <= 1e-10:
+            init_r = abs(float(getattr(pos, "entry_price", 0.0) or 0.0) - float(getattr(pos, "sl_price", 0.0) or 0.0))
+        if init_r <= 1e-10:
+            return ""
+        side = str(getattr(pos, "side", "") or "").lower()
+        entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+        progress_r = ((price - entry) if side == "long" else (entry - price)) / init_r
+        mfe_r = float(getattr(pos, "peak_profit", 0.0) or 0.0) / init_r
+        age = max(0.0, float(now) - entry_time)
+
+        early_frac = float(getattr(config, "QUANT_TIME_STOP_EARLY_FRACTION", 0.55) or 0.55)
+        failed_r = float(getattr(config, "QUANT_TIME_STOP_FAILED_AUCTION_R", -0.35) or -0.35)
+        failed_mfe_r = float(getattr(config, "QUANT_TIME_STOP_FAILED_AUCTION_MAX_MFE_R", 0.50) or 0.50)
+        min_delivery_r = float(getattr(config, "QUANT_TIME_STOP_MIN_PROGRESS_R", 0.20) or 0.20)
+        hard_mult = float(getattr(config, "QUANT_TIME_STOP_HARD_MAX_MULT", 1.35) or 1.35)
+
+        if age >= max_hold * max(1.0, hard_mult):
+            return "time_stop_hard_max_hold"
+        if age >= max_hold and progress_r < min_delivery_r:
+            return "time_stop_no_delivery"
+        if age >= max_hold * max(0.10, min(early_frac, 0.95)) and progress_r <= failed_r and mfe_r < failed_mfe_r:
+            return "time_stop_failed_auction"
+        return ""
+
     def _manage_active(self, data_manager, order_manager, now):
         """Manage protected exposure without introducing a second alpha authority.
 
@@ -3746,6 +3795,11 @@ class QuantStrategy:
             return
         self._last_known_price = price
         self._observe_position_extremes(pos, price)
+        time_stop_reason = self._time_decay_exit_reason(pos, price, now)
+        if time_stop_reason and pos.phase == PositionPhase.ACTIVE:
+            logger.info("Structural auction time-decay exit armed: %s at %.4f", time_stop_reason, price)
+            self._exit_trade(order_manager, price, time_stop_reason)
+            return
 
         exchange = str(getattr(pos, "exchange", "") or "").lower()
         side = str(getattr(pos, "side", "") or "").lower()
@@ -4422,14 +4476,21 @@ class QuantStrategy:
                     delivery_p = None
 
         allocation_allowed = price_f > 0.0 and sl_dist > 1e-9 and side_l in ("long", "short")
-        if fee_to_risk >= fee_no_alloc:
-            reason = (
-                "extreme execution-cost drag; allocate with maximum haircut instead of veto"
-            )
+        if reward <= 0.0:
+            allocation_allowed = False
+            reason = "missing executable reward target"
+        elif net_win_r <= 0.0:
+            allocation_allowed = False
+            reason = "non-positive net reward after execution costs"
+        elif fee_to_risk >= fee_no_alloc:
+            allocation_allowed = False
+            reason = "extreme execution-cost drag; no allocation"
         elif fee_to_risk > fee_soft:
             reason = "fee drag above soft band; allocate with execution haircut"
         else:
             reason = "execution geometry viable"
+        if price_f <= 0.0 or sl_dist <= 1e-9 or side_l not in ("long", "short"):
+            reason = "invalid executable geometry"
 
         return ExecutionViability(
             route=route,

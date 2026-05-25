@@ -21,6 +21,11 @@ import logging
 import math
 import statistics
 import time
+from datetime import datetime, timedelta, timezone
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover
+    ZoneInfo = None  # type: ignore
 try:
     import config
 except Exception:  # pragma: no cover - test stubs may not load runtime config
@@ -148,6 +153,58 @@ class _Thesis:
     evidence_score: float = 0.0
     structural_origin: str = "RAID_WICK"
     last_reason: str = "waiting for FVG repricing"
+
+
+@dataclass(frozen=True)
+class _PDArrayConfluence:
+    score: float
+    block: str
+    dealing_low: float
+    dealing_high: float
+    dealing_mid: float
+    pd_position: float
+    pd_zone: str
+    ote_retracement: float
+    ote_score: float
+    fvg_score: float
+    order_block_low: float
+    order_block_high: float
+    order_block_score: float
+    killzone_label: str
+    killzone_score: float
+
+
+@dataclass(frozen=True)
+class _SetupQualityDossier:
+    score: float
+    grade: str
+    block: str
+    context_score: float
+    displacement_score: float
+    pd_array_score: float
+    target_delivery_score: float
+    target_rank_score: float
+    net_r_score: float
+    gauntlet_score: float
+    microstructure_score: float
+    cost_score: float
+
+    def as_payload(self) -> Dict[str, Any]:
+        return {
+            "setup_dossier_score": self.score,
+            "setup_grade": self.grade,
+            "setup_dossier_block": self.block,
+            "setup_context_score": self.context_score,
+            "setup_displacement_score": self.displacement_score,
+            "setup_pd_array_score": self.pd_array_score,
+            "setup_target_delivery_score": self.target_delivery_score,
+            "setup_target_rank_score": self.target_rank_score,
+            "setup_net_r_score": self.net_r_score,
+            "setup_gauntlet_score": self.gauntlet_score,
+            "setup_microstructure_score": self.microstructure_score,
+            "setup_cost_score": self.cost_score,
+            "setup_dossier_model": "STRUCTURE_PD_ARRAY_LIQUIDITY_NETR_GAUNTLET_FLOW",
+        }
 
 
 _EPS = 1e-12
@@ -309,6 +366,16 @@ def _sweep_key(sweep: SweepResult) -> tuple:
     return (round(_f(getattr(pool, "price", 0.0)), 8), side, round(_f(getattr(sweep, "detected_at", 0.0)), 3))
 
 
+def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, _f(x, lo)))
+
+
+def _row_ts_sec(row: Dict[str, Any]) -> float:
+    raw = row.get("t", row.get("timestamp", 0.0)) if isinstance(row, dict) else 0.0
+    val = _f(raw)
+    return val / 1000.0 if val > 1e11 else val
+
+
 class ICTLiquidityEntryEngine:
     """Unified institutional structural authority; all desks share one candidate ledger."""
 
@@ -365,6 +432,12 @@ class ICTLiquidityEntryEngine:
         payload = {"block_reason": str(reason), "trigger": "WAIT"}
         payload.update(values)
         self._last_analysis.update(payload)
+
+    def _max_thesis_age_sec(self, thesis: Optional[_Thesis] = None) -> float:
+        base = _cfg_float("ICT_THESIS_MAX_AGE_SEC", 900.0)
+        if thesis is not None and thesis.entry_type == EntryType.DISPLACEMENT_CONTINUATION:
+            base = _cfg_float("ICT_CONTINUATION_THESIS_MAX_AGE_SEC", base)
+        return max(120.0, base)
 
     @staticmethod
     def _direction_int(side: str) -> int:
@@ -527,12 +600,12 @@ class ICTLiquidityEntryEngine:
             return
 
         if self._thesis is not None:
-            if now - self._thesis.formed_at > 1800.0:
+            if now - self._thesis.formed_at > self._max_thesis_age_sec(self._thesis):
                 self._last_analysis.update({"expired_thesis_age_sec": now - self._thesis.formed_at})
                 self._thesis = None
                 self._state = EngineState.SCANNING
             else:
-                self._try_reprice_thesis(self._thesis, liq_snapshot, price, atr, now)
+                self._try_reprice_thesis(self._thesis, liq_snapshot, price, atr, now, c5, c15, c4h)
                 if self._signal is not None:
                     return
                 # A waiting reprice is a live candidate, not a global lock.  Continue
@@ -562,7 +635,7 @@ class ICTLiquidityEntryEngine:
             # the raid-specific models own attribution and invalidation geometry.
             continuation = self._build_displacement_continuation_thesis(ctx4, ctx15, c5, atr, now)
             if self._adopt_candidate(continuation) and self._thesis is not None:
-                self._try_reprice_thesis(self._thesis, liq_snapshot, price, atr, now)
+                self._try_reprice_thesis(self._thesis, liq_snapshot, price, atr, now, c5, c15, c4h)
                 if self._signal is not None:
                     return
             # Do not overwrite an active displacement/retest thesis with a raid-only
@@ -583,7 +656,7 @@ class ICTLiquidityEntryEngine:
         for sweep in sorted(fresh, key=lambda sw: _f(getattr(sw, "quality", 0.0)), reverse=True):
             expansion = self._build_liquidity_expansion_thesis(sweep, ctx4, ctx15, c5, atr, now)
             if self._adopt_candidate(expansion) and self._thesis is not None:
-                self._try_reprice_thesis(self._thesis, liq_snapshot, price, atr, now)
+                self._try_reprice_thesis(self._thesis, liq_snapshot, price, atr, now, c5, c15, c4h)
                 if self._signal is not None:
                     return
             side = str(getattr(sweep, "direction", "") or "").lower()
@@ -631,7 +704,7 @@ class ICTLiquidityEntryEngine:
                 continue
             if self._adopt_candidate(thesis) and self._thesis is not None:
                 self._last_analysis["state"] = self._state.value
-                self._try_reprice_thesis(self._thesis, liq_snapshot, price, atr, now)
+                self._try_reprice_thesis(self._thesis, liq_snapshot, price, atr, now, c5, c15, c4h)
                 if self._signal is not None:
                     return
         if self._last_analysis.get("block_reason") == "EVALUATING" and self._thesis is None:
@@ -895,6 +968,19 @@ class ICTLiquidityEntryEngine:
             details["selectivity_required_target_rank_score"] = min_rank
             return "TARGET_RANK_BELOW_SELECTIVITY_FLOOR", details
 
+        micro = getattr(self, "_last_microstructure", None)
+        if _cfg_bool("ICT_MICROSTRUCTURE_GUARD_ENABLED", True) and micro is not None and getattr(micro, "fresh", False):
+            micro_score = float(micro.aligned_score(thesis.side))
+            min_micro = _cfg_float("ICT_MIN_FRESH_MICROSTRUCTURE_SCORE", -0.20)
+            details.update({
+                "selectivity_microstructure_score": micro_score,
+                "selectivity_required_microstructure_score": min_micro,
+                "selectivity_micro_spread_atr": _f(getattr(micro, "spread_atr", 0.0)),
+                "selectivity_micro_book_age_sec": _f(getattr(micro, "book_age_sec", 0.0)),
+            })
+            if micro_score < min_micro:
+                return "ADVERSE_EXECUTION_FLOW_BLOCKED_BY_SELECTIVITY", details
+
         if path == "PARTIAL_HTF_DOL":
             partial_delivery = _cfg_float("ICT_PARTIAL_HTF_MIN_DELIVERY_SCORE", 0.70)
             partial_disp = _cfg_float("ICT_PARTIAL_HTF_MIN_DISPLACEMENT_ATR", 2.00)
@@ -906,6 +992,72 @@ class ICTLiquidityEntryEngine:
                 return "PARTIAL_HTF_DOL_REQUIRES_EXCEPTIONAL_PROOF", details
 
         return None
+
+    def _setup_quality_dossier(self, thesis: _Thesis, rr: float, rank_score: float,
+                               delivery_score: float,
+                               pd_confluence: Optional[_PDArrayConfluence]) -> _SetupQualityDossier:
+        """Single trade-quality authority after structural geometry is known.
+
+        Earlier gates prove each prerequisite independently.  This dossier asks
+        the desk question that matters before a ticket is allowed to exist:
+        does the whole setup, net of target quality and execution conditions,
+        deserve risk right now?  It remains an evidence score, not a claimed win
+        probability.
+        """
+        archetype = thesis.entry_type
+        if archetype == EntryType.DISPLACEMENT_CONTINUATION:
+            disp_floor = _cfg_float("ICT_ENTRY_MIN_DISPLACEMENT_ATR_CONTINUATION", 1.50)
+        else:
+            disp_floor = _cfg_float("ICT_ENTRY_MIN_DISPLACEMENT_ATR_RAID", 1.35)
+        context_score = _clamp(thesis.context_delivery_score)
+        displacement_score = _clamp(thesis.displacement_atr / max(disp_floor * 1.75, _EPS))
+        pd_score = _clamp(pd_confluence.score if pd_confluence is not None else 0.70)
+        target_score = _clamp(delivery_score)
+
+        rank_norm = max(0.50, _cfg_float("ICT_SETUP_DOSSIER_RANK_NORM", 3.0))
+        target_rank_norm = _clamp(math.tanh(max(0.0, rank_score) / rank_norm))
+        net_r = _f(self._last_analysis.get("target_net_win_r", rr), rr)
+        net_r_score = _clamp(math.tanh(max(0.0, net_r) / max(self._min_structural_rr, 1.0)))
+        gauntlet_score = _clamp(_f(self._last_analysis.get("target_gauntlet_penalty", 1.0), 1.0))
+        cost_r = _f(self._last_analysis.get("target_cost_r", 0.0), 0.0)
+        cost_score = _clamp(1.0 - cost_r / max(0.35, _cfg_float("FEE_TO_RISK_NO_ALLOC", 1.25)))
+
+        micro = getattr(self, "_last_microstructure", None)
+        if micro is not None and getattr(micro, "fresh", False):
+            micro_raw = _clamp(float(micro.aligned_score(thesis.side)), -1.0, 1.0)
+            micro_score = _clamp((micro_raw + 1.0) / 2.0)
+        else:
+            micro_score = 0.55
+
+        liquidity_score = _clamp(0.48 * target_score + 0.28 * target_rank_norm + 0.16 * net_r_score + 0.08 * gauntlet_score)
+        execution_score = _clamp(0.60 * micro_score + 0.40 * cost_score)
+        score = _clamp(
+            0.18 * context_score
+            + 0.18 * displacement_score
+            + 0.22 * pd_score
+            + 0.27 * liquidity_score
+            + 0.15 * execution_score
+        )
+        if score >= 0.82:
+            grade = "S"
+        elif score >= 0.72:
+            grade = "A"
+        elif score >= 0.60:
+            grade = "B"
+        elif score >= 0.50:
+            grade = "C"
+        else:
+            grade = "D"
+        min_score = _cfg_float("ICT_SETUP_DOSSIER_MIN_SCORE", 0.60)
+        block = "NONE" if score >= min_score else "SETUP_DOSSIER_BELOW_FLOOR"
+        return _SetupQualityDossier(
+            score=score, grade=grade, block=block,
+            context_score=context_score, displacement_score=displacement_score,
+            pd_array_score=pd_score, target_delivery_score=target_score,
+            target_rank_score=target_rank_norm, net_r_score=net_r_score,
+            gauntlet_score=gauntlet_score, microstructure_score=micro_score,
+            cost_score=cost_score,
+        )
 
     def _adopt_candidate(self, candidate: Optional[_Thesis]) -> bool:
         if candidate is None:
@@ -1063,8 +1215,122 @@ class ICTLiquidityEntryEngine:
             evidence_score=context_score, structural_origin="EXPANSION_ORIGIN",
         )
 
+    def _dealing_range(self, candles_15m: List[Dict], candles_4h: List[Dict]) -> Tuple[float, float, float]:
+        lookback = max(12, int(_cfg_float("ICT_DEALING_RANGE_LOOKBACK_15M", 48)))
+        rows = list(candles_15m[-lookback:] or [])
+        if len(rows) < 12:
+            rows = list(candles_4h[-20:] or [])
+        highs = [_f(row.get("h")) for row in rows if _f(row.get("h")) > 0]
+        lows = [_f(row.get("l")) for row in rows if _f(row.get("l")) > 0]
+        if not highs or not lows:
+            return 0.0, 0.0, 0.0
+        low, high = min(lows), max(highs)
+        return low, high, (low + high) / 2.0 if high > low else 0.0
+
+    def _killzone_quality(self, candles_5m: List[Dict], now: float) -> Tuple[float, str]:
+        if not _cfg_bool("ICT_PD_KILLZONE_WEIGHT_ENABLED", True):
+            return 0.55, "DISABLED"
+        ts = _row_ts_sec(candles_5m[-1]) if candles_5m else 0.0
+        ts = ts if ts > 0 else now
+        try:
+            if ZoneInfo is not None:
+                dt = datetime.fromtimestamp(ts, timezone.utc).astimezone(ZoneInfo("America/New_York"))
+            else:  # pragma: no cover
+                dt = datetime.fromtimestamp(ts, timezone.utc) - timedelta(hours=5)
+        except Exception:
+            return 0.55, "UNKNOWN"
+        minutes = dt.hour * 60 + dt.minute
+        windows = (
+            ("LONDON_KILLZONE", 2 * 60, 5 * 60),
+            ("NY_AM_KILLZONE", 8 * 60 + 30, 11 * 60),
+            ("NY_LUNCH_MACRO", 12 * 60, 13 * 60 + 30),
+            ("NY_PM_KILLZONE", 13 * 60 + 30, 16 * 60),
+        )
+        for label, start, end in windows:
+            if start <= minutes <= end:
+                return 1.0, label
+        near = min(min(abs(minutes - start), abs(minutes - end)) for _, start, end in windows)
+        if near <= 30:
+            return 0.72, "KILLZONE_ADJACENT"
+        return 0.45, "OUTSIDE_KILLZONE"
+
+    def _order_block_zone(self, thesis: _Thesis, candles_5m: List[Dict]) -> Tuple[float, float]:
+        impulse_idx = max(1, min(len(candles_5m) - 1, int(thesis.fvg.index) - 1))
+        start = max(0, impulse_idx - 8)
+        for row in reversed(candles_5m[start:impulse_idx]):
+            opened, closed = _f(row.get("o")), _f(row.get("c"))
+            if opened <= 0 or closed <= 0:
+                continue
+            if thesis.side == "long" and closed < opened:
+                return _f(row.get("l")), _f(row.get("h"))
+            if thesis.side == "short" and closed > opened:
+                return _f(row.get("l")), _f(row.get("h"))
+        origin = candles_5m[max(0, impulse_idx - 1)]
+        return _f(origin.get("l")), _f(origin.get("h"))
+
+    def _pd_array_confluence(self, thesis: _Thesis, entry: float, atr: float, now: float,
+                             candles_5m: List[Dict], candles_15m: List[Dict],
+                             candles_4h: List[Dict]) -> _PDArrayConfluence:
+        dealing_low, dealing_high, dealing_mid = self._dealing_range(candles_15m, candles_4h)
+        width = max(dealing_high - dealing_low, _EPS)
+        pd_position = _clamp((entry - dealing_low) / width) if dealing_high > dealing_low else 0.50
+        pd_zone = "DISCOUNT" if pd_position < 0.50 else ("PREMIUM" if pd_position > 0.50 else "EQUILIBRIUM")
+        if thesis.side == "long":
+            pd_score = 1.0 if pd_position <= 0.50 else _clamp(1.0 - (pd_position - 0.50) / 0.35)
+            impulse_extreme = max([_f(row.get("h")) for row in candles_5m[max(0, thesis.fvg.index - 2):]] or [entry])
+            retracement = (impulse_extreme - entry) / max(impulse_extreme - thesis.invalidation_anchor, _EPS)
+        else:
+            pd_score = 1.0 if pd_position >= 0.50 else _clamp(1.0 - (0.50 - pd_position) / 0.35)
+            impulse_extreme = min([_f(row.get("l")) for row in candles_5m[max(0, thesis.fvg.index - 2):] if _f(row.get("l")) > 0] or [entry])
+            retracement = (entry - impulse_extreme) / max(thesis.invalidation_anchor - impulse_extreme, _EPS)
+
+        ote_min = _cfg_float("ICT_OTE_MIN_RETRACEMENT", 0.50)
+        ote_max = _cfg_float("ICT_OTE_MAX_RETRACEMENT", 0.79)
+        if ote_min <= retracement <= ote_max:
+            center = (ote_min + ote_max) / 2.0
+            half = max((ote_max - ote_min) / 2.0, _EPS)
+            ote_score = 1.0 - 0.18 * min(1.0, abs(retracement - center) / half)
+        else:
+            ote_score = math.exp(-min(abs(retracement - ote_min), abs(retracement - ote_max)) / 0.18)
+
+        gap_half = max((thesis.fvg.high - thesis.fvg.low) / 2.0, 0.05 * atr, _EPS)
+        fvg_score = _clamp(1.0 - abs(entry - thesis.fvg.equilibrium) / (gap_half * 1.25))
+
+        ob_low, ob_high = self._order_block_zone(thesis, candles_5m)
+        if ob_low > 0 and ob_high > ob_low:
+            if ob_low <= entry <= ob_high:
+                ob_score = 1.0
+            else:
+                ob_distance = min(abs(entry - ob_low), abs(entry - ob_high))
+                ob_score = 0.90 * math.exp(-ob_distance / max(0.75 * atr, _EPS))
+        else:
+            ob_score = 0.55
+
+        kz_score, kz_label = self._killzone_quality(candles_5m, now)
+        score = _clamp(0.26 * pd_score + 0.24 * ote_score + 0.22 * fvg_score + 0.18 * ob_score + 0.10 * kz_score)
+        block = "NONE"
+        if (_cfg_bool("ICT_PD_ARRAY_STRICT_PREMIUM_DISCOUNT", True)
+                and thesis.entry_type == EntryType.LIQUIDITY_RAID_REVERSAL):
+            if thesis.side == "long" and pd_position > 0.50:
+                block = "LONG_NOT_IN_DISCOUNT_PD_ARRAY"
+            elif thesis.side == "short" and pd_position < 0.50:
+                block = "SHORT_NOT_IN_PREMIUM_PD_ARRAY"
+        min_score = _cfg_float("ICT_PD_ARRAY_MIN_SCORE", 0.58)
+        if block == "NONE" and score < min_score:
+            block = "PD_ARRAY_CONFLUENCE_BELOW_FLOOR"
+        return _PDArrayConfluence(
+            score=score, block=block, dealing_low=dealing_low, dealing_high=dealing_high,
+            dealing_mid=dealing_mid, pd_position=pd_position, pd_zone=pd_zone,
+            ote_retracement=_f(retracement), ote_score=_clamp(ote_score), fvg_score=fvg_score,
+            order_block_low=ob_low, order_block_high=ob_high, order_block_score=_clamp(ob_score),
+            killzone_label=kz_label, killzone_score=kz_score,
+        )
+
     def _try_reprice_thesis(self, thesis: _Thesis, snap: LiquidityMapSnapshot,
-                            price: float, atr: float, now: float) -> None:
+                            price: float, atr: float, now: float,
+                            candles_5m: Optional[List[Dict]] = None,
+                            candles_15m: Optional[List[Dict]] = None,
+                            candles_4h: Optional[List[Dict]] = None) -> None:
         zone_tol = 0.08 * atr
         low_bound, high_bound = thesis.fvg.low - zone_tol, thesis.fvg.high + zone_tol
         in_reprice_zone = low_bound <= price <= high_bound
@@ -1091,6 +1357,21 @@ class ICTLiquidityEntryEngine:
             "thesis_age_sec": max(0.0, now - thesis.formed_at),
         })
         if not in_reprice_zone:
+            max_extension = _cfg_float("ICT_MAX_FVG_EXTENSION_BEFORE_REPRICE_ATR", 3.25)
+            directional_extension = (
+                (thesis.side == "long" and price > high_bound)
+                or (thesis.side == "short" and price < low_bound)
+            )
+            if directional_extension and (distance_to_zone / max(atr, _EPS)) > max_extension:
+                self._thesis = None
+                self._state = EngineState.SCANNING
+                thesis.last_reason = "displacement travelled too far before repricing"
+                self._record_block(
+                    "FVG_REPRICE_TOO_EXTENDED_RESET",
+                    fvg_extension_atr=distance_to_zone / max(atr, _EPS),
+                    fvg_max_extension_atr=max_extension,
+                )
+                return
             thesis.last_reason = "MSS confirmed; awaiting 5m FVG rebalance"
             self._record_block("AWAITING_FVG_REBALANCE", trigger="AWAITING_FVG_REBALANCE")
             return
@@ -1099,6 +1380,35 @@ class ICTLiquidityEntryEngine:
             self._record_block("AWAITING_FVG_EQUILIBRIUM_REBALANCE", trigger="AWAITING_FVG_EQUILIBRIUM_REBALANCE")
             return
         entry = price
+        pd_confluence: Optional[_PDArrayConfluence] = None
+        if _cfg_bool("ICT_PD_ARRAY_GUARD_ENABLED", True):
+            pd_confluence = self._pd_array_confluence(
+                thesis, entry, atr, now,
+                list(candles_5m or []), list(candles_15m or []), list(candles_4h or []),
+            )
+            pd_payload = {
+                "pd_array_score": pd_confluence.score,
+                "pd_array_block": pd_confluence.block,
+                "pd_array_zone": pd_confluence.pd_zone,
+                "pd_array_position": pd_confluence.pd_position,
+                "pd_dealing_low": pd_confluence.dealing_low,
+                "pd_dealing_high": pd_confluence.dealing_high,
+                "pd_dealing_mid": pd_confluence.dealing_mid,
+                "pd_ote_retracement": pd_confluence.ote_retracement,
+                "pd_ote_score": pd_confluence.ote_score,
+                "pd_fvg_ce_score": pd_confluence.fvg_score,
+                "pd_order_block_low": pd_confluence.order_block_low,
+                "pd_order_block_high": pd_confluence.order_block_high,
+                "pd_order_block_score": pd_confluence.order_block_score,
+                "pd_killzone": pd_confluence.killzone_label,
+                "pd_killzone_score": pd_confluence.killzone_score,
+                "pd_array_model": "PREMIUM_DISCOUNT_OTE_FVG_CE_OB_KILLZONE",
+            }
+            self._last_analysis.update(pd_payload)
+            if pd_confluence.block != "NONE":
+                thesis.last_reason = f"PD array confluence rejected setup: {pd_confluence.block}"
+                self._record_block(pd_confluence.block, trigger="PD_ARRAY_FILTER", **pd_payload)
+                return
         stop = self._structural_stop(thesis, atr)
         anchor = _f(getattr(thesis, "invalidation_anchor", 0.0))
         if anchor <= 0 and thesis.sweep is not None:
@@ -1130,6 +1440,15 @@ class ICTLiquidityEntryEngine:
             thesis.last_reason = f"institutional selectivity rejected setup: {reason}"
             self._record_block(reason, trigger="SELECTIVITY_FILTER", **details)
             return
+        dossier: Optional[_SetupQualityDossier] = None
+        if _cfg_bool("ICT_SETUP_DOSSIER_ENABLED", True):
+            dossier = self._setup_quality_dossier(thesis, rr, rank_score, delivery_score, pd_confluence)
+            dossier_payload = dossier.as_payload()
+            self._last_analysis.update(dossier_payload)
+            if dossier.block != "NONE":
+                thesis.last_reason = f"institutional setup dossier rejected setup: {dossier.block}"
+                self._record_block(dossier.block, trigger="SETUP_DOSSIER_FILTER", **dossier_payload)
+                return
         quality = {
             "context_4h": thesis.context_4h.confidence,
             "context_15m": thesis.context_15m.confidence,
@@ -1141,6 +1460,16 @@ class ICTLiquidityEntryEngine:
             "probability_calibrated": False,
             "archetype": thesis.entry_type.value,
         }
+        if pd_confluence is not None:
+            quality.update({
+                "pd_array_score": pd_confluence.score,
+                "pd_array_position": pd_confluence.pd_position,
+                "ote_retracement": pd_confluence.ote_retracement,
+                "order_block_score": pd_confluence.order_block_score,
+                "killzone_score": pd_confluence.killzone_score,
+            })
+        if dossier is not None:
+            quality.update(dossier.as_payload())
         explanation = (
             f"4H={thesis.context_4h.label}({thesis.context_4h.confidence:.2f}) | "
             f"15m={thesis.context_15m.label}({thesis.context_15m.confidence:.2f}) | "
@@ -1148,6 +1477,14 @@ class ICTLiquidityEntryEngine:
             f"archetype={thesis.entry_type.value} MSS/FVG | displacement={thesis.displacement_atr:.2f}ATR | "
             f"deliveryScore={delivery_score:.2f} rankScore={rank_score:.2f} (uncalibrated)"
         )
+        if pd_confluence is not None:
+            explanation += (
+                f" | PD={pd_confluence.pd_zone}({pd_confluence.score:.2f}) "
+                f"OTE={pd_confluence.ote_retracement:.2f} OB={pd_confluence.order_block_score:.2f} "
+                f"KZ={pd_confluence.killzone_label}"
+            )
+        if dossier is not None:
+            explanation += f" | setupGrade={dossier.grade}({dossier.score:.2f})"
         self._signal = EntrySignal(
             side=thesis.side, entry_type=thesis.entry_type, entry_price=entry,
             sl_price=stop, tp_price=tp, rr_ratio=rr, target_pool=target_obj,
@@ -1173,6 +1510,27 @@ class ICTLiquidityEntryEngine:
             "target_pool_price": _f(getattr(target_obj.pool, "price", 0.0)),
             "target_significance": _f(getattr(target_obj, "significance", 0.0)),
         })
+        if dossier is not None:
+            self._last_analysis.update(dossier.as_payload())
+        if pd_confluence is not None:
+            self._last_analysis.update({
+                "pd_array_score": pd_confluence.score,
+                "pd_array_block": pd_confluence.block,
+                "pd_array_zone": pd_confluence.pd_zone,
+                "pd_array_position": pd_confluence.pd_position,
+                "pd_dealing_low": pd_confluence.dealing_low,
+                "pd_dealing_high": pd_confluence.dealing_high,
+                "pd_dealing_mid": pd_confluence.dealing_mid,
+                "pd_ote_retracement": pd_confluence.ote_retracement,
+                "pd_ote_score": pd_confluence.ote_score,
+                "pd_fvg_ce_score": pd_confluence.fvg_score,
+                "pd_order_block_low": pd_confluence.order_block_low,
+                "pd_order_block_high": pd_confluence.order_block_high,
+                "pd_order_block_score": pd_confluence.order_block_score,
+                "pd_killzone": pd_confluence.killzone_label,
+                "pd_killzone_score": pd_confluence.killzone_score,
+                "pd_array_model": "PREMIUM_DISCOUNT_OTE_FVG_CE_OB_KILLZONE",
+            })
         logger.info("INSTITUTIONAL_AUCTION ENTRY READY archetype=%s %s @ %.4f | SL=%.4f TP=%.4f grossRR=%.2f netWinR=%s rank=%s calibratedP=N/A | %s",
                     thesis.entry_type.value, thesis.side.upper(), entry, stop, tp, rr,
                     f"{self._last_analysis.get('target_net_win_r'):.2f}" if self._last_analysis.get('target_net_win_r') is not None else "N/A",
@@ -1213,6 +1571,8 @@ class ICTLiquidityEntryEngine:
         pools = snap.bsl_pools if side == "long" else snap.ssl_pools
         audit["pool_total"] = len(list(pools or []))
         candidates = []
+        all_candidate_rows: List[Dict[str, Any]] = []
+        opposing_pools = snap.ssl_pools if side == "long" else snap.bsl_pools
         for t in list(pools or []):
             pool = getattr(t, "pool", None)
             px = _f(getattr(pool, "price", 0.0))
@@ -1257,9 +1617,43 @@ class ICTLiquidityEntryEngine:
             delivery_score = max(0.0, min(0.99, 0.46 * context + 0.34 * sig_term + 0.20 * dist_reachability))
             cost_r = self._execution_cost_points / max(risk, _EPS)
             net_win_r = rr - cost_r
+            lo, hi = sorted((entry, tp))
+            gauntlet_n = 0
+            gauntlet_sig = 0.0
+            for opp in list(opposing_pools or []):
+                opp_pool = getattr(opp, "pool", None)
+                opp_px = _f(getattr(opp_pool, "price", 0.0))
+                if opp_px <= lo or opp_px >= hi:
+                    continue
+                opp_sig = max(0.0, _f(getattr(opp, "significance", 0.0)))
+                if opp_sig >= max(1.0, significance * 0.45):
+                    gauntlet_n += 1
+                    gauntlet_sig += opp_sig
+            gauntlet_penalty = 1.0 / (1.0 + 0.22 * gauntlet_n + 0.035 * gauntlet_sig)
             # A target is selected by structural score and net R; the score is
             # explicitly not converted into an uncalibrated win probability.
-            rank_score = delivery_score * max(0.0, net_win_r)
+            rank_score = delivery_score * max(0.0, net_win_r) * gauntlet_penalty
+            row = {
+                "pool_price": px,
+                "tp_price": tp,
+                "pool_side": str(getattr(getattr(pool, "side", None), "value", "") or ""),
+                "timeframe": str(getattr(pool, "timeframe", "") or ""),
+                "tf_sources": list(getattr(t, "tf_sources", []) or []),
+                "significance": significance,
+                "distance_atr": distance_atr,
+                "gross_rr": rr,
+                "cost_r": cost_r,
+                "net_win_r": net_win_r,
+                "delivery_score": delivery_score,
+                "rank_score": rank_score,
+                "gauntlet_n": gauntlet_n,
+                "gauntlet_sig": gauntlet_sig,
+                "gauntlet_penalty": gauntlet_penalty,
+                "buffer": buffer,
+                "selected": False,
+                "reason": "opposing HTF liquidity candidate",
+            }
+            all_candidate_rows.append(row)
             if net_win_r > 0.0 and rank_score > 0.0:
                 audit["positive"] += 1
                 candidates.append({
@@ -1274,6 +1668,10 @@ class ICTLiquidityEntryEngine:
                     "distance_atr": distance_atr,
                     "cost_r": cost_r,
                     "net_win_r": net_win_r,
+                    "gauntlet_n": gauntlet_n,
+                    "gauntlet_sig": gauntlet_sig,
+                    "gauntlet_penalty": gauntlet_penalty,
+                    "row": row,
                 })
             else:
                 audit["non_positive_net_reward"] += 1
@@ -1292,7 +1690,7 @@ class ICTLiquidityEntryEngine:
                 summary = "no positive-net-R opposing 15m+ liquidity destination"
                 block = "NO_POSITIVE_NET_R_OPPOSING_15M_PLUS_POOL"
             self._last_pool_plan = {"ts": time.time(), "role": "TP", "side": side,
-                                    "summary": summary}
+                                    "summary": summary, "candidates": all_candidate_rows}
             self._last_analysis["target_block"] = block
             return None
         best = max(
@@ -1314,9 +1712,17 @@ class ICTLiquidityEntryEngine:
         distance_atr = float(best["distance_atr"])
         cost_r = float(best["cost_r"])
         net_win_r = float(best["net_win_r"])
+        selected_row = dict(best.get("row") or {})
+        selected_row["selected"] = True
+        for row in all_candidate_rows:
+            if (abs(_f(row.get("pool_price")) - _f(selected_row.get("pool_price"))) <= 1e-9
+                    and str(row.get("timeframe", "")) == str(selected_row.get("timeframe", ""))):
+                row["selected"] = True
         self._last_pool_plan = {
             "ts": time.time(), "role": "TP", "side": side,
             "summary": f"LIQUIDITY_GRAPH_NET_R_RANK {target.pool.timeframe} {target.pool.side.value}@{target.pool.price:.4f} grossRR={rr:.2f} netWinR={net_win_r:.2f} deliveryScore={delivery_score:.2f} rank={rank_score:+.2f}",
+            "selected": selected_row,
+            "candidates": all_candidate_rows,
         }
         self._last_analysis.update({
             "target_timeframe": str(getattr(target.pool, "timeframe", "")),
@@ -1325,6 +1731,8 @@ class ICTLiquidityEntryEngine:
             "target_significance": significance, "target_rr": rr,
             "target_gross_rr": rr, "target_cost_r": cost_r,
             "target_net_win_r": net_win_r,
+            "target_gauntlet_n": int(best.get("gauntlet_n", 0) or 0),
+            "target_gauntlet_penalty": float(best.get("gauntlet_penalty", 1.0) or 1.0),
             "target_selection_model": "LIQUIDITY_GRAPH_NET_R_RANK",
             "target_policy_max_rr": max_rr_cap,
             "delivery_probability": None, "probability_calibrated": False,
