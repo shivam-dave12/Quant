@@ -26,6 +26,7 @@ import config
 from .api import BreezeRestClient
 from .market_session import icici_market_session_state
 from .rate_limiter import breeze_throttle
+from .live_feed import hub_for_api
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +48,12 @@ class ICICIUnderlyingDataManager:
         self._trades: deque = deque(maxlen=100)
         self.is_ready = False
         self._strategy_ref = None
-        self._sio = None
+        self._sio = None  # compatibility marker: set to shared BreezeLiveFeedHub while subscribed
         self._stream_script = ""
+        self._stream_subscription_ids: list[str] = []
+        self._last_stream_tick_ts = 0.0
+        self._stream_armed_at = 0.0
+        self._first_stream_tick = threading.Event()
         self._last_rest_refresh_attempt = 0.0
         logger.info(
             "ICICIUnderlyingDataManager initialised [%s -> underlying=%s]",
@@ -75,7 +80,10 @@ class ICICIUnderlyingDataManager:
             min_bars = int(_cfg("ICICI_UNDERLYING_MIN_READY_1M_BARS", 20))
             self.is_ready = len(self._candles.get("1m", ())) >= min_bars or len(self._candles.get("5m", ())) >= min_bars
             if self.is_ready:
-                self._start_websocket()
+                stream_ok = self._start_websocket()
+                if bool(_cfg("ICICI_INDEX_WEBSOCKET_REQUIRED", True)) and not stream_ok:
+                    self.is_ready = False
+                    logger.error("ICICI underlying desk blocked: mandatory real-time websocket is not live for %s", self._display_underlying())
             if not self.is_ready:
                 logger.warning(
                     "ICICI underlying chart not ready for %s: %s",
@@ -104,14 +112,18 @@ class ICICIUnderlyingDataManager:
 
     def stop(self) -> None:
         try:
-            if self._sio is not None:
-                self._sio.disconnect()
+            if self._sio is not None and self._stream_subscription_ids:
+                self._sio.unsubscribe(list(self._stream_subscription_ids))
         except Exception:
             pass
+        self._stream_subscription_ids = []
         self._sio = None
+        self._last_stream_tick_ts = 0.0
+        self._first_stream_tick.clear()
         return None
 
     def restart_streams(self) -> bool:
+        self.stop()
         return self.start()
 
     def wait_until_ready(self, timeout_sec: float = 120.0) -> bool:
@@ -209,7 +221,8 @@ class ICICIUnderlyingDataManager:
             with self._lock:
                 self._candles[timeframe].clear(); self._candles[timeframe].extend(parsed[-800:])
                 self._last_price = float(parsed[-1]["c"])
-                self._last_quote_ts = time.time()
+                if not bool(_cfg("ICICI_INDEX_WEBSOCKET_REQUIRED", True)):
+                    self._last_quote_ts = time.time()
 
     @staticmethod
     def _rows(resp: Dict[str, Any]) -> List[Any]:
@@ -273,7 +286,7 @@ class ICICIUnderlyingDataManager:
                 return int(iso.timestamp() * 1000)
         except Exception:
             pass
-        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d-%b-%Y %H:%M:%S", "%Y-%m-%d"):
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d-%b-%Y %H:%M:%S", "%a %b %d %H:%M:%S %Y", "%Y-%m-%d"):
             try:
                 return int(datetime.strptime(text, fmt).replace(tzinfo=_ICICI_LOCAL_TZ).timestamp() * 1000)
             except Exception:
@@ -312,96 +325,124 @@ class ICICIUnderlyingDataManager:
             })
         return out
 
-    def _start_websocket(self) -> None:
+    def _start_websocket(self) -> bool:
         if not bool(_cfg("ICICI_INDEX_STREAM_ENABLED", True)):
-            return
-        script_code = self._stream_script_code()
-        if not script_code:
-            if bool(_cfg("ICICI_INDEX_WEBSOCKET_REQUIRED", False)):
-                logger.warning("ICICI underlying websocket script code missing for %s", self._display_underlying())
-            return
-        if self._sio is not None:
-            return
+            logger.error("ICICI underlying websocket disabled by configuration for %s", self._display_underlying())
+            return False
+        if self._stream_subscription_ids:
+            return True
         try:
-            import socketio  # type: ignore
-            session = self.api.auth.get_session(force_refresh=False)
-            user_id, token = base64.b64decode(session.session_token.encode("ascii")).decode("ascii").split(":", 1)
-            sio = socketio.Client(logger=False, engineio_logger=False, reconnection=True)
-
-            def _handle(data):
-                self._on_stream_candle(data)
-
-            for channel in self._stream_channels():
-                sio.on(channel, _handle)
-            sio.connect(
-                "https://breezeapi.icicidirect.com",
-                headers={"User-Agent": "python-socketio[client]/socket"},
-                auth={"user": user_id, "token": token},
-                transports=["websocket"],
-                socketio_path="ohlcvstream",
-                wait_timeout=5,
+            hub = hub_for_api(self.api)
+            self._first_stream_tick.clear()
+            self._stream_armed_at = time.time()
+            subscription_id = hub.subscribe_underlying_quotes(
+                exchange_code=self._underlying_exchange(),
+                stock_code=self._underlying_code(),
+                callback=self._on_stream_candle,
             )
-            sio.emit("join", script_code)
-            self._sio = sio
-            self._stream_script = script_code
-            logger.info("ICICI underlying websocket live for %s script=%s channels=%s", self._display_underlying(), script_code, ",".join(self._stream_channels()))
+            self._sio = hub
+            self._stream_subscription_ids = [subscription_id]
+            timeout = max(0.0, float(_cfg("ICICI_INDEX_STREAM_FIRST_TICK_TIMEOUT_SEC", 12.0)))
+            if bool(_cfg("ICICI_INDEX_WEBSOCKET_REQUIRED", True)) and timeout > 0 and not self._first_stream_tick.wait(timeout):
+                hub.unsubscribe(self._stream_subscription_ids)
+                self._stream_subscription_ids = []
+                self._sio = None
+                logger.error("ICICI underlying websocket subscribed but delivered no live tick within %.1fs for %s", timeout, self._display_underlying())
+                return False
+            logger.info("ICICI underlying websocket LIVE for %s via official Breeze quote feed; 1m/5m/15m/1h/4h bars are streamed/aggregated locally", self._display_underlying())
+            return True
         except Exception as exc:
-            logger.warning("ICICI underlying websocket unavailable for %s: %s; REST warmup remains active", self._display_underlying(), exc)
+            logger.error("ICICI mandatory underlying websocket unavailable for %s: %s", self._display_underlying(), exc)
+            return False
 
-    def _stream_channels(self) -> list[str]:
-        raw = str(_cfg("ICICI_INDEX_STREAM_CHANNELS", "1MIN,5MIN") or "")
-        return [x.strip().upper() for x in raw.replace(";", ",").split(",") if x.strip()]
-
-    def _stream_script_code(self) -> str:
-        raw = _cfg("ICICI_INDEX_STREAM_SCRIPT_CODES", {})
-        keys = {self._display_underlying(), self._underlying_code(), str(getattr(self.instrument, "asset_id", "")).upper()}
-        if isinstance(raw, dict):
-            for k, v in raw.items():
-                if str(k).upper() in keys and str(v or "").strip():
-                    return str(v).strip()
-        return ""
+    def _matches_underlying_tick(self, row: Dict[str, Any]) -> bool:
+        exchange = str(row.get("exchange_code") or row.get("exchange") or "").upper()
+        if exchange and self._underlying_exchange() not in exchange:
+            return False
+        if row.get("expiry_date") or row.get("strike_price") or row.get("right") or row.get("right_type"):
+            return False
+        symbol = str(row.get("stock_code") or row.get("stock_name") or row.get("symbol") or "").upper().replace(" ", "")
+        target = self._underlying_code().replace(" ", "")
+        return not symbol or target in symbol or symbol in target or (target == "NIFTY" and "NIFTY50" in symbol)
 
     def _on_stream_candle(self, data: Any) -> None:
+        """Consume official Breeze live underlying quotes/OHLC without synthetic prices.
+
+        NIFTY is documented by Breeze as a real-time quote subscription.  The
+        tick price therefore updates the current one-minute candle, from which
+        the institutional 5m/15m/1h/4h structural frames are aggregated.
+        """
         try:
-            row = data[0] if isinstance(data, list) and data and isinstance(data[0], (list, tuple, dict)) else data
-            if isinstance(row, dict):
-                c = self._float_first(row, ("close", "Close", "c"))
+            row = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else data
+            if not isinstance(row, dict) or not self._matches_underlying_tick(row):
+                return
+            c = self._float_first(row, ("last", "ltp", "last_price", "close", "Close", "c"))
+            if c <= 0:
+                return
+            ts = row.get("datetime") or row.get("ltt") or row.get("time") or row.get("t") or time.time()
+            interval = str(row.get("interval") or row.get("Interval") or "").lower()
+            if interval in {"1minute", "1min", "1m"}:
                 o = self._float_first(row, ("open", "Open", "o")) or c
                 h = self._float_first(row, ("high", "High", "h")) or c
                 l = self._float_first(row, ("low", "Low", "l")) or c
                 v = self._float_first(row, ("volume", "Volume", "v"))
-                ts = row.get("datetime") or row.get("time") or row.get("t") or time.time()
-                interval = str(row.get("interval") or row.get("Interval") or "").upper()
-            elif isinstance(row, (list, tuple)) and len(row) >= 9:
-                # ICICI StreamLiveOHLCV positional payload:
-                # exchange, stock, low, high, open, close, volume, datetime, interval.
-                l = self._num(row[2]); h = self._num(row[3]); o = self._num(row[4]); c = self._num(row[5]); v = self._num(row[6])
-                ts = row[7]; interval = str(row[8] or "").upper()
             else:
-                return
-            if c <= 0:
-                return
-            tf = "1m" if "1" in interval else "5m" if "5" in interval else ""
-            if not tf:
-                return
+                # Quote responses expose session OHLC/TTQ, not one-minute OHLCV.
+                # Using those fields as a 1m candle would contaminate ATR, sweeps
+                # and delivery geometry. Build live bars strictly from tick LTP.
+                o = h = l = c
+                v = 0.0
             candle = self._canonical_candle(ts, o, h, l, c, v)
+            bucket = (int(candle["t"]) // 60000) * 60000
+            candle["t"] = bucket; candle["timestamp"] = bucket / 1000.0
             with self._lock:
-                target = self._candles[tf]
-                if target and int(target[-1].get("t", 0)) == int(candle["t"]):
-                    target[-1] = candle
-                else:
-                    target.append(candle)
+                self._upsert_live_candle("1m", candle)
+                self._aggregate_live_frames_from_1m(int(candle["t"]))
                 self._last_price = float(candle["c"])
                 self._last_quote_ts = time.time()
+                self._last_stream_tick_ts = self._last_quote_ts
                 quote_price = self._last_price
-            # Wake active candidate monitoring outside the feed lock; the strategy
-            # remains the single execution authority on its own evaluation thread.
+            self._first_stream_tick.set()
             if self._strategy_ref is not None:
                 callback = getattr(self._strategy_ref, "_on_realtime_quote", None)
                 if callable(callback):
                     callback(quote_price)
-        except Exception:
-            return
+        except Exception as exc:
+            logger.debug("ICICI underlying websocket tick rejected: %s", exc)
+
+    def _upsert_live_candle(self, timeframe: str, candle: Dict[str, Any]) -> None:
+        target = self._candles[timeframe]
+        ts = int(candle.get("t", 0) or 0)
+        if target and int(target[-1].get("t", 0) or 0) == ts:
+            previous = target[-1]
+            merged = dict(candle)
+            merged["o"] = merged["open"] = float(previous.get("o", previous.get("open", candle["o"])) or candle["o"])
+            merged["h"] = merged["high"] = max(float(previous.get("h", previous.get("high", candle["h"])) or candle["h"]), float(candle["h"]))
+            merged["l"] = merged["low"] = min(float(previous.get("l", previous.get("low", candle["l"])) or candle["l"]), float(candle["l"]))
+            # Quote ticks may expose cumulative volume; never add it repeatedly.
+            merged["v"] = merged["volume"] = max(float(previous.get("v", 0.0) or 0.0), float(candle.get("v", 0.0) or 0.0))
+            target[-1] = merged
+        elif not target or ts > int(target[-1].get("t", 0) or 0):
+            target.append(candle)
+
+    def _aggregate_live_frames_from_1m(self, timestamp_ms: int) -> None:
+        rows = list(self._candles.get("1m", ()))
+        for timeframe, minutes in (("5m", 5), ("15m", 15), ("1h", 60), ("4h", 240)):
+            bucket_ms = minutes * 60000
+            bucket = (timestamp_ms // bucket_ms) * bucket_ms
+            chunk = [r for r in rows if bucket <= int(r.get("t", 0) or 0) < bucket + bucket_ms]
+            if not chunk:
+                continue
+            aggregated = {
+                "t": bucket, "timestamp": bucket / 1000.0,
+                "o": float(chunk[0]["o"]), "open": float(chunk[0]["o"]),
+                "h": max(float(r["h"]) for r in chunk), "high": max(float(r["h"]) for r in chunk),
+                "l": min(float(r["l"]) for r in chunk), "low": min(float(r["l"]) for r in chunk),
+                "c": float(chunk[-1]["c"]), "close": float(chunk[-1]["c"]),
+                "v": sum(float(r.get("v", 0.0) or 0.0) for r in chunk),
+                "volume": sum(float(r.get("v", 0.0) or 0.0) for r in chunk),
+            }
+            self._upsert_live_candle(timeframe, aggregated)
 
     def _count_summary(self) -> str:
         with self._lock:
@@ -411,25 +452,27 @@ class ICICIUnderlyingDataManager:
         session = icici_market_session_state()
         if not session.is_open and bool(_cfg("ICICI_ANALYZE_ONLY_DURING_MARKET_SESSION", True)):
             return
-        interval = float(_cfg("ICICI_UNDERLYING_REST_REFRESH_SEC", 30.0) or 0.0)
-        if interval <= 0:
+        repair_interval = float(_cfg("ICICI_UNDERLYING_REST_REFRESH_SEC", 30.0) or 0.0)
+        reconcile_interval = float(_cfg("ICICI_UNDERLYING_REST_RECONCILE_SEC", 900.0) or 900.0)
+        if repair_interval <= 0:
             return
         now = time.time()
         with self._lock:
-            age = now - float(self._last_quote_ts or 0.0) if self._last_quote_ts else 999999.0
-        # If the stream is updating, do not add REST load.  If it is silent or no
-        # script code exists for this index, refresh the latest candles on a
-        # throttled cadence so ICICI desks do not trade frozen warmup prices.
-        if self._sio is not None and age <= max(interval * 2.0, 15.0):
-            return
+            stream_age = now - float(self._last_stream_tick_ts or 0.0) if self._last_stream_tick_ts else 999999.0
+        live = bool(self._stream_subscription_ids) and stream_age <= float(_cfg("ICICI_INDEX_STREAM_MAX_STALE_SEC", 15.0))
+        interval = reconcile_interval if live else repair_interval
         if now - float(self._last_rest_refresh_attempt or 0.0) < interval:
             return
         self._last_rest_refresh_attempt = now
         try:
-            self._load_historical("1m")
-            self._load_historical("5m")
+            # REST repairs history but never makes the mandatory websocket look fresh.
+            # Crucially, all structural frames used by the strategy are reconciled.
+            for timeframe in ("1m", "5m", "15m", "1h", "4h"):
+                self._load_historical(timeframe)
+            if not live:
+                logger.warning("ICICI underlying live stream stale/unavailable for %s; REST history repaired but trading remains blocked until websocket ticks resume", self._display_underlying())
         except Exception as exc:
-            logger.debug("ICICI underlying REST refresh skipped for %s: %s", self._display_underlying(), exc)
+            logger.debug("ICICI underlying REST reconciliation skipped for %s: %s", self._display_underlying(), exc)
 
     def get_last_update(self) -> float:
         with self._lock:
@@ -446,7 +489,7 @@ class ICICIUnderlyingDataManager:
             return float(self._last_price or 0.0)
 
     def get_orderbook(self) -> Dict:
-        return {"bids": [], "asks": [], "timestamp": self._last_quote_ts, "_sources": 0, "_executable_source": "icici_underlying_history"}
+        return {"bids": [], "asks": [], "timestamp": self._last_quote_ts, "_sources": 0, "_executable_source": "icici_breeze_websocket_underlying" if self._last_stream_tick_ts > 0 else "icici_underlying_rest_reconcile"}
 
     def get_recent_trades(self, limit: int = 100) -> List[Dict]:
         return []
@@ -456,8 +499,9 @@ class ICICIUnderlyingDataManager:
 
     def is_price_fresh(self, max_stale_seconds: float = 90.0) -> bool:
         with self._lock:
-            ts = float(self._last_quote_ts or 0.0)
-        return ts > 0 and (time.time() - ts) <= float(max_stale_seconds)
+            ts = float(self._last_stream_tick_ts if bool(_cfg("ICICI_INDEX_WEBSOCKET_REQUIRED", True)) else self._last_quote_ts or 0.0)
+        maximum = min(float(max_stale_seconds), float(_cfg("ICICI_INDEX_STREAM_MAX_STALE_SEC", 15.0))) if bool(_cfg("ICICI_INDEX_WEBSOCKET_REQUIRED", True)) else float(max_stale_seconds)
+        return ts > 0 and (time.time() - ts) <= maximum
 
     @staticmethod
     def _float_first(row: Dict[str, Any], names: tuple[str, ...]) -> float:

@@ -1,8 +1,9 @@
-"""ICICI Breeze option data manager.
+"""ICICI Breeze option execution-vehicle data manager.
 
-Polling-only by design: Breeze does not use the Delta websocket contract here.
-No synthetic candles are produced. If Breeze historical/quote data is missing,
-the manager remains not-ready and the runtime will not trade that option.
+The selected CE/PE contract is streamed through the official Breeze websocket.
+REST is retained for historical warmup, session-book prechecks and periodic
+reconciliation; it is not the source of live execution pricing once a vehicle
+is activated. No synthetic prices or book depth are produced.
 """
 from __future__ import annotations
 
@@ -28,6 +29,7 @@ except Exception:  # pragma: no cover
 from .api import BreezeRestClient
 from .market_session import icici_market_session_state
 from .rate_limiter import breeze_throttle
+from .live_feed import hub_for_api
 from agents.icici_chain_architect import (
     chain_quality, is_chain_instrument, apply_contract_choice,
     build_session_contract_book, select_contract_from_session_book,
@@ -68,6 +70,17 @@ class ICICIOptionDataManager:
         self._contract_snapshots: dict[tuple[str, str, float], dict[str, Any]] = {}
         self._session_book_last_refresh_ts = 0.0
         self._session_book_last_refresh_attempt_ts = 0.0
+        self._live_hub = None
+        # The day-start CE/PE book is pre-streamed so a signal never waits for
+        # a new option subscription before execution pricing is available.
+        self._stream_subscription_ids: list[str] = []
+        self._book_stream_subscription_ids: dict[tuple[str, str, float], list[str]] = {}
+        self._book_stream_state: dict[tuple[str, str, float], dict[str, Any]] = {}
+        self._active_stream_key: tuple[str, str, float] | None = None
+        self._active_stream_contract: dict[str, Any] = {}
+        self._last_stream_tick_ts = 0.0
+        self._stream_armed_at = 0.0
+        self._first_stream_tick = threading.Event()
         self._underlying_route_fields = self._route_field_snapshot()
         logger.info("ICICIOptionDataManager initialised [%s]", getattr(instrument, "asset_id", "ICICI"))
 
@@ -285,8 +298,251 @@ class ICICIOptionDataManager:
     def _clear_option_execution_state(self) -> None:
         with self._lock:
             self._last_price = 0.0; self._last_quote_ts = 0.0; self._best_bid = 0.0; self._best_ask = 0.0; self._best_bid_qty = 0.0; self._best_ask_qty = 0.0
+            self._last_stream_tick_ts = 0.0
             self._candles = {tf: deque(maxlen=600) for tf in ("1m", "5m", "15m", "1h", "4h", "1d")}
             self._trades.clear()
+            self._first_stream_tick.clear()
+
+    def _active_route(self) -> dict[str, Any]:
+        raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
+        selected = raw.get("selected_option_contract") if isinstance(raw, dict) else None
+        if isinstance(selected, dict) and isinstance(selected.get("raw"), dict):
+            return dict(selected.get("raw") or {})
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    @staticmethod
+    def _ws_expiry(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        for fmt in ("%d-%b-%Y", "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S.000Z", "%Y-%m-%dT%H:%M:%SZ"):
+            try:
+                return datetime.strptime(text, fmt).strftime("%d-%b-%Y")
+            except Exception:
+                continue
+        return text
+
+    def _stop_option_stream(self) -> None:
+        try:
+            if self._live_hub is not None and self._stream_subscription_ids:
+                self._live_hub.unsubscribe(list(self._stream_subscription_ids))
+        except Exception:
+            pass
+        self._stream_subscription_ids = []
+        self._book_stream_subscription_ids = {}
+        self._book_stream_state = {}
+        self._active_stream_key = None
+        self._active_stream_contract = {}
+        self._last_stream_tick_ts = 0.0
+        self._first_stream_tick.clear()
+
+    def _stream_identity_for_choice(self, choice) -> dict[str, Any]:
+        raw = dict(getattr(choice, "raw", {}) or {})
+        stock_code = str(raw.get("stock_code") or raw.get("ShortName") or getattr(self.instrument, "asset_id", "")).upper()
+        expiry = self._ws_expiry(raw.get("expiry_date") or raw.get("ExpiryDate") or getattr(choice, "expiry", ""))
+        right = self.api._normalise_right(raw.get("right") or raw.get("OptionType") or getattr(choice, "right", ""))
+        strike = float(raw.get("strike_price") or raw.get("StrikePrice") or getattr(choice, "strike", 0.0) or 0.0)
+        return {"stock_code": stock_code, "expiry": expiry, "right": right, "strike": strike}
+
+    def _matches_option_identity_tick(self, row: Dict[str, Any], identity: dict[str, Any]) -> bool:
+        if not identity:
+            return False
+        exchange = str(row.get("exchange_code") or row.get("exchange") or "").upper()
+        if exchange and "NFO" not in exchange:
+            return False
+        stock = str(row.get("stock_code") or row.get("stock_name") or "").upper().replace(" ", "")
+        if stock and str(identity.get("stock_code", "")).replace(" ", "") not in stock:
+            return False
+        right_val = self.api._normalise_right(row.get("right") or row.get("right_type") or row.get("option_type") or "")
+        if right_val and right_val != identity.get("right"):
+            return False
+        strike_val = self._float_first(row, ("strike_price", "strike", "StrikePrice"))
+        if strike_val and abs(strike_val - float(identity.get("strike", 0.0) or 0.0)) > 1e-6:
+            return False
+        return bool("NFO" in exchange or right_val or strike_val or row.get("expiry_date"))
+
+    def _arm_session_book_streams(self, book) -> bool:
+        """Stream both preselected CE/PE contracts before the scan may enter."""
+        if not bool(_cfg("ICICI_OPTION_STREAM_ENABLED", True)):
+            logger.error("ICICI session book rejected: option websocket disabled by configuration")
+            return False
+        self._stop_option_stream()
+        try:
+            hub = hub_for_api(self.api)
+            self._live_hub = hub
+            timeout = max(0.0, float(_cfg("ICICI_OPTION_STREAM_FIRST_TICK_TIMEOUT_SEC", 12.0)))
+            for choice in (book.call, book.put):
+                key = self._snapshot_key(choice)
+                identity = self._stream_identity_for_choice(choice)
+                if not all((identity.get("stock_code"), identity.get("expiry"), identity.get("right"), identity.get("strike"))):
+                    raise RuntimeError(f"incomplete option websocket route for {getattr(choice, 'selected_symbol', key)}")
+                event = threading.Event()
+                snapshot = self._contract_snapshots.get(key, {})
+                candles = {tf: deque(rows, maxlen=600) for tf, rows in (snapshot.get("candles") or {}).items()}
+                for tf in ("1m", "5m", "15m", "1h", "4h", "1d"):
+                    candles.setdefault(tf, deque(maxlen=600))
+                self._book_stream_state[key] = {"identity": identity, "event": event, "last_stream_tick_ts": 0.0, "last_price": 0.0, "best_bid": 0.0, "best_ask": 0.0, "best_bid_qty": 0.0, "best_ask_qty": 0.0, "candles": candles}
+                callback = lambda data, stream_key=key, stream_identity=identity: self._on_session_book_option_tick(stream_key, stream_identity, data)
+                ids = hub.subscribe_option_quotes_and_ohlcv(stock_code=identity["stock_code"], expiry_date=identity["expiry"], strike_price=str(identity["strike"]), right=identity["right"], callback=callback)
+                self._book_stream_subscription_ids[key] = list(ids)
+                self._stream_subscription_ids.extend(ids)
+            if bool(_cfg("ICICI_OPTION_WEBSOCKET_REQUIRED", True)) and timeout > 0:
+                deadline = time.time() + timeout
+                for key, state in self._book_stream_state.items():
+                    if not state["event"].wait(max(0.0, deadline - time.time())):
+                        raise RuntimeError(f"no first live option tick within {timeout:.1f}s for session vehicle {key}")
+            logger.info("ICICI CE/PE session vehicles websocket LIVE before signal execution; streamed_contracts=%d", len(self._book_stream_state))
+            return True
+        except Exception as exc:
+            self._stop_option_stream()
+            logger.error("ICICI session contract book rejected: mandatory CE/PE websocket arming failed: %s", exc)
+            return False
+
+    def _on_session_book_option_tick(self, key: tuple[str, str, float], identity: dict[str, Any], data: Any) -> None:
+        row = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else data
+        if not isinstance(row, dict) or not self._matches_option_identity_tick(row, identity):
+            return
+        px = self._float_first(row, ("last", "ltp", "last_price", "close", "price", "Close", "c"))
+        if px <= 0:
+            return
+        now = time.time()
+        state = self._book_stream_state.get(key)
+        if state is None:
+            return
+        state["last_stream_tick_ts"] = now
+        state["last_price"] = px
+        for target, names in (("best_bid", ("best_bid_price", "best_bid", "bid", "bPrice", "bid_price")), ("best_ask", ("best_offer_price", "best_ask_price", "best_ask", "ask", "sPrice", "ask_price", "offer_price")), ("best_bid_qty", ("best_bid_quantity", "bid_quantity", "bid_qty", "bQty")), ("best_ask_qty", ("best_offer_quantity", "best_ask_quantity", "ask_quantity", "ask_qty", "sQty"))):
+            value = self._float_first(row, names)
+            if value > 0:
+                state[target] = value
+        interval = str(row.get("interval") or row.get("Interval") or "").lower()
+        if interval in {"1minute", "1min", "1m"}:
+            o = self._float_first(row, ("open", "Open", "o")) or px
+            h = self._float_first(row, ("high", "High", "h")) or px
+            l = self._float_first(row, ("low", "Low", "l")) or px
+            v = self._float_first(row, ("volume", "Volume", "v"))
+            ts = row.get("datetime") or row.get("ltt") or row.get("time") or row.get("t") or now
+            candle = self._canonical_option_candle(ts, o, h, l, px, v)
+            with self._lock:
+                self._upsert_option_live_candle("1m", candle, store=state["candles"])
+                self._aggregate_option_live_frames(int(candle["t"]), store=state["candles"])
+        state["event"].set()
+        if self._active_stream_key == key:
+            self._active_stream_contract = dict(identity)
+            self._on_option_stream_tick(data)
+
+    def _start_selected_contract_stream(self) -> bool:
+        if not bool(_cfg("ICICI_OPTION_STREAM_ENABLED", True)):
+            logger.error("ICICI option websocket disabled by configuration for active execution vehicle")
+            return False
+        route = self._active_route()
+        stock_code = str(route.get("stock_code") or route.get("ShortName") or "").upper()
+        expiry = self._ws_expiry(route.get("expiry_date") or route.get("ExpiryDate") or "")
+        right = self.api._normalise_right(route.get("right") or route.get("OptionType") or "")
+        strike = str(route.get("strike_price") or route.get("StrikePrice") or "")
+        if not all((stock_code, expiry, right, strike)):
+            logger.error("ICICI option websocket cannot subscribe: incomplete selected contract identity")
+            return False
+        self._stop_option_stream()
+        try:
+            hub = hub_for_api(self.api)
+            self._live_hub = hub
+            self._active_stream_contract = {"stock_code": stock_code, "expiry": expiry, "right": right, "strike": float(strike)}
+            self._stream_armed_at = time.time()
+            self._stream_subscription_ids = hub.subscribe_option_quotes_and_ohlcv(
+                stock_code=stock_code, expiry_date=expiry, strike_price=strike, right=right, callback=self._on_option_stream_tick)
+            timeout = max(0.0, float(_cfg("ICICI_OPTION_STREAM_FIRST_TICK_TIMEOUT_SEC", 12.0)))
+            if bool(_cfg("ICICI_OPTION_WEBSOCKET_REQUIRED", True)) and timeout > 0 and not self._first_stream_tick.wait(timeout):
+                self._stop_option_stream()
+                logger.error("ICICI option websocket subscribed but produced no first tick within %.1fs for %s %s %s %s", timeout, stock_code, expiry, strike, right)
+                return False
+            logger.info("ICICI option websocket LIVE for %s %s %s %s; live quotes/OHLCV are primary execution data", stock_code, expiry, strike, right)
+            return True
+        except Exception as exc:
+            self._stop_option_stream()
+            logger.error("ICICI mandatory option websocket unavailable for selected vehicle: %s", exc)
+            return False
+
+    def _matches_active_option_tick(self, row: Dict[str, Any]) -> bool:
+        return self._matches_option_identity_tick(row, self._active_stream_contract)
+
+    def _on_option_stream_tick(self, data: Any) -> None:
+        try:
+            row = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else data
+            if not isinstance(row, dict) or not self._matches_active_option_tick(row):
+                return
+            px = self._float_first(row, ("last", "ltp", "last_price", "close", "price", "Close", "c"))
+            if px <= 0:
+                return
+            now = time.time()
+            bid = self._float_first(row, ("best_bid_price", "best_bid", "bid", "bPrice", "bid_price"))
+            ask = self._float_first(row, ("best_offer_price", "best_ask_price", "best_ask", "ask", "sPrice", "ask_price", "offer_price"))
+            bid_qty = self._float_first(row, ("best_bid_quantity", "bid_quantity", "bid_qty", "bQty"))
+            ask_qty = self._float_first(row, ("best_offer_quantity", "best_ask_quantity", "ask_quantity", "ask_qty", "sQty"))
+            interval = str(row.get("interval") or row.get("Interval") or "").lower()
+            v = self._float_first(row, ("volume", "Volume", "v")) if interval in {"1minute", "1min", "1m"} else 0.0
+            candle = None
+            if interval in {"1minute", "1min", "1m"}:
+                # Only the official OHLCV interval feed may populate premium bars.
+                # Quote payload open/high/low are session fields and must never be
+                # interpreted as one-minute premium structure.
+                o = self._float_first(row, ("open", "Open", "o")) or px
+                h = self._float_first(row, ("high", "High", "h")) or px
+                l = self._float_first(row, ("low", "Low", "l")) or px
+                ts = row.get("datetime") or row.get("ltt") or row.get("time") or row.get("t") or now
+                candle = self._canonical_option_candle(ts, o, h, l, px, v)
+            with self._lock:
+                if candle is not None:
+                    self._upsert_option_live_candle("1m", candle)
+                    self._aggregate_option_live_frames(int(candle["t"]))
+                self._last_price = px
+                self._last_quote_ts = now
+                self._last_stream_tick_ts = now
+                if bid > 0: self._best_bid = bid
+                if ask > 0: self._best_ask = ask
+                if bid_qty > 0: self._best_bid_qty = bid_qty
+                if ask_qty > 0: self._best_ask_qty = ask_qty
+                self._trades.append({"price": px, "quantity": v, "side": "buy", "timestamp": now, "source": "icici_websocket"})
+            self._first_stream_tick.set()
+            if self._strategy_ref is not None:
+                callback = getattr(self._strategy_ref, "_on_realtime_quote", None)
+                if callable(callback):
+                    callback(px)
+        except Exception as exc:
+            logger.debug("ICICI option websocket tick rejected: %s", exc)
+
+    def _canonical_option_candle(self, ts: Any, o: float, h: float, l: float, c: float, v: float = 0.0) -> dict[str, Any]:
+        ts_ms = self._parse_ts_ms(ts)
+        interval_ms = 60 * 1000
+        ts_ms = (ts_ms // interval_ms) * interval_ms
+        high = max(float(h or c), float(o or c), float(c))
+        low = min(float(l or c), float(o or c), float(c))
+        return {"t": ts_ms, "timestamp": ts_ms / 1000.0, "o": float(o or c), "open": float(o or c), "h": high, "high": high, "l": low, "low": low, "c": float(c), "close": float(c), "v": float(v or 0.0), "volume": float(v or 0.0)}
+
+    def _upsert_option_live_candle(self, timeframe: str, candle: dict[str, Any], store: dict[str, deque] | None = None) -> None:
+        target = (self._candles if store is None else store)[timeframe]
+        ts = int(candle.get("t", 0) or 0)
+        if target and int(target[-1].get("t", 0) or 0) == ts:
+            previous = target[-1]
+            candle = dict(candle)
+            candle["o"] = candle["open"] = float(previous.get("o", previous.get("open", candle["o"])) or candle["o"])
+            candle["h"] = candle["high"] = max(float(previous.get("h", previous.get("high", candle["h"])) or candle["h"]), float(candle["h"]))
+            candle["l"] = candle["low"] = min(float(previous.get("l", previous.get("low", candle["l"])) or candle["l"]), float(candle["l"]))
+            candle["v"] = candle["volume"] = max(float(previous.get("v", 0.0) or 0.0), float(candle.get("v", 0.0) or 0.0))
+            target[-1] = candle
+        elif not target or ts > int(target[-1].get("t", 0) or 0):
+            target.append(candle)
+
+    def _aggregate_option_live_frames(self, timestamp_ms: int, store: dict[str, deque] | None = None) -> None:
+        candle_store = self._candles if store is None else store
+        rows = list(candle_store.get("1m", ()))
+        for timeframe, minutes in (("5m", 5), ("15m", 15), ("1h", 60)):
+            bucket_ms = minutes * 60000; bucket = (timestamp_ms // bucket_ms) * bucket_ms
+            chunk = [r for r in rows if bucket <= int(r.get("t", 0) or 0) < bucket + bucket_ms]
+            if not chunk:
+                continue
+            agg = {"t": bucket, "timestamp": bucket / 1000.0, "o": float(chunk[0]["o"]), "open": float(chunk[0]["o"]), "h": max(float(r["h"]) for r in chunk), "high": max(float(r["h"]) for r in chunk), "l": min(float(r["l"]) for r in chunk), "low": min(float(r["l"]) for r in chunk), "c": float(chunk[-1]["c"]), "close": float(chunk[-1]["c"]), "v": sum(float(r.get("v", 0.0) or 0.0) for r in chunk), "volume": sum(float(r.get("v", 0.0) or 0.0) for r in chunk)}
+            self._upsert_option_live_candle(timeframe, agg, store=candle_store)
 
     def _option_premium_atr(self, timeframe: str = "1m", period: int = 14) -> float:
         """ATR on the execution vehicle premium, not the NIFTY underlying."""
@@ -388,6 +644,8 @@ class ICICIOptionDataManager:
             if not self._prewarm_session_vehicle(book.call) or not self._prewarm_session_vehicle(book.put):
                 logger.error("ICICI session contract book rejected: CE/PE option premium historical/quote warmup failed")
                 return False
+        if not self._arm_session_book_streams(book):
+            return False
         raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
         if not isinstance(raw, dict):
             return False
@@ -453,10 +711,30 @@ class ICICIOptionDataManager:
                 self._candles = {tf: deque(rows, maxlen=600) for tf, rows in (snapshot.get("candles") or {}).items()}
         else:
             self._warmup(historical_only=False)
-        # Execution uses a fresh option quote even though the contract was chosen
-        # at session start.  Contract selection is not re-run on each signal.
-        self._refresh_quote()
+        # Both session vehicles are websocket-armed before signal execution.
+        # Activation routes the already-live direction-specific vehicle without
+        # waiting for a new subscription or accepting a REST-only entry price.
+        key = self._snapshot_key(choice)
+        stream_state = self._book_stream_state.get(key)
+        self._active_stream_key = key
+        if stream_state:
+            with self._lock:
+                self._active_stream_contract = dict(stream_state.get("identity") or {})
+                self._last_price = float(stream_state.get("last_price", 0.0) or 0.0)
+                self._last_quote_ts = float(stream_state.get("last_stream_tick_ts", 0.0) or 0.0)
+                self._last_stream_tick_ts = self._last_quote_ts
+                self._best_bid = float(stream_state.get("best_bid", 0.0) or 0.0)
+                self._best_ask = float(stream_state.get("best_ask", 0.0) or 0.0)
+                self._best_bid_qty = float(stream_state.get("best_bid_qty", 0.0) or 0.0)
+                self._best_ask_qty = float(stream_state.get("best_ask_qty", 0.0) or 0.0)
+                if stream_state.get("candles"):
+                    self._candles = {tf: deque(rows, maxlen=600) for tf, rows in stream_state["candles"].items()}
+        else:
+            # Compatibility path for a direct single-contract ICICI instrument.
+            if not self._start_selected_contract_stream():
+                return False
         if self._last_price <= 0 or not self.is_price_fresh(float(_cfg("ICICI_OPTION_MAX_QUOTE_STALE_SEC", 10.0))):
+            logger.error("ICICI selected session vehicle has no fresh websocket execution price: %s", getattr(choice, "selected_symbol", key))
             return False
         # The entry price, affordability check and premium-native SL/TP must use
         # the execution-time quote, not the session-start snapshot premium.
@@ -499,7 +777,8 @@ class ICICIOptionDataManager:
                 logger.warning("ICICI preselected session vehicle unavailable for %s thesis=%s reason=%s", getattr(self.instrument, "asset_id", "?"), thesis_side, status)
                 return None
         if not self._activate_session_vehicle(choice):
-            logger.error("ICICI preselected vehicle failed fresh quote activation: %s", choice.selected_symbol)
+            logger.error("ICICI preselected vehicle failed mandatory websocket activation: %s", choice.selected_symbol)
+            self.release_execution_vehicle()
             return None
         # The session book was built earlier, but the final affordability and
         # executable spread test must be repeated using the fresh entry quote.
@@ -545,10 +824,14 @@ class ICICIOptionDataManager:
             # Invalidate any live thread before a future vehicle can re-enable polling.
             self._poll_generation += 1
             self._running = False
+        # Session-book CE/PE websocket subscriptions remain armed across flat
+        # transitions so the next thesis has immediate live execution pricing.
+        self._active_stream_key = None
+        self._active_stream_contract = {}
         self._restore_route_fields(dict(self._underlying_route_fields))
         self._selected_contract = None
         self._clear_option_execution_state()
-        logger.info("ICICI execution vehicle released after confirmed FLAT; next entry will activate today’s direction-specific session contract")
+        logger.info("ICICI execution vehicle released after confirmed FLAT; CE/PE session websocket feeds remain live for next direction")
 
     def register_strategy(self, strategy) -> None:
         self._strategy_ref = strategy
@@ -620,6 +903,7 @@ class ICICIOptionDataManager:
         with self._lock:
             self._poll_generation += 1
             self._running = False
+        self._stop_option_stream()
 
     def restart_streams(self) -> bool:
         self.stop()
@@ -770,7 +1054,7 @@ class ICICIOptionDataManager:
                 return int(iso.timestamp() * 1000)
         except Exception:
             pass
-        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d-%b-%Y %H:%M:%S", "%Y-%m-%d"):
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d-%b-%Y %H:%M:%S", "%a %b %d %H:%M:%S %Y", "%Y-%m-%d"):
             try:
                 return int(datetime.strptime(text, fmt).replace(tzinfo=_ICICI_LOCAL_TZ).timestamp() * 1000)
             except Exception:
@@ -828,7 +1112,8 @@ class ICICIOptionDataManager:
             ts = self._last_quote_ts
         # Never fabricate order-book depth: liquidity and order-flow features use
         # only executable size Breeze actually returned.
-        return {"bids": [[bid, bid_qty]] if bid > 0 and bid_qty > 0 else [], "asks": [[ask, ask_qty]] if ask > 0 and ask_qty > 0 else [], "timestamp": ts, "_sources": 1, "_executable_source": "icici_quote"}
+        source = "icici_breeze_websocket" if self._stream_subscription_ids and self._last_stream_tick_ts > 0 else "icici_rest_quote_reconcile"
+        return {"bids": [[bid, bid_qty]] if bid > 0 and bid_qty > 0 else [], "asks": [[ask, ask_qty]] if ask > 0 and ask_qty > 0 else [], "timestamp": ts, "_sources": 1, "_executable_source": source}
 
     def get_recent_trades(self, limit: int = 100) -> List[Dict]:
         with self._lock:
@@ -838,7 +1123,11 @@ class ICICIOptionDataManager:
         return self.get_recent_trades(limit)
 
     def is_price_fresh(self, max_stale_seconds: float = 90.0) -> bool:
-        return self._last_quote_ts > 0 and time.time() - self._last_quote_ts <= max_stale_seconds
+        with self._lock:
+            streaming_required = bool(_cfg("ICICI_OPTION_WEBSOCKET_REQUIRED", True)) and bool(self._stream_subscription_ids)
+            ts = float(self._last_stream_tick_ts if streaming_required else self._last_quote_ts or 0.0)
+        maximum = min(float(max_stale_seconds), float(_cfg("ICICI_OPTION_STREAM_MAX_STALE_SEC", 15.0))) if streaming_required else float(max_stale_seconds)
+        return ts > 0 and time.time() - ts <= maximum
 
     @staticmethod
     def _float_first(row: Dict[str, Any], names: tuple[str, ...]) -> float:
