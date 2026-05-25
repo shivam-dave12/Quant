@@ -115,6 +115,17 @@ def test_runtime_contract_fixes_match_live_crash_sites(monkeypatch):
     assert module.MultiAssetQuantBot._icici_market_open() == (True, "synthetic_open")
 
 
+def test_daily_risk_gate_locks_out_after_single_realised_loss():
+    gate = DailyRiskGate()
+    gate.set_opening_balance(1000.0)
+    gate.record_trade_result(-1.0)
+
+    allowed, reason = gate.can_trade(999.0)
+
+    assert allowed is False
+    assert "Loss lockout" in reason
+
+
 def test_icici_supervised_premium_tp_completes_two_full_cycles_with_exact_fill_ledger():
     qs = _strategy_for_reconciliation(_minimal_icici_instrument())
     notices = []
@@ -195,6 +206,15 @@ class _ChildFillBroker:
                 "fee_paid": 0.01, "fee_exact": True, "order_id": tp_order_id or "tp"}
 
 
+class _EntryFeeRecoveryBroker(_ChildFillBroker):
+    def get_fill_details(self, order_id):
+        if order_id == "entry-missing-fee":
+            return {"status": "FILLED", "fill_price": 100.0, "filled_qty": 1.0,
+                    "paid_commission": 0.25, "paid_commission_exact": True}
+        return {"status": "FILLED", "fill_price": self.fill_price, "filled_qty": 1.0,
+                "paid_commission": 0.01, "paid_commission_exact": True}
+
+
 def _venue_instrument(exchange: str, asset: str, symbol: str):
     return SimpleNamespace(
         asset_id=asset, display_symbol=symbol,
@@ -229,6 +249,59 @@ def test_broker_protected_tp_reconciliation_completes_two_cycles_for_non_icici_d
     assert qs._total_trades == 2 and qs._winning_trades == 2
     assert len(qs._trade_history) == 2
     assert all(r["pnl_model"] == model and r["currency"] == currency and r["reason"] == "tp_hit" for r in qs._trade_history)
+
+
+def test_trade_history_uses_lifecycle_quantity_after_tp_ladder_scaleout():
+    qs = _strategy_for_reconciliation(_venue_instrument("delta", "BTC", "BTCUSD"))
+    qs._om = _ChildFillBroker(fill_price=110.0)
+    risk_calls = []
+    qs._risk_manager_ref = SimpleNamespace(
+        set_position_open=lambda state: None,
+        record_trade=lambda **kwargs: risk_calls.append(kwargs),
+    )
+    qs._pos = PositionState(
+        phase=PositionPhase.ACTIVE, side="long", quantity=0.4,
+        entry_price=100.0, sl_price=95.0, tp_price=110.0,
+        sl_order_id="sl-ladder", tp_order_id="tp-final", entry_time=time.time(),
+        exchange="delta", execution_symbol="BTCUSD", asset_id="BTC", pnl_model="inverse_btcusd",
+        currency_symbol="$", currency_code="USD", quantity_unit="contracts",
+        entry_fee_paid=1.0, entry_fee_exact=True, entry_leverage=2.0,
+        tp_ladder_initial_qty=1.0, tp_ladder_realized_pnl=3.0,
+        tp_ladder_realized_gross=3.6, tp_ladder_realized_fees=0.6,
+        tp_ladder_realized_entry_fees=0.6, tp_ladder_realized_exit_fees=0.0,
+    )
+
+    qs._record_exchange_exit({"size": 0.0})
+
+    record = qs._trade_history[-1]
+    expected_pnl = 3.0 + (110.0 - 100.0) * 0.4 - 0.4 - 0.01
+    assert record["qty"] == pytest.approx(1.0)
+    assert record["residual_qty"] == pytest.approx(0.4)
+    assert record["partial_qty"] == pytest.approx(0.6)
+    assert record["pnl"] == pytest.approx(expected_pnl)
+    assert record["margin_pnl_pct"] == pytest.approx(expected_pnl / (100.0 * 1.0 / 2.0) * 100.0)
+    assert risk_calls and risk_calls[0]["quantity"] == pytest.approx(1.0)
+
+
+def test_exit_reconciler_recovers_exact_entry_fee_before_booking_pnl():
+    qs = _strategy_for_reconciliation(_venue_instrument("delta", "BTC", "BTCUSD"))
+    qs._om = _EntryFeeRecoveryBroker(fill_price=105.0)
+    qs._pos = PositionState(
+        phase=PositionPhase.ACTIVE, side="long", quantity=1.0,
+        entry_price=100.0, sl_price=95.0, tp_price=105.0,
+        sl_order_id="sl", tp_order_id="tp", entry_order_id="entry-missing-fee",
+        entry_time=time.time(), exchange="delta", execution_symbol="BTCUSD", asset_id="BTC",
+        pnl_model="inverse_btcusd", currency_symbol="$", currency_code="USD",
+        quantity_unit="contracts", entry_fee_paid=0.0, entry_fee_exact=False,
+        entry_leverage=2.0, tp_ladder_initial_qty=1.0,
+    )
+
+    qs._record_exchange_exit({"size": 0.0})
+
+    record = qs._trade_history[-1]
+    assert record["entry_fee"] == pytest.approx(0.25)
+    assert record["exact_fees"] is True
+    assert record["pnl"] == pytest.approx(5.0 - 0.25 - 0.01)
 
 
 def test_real_strategy_handoff_executes_new_entry_engine_property_contract(monkeypatch):

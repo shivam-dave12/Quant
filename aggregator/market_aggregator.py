@@ -384,6 +384,15 @@ class MarketAggregator:
         if callable(releaser):
             releaser()
 
+    def get_session_contract_book_status(self) -> Dict:
+        status_fn = getattr(self._primary, "session_contract_book_status", None)
+        if callable(status_fn):
+            try:
+                return dict(status_fn() or {})
+            except Exception:
+                return {"status": "ERROR"}
+        return {"status": "UNSUPPORTED"}
+
     def register_strategy(self, strategy) -> None:
         self._strategy_ref = strategy
         self._primary.register_strategy(strategy)

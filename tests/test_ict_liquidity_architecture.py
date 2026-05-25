@@ -356,6 +356,27 @@ def test_ranging_4h_with_15m_dol_can_approve_short_external_liquidity_raid():
     assert info["block_reason"] == "NONE"
 
 
+def test_counter_delivery_raid_can_trade_when_5m_proof_completes():
+    now = time.time()
+    c4h = _ranging_candles(30)
+    c15 = _trend_candles(0.70, 34)
+    c5 = _short_raid_candles()
+    raid_pool = LiquidityPool(101.0, PoolSide.BSL, "5m", status=PoolStatus.SWEPT, created_at=now - 40)
+    raid = SweepResult(raid_pool, 20, 102.0, 1.0, 1.5, 0.92, "short", now - 30)
+    ssl_pool = LiquidityPool(90.0, PoolSide.SSL, "15m", status=PoolStatus.DETECTED, created_at=now - 90, htf_count=1)
+    target = PoolTarget(ssl_pool, 9.50, "short", 5.0, ["15m"])
+    engine = EntryEngine()
+    engine.update(_snap(ssl=[target], sweeps=[raid]), price=99.50, atr=1.0, now=now,
+                  candles_5m=c5, candles_15m=c15, candles_4h=c4h)
+    signal = engine.get_signal()
+    info = engine.analysis_info
+    assert signal is not None
+    assert signal.side == "short"
+    assert info["context_bias_path"] == "COUNTER_DELIVERY_RAID_REQUIRES_5M_PROOF"
+    assert info["block_reason"] == "NONE"
+    assert info["context_permission"] is True
+
+
 def test_unanimous_htf_delivery_against_raid_is_rejected_before_execution():
     now = time.time()
     c4h = _trend_candles(1.00, 30)

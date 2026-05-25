@@ -110,6 +110,20 @@ def test_icici_selector_uses_available_funds_and_thesis_side():
     assert unaffordable is None
 
 
+def test_icici_selector_stores_black_scholes_iv_and_budget_metadata():
+    inst = _nifty_inst(_chain())
+    choice = select_contract_for_thesis(inst, "long", underlying_spot=23100, available_funds=10_000)
+
+    assert choice is not None
+    assert choice.raw["bs_volatility_source"] in {"quote_implied", "live_field", "stress_prior"}
+    assert 0.03 <= choice.raw["bs_volatility"] <= 1.50
+    assert choice.raw["bs_snapshot"]["delta"] == choice.delta
+    assert choice.raw["selected_contract_cost"] == 72.0 * 50
+    assert choice.raw["selected_max_contract_cost"] == 4200.0
+    assert 0.0 < choice.raw["selected_contract_utilization"] <= 1.0
+    assert any(str(reason).startswith("iv=") for reason in choice.reasons)
+
+
 def test_icici_order_manager_balance_uses_fno_allocation_not_bank_total():
     inst = _nifty_inst(_chain())
 
@@ -413,6 +427,33 @@ def test_telegram_start_preflights_icici_token_before_bot_start(monkeypatch, tmp
     assert next(i for i, c in enumerate(calls) if c[0] == "preflight") < next(i for i, c in enumerate(calls) if c[0] == "refresh")
     assert ("refresh", True) in calls
     assert any("ICICI Breeze Ready" in m for m in sent)
+
+
+def test_breeze_token_service_refreshes_stale_daily_session_cache(tmp_path):
+    import time
+    from exchanges.icici.breeze_auth import BreezeSession, BreezeTokenService
+
+    cache = tmp_path / "icici_breeze_session.json"
+    svc = BreezeTokenService(
+        api_key="app-key",
+        secret_key="secret",
+        api_session="fresh-api-session",
+        cache_path=cache,
+        ttl_sec=86400 * 7,
+    )
+    svc._save_cache(BreezeSession("old-api-session", "old-session-token", time.time() - 2 * 86400, {}))
+    calls = []
+
+    def exchange(api_session):
+        calls.append(api_session)
+        return BreezeSession(api_session, "new-session-token", time.time(), {"source": "test"})
+
+    svc.exchange_api_session = exchange
+    session = svc.get_session(force_refresh=False)
+
+    assert calls == ["fresh-api-session"]
+    assert session.session_token == "new-session-token"
+    assert svc.session_status(session)["same_trading_day"] is True
 
 
 def test_telegram_plain_six_digit_otp_is_consumed_when_waiting(monkeypatch):
@@ -730,6 +771,41 @@ def test_icici_session_book_preselects_ce_and_pe_but_signal_activates_direction(
     assert bullish_status == bearish_status == "session_contract_ready"
     assert bullish.right == "call" and bearish.right == "put"
     assert bullish.selected_symbol != bearish.selected_symbol
+
+
+def test_icici_session_book_forces_fresh_daily_reselection_after_date_rollover():
+    inst = _nifty_inst(_chain())
+    assert build_session_contract_book(inst, underlying_spot=23100, available_funds=10_000) is not None
+    inst.primary.raw["session_contract_book"]["trade_date_ist"] = "2000-01-01"
+
+    choice, status = select_contract_from_session_book(inst, "long", underlying_spot=23100, available_funds=10_000)
+
+    assert choice is None
+    assert status == "session_contract_book_new_trading_day"
+
+
+def test_icici_preselected_book_is_reported_before_signal_vehicle_activation():
+    from exchanges.icici.data_manager import ICICIOptionDataManager
+    from strategy.quant_strategy import QuantStrategy
+
+    inst = _nifty_inst(_chain())
+    assert build_session_contract_book(inst, underlying_spot=23100, available_funds=10_000) is not None
+    status = ICICIOptionDataManager(inst, api=SimpleNamespace()).session_contract_book_status()
+
+    class DM:
+        def get_orderbook(self):
+            return {"bids": [], "asks": [], "timestamp": 0.0}
+        def get_session_contract_book_status(self):
+            return status
+
+    qs = QuantStrategy(instrument=inst)
+    qs._atr_5m._atr = 50.0
+    ok, cost = qs._spread_atr_gate(DM())
+
+    assert ok is True and cost == 0.0
+    assert qs._last_spread_gate_context["book_status"] == "SESSION_PRESELECTED"
+    assert qs._last_spread_gate_context["session_call_symbol"]
+    assert qs._last_spread_gate_context["session_put_symbol"]
 
 
 def test_icici_session_book_refresh_required_after_material_spot_drift(monkeypatch):

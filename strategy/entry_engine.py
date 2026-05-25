@@ -163,6 +163,21 @@ def _f(x: Any, default: float = 0.0) -> float:
         return default
 
 
+def _cfg_float(name: str, default: float) -> float:
+    if config is None:
+        return float(default)
+    return _f(getattr(config, name, default), default)
+
+
+def _cfg_bool(name: str, default: bool = False) -> bool:
+    if config is None:
+        return bool(default)
+    raw = getattr(config, name, default)
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("1", "true", "yes", "on", "enabled")
+    return bool(raw)
+
+
 def _closed(candles: Optional[Sequence[Dict]], minimum: int = 0,
             timeframe: str = "5m", now: Optional[float] = None) -> List[Dict]:
     rows = list(candles or [])
@@ -395,6 +410,12 @@ class ICTLiquidityEntryEngine:
             path = "BALANCED_RANGE_EXTERNAL_RAID"
         elif ranging == 1 and opposing == 1:
             path = "COUNTER_DELIVERY_RAID_REQUIRES_5M_PROOF"
+            if (_cfg_bool("ICT_SELECTIVITY_MODE", True)
+                    and not _cfg_bool("ICT_ALLOW_COUNTER_DELIVERY_RAIDS", False)):
+                score = max(0.0, 0.10 + 0.20 * _f(sweep_quality) - 0.25 * opposing_strength)
+                return _ContextDecision(side, False, path,
+                                        "COUNTER_DELIVERY_RAID_BLOCKED_BY_SELECTIVITY",
+                                        score, False, supporting, opposing, ranging)
         else:
             path = "LIQUIDITY_RAID_DOL"
         score = (
@@ -827,6 +848,65 @@ class ICTLiquidityEntryEngine:
         # Displacement is structural proof; evidence ranks competing valid theses.
         return max(0.0, thesis.evidence_score) + 0.25 * math.tanh(max(0.0, thesis.displacement_atr))
 
+    def _selectivity_block(self, thesis: _Thesis, rr: float, rank_score: float,
+                           delivery_score: float) -> Optional[Tuple[str, Dict[str, Any]]]:
+        if not _cfg_bool("ICT_SELECTIVITY_MODE", True):
+            return None
+        path = str(getattr(thesis, "context_path", "") or "")
+        archetype = thesis.entry_type
+        displacement = max(0.0, _f(getattr(thesis, "displacement_atr", 0.0), 0.0))
+        context_score = max(0.0, _f(getattr(thesis, "context_delivery_score", 0.0), 0.0))
+
+        details = {
+            "selectivity_archetype": archetype.value,
+            "selectivity_path": path,
+            "selectivity_displacement_atr": displacement,
+            "selectivity_context_delivery_score": context_score,
+            "selectivity_delivery_score": delivery_score,
+            "selectivity_target_rank_score": rank_score,
+            "selectivity_rr": rr,
+        }
+
+        if (path == "COUNTER_DELIVERY_RAID_REQUIRES_5M_PROOF"
+                and not _cfg_bool("ICT_ALLOW_COUNTER_DELIVERY_RAIDS", False)):
+            return "COUNTER_DELIVERY_RAID_BLOCKED_BY_SELECTIVITY", details
+
+        min_context = _cfg_float("ICT_ENTRY_MIN_CONTEXT_DELIVERY_SCORE", 0.25)
+        if context_score < min_context:
+            details["selectivity_required_context_delivery_score"] = min_context
+            return "WEAK_CONTEXT_DELIVERY_BLOCKED_BY_SELECTIVITY", details
+
+        min_delivery = _cfg_float("ICT_ENTRY_MIN_DELIVERY_SCORE", 0.55)
+        min_rank = _cfg_float("ICT_ENTRY_MIN_TARGET_RANK_SCORE", 1.50)
+        if archetype == EntryType.DISPLACEMENT_CONTINUATION:
+            min_delivery = max(min_delivery, _cfg_float("ICT_CONTINUATION_MIN_DELIVERY_SCORE", 0.58))
+            min_rank = max(min_rank, _cfg_float("ICT_CONTINUATION_MIN_TARGET_RANK_SCORE", 2.40))
+            min_disp = _cfg_float("ICT_ENTRY_MIN_DISPLACEMENT_ATR_CONTINUATION", 1.25)
+        else:
+            min_disp = _cfg_float("ICT_ENTRY_MIN_DISPLACEMENT_ATR_RAID", 1.20)
+
+        if displacement < min_disp:
+            details["selectivity_required_displacement_atr"] = min_disp
+            return "DISPLACEMENT_BELOW_SELECTIVITY_FLOOR", details
+        if delivery_score < min_delivery:
+            details["selectivity_required_delivery_score"] = min_delivery
+            return "DELIVERY_SCORE_BELOW_SELECTIVITY_FLOOR", details
+        if rank_score < min_rank:
+            details["selectivity_required_target_rank_score"] = min_rank
+            return "TARGET_RANK_BELOW_SELECTIVITY_FLOOR", details
+
+        if path == "PARTIAL_HTF_DOL":
+            partial_delivery = _cfg_float("ICT_PARTIAL_HTF_MIN_DELIVERY_SCORE", 0.70)
+            partial_disp = _cfg_float("ICT_PARTIAL_HTF_MIN_DISPLACEMENT_ATR", 2.00)
+            if delivery_score < partial_delivery or displacement < partial_disp:
+                details.update({
+                    "selectivity_required_partial_delivery_score": partial_delivery,
+                    "selectivity_required_partial_displacement_atr": partial_disp,
+                })
+                return "PARTIAL_HTF_DOL_REQUIRES_EXCEPTIONAL_PROOF", details
+
+        return None
+
     def _adopt_candidate(self, candidate: Optional[_Thesis]) -> bool:
         if candidate is None:
             return False
@@ -895,6 +975,24 @@ class ICTLiquidityEntryEngine:
         if result is None:
             return None
         fvg, mss, anchor, threshold, source = result
+        context_score = max(0.0, evidence.score_for(side))
+        if _cfg_bool("ICT_SELECTIVITY_MODE", True):
+            min_disp = _cfg_float("ICT_ENTRY_MIN_DISPLACEMENT_ATR_CONTINUATION", 1.25)
+            if fvg.displacement_atr < min_disp:
+                self._record_block(
+                    "CONTINUATION_DISPLACEMENT_BELOW_SELECTIVITY_FLOOR",
+                    continuation_body_atr=fvg.displacement_atr,
+                    continuation_required_body_atr=min_disp,
+                )
+                return None
+            min_context = _cfg_float("ICT_CONTINUATION_MIN_CONTEXT_SCORE", 0.25)
+            if context_score < min_context:
+                self._record_block(
+                    "CONTINUATION_WEAK_CONTEXT_DELIVERY_BLOCKED_BY_SELECTIVITY",
+                    continuation_context_delivery_score=context_score,
+                    continuation_required_context_score=min_context,
+                )
+                return None
         key = ("DISPLACEMENT_CONTINUATION", side, self._candle_key(candles_5m[fvg.index], fvg.index))
         self._last_analysis.update({
             "candidate_archetype": EntryType.DISPLACEMENT_CONTINUATION.value,
@@ -905,10 +1003,10 @@ class ICTLiquidityEntryEngine:
         return _Thesis(
             sweep_key=key, side=side, sweep=None, formed_at=now, context_4h=ctx4, context_15m=ctx15,
             context_path="LIQUIDITY_DESTINATION_DISPLACEMENT",
-            context_delivery_score=max(0.0, evidence.score_for(side)), mss_level=mss,
+            context_delivery_score=context_score, mss_level=mss,
             displacement_atr=fvg.displacement_atr, fvg=fvg,
             entry_type=EntryType.DISPLACEMENT_CONTINUATION, invalidation_anchor=anchor,
-            evidence_score=max(0.0, evidence.score_for(side)), structural_origin="DISPLACEMENT_ORIGIN",
+            evidence_score=context_score, structural_origin="DISPLACEMENT_ORIGIN",
         )
 
     def _build_liquidity_expansion_thesis(self, sweep: SweepResult, ctx4: _TrendContext, ctx15: _TrendContext,
@@ -931,6 +1029,24 @@ class ICTLiquidityEntryEngine:
         if result is None:
             return None
         fvg, mss, anchor, threshold, source = result
+        context_score = max(0.0, evidence.score_for(side))
+        if _cfg_bool("ICT_SELECTIVITY_MODE", True):
+            min_disp = _cfg_float("ICT_ENTRY_MIN_DISPLACEMENT_ATR_RAID", 1.20)
+            min_context = _cfg_float("ICT_ENTRY_MIN_CONTEXT_DELIVERY_SCORE", 0.25)
+            if fvg.displacement_atr < min_disp:
+                self._record_block(
+                    "EXPANSION_DISPLACEMENT_BELOW_SELECTIVITY_FLOOR",
+                    expansion_body_atr=fvg.displacement_atr,
+                    expansion_required_body_atr=min_disp,
+                )
+                return None
+            if context_score < min_context:
+                self._record_block(
+                    "EXPANSION_WEAK_CONTEXT_DELIVERY_BLOCKED_BY_SELECTIVITY",
+                    expansion_context_delivery_score=context_score,
+                    expansion_required_context_score=min_context,
+                )
+                return None
         key = ("LIQUIDITY_EXPANSION_RETEST", side, round(pool_px, 8), self._candle_key(candles_5m[fvg.index], fvg.index))
         self._last_analysis.update({
             "candidate_archetype": EntryType.LIQUIDITY_EXPANSION_RETEST.value,
@@ -941,10 +1057,10 @@ class ICTLiquidityEntryEngine:
         return _Thesis(
             sweep_key=key, side=side, sweep=sweep, formed_at=now, context_4h=ctx4, context_15m=ctx15,
             context_path="LIQUIDITY_EXPANSION_DELIVERY",
-            context_delivery_score=max(0.0, evidence.score_for(side)), mss_level=mss,
+            context_delivery_score=context_score, mss_level=mss,
             displacement_atr=fvg.displacement_atr, fvg=fvg,
             entry_type=EntryType.LIQUIDITY_EXPANSION_RETEST, invalidation_anchor=anchor,
-            evidence_score=max(0.0, evidence.score_for(side)), structural_origin="EXPANSION_ORIGIN",
+            evidence_score=context_score, structural_origin="EXPANSION_ORIGIN",
         )
 
     def _try_reprice_thesis(self, thesis: _Thesis, snap: LiquidityMapSnapshot,
@@ -1008,6 +1124,12 @@ class ICTLiquidityEntryEngine:
             self._record_block("AWAITING_POSITIVE_NET_R_LIQUIDITY_TARGET")
             return
         target_obj, tp, rr, rank_score, delivery_score = target
+        selectivity_block = self._selectivity_block(thesis, rr, rank_score, delivery_score)
+        if selectivity_block is not None:
+            reason, details = selectivity_block
+            thesis.last_reason = f"institutional selectivity rejected setup: {reason}"
+            self._record_block(reason, trigger="SELECTIVITY_FILTER", **details)
+            return
         quality = {
             "context_4h": thesis.context_4h.confidence,
             "context_15m": thesis.context_15m.confidence,

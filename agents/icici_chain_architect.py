@@ -172,6 +172,50 @@ def _lot_size(raw: Mapping[str, Any]) -> float:
     return max(0.0, fallback)
 
 
+def _configured_vol_bounds() -> tuple[float, float]:
+    low = max(0.0001, safe_float(_cfg("ICICI_OPTION_MIN_IMPLIED_VOL", 0.03), 0.03))
+    high = max(low * 2.0, safe_float(_cfg("ICICI_OPTION_MAX_IMPLIED_VOL", 1.50), 1.50))
+    return low, high
+
+
+def _raw_iv(raw: Mapping[str, Any], quote: Mapping[str, Any] | None = None) -> float:
+    for src in (quote or {}, raw):
+        for key in (
+            "iv", "IV", "implied_volatility", "impliedVolatility",
+            "implied_vol", "ImpliedVolatility",
+        ):
+            value = safe_float(src.get(key), 0.0)
+            if value > 0:
+                if value > 3.0:
+                    value /= 100.0
+                low, high = _configured_vol_bounds()
+                return max(low, min(high, value))
+    return 0.0
+
+
+def _market_volatility(
+    option_type: str,
+    spot: float,
+    strike: float,
+    dte: float,
+    rate: float,
+    premium: float,
+    raw: Mapping[str, Any],
+    quote: Mapping[str, Any] | None = None,
+) -> tuple[float, str]:
+    live_iv = _raw_iv(raw, quote)
+    if live_iv > 0:
+        return live_iv, "live_field"
+    low, high = _configured_vol_bounds()
+    implied = BlackScholesModel.implied_volatility(
+        option_type, spot, strike, dte, rate, premium,
+        min_vol=low, max_vol=high,
+    )
+    if implied and implied > 0:
+        return implied, "quote_implied"
+    return max(low, min(high, safe_float(_cfg("ICICI_OPTION_IV_STRESS_PRIOR", 0.24), 0.24))), "stress_prior"
+
+
 @dataclass(frozen=True)
 class ICICIContractChoice:
     score: float
@@ -356,6 +400,7 @@ def build_session_contract_book(
         underlying_spot=float(underlying_spot or 0.0),
         available_funds=float(available_funds or 0.0),
         call=call, put=put,
+        source=str(raw.get("chain_source") or "session_start_option_chain"),
     )
     if commit and isinstance(raw, dict):
         raw["session_contract_book"] = book.as_dict()
@@ -392,9 +437,11 @@ def select_contract_from_session_book(
     # static spot percentage.
     if spot > 0 and choice.strike > 0:
         dte = _dte(choice.raw) or choice.dte
-        iv = float(_cfg("ICICI_OPTION_IV_STRESS_PRIOR", 0.24))
         rate = float(_cfg("INDIA_RISK_FREE_RATE", 0.065))
         premium = _premium(choice.raw)
+        iv = safe_float(choice.raw.get("bs_volatility"), 0.0)
+        if iv <= 0:
+            iv, _ = _market_volatility(choice.right, spot, choice.strike, dte, rate, premium, choice.raw)
         greeks = BlackScholesModel.greeks(choice.right, spot, choice.strike, dte, rate, iv, premium=premium)
         if greeks is not None:
             target_delta = float(_cfg("ICICI_INDEX_OPTION_TARGET_ABS_DELTA", 0.45))
@@ -489,7 +536,7 @@ def select_contract_for_thesis(
     target_delta = float(_cfg("ICICI_INDEX_OPTION_TARGET_ABS_DELTA", 0.45) if raw.get("desk_id") == "ICICI_INDEX_OPTIONS" else _cfg("ICICI_STOCK_OPTION_TARGET_ABS_DELTA", 0.50))
     delta_band = float(_cfg("ICICI_OPTION_DELTA_BAND", 0.22))
     max_theta = float(_cfg("ICICI_OPTION_MAX_THETA_TO_PREMIUM", 0.08))
-    iv = float(_cfg("ICICI_OPTION_IV_STRESS_PRIOR", 0.24))
+    iv_prior = float(_cfg("ICICI_OPTION_IV_STRESS_PRIOR", 0.24))
     rate = float(_cfg("INDIA_RISK_FREE_RATE", 0.065))
     funds = max(0.0, safe_float(available_funds, 0.0))
     cash_buffer = max(0.0, safe_float(_cfg("ICICI_OPTION_MIN_CASH_BUFFER_INR", 0.0), 0.0))
@@ -534,6 +581,10 @@ def select_contract_for_thesis(
             # instead of fabricating a price.  This keeps the candidate eligible
             # for later quote validation but discounts the score.
             local_spot = strike
+        iv, iv_source = _market_volatility(desired, local_spot, strike, dte, rate, prem, c, q)
+        if iv <= 0:
+            iv = iv_prior
+            iv_source = "stress_prior"
         bs = BlackScholesModel.greeks(desired, local_spot, strike, dte, rate, iv, premium=prem)
         if bs:
             # A session execution vehicle must already lie within the intended
@@ -545,12 +596,15 @@ def select_contract_for_thesis(
             delta_score = clamp(1.0 - abs(abs(bs.delta) - target_delta) / max(delta_band, 1e-6))
             theta_score = clamp(1.0 - bs.theta_to_premium / max_theta)
             moneyness_score = clamp(1.0 - abs(bs.moneyness - 1.0) / 0.10)
-            bs_score = 0.42 * delta_score + 0.36 * theta_score + 0.22 * moneyness_score
+            model_edge_bps = abs(bs.theoretical_price - prem) / max(prem, 1e-9) * 10000.0 if prem > 0 else 0.0
+            edge_score = clamp(1.0 - model_edge_bps / 2500.0)
+            bs_score = 0.38 * delta_score + 0.34 * theta_score + 0.20 * moneyness_score + 0.08 * edge_score
             delta = bs.delta; theta = bs.theta_to_premium; mon = bs.moneyness
         else:
             prox = clamp(1.0 - abs(local_spot - strike) / max(abs(local_spot) * 0.12, 1.0))
             bs_score = 0.35 * prox
             delta = 0.0; theta = 0.0; mon = local_spot / strike if strike else 0.0
+            model_edge_bps = 0.0
         dte_mid = (min_dte + max_dte) / 2.0
         dte_score = clamp(1.0 - abs(dte - dte_mid) / max(1.0, max_dte - min_dte))
         live_score = 1.0 if (q or prem > 0) else 0.35
@@ -578,11 +632,26 @@ def select_contract_for_thesis(
         if max_contract_cost > 0:
             reasons.append(f"funds_fit={contract_cost:.0f}/{max_contract_cost:.0f}")
         if bs:
-            reasons.extend([f"delta={delta:+.2f}", f"theta/prem={theta:.2%}"])
+            reasons.extend([f"delta={delta:+.2f}", f"theta/prem={theta:.2%}", f"iv={iv:.1%}", f"vol={iv_source}"])
         enriched = dict(c)
         enriched.setdefault("runtime_lot_size", lot)
         enriched.setdefault("selected_entry_premium", prem)
         enriched.setdefault("selected_contract_cost", contract_cost)
+        enriched.setdefault("selected_max_contract_cost", max_contract_cost)
+        enriched.setdefault("selected_contract_utilization", contract_cost / max(max_contract_cost, 1e-9) if max_contract_cost > 0 else 0.0)
+        enriched.setdefault("bs_volatility", iv)
+        enriched.setdefault("bs_volatility_source", iv_source)
+        enriched.setdefault("bs_model_edge_bps", model_edge_bps)
+        if bs:
+            enriched.setdefault("bs_snapshot", bs.as_dict())
+            enriched.setdefault("bs_theoretical_price", bs.theoretical_price)
+            enriched.setdefault("bs_delta", bs.delta)
+            enriched.setdefault("bs_gamma", bs.gamma)
+            enriched.setdefault("bs_theta_per_day", bs.theta_per_day)
+            enriched.setdefault("bs_vega_per_vol_point", bs.vega_per_vol_point)
+            enriched.setdefault("bs_intrinsic", bs.intrinsic)
+            enriched.setdefault("bs_extrinsic", bs.extrinsic)
+            enriched.setdefault("bs_theta_to_premium", bs.theta_to_premium)
         choices.append(ICICIContractChoice(score, normalise_symbol(raw.get("stock_code") or raw.get("underlying") or ""), side, symbol, desired, strike, str(c.get("expiry_date") or c.get("ExpiryDate") or ""), dte, delta, theta, mon, tuple(reasons), enriched))
     choices.sort(key=lambda x: x.score, reverse=True)
     return choices[0] if choices else None

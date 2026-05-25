@@ -105,6 +105,26 @@ def test_live_stale_execution_book_is_hard_blocked_before_entry_cost_approval():
     assert qs._last_spread_gate_context["hard_fail_reason"] == "STALE_EXECUTION_BOOK"
 
 
+def test_commodity_spread_atr_is_allocation_haircut_not_execution_veto():
+    qs = QuantStrategy.__new__(QuantStrategy)
+    qs._atr_5m = SimpleNamespace(atr=0.10)
+    qs._active_spread_cost_mult = 1.0
+    qs._last_spread_gate_context = {}
+    qs._instrument = SimpleNamespace(asset_id="SILVER", asset_class=SimpleNamespace(value="commodity"), tick_size=0.01)
+    dm = SimpleNamespace(
+        get_data_lineage=lambda: {"analysis_source": "DeltaDataManager"},
+        get_orderbook=lambda: {"bids": [[100.00, 2]], "asks": [[100.30, 3]], "timestamp": time.time()},
+    )
+
+    ok, ratio = qs._spread_atr_gate(dm)
+
+    assert ok is True
+    assert ratio > 0.65
+    assert qs._last_spread_gate_context["hard_fail"] is False
+    assert qs._last_spread_gate_context["cost_alert"] is True
+    assert 0.0 < qs._last_spread_gate_context["size_mult"] < 1.0
+
+
 def test_live_stale_analysis_quote_blocks_structural_authority_even_with_valid_bars(monkeypatch):
     import strategy.quant_strategy as qm
     qs = QuantStrategy.__new__(QuantStrategy)

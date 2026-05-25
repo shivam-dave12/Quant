@@ -1085,6 +1085,12 @@ def format_entry_alert(*, side: str, price: float = 0.0, entry: float = 0.0, sl:
     inst = instrument or _tg_current_instrument()
     sym = _venue_currency(venue, inst)
     price = float(price or entry or 0.0)
+    risk_usd = float(kwargs.get("risk_usd", kwargs.get("structural_risk", 0.0)) or 0.0)
+    margin_used = float(kwargs.get("margin_used", 0.0) or 0.0)
+    fee_status = str(kwargs.get("fee_status", kwargs.get("fee_line", "")) or "")
+    raid_label = str(kwargs.get("raid_label", "-") or "-")
+    raid_price = float(kwargs.get("raid_price", 0.0) or 0.0)
+    target_label = str(kwargs.get("target_label", "opposing HTF liquidity") or "opposing HTF liquidity")
     vehicle = ""
     try:
         primary = getattr(inst, "primary", None)
@@ -1101,33 +1107,145 @@ def format_entry_alert(*, side: str, price: float = 0.0, entry: float = 0.0, sl:
     calibration = (f"Calibrated delivery P={float(delivery_probability):.3f} | utility={float(delivery_utility_r):+.3f}R"
                    if probability_calibrated and delivery_probability is not None
                    else "Calibrated delivery P=N/A | sizing=structural risk + measured execution cost")
-    return (f"🏛️ <b>INSTITUTIONAL AUCTION ENTRY TICKET — {_side_arrow(side)}</b>\n"
-            f"Archetype: {_html_lib.escape(str(archetype))}\n"
-            f"Entry {sym}{float(price):,.2f} | SL {sym}{float(sl):,.2f} | TP {sym}{float(tp):,.2f}{vehicle}\n"
-            f"Qty {float(qty):.6f} | Lev {float(leverage):.1f}x | R:R {float(rr):.2f}\n"
-            f"4H { _html_lib.escape(str(context_4h)) } | 15m { _html_lib.escape(str(context_15m)) }\n"
-            f"Raid evidence {float(raid_quality):.3f} | displacement {float(displacement_atr):.2f} ATR | delivery score={float(delivery_score):+.3f}\n"
-            f"{calibration}\n"
-            "Protection: venue-native bracket required")
+    price_block = (
+        f"ENTRY  {sym}{float(price):,.4f}\n"
+        f"SL     {sym}{float(sl):,.4f}\n"
+        f"TP     {sym}{float(tp):,.4f}\n"
+        f"R:R    1:{float(rr):.2f}"
+    )
+    size_block = (
+        f"QTY    {float(qty):.8g}\n"
+        f"LEV    {float(leverage):.1f}x\n"
+        f"RISK   {sym}{risk_usd:,.2f}"
+    )
+    if margin_used > 0:
+        size_block += f"\nMARGIN {sym}{margin_used:,.2f}"
+    context_block = (
+        f"4H     {_esc(context_4h)}\n"
+        f"15m    {_esc(context_15m)}\n"
+        f"RAID   {_esc(raid_label)}" + (f" @ {sym}{raid_price:,.4f}" if raid_price > 0 else "") + "\n"
+        f"DISP   {float(displacement_atr):.2f} ATR\n"
+        f"SCORE  delivery {float(delivery_score):+.2f} | raid {float(raid_quality):.2f}"
+    )
+    lines = [
+        f"<b>ENTRY TICKET | {_side_arrow(side)}</b>",
+        f"<code>{_esc(archetype)}</code>",
+        "<b>Price Map</b>",
+        f"<pre>{_esc(price_block)}</pre>",
+        "<b>Size / Risk</b>",
+        f"<pre>{_esc(size_block)}</pre>",
+        "<b>Structure</b>",
+        f"<pre>{context_block}</pre>",
+        f"<b>Model</b>\n<code>{_esc(calibration)}</code>",
+        f"<b>Exit Authority</b>\n<code>Structural SL + {_esc(target_label)}</code>",
+    ]
+    if fee_status:
+        lines.append(f"<b>Fees</b>\n<code>{_esc(fee_status)}</code>")
+    if vehicle:
+        lines.append(vehicle.lstrip())
+    return "\n".join(lines)
 
 
 def format_exit_alert(*, side: str = "", entry_price: float = 0.0, exit_price: float = 0.0,
                       pnl: float = 0.0, reason: str = "", venue: str = "", quantity: float = 0.0,
                       exact_fill: bool = True, provisional: bool = False, **kwargs) -> str:
     sym = _venue_currency(venue, _tg_current_instrument())
-    state = "EXACT BROKER FILL" if exact_fill and not provisional else "PENDING RECONCILIATION"
-    return (f"🔒 <b>POSITION EXIT — {_side_arrow(side)}</b>\n"
-            f"Entry {sym}{float(entry_price):,.2f} → Exit {sym}{float(exit_price):,.2f}\n"
-            f"Qty {float(quantity):.6f} | P&amp;L {sym}{float(pnl):+,.2f}\n"
-            f"Reason: {_html_lib.escape(str(reason or '-'))}\nAccounting: {state}")
+    entry_price = float(kwargs.get("entry", entry_price) or 0.0)
+    quantity = float(kwargs.get("qty", quantity) or 0.0)
+    residual_qty = float(kwargs.get("residual_qty", 0.0) or 0.0)
+    partial_qty = float(kwargs.get("partial_qty", 0.0) or 0.0)
+    gross = float(kwargs.get("gross", pnl) or 0.0)
+    fees = float(kwargs.get("fees", 0.0) or 0.0)
+    r_realised = float(kwargs.get("r_realised", 0.0) or 0.0)
+    mfe_r = float(kwargs.get("mfe_r", 0.0) or 0.0)
+    planned_rr = float(kwargs.get("planned_rr", 0.0) or 0.0)
+    margin_pct = float(kwargs.get("margin_pct", 0.0) or 0.0)
+    margin_used = float(kwargs.get("margin_used", 0.0) or 0.0)
+    fee_source = str(kwargs.get("fee_source", "") or "")
+    tp_ladder_net = float(kwargs.get("tp_ladder_net", 0.0) or 0.0)
+    residual_net = float(kwargs.get("residual_net", pnl) or 0.0)
+    exact_fill = bool(kwargs.get("exact_fees", exact_fill))
+    provisional = bool(kwargs.get("pnl_provisional", provisional))
+    state = "EXACT BROKER FILL" if exact_fill and not provisional else "PENDING FEE/FILL RECONCILIATION"
+    price_block = (
+        f"ENTRY  {sym}{entry_price:,.4f}\n"
+        f"EXIT   {sym}{float(exit_price):,.4f}\n"
+        f"R      {r_realised:+.2f}R / plan {planned_rr:.2f}R\n"
+        f"MFE    {mfe_r:+.2f}R"
+    )
+    pnl_block = (
+        f"GROSS  {sym}{gross:+,.4f}\n"
+        f"FEES   {sym}{fees:,.4f}\n"
+        f"NET    {sym}{float(pnl):+,.4f}\n"
+        f"ROE    {margin_pct:+.2f}%"
+    )
+    if margin_used > 0:
+        pnl_block += f"\nMARGIN {sym}{margin_used:,.2f}"
+    qty_block = (
+        f"START  {quantity:.8g}\n"
+        f"PART   {partial_qty:.8g}\n"
+        f"FINAL  {residual_qty:.8g}"
+    )
+    lines = [
+        f"<b>EXIT REPORT | {_side_arrow(side)}</b>",
+        f"<code>{_esc(reason or '-')} | {state}</code>",
+        "<b>Price / R</b>",
+        f"<pre>{_esc(price_block)}</pre>",
+        "<b>P&amp;L</b>",
+        f"<pre>{_esc(pnl_block)}</pre>",
+        "<b>Quantity</b>",
+        f"<pre>{_esc(qty_block)}</pre>",
+    ]
+    if abs(tp_ladder_net) > 1e-12 or abs(residual_net - pnl) > 1e-12:
+        ladder_block = (
+            f"LADDER    {sym}{tp_ladder_net:+,.4f}\n"
+            f"RESIDUAL  {sym}{residual_net:+,.4f}"
+        )
+        lines.extend(["<b>Lifecycle Split</b>", f"<pre>{_esc(ladder_block)}</pre>"])
+    if fee_source:
+        lines.extend(["<b>Fee Source</b>", f"<code>{_esc(fee_source)}</code>"])
+    return "\n".join(lines)
 
 
 def format_partial_exit_alert(*, side: str = "", price: float = 0.0, qty: float = 0.0,
                               pnl: float = 0.0, venue: str = "", target: str = "TP", **kwargs) -> str:
     sym = _venue_currency(venue, _tg_current_instrument())
-    return (f"🎯 <b>{_html_lib.escape(str(target))} FILL — {_side_arrow(side)}</b>\n"
-            f"Fill {sym}{float(price):,.2f} | Qty {float(qty):.6f} | Realised {sym}{float(pnl):+,.2f}\n"
-            "Accounting: broker-reconciled fill")
+    target = str(kwargs.get("role", target) or target)
+    price = float(kwargs.get("fill_price", price) or 0.0)
+    qty = float(kwargs.get("qty_closed", qty) or 0.0)
+    remaining = float(kwargs.get("qty_remaining", 0.0) or 0.0)
+    gross = float(kwargs.get("gross", pnl) or 0.0)
+    fees = float(kwargs.get("fees", 0.0) or 0.0)
+    pnl = float(kwargs.get("net", pnl) or 0.0)
+    cumulative = float(kwargs.get("cumulative_net", pnl) or 0.0)
+    sl = float(kwargs.get("sl", 0.0) or 0.0)
+    final_tp = float(kwargs.get("final_tp", 0.0) or 0.0)
+    status = str(kwargs.get("status", "FILLED") or "FILLED")
+    exact = bool(kwargs.get("exact_fees", True))
+    fill_block = (
+        f"FILL   {sym}{price:,.4f}\n"
+        f"CLOSED {qty:.8g}\n"
+        f"LEFT   {remaining:.8g}\n"
+        f"STATE  {status}"
+    )
+    pnl_block = (
+        f"GROSS  {sym}{gross:+,.4f}\n"
+        f"FEES   {sym}{fees:,.4f}\n"
+        f"NET    {sym}{pnl:+,.4f}\n"
+        f"TOTAL  {sym}{cumulative:+,.4f}"
+    )
+    lines = [
+        f"<b>PARTIAL EXIT | {_esc(target)} | {_side_arrow(side)}</b>",
+        f"<code>{'exact broker fill' if exact else 'fee pending'}</code>",
+        "<b>Fill</b>",
+        f"<pre>{_esc(fill_block)}</pre>",
+        "<b>P&amp;L</b>",
+        f"<pre>{_esc(pnl_block)}</pre>",
+    ]
+    if sl > 0 or final_tp > 0:
+        structure_block = f"SL     {sym}{sl:,.4f}\nFINAL  {sym}{final_tp:,.4f}"
+        lines.extend(["<b>Remaining Structure</b>", f"<pre>{_esc(structure_block)}</pre>"])
+    return "\n".join(lines)
 
 
 def format_periodic_report(*, asset: str = "", symbol: str = "", state: str = "SCANNING",

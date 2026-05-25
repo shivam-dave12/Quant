@@ -1046,8 +1046,10 @@ class TelegramBotController:
                 "Usage: /set &lt;key&gt; &lt;value&gt;\n\n"
                 "<b>Adjustable:</b>\n"
                 "  leverage          int   (e.g. 20)\n"
-                "  risk              float (0.001–0.020, e.g. 0.006 = 0.6%)\n"
+                "  risk              float (0.001-0.050, e.g. 0.025 = 2.5%)\n"
                 "  cooldown          int   seconds\n"
+                "  loss_lockout      int   seconds after any loss\n"
+                "  consec_lockout    int   seconds after max consecutive losses\n"
                 "  max_daily_trades  int\n"
                 "  max_daily_loss    float %\n"
                 "  max_consec_loss   int\n"
@@ -1066,6 +1068,8 @@ class TelegramBotController:
             # in ICT/Liquidity decision and funding logs.
             "risk":             ("RISK_PER_TRADE",       float),
             "cooldown":         ("MIN_TIME_BETWEEN_TRADES_SEC", int),
+            "loss_lockout":     ("QUANT_LOCKOUT_AFTER_LOSS_SEC", int),
+            "consec_lockout":   ("QUANT_LOSS_LOCKOUT_SEC", int),
             "max_daily_trades": ("MAX_DAILY_TRADES",     int),
             "max_daily_loss":   ("MAX_DAILY_LOSS_PCT",   float),
             "max_consec_loss":  ("MAX_CONSECUTIVE_LOSSES", int),
@@ -1102,12 +1106,11 @@ class TelegramBotController:
 
         # ── Risk per trade validation ─────────────────────────────────────
         if key == "risk":
-            if not (0.001 <= new_val <= 0.020):
+            if not (0.001 <= new_val <= 0.050):
                 return (
-                    f"❌ Risk/trade must be 0.001–0.020 (0.1%–2.0%).\n"
+                    f"Risk/trade must be 0.001-0.050 (0.1%-5.0%).\n"
                     f"You entered: {new_val} ({new_val*100:.2f}%)\n"
-                    f"Example: /set risk 0.006  (= 0.6% of balance risked per trade)\n"
-                    f"Industry standard: 0.5%–1.0% per trade."
+                    f"Example: /set risk 0.025  (= 2.5% of balance risked per trade at SL)"
                 )
             if bot_running and bot_instance and bot_instance.strategy:
                 pos = bot_instance.strategy.get_position()
@@ -1122,6 +1125,9 @@ class TelegramBotController:
                 f"✅ <b>RISK/TRADE</b>: {old_val*100:.2f}% → <b>{new_val*100:.2f}%</b>\n"
                 f"Next trade will risk {new_val*100:.2f}% of available balance at SL."
             )
+
+        if key == "cooldown":
+            setattr(cfg, "TRADE_COOLDOWN_SECONDS", int(new_val))
 
         setattr(cfg, attr_name, new_val)
         logger.info(f"CONFIG via Telegram: {attr_name} {old_val} → {new_val}")

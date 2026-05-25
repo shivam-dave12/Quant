@@ -165,6 +165,61 @@ class OptionSelectionScore:
 
 class BlackScholesModel:
     @staticmethod
+    def price(option_type: str, spot: float, strike: float, dte: float, rate: float, volatility: float) -> Optional[float]:
+        s = float(spot or 0.0); k = float(strike or 0.0); days = float(dte or 0.0)
+        sigma = float(volatility or 0.0); r = float(rate or 0.0)
+        if s <= 0 or k <= 0 or days <= 0 or sigma <= 0:
+            return None
+        t = max(days / 365.0, 1e-6)
+        d1 = (math.log(s / k) + (r + 0.5 * sigma * sigma) * t) / (sigma * math.sqrt(t))
+        d2 = d1 - sigma * math.sqrt(t)
+        if str(option_type or "").lower() == "put":
+            theo = k * math.exp(-r * t) * _norm_cdf(-d2) - s * _norm_cdf(-d1)
+        else:
+            theo = s * _norm_cdf(d1) - k * math.exp(-r * t) * _norm_cdf(d2)
+        return max(0.0, theo)
+
+    @staticmethod
+    def implied_volatility(
+        option_type: str,
+        spot: float,
+        strike: float,
+        dte: float,
+        rate: float,
+        premium: float,
+        *,
+        min_vol: float = 0.03,
+        max_vol: float = 1.50,
+        tolerance: float = 1e-4,
+        iterations: int = 80,
+    ) -> Optional[float]:
+        s = float(spot or 0.0); k = float(strike or 0.0); days = float(dte or 0.0)
+        target = float(premium or 0.0)
+        if s <= 0 or k <= 0 or days <= 0 or target <= 0:
+            return None
+        option_type = str(option_type or "").lower()
+        intrinsic = max(0.0, k - s) if option_type == "put" else max(0.0, s - k)
+        if target + tolerance < intrinsic:
+            return None
+        low = max(1e-4, float(min_vol or 0.03))
+        high = max(low * 2.0, float(max_vol or 1.50))
+        high_price = BlackScholesModel.price(option_type, s, k, days, rate, high)
+        if high_price is None or high_price < target:
+            return None
+        for _ in range(max(1, int(iterations))):
+            mid = (low + high) / 2.0
+            mid_price = BlackScholesModel.price(option_type, s, k, days, rate, mid)
+            if mid_price is None:
+                return None
+            if abs(mid_price - target) <= tolerance:
+                return mid
+            if mid_price < target:
+                low = mid
+            else:
+                high = mid
+        return (low + high) / 2.0
+
+    @staticmethod
     def greeks(option_type: str, spot: float, strike: float, dte: float, rate: float, volatility: float, premium: float = 0.0) -> Optional[BlackScholesSnapshot]:
         s = float(spot or 0.0); k = float(strike or 0.0); days = float(dte or 0.0)
         sigma = float(volatility or 0.0); r = float(rate or 0.0)

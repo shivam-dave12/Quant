@@ -80,19 +80,19 @@ REMAINDER_MIN_QTY        = 0.001
 #   The inconsistency caused 100× over-sizing (entire balance at risk per trade),
 #   triggering the "required margin > available — scaling down" warnings in logs.
 #   Fix: one convention (fraction), both consumers agree. See risk_manager.py line 266.
-RISK_PER_TRADE           = 0.020  # 2.0% stop-loss risk ceiling applied to allocated margin; never increased by signal strength
+RISK_PER_TRADE           = 0.025  # 2.5% stop-loss risk ceiling; aggressive mode still bounded by SL, margin and liquidation safety
 MAX_DAILY_LOSS           = 10000
-MAX_DAILY_LOSS_PCT       = 10.0       # day circuit breaker
-MAX_DRAWDOWN_PCT         = 25.0      # realistic drawdown limit
-MAX_CONSECUTIVE_LOSSES   = 3     # risk-synchronized with 2.0% per-trade risk and 10% daily circuit
+MAX_DAILY_LOSS_PCT       = 10.0      # day circuit breaker
+MAX_DRAWDOWN_PCT         = 25.0      # portfolio circuit breaker
+MAX_CONSECUTIVE_LOSSES   = 4
 ALLOW_TIME_BASED_CONSEC_LOSS_RESET = False
 CONSEC_LOSS_AUTO_RESET_HOURS = 1.0
-MAX_DAILY_TRADES         = 6         # institutional selectivity; matches 3-6 trade/session design
+MAX_DAILY_TRADES         = 12
 ONE_POSITION_AT_A_TIME   = True
-MIN_TIME_BETWEEN_TRADES_SEC = 300.0
-TRADE_COOLDOWN_SECONDS   = 300       # 5m cooldown after loss
-MIN_RISK_REWARD_RATIO    = 2.0       # expected-utility reference; thin R:R reduces size/EV
-TARGET_RISK_REWARD_RATIO = 3.0
+MIN_TIME_BETWEEN_TRADES_SEC = 180.0
+TRADE_COOLDOWN_SECONDS   = 180
+MIN_RISK_REWARD_RATIO    = 2.00      # structural R:R floor; execution costs shape size, not thesis existence
+TARGET_RISK_REWARD_RATIO = 3.00
 MAX_RR_RATIO             = 20.0
 
 
@@ -166,7 +166,7 @@ STOP_EXIT_COMMISSION_RATE   = 0.00055
 # Above SOFT_MAX the bot cuts allocation; above NO_ALLOC the unit economics are
 # negative per unit of risk, so the allocator returns no capital.
 FEE_TO_RISK_SOFT_MAX        = 0.35
-FEE_TO_RISK_NO_ALLOC        = 0.75
+FEE_TO_RISK_NO_ALLOC        = 1.25
 
 # ── Rate limiting ─────────────────────────────────────────────────────────────
 GLOBAL_API_MIN_INTERVAL  = 3.0
@@ -228,7 +228,8 @@ QUANT_ATR_PCTILE_WINDOW        = 100
 QUANT_ATR_MIN_PCTILE           = 0.05
 QUANT_ATR_MAX_PCTILE           = 0.97
 QUANT_MAX_HOLD_SEC             = 3600      # 60 min max hold
-QUANT_LOSS_LOCKOUT_SEC         = 1800      # 30 min lockout after consec losses
+QUANT_LOSS_LOCKOUT_SEC         = 600       # max-consecutive-loss lockout
+QUANT_LOCKOUT_AFTER_LOSS_SEC   = 180       # short post-loss auction reset, not a no-trade freeze
 QUANT_POS_SYNC_SEC             = 30
 RECONCILE_EXIT_SETTLE_SEC = 15.0      # protect exact-fill accounting from stale position feed after a local close
 
@@ -241,24 +242,40 @@ RECONCILE_EXIT_SETTLE_SEC = 15.0      # protect exact-fill accounting from stale
 # 1m/5m/15m liquidity-first stack; relax with caution.
 
 QUANT_TP_MAX_RR                = 3.5
-QUANT_MAX_SPREAD_ATR_RATIO     = 0.50     # crypto/BTC hard spread/ATR cap
+QUANT_MAX_SPREAD_ATR_RATIO     = 2.50
 # Asset-aware spread gate (v8): xStock/RWA products have coarse tick geometry;
 # a normal 1-4 tick spread can exceed the current 5m ATR in quiet windows.
 # These caps hard-block genuinely broken books while converting normal wide
 # tokenised-equity spreads into allocation haircuts handled by sizing/EV.
-QUANT_SPREAD_SOFT_ATR_RATIO_CRYPTO    = 0.30
-QUANT_MAX_SPREAD_BPS_CRYPTO           = 12.0
-QUANT_MAX_SPREAD_TICKS_CRYPTO         = 10.0
+QUANT_SPREAD_SOFT_ATR_RATIO_CRYPTO    = 0.40
+QUANT_MAX_SPREAD_BPS_CRYPTO           = 40.0
+QUANT_MAX_SPREAD_TICKS_CRYPTO         = 30.0
 QUANT_SPREAD_SOFT_ATR_RATIO_EQUITY    = 0.50
 QUANT_MAX_SPREAD_ATR_RATIO_EQUITY     = 4.00
 QUANT_MAX_SPREAD_BPS_EQUITY           = 35.0
 QUANT_MAX_SPREAD_TICKS_EQUITY         = 8.0
-QUANT_SPREAD_SOFT_ATR_RATIO_COMMODITY = 0.50
-QUANT_MAX_SPREAD_ATR_RATIO_COMMODITY  = 2.00
-QUANT_MAX_SPREAD_BPS_COMMODITY        = 45.0
-QUANT_MAX_SPREAD_TICKS_COMMODITY      = 10.0
-QUANT_SPREAD_MIN_SIZE_MULT            = 0.35
-QUANT_SPREAD_SIZE_HAIRCUT_MAX         = 0.55
+QUANT_SPREAD_SOFT_ATR_RATIO_COMMODITY = 0.60
+QUANT_MAX_SPREAD_ATR_RATIO_COMMODITY  = 2.50
+QUANT_MAX_SPREAD_BPS_COMMODITY        = 60.0
+QUANT_MAX_SPREAD_TICKS_COMMODITY      = 30.0
+QUANT_SPREAD_MIN_SIZE_MULT            = 0.70
+QUANT_SPREAD_SIZE_HAIRCUT_MAX         = 0.30
+
+# Institutional selectivity mode:
+# The engine still waits for actual raid/MSS/FVG/liquidity structure, but it no
+# longer allocates to weak continuation, counter-delivery, or low-rank targets.
+ICT_SELECTIVITY_MODE = False
+ICT_ALLOW_COUNTER_DELIVERY_RAIDS = True
+ICT_ENTRY_MIN_CONTEXT_DELIVERY_SCORE = 0.10
+ICT_ENTRY_MIN_DELIVERY_SCORE = 0.35
+ICT_ENTRY_MIN_TARGET_RANK_SCORE = 0.75
+ICT_ENTRY_MIN_DISPLACEMENT_ATR_RAID = 1.20
+ICT_ENTRY_MIN_DISPLACEMENT_ATR_CONTINUATION = 1.25
+ICT_CONTINUATION_MIN_CONTEXT_SCORE = 0.25
+ICT_CONTINUATION_MIN_DELIVERY_SCORE = 0.58
+ICT_CONTINUATION_MIN_TARGET_RANK_SCORE = 2.40
+ICT_PARTIAL_HTF_MIN_DELIVERY_SCORE = 0.70
+ICT_PARTIAL_HTF_MIN_DISPLACEMENT_ATR = 2.00
 
 # ── Fee engine ────────────────────────────────────────────────────────────────
 FEE_SPREAD_HIST_MAXLEN      = 500
@@ -436,6 +453,8 @@ ICICI_STOCK_OPTION_TARGET_ABS_DELTA = 0.50
 ICICI_OPTION_DELTA_BAND = 0.22
 ICICI_OPTION_MAX_THETA_TO_PREMIUM = 0.08
 ICICI_OPTION_IV_STRESS_PRIOR = 0.24
+ICICI_OPTION_MIN_IMPLIED_VOL = 0.03
+ICICI_OPTION_MAX_IMPLIED_VOL = 1.50
 INDIA_RISK_FREE_RATE = 0.065
 ICICI_OPTION_MAX_FUNDS_FRACTION_PER_TRADE = 0.42
 ICICI_OPTION_MIN_CASH_BUFFER_INR = 0.0
@@ -482,7 +501,7 @@ UNIVERSE_INCLUDE_EXCHANGES = os.getenv(
 # contract gets only one ENTERING/ACTIVE/EXITING slot.  Sizing is not divided
 # into fixed equal buckets.  Each candidate sees live free cash from the
 # exchange and then applies its own desk/instrument margin_pct dynamically.
-PORTFOLIO_MAX_OPEN_POSITIONS = 6
+PORTFOLIO_MAX_OPEN_POSITIONS = 5
 PORTFOLIO_MAX_OPEN_PER_CONTRACT = 1
 PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS = 3
 PORTFOLIO_BUDGET_MODE = "available_funds"   # available_funds | equal_slots | active_equal_slots
@@ -539,14 +558,14 @@ POLICY_COMMODITY_TICK_EVAL_SEC = 0.50
 POLICY_COMMODITY_LOOP_INTERVAL_SEC = 0.50
 POLICY_COMMODITY_MIN_1M_BARS = 85
 POLICY_COMMODITY_MIN_5M_BARS = 65
-POLICY_COMMODITY_MIN_RR = 1.85
+POLICY_COMMODITY_MIN_RR = 2.20
 POLICY_COMMODITY_MAX_RR = 5.0
 POLICY_COMMODITY_MAX_HOLD_SEC = 4800
-POLICY_COMMODITY_COOLDOWN_SEC = 210
+POLICY_COMMODITY_COOLDOWN_SEC = 180
 POLICY_COMMODITY_SL_BUFFER_ATR = 0.50
 
-POLICY_EQUITY_RISK_MULT = 0.55
-POLICY_EQUITY_MARGIN_PCT = 0.18
+POLICY_EQUITY_RISK_MULT = 0.80
+POLICY_EQUITY_MARGIN_PCT = 0.30
 POLICY_EQUITY_MIN_MARGIN_USD = 0.00
 POLICY_EQUITY_TICK_EVAL_SEC = 0.75
 POLICY_EQUITY_LOOP_INTERVAL_SEC = 0.75
@@ -558,7 +577,7 @@ POLICY_EQUITY_MAX_HOLD_SEC = 5400
 POLICY_EQUITY_COOLDOWN_SEC = 180
 POLICY_EQUITY_SL_BUFFER_ATR = 0.55
 
-POLICY_OPTION_RISK_MULT = 0.85
+POLICY_OPTION_RISK_MULT = 1.00
 POLICY_OPTION_MARGIN_PCT = 0.42
 POLICY_OPTION_MIN_MARGIN_USD = 0.0
 POLICY_OPTION_TICK_EVAL_SEC = 0.50
@@ -569,7 +588,7 @@ POLICY_OPTION_MIN_RR = 1.60
 POLICY_OPTION_MAX_RR = 4.00
 POLICY_OPTION_MAX_HOLD_SEC = 2700
 POLICY_OPTION_COOLDOWN_SEC = 120
-POLICY_OPTION_LOSS_LOCKOUT_SEC = 1200
+POLICY_OPTION_LOSS_LOCKOUT_SEC = 300
 POLICY_OPTION_SL_BUFFER_ATR = 0.75
 POLICY_OPTION_ATR_MIN_PCTILE = 0.02
 POLICY_OPTION_ATR_MAX_PCTILE = 0.995
@@ -612,10 +631,10 @@ TRADING_DESKS = {
         "loop_interval_sec": 0.65,
         "min_1m_bars": 100,
         "min_5m_bars": 80,
-        "min_rr": 2.20,
+        "min_rr": POLICY_COMMODITY_MIN_RR,
         "max_rr": 5.50,
         "max_hold_sec": 3600,
-        "cooldown_sec": 300,
+        "cooldown_sec": POLICY_COMMODITY_COOLDOWN_SEC,
         "sl_buffer_atr": 0.65,
     },
     "STOCKS": {

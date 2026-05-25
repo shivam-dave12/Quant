@@ -405,6 +405,40 @@ class ICICIOptionDataManager:
         )
         return True
 
+    def session_contract_book_status(self) -> dict[str, Any]:
+        raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
+        book = raw.get("session_contract_book") if isinstance(raw, dict) else None
+        if not isinstance(book, dict):
+            return {"status": "MISSING"}
+
+        def choice_summary(name: str) -> dict[str, Any]:
+            choice = book.get(name) if isinstance(book.get(name), dict) else {}
+            choice_raw = choice.get("raw") if isinstance(choice.get("raw"), dict) else {}
+            return {
+                "symbol": choice.get("selected_symbol", ""),
+                "right": choice.get("right", ""),
+                "strike": float(choice.get("strike", 0.0) or 0.0),
+                "expiry": choice.get("expiry", ""),
+                "premium": float(choice_raw.get("selected_entry_premium", 0.0) or 0.0),
+                "lot": float(choice_raw.get("runtime_lot_size", 0.0) or 0.0),
+                "cost": float(choice_raw.get("selected_contract_cost", 0.0) or 0.0),
+                "delta": float(choice.get("delta", 0.0) or 0.0),
+                "iv": float(choice_raw.get("bs_volatility", 0.0) or 0.0),
+                "iv_source": str(choice_raw.get("bs_volatility_source") or ""),
+            }
+
+        return {
+            "status": str(raw.get("session_contract_book_status") or "READY"),
+            "trade_date_ist": str(book.get("trade_date_ist") or ""),
+            "built_at": float(book.get("built_at", 0.0) or 0.0),
+            "underlying": str(book.get("underlying") or getattr(self.instrument, "asset_id", "")),
+            "underlying_spot": float(book.get("underlying_spot", 0.0) or 0.0),
+            "available_funds": float(book.get("available_funds", 0.0) or 0.0),
+            "source": str(book.get("source") or ""),
+            "call": choice_summary("call"),
+            "put": choice_summary("put"),
+        }
+
     def _activate_session_vehicle(self, choice) -> bool:
         apply_contract_choice(self.instrument, choice)
         snapshot = self._contract_snapshots.get(self._snapshot_key(choice))

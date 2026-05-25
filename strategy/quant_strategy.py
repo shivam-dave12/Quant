@@ -27,7 +27,7 @@ import config
 from core.pnl import gross_pnl_usd
 from core.instruments import current_instrument, instrument_scope
 from core.market_policy import policy_value, active_policy
-from telegram.notifier import send_telegram_message, format_exit_alert, format_partial_exit_alert
+from telegram.notifier import send_telegram_message, format_entry_alert, format_exit_alert, format_partial_exit_alert
 from execution.order_manager import CancelResult
 try:
     from strategy.tp_ladder import build_tp_ladder, TPLadderPlan
@@ -859,12 +859,14 @@ class DailyRiskGate:
         self._today = self._today_ist(); self._daily_trades = 0; self._consec_losses = 0
         self._daily_pnl = 0.0; self._daily_open_bal = 0.0
         self._loss_lockout_until = 0.0; self._lock = threading.Lock()
+        self._loss_lockout_resets_consec = False
 
     def _reset_if_new_day(self):
         today = self._today_ist()
         if today != self._today:
             self._today = today; self._daily_trades = 0; self._daily_pnl = 0.0
             self._daily_open_bal = 0.0; self._consec_losses = 0; self._loss_lockout_until = 0.0
+            self._loss_lockout_resets_consec = False
 
     def set_opening_balance(self, balance):
         with self._lock:
@@ -880,12 +882,15 @@ class DailyRiskGate:
             # actually trade again.  Without this the lockout re-arms on every
             # call after expiry because consec_losses is still ≥ MAX — infinite loop.
             elif self._loss_lockout_until > 0 and now >= self._loss_lockout_until:
-                self._consec_losses = 0
+                if self._loss_lockout_resets_consec:
+                    self._consec_losses = 0
                 self._loss_lockout_until = 0.0
+                self._loss_lockout_resets_consec = False
             if self._daily_trades >= QCfg.MAX_DAILY_TRADES():
                 return False, f"Daily cap: {self._daily_trades}/{QCfg.MAX_DAILY_TRADES()}"
             if self._consec_losses >= QCfg.MAX_CONSEC_LOSSES():
                 self._loss_lockout_until = now + QCfg.LOSS_LOCKOUT_SEC()
+                self._loss_lockout_resets_consec = True
                 return False, f"Consec loss cap → {QCfg.LOSS_LOCKOUT_SEC()}s lockout"
             if self._daily_open_bal > 1e-10:
                 lp = -self._daily_pnl / self._daily_open_bal * 100.0
@@ -899,8 +904,18 @@ class DailyRiskGate:
     def record_trade_result(self, pnl):
         with self._lock:
             self._daily_pnl += pnl
-            if pnl < 0: self._consec_losses += 1
-            else: self._consec_losses = 0
+            if pnl < 0:
+                self._consec_losses += 1
+                try:
+                    loss_lockout = float(getattr(config, "QUANT_LOCKOUT_AFTER_LOSS_SEC", QCfg.LOSS_LOCKOUT_SEC()) or 0.0)
+                except Exception:
+                    loss_lockout = float(QCfg.LOSS_LOCKOUT_SEC())
+                if loss_lockout > 0.0:
+                    self._loss_lockout_until = max(self._loss_lockout_until, time.time() + loss_lockout)
+                    self._loss_lockout_resets_consec = self._consec_losses >= QCfg.MAX_CONSEC_LOSSES()
+            else:
+                self._consec_losses = 0
+                self._loss_lockout_resets_consec = False
 
     def force_reset(self, reset_consec: bool = True, reset_daily: bool = False) -> str:
         """
@@ -918,6 +933,7 @@ class DailyRiskGate:
                 prev_lo = self._loss_lockout_until
                 self._consec_losses       = 0
                 self._loss_lockout_until  = 0.0
+                self._loss_lockout_resets_consec = False
                 parts.append(f"consec_losses {prev_cl}→0")
                 if prev_lo > 0:
                     import time as _t
@@ -1230,11 +1246,11 @@ class QuantStrategy:
         Structural evidence is deliberately excluded from this function because a
         live evidence score is not a statistically calibrated hit probability.
         """
-        fee = self._bounded(float(fee_drag_mult or 1.0), 0.20, 1.0)
+        fee = self._bounded(float(fee_drag_mult or 1.0), 0.50, 1.0)
         if calibrated_probability is None:
             return fee
         p = self._bounded(float(calibrated_probability), 0.10, 1.0)
-        return self._bounded((0.35 + 0.65 * p) * fee, 0.10, 1.0)
+        return self._bounded((0.70 + 0.30 * p) * fee, 0.50, 1.0)
 
 
     def _sl_liquidation_sanity(self, side: str, entry: float, sl: float, leverage_override: float = None):
@@ -1361,25 +1377,12 @@ class QuantStrategy:
 
     def _spread_atr_gate(self, data_manager) -> tuple:
         """
-        Live spread/ATR gate with asset-class-aware calibration.
+        Live spread/ATR participation model.
 
-        The original hard gate used one BTC-calibrated threshold for every
-        product: spread/ATR <= QUANT_MAX_SPREAD_ATR_RATIO.  That is valid for
-        BTC/major crypto books, but it is wrong for tokenised xStock/RWA
-        contracts.  xStocks often quote in coarse ticks and a normal 1-4 tick
-        spread can be larger than the current 5m ATR during quiet US-market
-        windows.  A single 0.50 spread/ATR cap therefore blocks the entire
-        equity universe even when the actual spread is only ~10-20 bps.
-
-        v8 policy:
-          • Crypto keeps the strict BTC-style hard gate.
-          • Equity / commodity token contracts use a dual hard gate:
-              block only when BOTH spread/ATR and spread-bps are excessive.
-            Otherwise the trade is allowed to proceed to the execution-cost / EV
-            model, with a spread-cost size haircut.
-          • Ratio is computed from the actual live spread price-units divided by
-            ATR price-units.  We no longer reconstruct the spread from last_price;
-            midpoint is the correct reference for bid/ask cost.
+        Spread is measured execution cost, not an alpha veto. Fresh executable
+        books continue into sizing with a cost haircut and operator telemetry.
+        Missing/stale books can still block because that is data integrity, not
+        a spread opinion.
         """
         strict_live = callable(getattr(data_manager, "get_data_lineage", None))
         try:
@@ -1395,7 +1398,29 @@ class QuantStrategy:
             bids  = (ob or {}).get("bids", [])
             asks  = (ob or {}).get("asks", [])
             if not bids or not asks:
-                self._last_spread_gate_context = {"book_status": "NO_EXECUTABLE_BOOK", "hard_fail": False}
+                book_status = {}
+                status_fn = getattr(data_manager, "get_session_contract_book_status", None)
+                if callable(status_fn):
+                    try:
+                        book_status = dict(status_fn() or {})
+                    except Exception:
+                        book_status = {}
+                if str(book_status.get("status") or "").upper() == "READY":
+                    call = dict(book_status.get("call") or {})
+                    put = dict(book_status.get("put") or {})
+                    self._last_spread_gate_context = {
+                        "book_status": "SESSION_PRESELECTED",
+                        "hard_fail": False,
+                        "session_trade_date": book_status.get("trade_date_ist"),
+                        "session_call_symbol": call.get("symbol"),
+                        "session_call_cost": call.get("cost"),
+                        "session_call_delta": call.get("delta"),
+                        "session_put_symbol": put.get("symbol"),
+                        "session_put_cost": put.get("cost"),
+                        "session_put_delta": put.get("delta"),
+                    }
+                else:
+                    self._last_spread_gate_context = {"book_status": "NO_EXECUTABLE_BOOK", "hard_fail": False}
                 return True, 0.0
             book_ts = float((ob or {}).get("timestamp", 0.0) or 0.0)
             book_age = max(0.0, time.time() - book_ts) if book_ts > 0 else None
@@ -1467,16 +1492,13 @@ class QuantStrategy:
             else:
                 self._active_spread_cost_mult = 1.0
 
-            # For non-crypto, hard-block only when spread is bad on at least two
-            # orthogonal dimensions.  A high ratio caused by tiny ATR alone is
-            # not enough; it becomes a size haircut instead.
-            if asset_class in ("equity", "commodity", "index"):
-                hard_fail = (
-                    (ratio > hard_ratio and spread_bps > hard_bps)
-                    or (spread_ticks > hard_ticks and spread_bps > hard_bps)
-                )
-            else:
-                hard_fail = (ratio > hard_ratio) or (spread_bps > hard_bps and ratio > soft_ratio)
+            # Fresh books are never vetoed by spread alone. Wide books are
+            # reported as cost alerts and flow into allocation intensity.
+            cost_alert = (
+                ratio > hard_ratio
+                or spread_ticks > hard_ticks
+                or spread_bps > hard_bps
+            )
 
             self._last_spread_gate_context = {
                 "asset_id": asset_id,
@@ -1493,7 +1515,8 @@ class QuantStrategy:
                 "hard_ratio": hard_ratio,
                 "hard_bps": hard_bps,
                 "size_mult": float(getattr(self, "_active_spread_cost_mult", 1.0) or 1.0),
-                "hard_fail": bool(hard_fail),
+                "hard_fail": False,
+                "cost_alert": bool(cost_alert),
                 "book_status": "FRESH",
                 "book_timestamp": book_ts,
                 "book_age_sec": book_age,
@@ -1501,15 +1524,15 @@ class QuantStrategy:
             }
 
             _now = time.time()
-            if hard_fail:
+            if cost_alert:
                 if _now - getattr(self, "_last_spread_gate_warn", 0.0) >= 60.0:
                     self._last_spread_gate_warn = _now
                     logger.info(
-                        f"⛔ Spread/ATR gate [{asset_class or 'unknown'}]: "
-                        f"ratio={ratio:.3f}>{hard_ratio:.2f} spread={spread_bps:.2f}bps "
-                        f"ticks={spread_ticks:.1f}>{hard_ticks:.1f} ATR={atr:.4f} "
-                        f"spread={spread_usd:.4f} — hard block")
-                return False, ratio
+                        f"Spread cost alert [{asset_class or 'unknown'}]: "
+                        f"ratio={ratio:.3f}/{hard_ratio:.2f} spread={spread_bps:.2f}/{hard_bps:.2f}bps "
+                        f"ticks={spread_ticks:.1f}/{hard_ticks:.1f} ATR={atr:.4f} "
+                        f"spread={spread_usd:.4f} size_mult={self._active_spread_cost_mult:.2f} "
+                        f"- no spread veto")
 
             if ratio > soft_ratio:
                 if _now - getattr(self, "_last_spread_gate_soft_log", 0.0) >= 60.0:
@@ -2024,6 +2047,12 @@ class QuantStrategy:
             spread_txt = (f"book={spread.get('book_status','?')}/{age_txt} spread={self._decision_fmt(spread,'spread_bps','.2f')}bps/"
                           f"{self._decision_fmt(spread,'spread_atr','.3f')}ATR size×{self._decision_fmt(spread,'size_mult','.2f','N/A')} "
                           f"hard={'Y' if spread.get('hard_fail') else 'N'}")
+            if spread.get("book_status") == "SESSION_PRESELECTED":
+                spread_txt = (
+                    f"book=SESSION_PRESELECTED/{spread.get('session_trade_date') or 'today'} "
+                    f"CE={spread.get('session_call_symbol') or 'n/a'} cost={self._decision_fmt(spread,'session_call_cost','.0f')} "
+                    f"PE={spread.get('session_put_symbol') or 'n/a'} cost={self._decision_fmt(spread,'session_put_cost','.0f')} hard=N"
+                )
         else:
             spread_txt = "not-evaluated"
         logger.info(
@@ -3113,10 +3142,8 @@ class QuantStrategy:
             return
         if executed_viability.utility_known and executed_viability.expected_net_utility_r <= 0.0:
             logger.info(
-                "AUCTION_EXECUTION_REJECT grossRR=%.2f netWinR=%.2f netLossR=%.2f netEU=%+.2fR | non-positive expected value after venue costs",
+                "AUCTION_EXECUTION_WARNING grossRR=%.2f netWinR=%.2f netLossR=%.2f netEU=%+.2fR | calibrated odds reduce allocation; no thesis veto",
                 rr, executed_viability.net_win_r, executed_viability.net_loss_r, executed_viability.expected_net_utility_r)
-            _release_icici_vehicle_if_unfilled("non_positive_net_execution_utility")
-            return
         logger.info(
             "AUCTION_EXECUTION_ECONOMICS grossRR=%.2f netWinR=%s netLossR=%s netEU=%s cost/risk=%.3fR route=%s",
             rr,
@@ -3645,19 +3672,32 @@ class QuantStrategy:
         _delivery_score = float(_quality.get("delivery_score", 0.0) or 0.0)
         _utility = float(_quality.get("delivery_utility_r", 0.0) or 0.0) if _prob_calibrated else 0.0
         _archetype = str(_quality.get("archetype", getattr(_es, "archetype", "STRUCTURAL_AUCTION")) or "STRUCTURAL_AUCTION")
-        _prob_line = (f"Calibrated delivery P: {_delivery_p:.2f} | expected net utility: {_utility:+.2f}R" if _prob_calibrated else "Calibrated delivery P: not available; sizing uses structural risk and measured execution cost only")
         _disp = float(_quality.get("displacement_atr", 0.0) or 0.0)
         _fee_line = (f"Broker fee exact {_entry_cur}{entry_fee_paid:.4f}" if entry_fee_exact else "Broker fee pending exact execution report")
-        _entry_msg = (
-            "🏛 <b>INSTITUTIONAL AUCTION ENTRY FILLED</b>\n"
-            f"{side.upper()} | {str(getattr(self._instrument, 'asset_id', QCfg.SYMBOL()))} | {_archetype}\n"
-            f"Entry: {_entry_cur}{fill_price:,.4f} | SL: {_entry_cur}{sl_price:,.4f} | TP: {_entry_cur}{tp_price:,.4f}\n"
-            f"Qty: {qty:g} | Leverage: {_entry_leverage:g}x | R:R: 1:{rr_a:.2f}\n"
-            f"4H context: {_quality.get('context_4h', 0.0):.2f} | 15m context: {_quality.get('context_15m', 0.0):.2f}\n"
-            f"5m raid: {_raid_label} @ {_entry_cur}{_raid_px:,.4f} | displacement: {_disp:.2f} ATR\n"
-            f"Delivery evidence score: {_delivery_score:+.2f} | {_prob_line}\n"
-            f"Structural risk: {_entry_cur}{dollar_risk:,.2f} | {_fee_line}\n"
-            "Exit authority: attached structural SL + opposing higher-timeframe liquidity targets"
+        _entry_msg = format_entry_alert(
+            side=side,
+            price=fill_price,
+            sl=sl_price,
+            tp=tp_price,
+            qty=qty,
+            leverage=_entry_leverage,
+            context_4h=f"{float(_quality.get('context_4h', 0.0) or 0.0):.2f}",
+            context_15m=f"{float(_quality.get('context_15m', 0.0) or 0.0):.2f}",
+            raid_quality=float(getattr(_raid, "quality", 0.0) or _quality.get("raid_quality", 0.0) or 0.0),
+            displacement_atr=_disp,
+            delivery_score=_delivery_score,
+            delivery_probability=_delivery_p if _prob_calibrated else None,
+            delivery_utility_r=_utility,
+            probability_calibrated=_prob_calibrated,
+            archetype=_archetype,
+            rr=rr_a,
+            instrument=getattr(self, "_instrument", None),
+            risk_usd=dollar_risk,
+            margin_used=(qty * fill_price / max(float(_entry_leverage or 1.0), 1.0)),
+            fee_status=_fee_line,
+            raid_label=_raid_label,
+            raid_price=_raid_px,
+            target_label="opposing higher-timeframe liquidity targets",
         )
         self._send_telegram(_entry_msg, event_type="entry")
         logger.info("✅ ACTIVE STRUCTURAL_AUCTION %s @ %s%.4f | SL=%s%.4f TP=%s%.4f | R:R=1:%.2f", side.upper(), _entry_cur, fill_price, _entry_cur, sl_price, _entry_cur, tp_price, rr_a)
@@ -4023,6 +4063,22 @@ class QuantStrategy:
 
         # Fees are booked only when returned by the venue.  CoinSwitch and ICICI
         # charges must not be guessed using Delta/global commission constants.
+        if not bool(getattr(pos, "entry_fee_exact", False)):
+            entry_order_id = str(getattr(pos, "entry_order_id", "") or "").strip()
+            if entry_order_id and hasattr(self._om, "get_fill_details"):
+                try:
+                    entry_details = self._om.get_fill_details(entry_order_id) or {}
+                    recovered_exact = bool(entry_details.get("paid_commission_exact", False))
+                    if recovered_exact:
+                        pos.entry_fee_paid = float(entry_details.get("paid_commission", 0.0) or 0.0)
+                        pos.entry_fee_exact = True
+                        logger.info(
+                            "Recovered exact entry fee before final P&L booking: %s %.4f",
+                            str(getattr(pos, "currency_symbol", "$") or "$"),
+                            float(pos.entry_fee_paid or 0.0),
+                        )
+                except Exception as _entry_fee_reconcile_e:
+                    logger.debug("Entry fee reconcile skipped for %s: %s", entry_order_id[:10], _entry_fee_reconcile_e)
         _entry_fee_exact = float(getattr(pos, "entry_fee_paid", 0.0) or 0.0)
         entry_fee_is_exact = bool(getattr(pos, "entry_fee_exact", False) or abs(_entry_fee_exact) > 1e-12)
         entry_fee = _entry_fee_exact if entry_fee_is_exact else 0.0
@@ -4087,11 +4143,16 @@ class QuantStrategy:
             if _rm is not None:
                 if hasattr(_rm, 'set_position_open'):
                     _rm.set_position_open(False)
+                _lifecycle_qty_for_record = float(
+                    getattr(pos, "tp_ladder_initial_qty", 0.0)
+                    or getattr(pos, "quantity", 0.0)
+                    or 0.0
+                )
                 _rm.record_trade(
                     side         = pos.side,
                     entry_price  = pos.entry_price,
                     exit_price   = fill_price,
-                    quantity     = pos.quantity,
+                    quantity     = _lifecycle_qty_for_record,
                     reason       = exit_reason,
                     pnl_override = pnl,
                     entry_leverage = float(getattr(pos, "entry_leverage", 0.0) or QCfg.LEVERAGE()),
@@ -4201,9 +4262,11 @@ class QuantStrategy:
         fb = dict(fee_breakdown or {})
         initial_risk = float(getattr(pos, "initial_sl_dist", 0.0) or 0.0)
         hold_min = (time.time() - entry_time) / 60.0 if entry_time > 0 else 0.0
+        lifecycle_qty = float(getattr(pos, "tp_ladder_initial_qty", 0.0) or getattr(pos, "quantity", 0.0) or 0.0)
+        residual_qty = float(getattr(pos, "quantity", 0.0) or 0.0)
         margin = 0.0
         try:
-            margin = float(pos.entry_price) * float(pos.quantity) / max(float(getattr(pos, "entry_leverage", 1.0) or 1.0), 1.0)
+            margin = float(pos.entry_price) * lifecycle_qty / max(float(getattr(pos, "entry_leverage", 1.0) or 1.0), 1.0)
         except Exception:
             margin = 0.0
         quality = dict(getattr(pos, "quant_components", {}) or {})
@@ -4216,7 +4279,9 @@ class QuantStrategy:
             "symbol": str(getattr(pos, "execution_symbol", "") or QCfg.SYMBOL()),
             "side": str(getattr(pos, "side", "") or ""), "mode": "INSTITUTIONAL_AUCTION_V514",
             "entry": float(getattr(pos, "entry_price", 0.0) or 0.0), "exit": float(exit_price or 0.0),
-            "qty": float(getattr(pos, "quantity", 0.0) or 0.0), "sl": float(getattr(pos, "sl_price", 0.0) or 0.0),
+            "qty": lifecycle_qty, "residual_qty": residual_qty,
+            "partial_qty": max(0.0, lifecycle_qty - residual_qty),
+            "sl": float(getattr(pos, "sl_price", 0.0) or 0.0),
             "tp": float(getattr(pos, "tp_price", 0.0) or 0.0), "pnl": float(pnl), "is_win": is_win,
             "reason": exit_reason, "hold_min": hold_min, "margin_pnl_pct": (float(pnl) / margin * 100.0 if margin > 0 else 0.0),
             "pnl_model": str(getattr(pos, "pnl_model", "linear") or "linear"),
@@ -4356,11 +4421,10 @@ class QuantStrategy:
                     utility_known = False
                     delivery_p = None
 
-        allocation_allowed = fee_to_risk < fee_no_alloc
+        allocation_allowed = price_f > 0.0 and sl_dist > 1e-9 and side_l in ("long", "short")
         if fee_to_risk >= fee_no_alloc:
             reason = (
-                "current execution geometry exceeds maximum cost per unit risk; "
-                "keep thesis only for repricing"
+                "extreme execution-cost drag; allocate with maximum haircut instead of veto"
             )
         elif fee_to_risk > fee_soft:
             reason = "fee drag above soft band; allocate with execution haircut"
@@ -4397,11 +4461,11 @@ class QuantStrategy:
         self, side: str, entry_price: float, sl_price: float, tp_price: float,
         atr: float, use_maker_entry: bool, delivery_probability: Optional[float],
     ) -> Tuple[float, float, bool]:
-        """Do not modify ICT geometry after approval; reject cost-impaired structures."""
+        """Do not modify ICT geometry after approval; execution costs shape size."""
         viability = self._execution_viability_model(side=side, price=entry_price, sl_price=sl_price, tp_price=tp_price, use_maker_entry=use_maker_entry, delivery_probability=delivery_probability)
         self._last_execution_viability = viability.as_refine_context()
         if not viability.allocation_allowed:
-            logger.info("STRUCTURAL_AUCTION execution rejected: structural setup cannot absorb venue costs | %s", viability.reason)
+            logger.info("STRUCTURAL_AUCTION execution unavailable: invalid executable geometry | %s", viability.reason)
         return sl_price, tp_price, False
 
     def _compute_quantity(self, risk_manager, price,
@@ -4554,7 +4618,7 @@ class QuantStrategy:
 
         if fee_to_risk > fee_soft:
             fee_drag_mult = max(
-                0.20,
+                0.50,
                 1.0 - ((fee_to_risk - fee_soft) / (fee_no_alloc - fee_soft)) * 0.80,
             )
             allocation_scalar *= fee_drag_mult
