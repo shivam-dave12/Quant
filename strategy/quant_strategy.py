@@ -2131,6 +2131,21 @@ class QuantStrategy:
                     cap_txt = f"{float(cap_raw):.2f}" if cap_raw is not None and float(cap_raw) > 0.0 else "N/A"
                 except Exception:
                     cap_txt = "N/A"
+                block_reason = str(info.get("block_reason", "") or "")
+                fvg_waiting = (
+                    block_reason in ("AWAITING_FVG_REBALANCE", "AWAITING_FVG_EQUILIBRIUM_REBALANCE")
+                    or not bool(info.get("fvg_rebalanced"))
+                )
+                if fvg_waiting and not self._decision_has(info, "structural_stop"):
+                    prerequisite = "FVG_EQUILIBRIUM_REBALANCE" if block_reason == "AWAITING_FVG_EQUILIBRIUM_REBALANCE" else "FVG_REBALANCE"
+                    logger.info(
+                        "📐 ICT_GEOMETRY stage=FVG_REPRICE_WAIT side=%s MSS=%s broken=Y disp=%sATR | FVG=[%s,%s] eq=%s gap=%sATR | "
+                        "SL=N/A prerequisite=%s | TP=N/A prerequisite=STRUCTURAL_STOP_AND_TARGET",
+                        str(info.get("side", info.get("raid_side", "-"))).upper(), self._decision_fmt(info,"mss_level"),
+                        self._decision_fmt(info,"displacement_atr",".2f"), self._decision_fmt(info,"fvg_low"), self._decision_fmt(info,"fvg_high"),
+                        self._decision_fmt(info,"fvg_equilibrium"), self._decision_fmt(info,"fvg_distance_atr",".2f"), prerequisite,
+                    )
+                    return
                 logger.info(
                     "📐 AUCTION_GEOMETRY stage=EXECUTABLE side=%s MSS=%s broken=Y disp=%sATR | FVG=[%s,%s] eq=%s gap=%sATR | "
                     "SL=%s clearance=%sATR model=%s+%s×pct | target=%s@%s model=%s eligible=%d/%d positive=%d RR=%s floor=%s cap=%s deliveryScore=%s calibratedP=%s",

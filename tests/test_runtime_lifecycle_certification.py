@@ -617,6 +617,37 @@ def test_decision_tape_emits_transition_and_slow_snapshot_without_tick_spam(capl
     assert "SNAPSHOT" in decision_lines[2]
 
 
+def test_fvg_wait_geometry_is_not_logged_as_executable_with_missing_sl_tp(caplog):
+    import logging
+    qs = QuantStrategy.__new__(QuantStrategy)
+    qs._last_decision_fingerprint = None
+    qs._last_decision_log = 0.0
+    qs._decision_snapshot_sec = 60.0
+    qs._last_spread_gate_context = {"spread_bps": 2.0, "spread_atr": 0.05, "size_mult": 1.0, "hard_fail": False}
+    qs._last_data_integrity_context = {}
+    info = {
+        "state": "LIQUIDITY_RAID",
+        "block_reason": "AWAITING_FVG_REBALANCE",
+        "trigger": "AWAITING_FVG_REBALANCE",
+        "raid_side": "long",
+        "side": "long",
+        "mss_broken": True,
+        "mss_level": 70.44,
+        "fvg_low": 70.60,
+        "fvg_high": 70.61,
+        "fvg_equilibrium": 70.605,
+        "fvg_distance_atr": 0.70,
+        "displacement_atr": 1.12,
+        "entry_5m_atr": 0.16,
+    }
+    with caplog.at_level(logging.INFO, logger="strategy.quant_strategy"):
+        qs._log_ict_decision_snapshot(info, 70.735, 100.0, force=True)
+    geometry_lines = [r.message for r in caplog.records if "GEOMETRY" in r.message]
+    assert any("stage=FVG_REPRICE_WAIT" in line for line in geometry_lines)
+    assert not any("AUCTION_GEOMETRY stage=EXECUTABLE" in line for line in geometry_lines)
+    assert any("SL=N/A prerequisite=FVG_REBALANCE" in line for line in geometry_lines)
+
+
 def test_execution_cost_gate_observes_current_completed_five_minute_atr_before_signal_approval(monkeypatch):
     import strategy.quant_strategy as qm
     now = 1_960_000_000.0
