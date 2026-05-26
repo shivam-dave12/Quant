@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import config
@@ -95,6 +96,7 @@ class MultiAssetQuantBot:
         self._last_scan_report = 0.0
         self._lock = threading.RLock()
         self._market_wakeup = threading.Event()
+        self._icici_premarket_refresh_day: str = ""
 
     def _build_api_clients(self):
         has_delta = bool(config.DELTA_API_KEY and config.DELTA_SECRET_KEY)
@@ -144,6 +146,82 @@ class MultiAssetQuantBot:
             return bool(state.is_open), str(state.reason or "")
         except Exception as exc:
             return False, f"ICICI market session check failed: {exc}"
+
+    @staticmethod
+    def _icici_auth_tz() -> timezone:
+        offset_min = int(getattr(config, "ICICI_SESSION_TIMEZONE_OFFSET_MIN", 330) or 330)
+        return timezone(timedelta(minutes=offset_min))
+
+    @classmethod
+    def _icici_local_now(cls, now: Optional[datetime] = None) -> datetime:
+        if now is None:
+            return datetime.now(cls._icici_auth_tz())
+        if now.tzinfo is None:
+            return now.replace(tzinfo=cls._icici_auth_tz())
+        return now.astimezone(cls._icici_auth_tz())
+
+    @staticmethod
+    def _icici_premarket_time_min() -> int:
+        raw = str(getattr(config, "ICICI_PREMARKET_TOKEN_REFRESH_TIME", "08:30") or "08:30").strip()
+        parts = raw.split(":", 1)
+        try:
+            hour = int(parts[0])
+            minute = int(parts[1]) if len(parts) > 1 else 0
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError(raw)
+            return hour * 60 + minute
+        except Exception:
+            logger.warning("Invalid ICICI_PREMARKET_TOKEN_REFRESH_TIME=%r; falling back to 08:30", raw)
+            return 8 * 60 + 30
+
+    def _maybe_icici_premarket_refresh(self, now: Optional[datetime] = None) -> None:
+        """Direct scanner guard: do not silently miss the daily Breeze rollover."""
+        if not bool(getattr(config, "ICICI_PREMARKET_TOKEN_REFRESH_ENABLED", True)):
+            return
+        if not bool(
+            getattr(config, "ICICI_DISCOVERY_ENABLED", False)
+            or getattr(config, "ICICI_ENABLED", False)
+            or getattr(config, "ICICI_OPTIONS_RUNTIME_ENABLED", False)
+        ):
+            return
+
+        local_now = self._icici_local_now(now)
+        day_key = local_now.date().isoformat()
+        if getattr(self, "_icici_premarket_refresh_day", "") == day_key:
+            return
+        start_min = self._icici_premarket_time_min()
+        window_min = max(1.0, float(getattr(config, "ICICI_PREMARKET_TOKEN_REFRESH_WINDOW_MIN", 90.0) or 90.0))
+        current_min = local_now.hour * 60 + local_now.minute + local_now.second / 60.0
+        if current_min < start_min or current_min > start_min + window_min:
+            return
+
+        self._icici_premarket_refresh_day = day_key
+        try:
+            from exchanges.icici.breeze_auth import BreezeTokenService
+            svc = BreezeTokenService()
+            status = svc.session_status()
+            if not bool(status.get("valid") and status.get("same_trading_day")):
+                try:
+                    session = svc.get_session(force_refresh=False)
+                    status = svc.session_status(session)
+                except Exception as exc:
+                    logger.warning("ICICI premarket direct scanner check could not validate session: %s", exc)
+            if bool(status.get("valid") and status.get("same_trading_day")):
+                logger.info("ICICI premarket direct scanner check passed for %s; same-day Breeze session is valid.", day_key)
+                send_telegram_message(
+                    "ICICI premarket check passed.\n"
+                    "Same-day Breeze session is valid; NIFTY websocket/option desk may arm during market hours."
+                )
+                return
+        except Exception as exc:
+            logger.warning("ICICI premarket direct scanner status check failed: %s", exc)
+
+        send_telegram_message(
+            "ICICI daily token is missing before NIFTY open.\n"
+            "Generate today's Breeze API_Session now. If the Telegram controller is running, use /icici_token; "
+            "otherwise run the ICICI token generator and restart/refresh before 09:15. "
+            "NIFTY trading stays blocked until the same-day session and mandatory websocket are live."
+        )
 
     def _icici_account_preflight(self, ctx: AssetContext) -> bool:
         """Verify F&O funds and exact NFO option positions before ICICI analysis starts.
@@ -1085,8 +1163,10 @@ class MultiAssetQuantBot:
 
     def run(self) -> None:
         logger.info("📊 Multi-asset loop active")
+        self._maybe_icici_premarket_refresh()
         while self.running:
             try:
+                self._maybe_icici_premarket_refresh()
                 now_ms = int(time.time() * 1000)
                 for ctx in list(self.contexts):
                     if not ctx.ready:

@@ -1426,12 +1426,36 @@ class QuantStrategy:
             book_age = max(0.0, time.time() - book_ts) if book_ts > 0 else None
             max_book_age = float(getattr(config, "EXECUTION_BOOK_MAX_STALE_SEC", 5.0) or 5.0)
             if strict_live and (book_age is None or book_age > max_book_age):
-                self._last_spread_gate_context = {
+                def _stale_px(lvl) -> float:
+                    if isinstance(lvl, (list, tuple)):
+                        return float(lvl[0])
+                    if isinstance(lvl, dict):
+                        return float(lvl.get("limit_price") or lvl.get("price") or 0)
+                    return 0.0
+
+                stale_ctx = {
                     "book_status": "STALE" if book_age is not None else "MISSING_TIMESTAMP",
                     "book_age_sec": book_age, "max_book_age_sec": max_book_age,
                     "hard_fail": True, "hard_fail_reason": "STALE_EXECUTION_BOOK",
                     "size_mult": 0.0,
                 }
+                try:
+                    bid = _stale_px(bids[0])
+                    ask = _stale_px(asks[0])
+                    if bid > 0.0 and ask > bid:
+                        mid = (bid + ask) / 2.0
+                        spread_usd = ask - bid
+                        stale_ctx.update({
+                            "bid": bid,
+                            "ask": ask,
+                            "mid": mid,
+                            "spread": spread_usd,
+                            "spread_bps": (spread_usd / mid) * 10_000.0 if mid > 0 else 0.0,
+                            "spread_atr": spread_usd / max(atr, 1e-12),
+                        })
+                except Exception:
+                    pass
+                self._last_spread_gate_context = stale_ctx
                 return False, float("inf")
 
             def _get_px(lvl) -> float:
@@ -2202,18 +2226,10 @@ class QuantStrategy:
                 "authority": "UNIFIED_STRUCTURAL_AUCTION",
             }, price, now)
             return
-        # Book/spread is execution evidence, not structural alpha.  A hard
-        # integrity failure blocks the whole signal path because an entry that
-        # cannot be priced safely is not an executable thesis.
+        # Book/spread is execution evidence, not structural alpha.  Keep
+        # structural detection running even when the execution book is stale;
+        # stale-book failure is enforced below as a pre-order block.
         spread_ok, _ = self._spread_atr_gate(data_manager)
-        if not spread_ok:
-            self._log_ict_decision_snapshot({
-                "state": "SCANNING", "block_reason": "EXECUTION_SPREAD_OR_BOOK_BLOCK",
-                "trigger": "WAIT_FOR_EXECUTABLE_BOOK", "entry_5m_atr": atr,
-                "atr_percentile": self._atr_5m.get_percentile(),
-                "authority": "UNIFIED_STRUCTURAL_AUCTION",
-            }, price, now, force=True)
-            return
         try:
             self._liq_map.update(candles_by_tf, price, atr, now)
             snapshot = self._liq_map.get_snapshot(price, atr)
@@ -2243,7 +2259,7 @@ class QuantStrategy:
         )
         signal = self._entry_engine.get_signal()
         info = self._entry_engine.analysis_info or {}
-        self._log_ict_decision_snapshot(info, price, now, force=signal is not None)
+        self._log_ict_decision_snapshot(info, price, now, force=signal is not None or not spread_ok)
         if signal is None:
             return
         side = str(signal.side or "").lower()
@@ -2261,6 +2277,39 @@ class QuantStrategy:
             logger.info(
                 "ICT_LIQUIDITY ticket rejected: target realism %.2f < %.2f rejects=%s notes=%s",
                 realism, min_realism, "; ".join(realism_rejects) or "none", "; ".join(realism_notes) or "none",
+            )
+            return
+        if not spread_ok:
+            spread_ctx = dict(getattr(self, "_last_spread_gate_context", {}) or {})
+            blocked_info = dict(info)
+            blocked_info.update({
+                "state": "EXECUTION_BLOCKED",
+                "block_reason": "EXECUTION_SPREAD_OR_BOOK_BLOCK",
+                "trigger": "PRE_ORDER_EXECUTION_BOOK_FRESHNESS",
+                "entry_5m_atr": atr,
+                "atr_percentile": self._atr_5m.get_percentile(),
+                "authority": "UNIFIED_STRUCTURAL_AUCTION",
+                "pre_order_structural_state": str(info.get("state", "")),
+                "pre_order_structural_trigger": str(info.get("trigger", "")),
+                "execution_book_status": str(spread_ctx.get("book_status", "")),
+                "execution_book_age_sec": spread_ctx.get("book_age_sec"),
+                "execution_book_max_age_sec": spread_ctx.get("max_book_age_sec"),
+                "execution_book_hard_fail_reason": str(spread_ctx.get("hard_fail_reason", "")),
+            })
+            self._log_ict_decision_snapshot(blocked_info, price, now, force=True)
+            logger.info(
+                "STRUCTURAL_SETUP_READY_BUT_EXECUTION_BOOK_BLOCK %s entry=%.4f SL=%.4f TP=%.4f RR=%.2f | "
+                "book=%s age=%s/%ss spread=%sbps/%sATR",
+                side.upper(), entry, sl, tp, rr,
+                spread_ctx.get("book_status", "UNKNOWN"),
+                self._decision_fmt(spread_ctx, "book_age_sec", ".2f"),
+                self._decision_fmt(spread_ctx, "max_book_age_sec", ".2f"),
+                self._decision_fmt(spread_ctx, "spread_bps", ".2f"),
+                self._decision_fmt(spread_ctx, "spread_atr", ".3f"),
+            )
+            self._entry_engine.mark_signal_deferred(
+                side, "execution_spread_or_book_block",
+                cooldown_sec=float(getattr(config, "EXECUTION_BOOK_SIGNAL_DEFER_COOLDOWN_SEC", 5.0) or 5.0),
             )
             return
         bal_info = risk_manager.get_available_balance()

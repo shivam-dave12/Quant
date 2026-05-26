@@ -429,6 +429,112 @@ def test_telegram_start_preflights_icici_token_before_bot_start(monkeypatch, tmp
     assert any("ICICI Breeze Ready" in m for m in sent)
 
 
+def test_telegram_premarket_refresh_starts_daily_icici_token(monkeypatch):
+    import sys
+    import types
+    from datetime import datetime, timedelta, timezone
+    import telegram.controller as ctl
+
+    calls = []
+
+    class FakeSvc:
+        def session_status(self, session=None):
+            calls.append("status")
+            return {"valid": False, "same_trading_day": False, "reason": "missing"}
+
+    monkeypatch.setitem(sys.modules, "exchanges.icici.breeze_auth", types.SimpleNamespace(BreezeTokenService=FakeSvc))
+    monkeypatch.setattr(ctl.config, "ICICI_OPTIONS_RUNTIME_ENABLED", True, raising=False)
+    monkeypatch.setattr(ctl.config, "ICICI_AUTO_TOKEN_GENERATOR_ON_STARTUP", True, raising=False)
+    monkeypatch.setattr(ctl.config, "ICICI_BREEZE_PREFLIGHT_ON_STARTUP", True, raising=False)
+    monkeypatch.setattr(ctl.config, "ICICI_PREMARKET_TOKEN_REFRESH_ENABLED", True, raising=False)
+    monkeypatch.setattr(ctl.config, "ICICI_PREMARKET_TOKEN_REFRESH_TIME", "08:30", raising=False)
+    monkeypatch.setattr(ctl.config, "ICICI_PREMARKET_TOKEN_REFRESH_WINDOW_MIN", 90.0, raising=False)
+
+    c = ctl.TelegramBotController.__new__(ctl.TelegramBotController)
+    c._icici_premarket_refresh_day = ""
+    sent = []
+    c.send_message = lambda msg, parse_mode="HTML": sent.append(msg) or True
+    c._cmd_icici_token = lambda: calls.append("token") or "started"
+
+    now = datetime(2026, 5, 26, 8, 31, tzinfo=timezone(timedelta(minutes=330)))
+    c._maybe_run_icici_premarket_refresh(now)
+    c._maybe_run_icici_premarket_refresh(now)
+
+    assert calls == ["status", "token"]
+    assert any("daily premarket login required" in m for m in sent)
+    assert any(m == "started" for m in sent)
+
+
+def test_telegram_premarket_refresh_skips_when_same_day_session_valid(monkeypatch):
+    import sys
+    import types
+    from datetime import datetime, timedelta, timezone
+    import telegram.controller as ctl
+
+    calls = []
+
+    class FakeSvc:
+        def session_status(self, session=None):
+            calls.append("status")
+            return {"valid": True, "same_trading_day": True, "reason": "ok"}
+
+    monkeypatch.setitem(sys.modules, "exchanges.icici.breeze_auth", types.SimpleNamespace(BreezeTokenService=FakeSvc))
+    monkeypatch.setattr(ctl.config, "ICICI_OPTIONS_RUNTIME_ENABLED", True, raising=False)
+    monkeypatch.setattr(ctl.config, "ICICI_AUTO_TOKEN_GENERATOR_ON_STARTUP", True, raising=False)
+    monkeypatch.setattr(ctl.config, "ICICI_BREEZE_PREFLIGHT_ON_STARTUP", True, raising=False)
+    monkeypatch.setattr(ctl.config, "ICICI_PREMARKET_TOKEN_REFRESH_ENABLED", True, raising=False)
+    monkeypatch.setattr(ctl.config, "ICICI_PREMARKET_TOKEN_REFRESH_TIME", "08:30", raising=False)
+    monkeypatch.setattr(ctl.config, "ICICI_PREMARKET_TOKEN_REFRESH_WINDOW_MIN", 90.0, raising=False)
+
+    c = ctl.TelegramBotController.__new__(ctl.TelegramBotController)
+    c._icici_premarket_refresh_day = ""
+    sent = []
+    c.send_message = lambda msg, parse_mode="HTML": sent.append(msg) or True
+    c._cmd_icici_token = lambda: calls.append("token") or "started"
+
+    now = datetime(2026, 5, 26, 8, 31, tzinfo=timezone(timedelta(minutes=330)))
+    c._maybe_run_icici_premarket_refresh(now)
+
+    assert calls == ["status"]
+    assert any("premarket check passed" in m for m in sent)
+
+
+def test_multi_asset_runtime_warns_when_daily_icici_token_missing(monkeypatch):
+    import sys
+    import types
+    from datetime import datetime, timedelta, timezone
+    import orchestration.multi_asset_bot as mab
+
+    calls = []
+
+    class FakeSvc:
+        def session_status(self, session=None):
+            calls.append("status")
+            return {"valid": False, "same_trading_day": False, "reason": "missing"}
+        def get_session(self, force_refresh=False):
+            calls.append(("get", force_refresh))
+            raise RuntimeError("missing api session")
+
+    monkeypatch.setitem(sys.modules, "exchanges.icici.breeze_auth", types.SimpleNamespace(BreezeTokenService=FakeSvc))
+    monkeypatch.setattr(mab.config, "ICICI_DISCOVERY_ENABLED", True, raising=False)
+    monkeypatch.setattr(mab.config, "ICICI_PREMARKET_TOKEN_REFRESH_ENABLED", True, raising=False)
+    monkeypatch.setattr(mab.config, "ICICI_PREMARKET_TOKEN_REFRESH_TIME", "08:30", raising=False)
+    monkeypatch.setattr(mab.config, "ICICI_PREMARKET_TOKEN_REFRESH_WINDOW_MIN", 90.0, raising=False)
+    sent = []
+    monkeypatch.setattr(mab, "send_telegram_message", lambda msg, *a, **kw: sent.append(msg) or True)
+
+    bot = mab.MultiAssetQuantBot.__new__(mab.MultiAssetQuantBot)
+    bot._icici_premarket_refresh_day = ""
+    now = datetime(2026, 5, 26, 8, 31, tzinfo=timezone(timedelta(minutes=330)))
+    bot._maybe_icici_premarket_refresh(now)
+    bot._maybe_icici_premarket_refresh(now)
+
+    assert calls == ["status", ("get", False)]
+    assert len(sent) == 1
+    assert "ICICI daily token is missing" in sent[0]
+    assert "NIFTY trading stays blocked" in sent[0]
+
+
 def test_breeze_token_service_refreshes_stale_daily_session_cache(tmp_path):
     import time
     from exchanges.icici.breeze_auth import BreezeSession, BreezeTokenService

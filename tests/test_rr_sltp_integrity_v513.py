@@ -91,11 +91,13 @@ def test_tp_ladder_cannot_generate_fibonacci_fallback_or_gap_filler_targets():
     assert plan.legs[0].price == pytest.approx(110.0)
 
 
-def test_orderbook_staleness_blocks_before_structural_signal_generation():
+def test_orderbook_staleness_blocks_order_launch_not_structural_signal_generation():
     src=inspect.getsource(__import__('strategy.quant_strategy', fromlist=['QuantStrategy']).QuantStrategy._evaluate_entry)
-    assert src.index('if not spread_ok:') < src.index('self._liq_map.update')
+    assert src.index('spread_ok, _ = self._spread_atr_gate') < src.index('self._liq_map.update')
     assert src.index('self._liq_map.update') < src.index('self._entry_engine.update')
-    assert 'WAIT_FOR_EXECUTABLE_BOOK' in src
+    assert src.index('self._entry_engine.update') < src.index('if not spread_ok:')
+    assert 'PRE_ORDER_EXECUTION_BOOK_FRESHNESS' in src
+    assert 'STRUCTURAL_SETUP_READY_BUT_EXECUTION_BOOK_BLOCK' in src
 
 
 def test_gross_rr_matches_realised_pnl_ratio_for_linear_and_delta_btc_inverse_models():

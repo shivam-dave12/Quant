@@ -169,6 +169,7 @@ class TelegramBotController:
         self._icici_waiting_for_otp: bool = False
         self._icici_refresh_thread: Optional[threading.Thread] = None
         self._icici_refresh_result: str = ""
+        self._icici_premarket_refresh_day: str = ""
 
         if not self.bot_token or not self.chat_id:
             raise ValueError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set")
@@ -1315,6 +1316,74 @@ class TelegramBotController:
     def _icici_auth_now(self) -> datetime:
         return datetime.now(self._icici_auth_tz())
 
+    def _icici_local_now(self, now: Optional[datetime] = None) -> datetime:
+        if now is None:
+            return self._icici_auth_now()
+        if now.tzinfo is None:
+            return now.replace(tzinfo=self._icici_auth_tz())
+        return now.astimezone(self._icici_auth_tz())
+
+    def _parse_icici_premarket_time_min(self) -> int:
+        raw = str(getattr(config, "ICICI_PREMARKET_TOKEN_REFRESH_TIME", "08:30") or "08:30").strip()
+        match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", raw)
+        if not match:
+            logger.warning("Invalid ICICI_PREMARKET_TOKEN_REFRESH_TIME=%r; falling back to 08:30", raw)
+            return 8 * 60 + 30
+        return int(match.group(1)) * 60 + int(match.group(2))
+
+    def _icici_same_day_session_ready(self) -> bool:
+        try:
+            from exchanges.icici.breeze_auth import BreezeTokenService
+            svc = BreezeTokenService()
+            status = svc.session_status()
+            return bool(status.get("valid") and status.get("same_trading_day"))
+        except Exception as exc:
+            logger.info("ICICI premarket session status unavailable; daily refresh will run: %s", exc)
+            return False
+
+    def _maybe_run_icici_premarket_refresh(self, now: Optional[datetime] = None) -> None:
+        """Once per trading day, ensure Breeze auth is ready before NIFTY opens."""
+        if not bool(getattr(config, "ICICI_PREMARKET_TOKEN_REFRESH_ENABLED", True)):
+            return
+        if not self._should_auto_icici_token_on_start():
+            return
+
+        local_now = self._icici_local_now(now)
+        day_key = local_now.date().isoformat()
+        if getattr(self, "_icici_premarket_refresh_day", "") == day_key:
+            return
+
+        refresh_min = self._parse_icici_premarket_time_min()
+        window_min = max(1.0, float(getattr(config, "ICICI_PREMARKET_TOKEN_REFRESH_WINDOW_MIN", 90.0) or 90.0))
+        current_min = local_now.hour * 60 + local_now.minute + local_now.second / 60.0
+        if current_min < refresh_min or current_min > refresh_min + window_min:
+            return
+
+        self._icici_premarket_refresh_day = day_key
+        try:
+            if self._icici_same_day_session_ready():
+                logger.info("ICICI premarket token check passed for %s; same-day Breeze session is valid.", day_key)
+                self.send_message(
+                    "ICICI premarket check passed.\n"
+                    "Same-day Breeze session is valid; NIFTY options scanner may trade after market open."
+                )
+                return
+
+            self.send_message(
+                "ICICI daily premarket login required.\n"
+                "No valid same-day Breeze session was found before NIFTY open. Starting token generation now."
+            )
+            response = self._cmd_icici_token()
+            if response:
+                self.send_message(response)
+        except Exception as exc:
+            logger.error("ICICI premarket token refresh failed: %s", exc, exc_info=True)
+            self.send_message(
+                "ICICI premarket token refresh failed.\n"
+                f"Reason: <code>{_esc(exc)}</code>\n"
+                "Use <code>/icici_token</code> to retry before NIFTY trading."
+            )
+
     def _format_icici_session_ok(self, session) -> str:
         try:
             status = session.masked()
@@ -1546,9 +1615,11 @@ class TelegramBotController:
             "🧪 Playwright runtime preflight: <code>enabled</code>\n\n"
             + self._cmd_help())
         logger.info("Telegram controller started")
+        self._maybe_run_icici_premarket_refresh()
 
         while self.running:
             try:
+                self._maybe_run_icici_premarket_refresh()
                 updates = self.get_updates(timeout=10)
                 for upd in updates:
                     self.last_update_id = upd.get("update_id", self.last_update_id)

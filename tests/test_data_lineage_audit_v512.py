@@ -103,6 +103,8 @@ def test_live_stale_execution_book_is_hard_blocked_before_entry_cost_approval():
     assert ok is False
     assert ratio == float("inf")
     assert qs._last_spread_gate_context["hard_fail_reason"] == "STALE_EXECUTION_BOOK"
+    assert qs._last_spread_gate_context["spread_bps"] > 0
+    assert qs._last_spread_gate_context["spread_atr"] > 0
 
 
 def test_commodity_spread_atr_is_allocation_haircut_not_execution_veto():

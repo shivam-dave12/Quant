@@ -652,9 +652,10 @@ def test_execution_cost_gate_observes_current_completed_five_minute_atr_before_s
     import strategy.quant_strategy as qm
     now = 1_960_000_000.0
     snap, c5, c15, c4h = _valid_long_setup(now)
+    updates = []
     class Liquidity:
         def update(self, candles, price, atr, tick_time):
-            raise AssertionError("liquidity/entry evaluation must not run after a hard spread block")
+            updates.append((price, atr, tick_time))
         def get_snapshot(self, price, atr):
             return snap
     class DM:
@@ -670,13 +671,21 @@ def test_execution_cost_gate_observes_current_completed_five_minute_atr_before_s
     seen = []
     def hard_spread_block(dm):
         seen.append(float(qs._atr_5m.atr or 0.0))
-        qs._last_spread_gate_context = {"spread_bps": 80.0, "spread_atr": 3.0, "size_mult": 0.0, "hard_fail": True}
+        qs._last_spread_gate_context = {
+            "book_status": "STALE", "book_age_sec": 5.8, "max_book_age_sec": 5.0,
+            "spread_bps": 80.0, "spread_atr": 3.0, "size_mult": 0.0,
+            "hard_fail": True, "hard_fail_reason": "STALE_EXECUTION_BOOK",
+        }
         return False, 3.0
     qs._spread_atr_gate = hard_spread_block
+    launched = []
+    qs._launch_entry_async = lambda *args, **kwargs: launched.append((args, kwargs))
     monkeypatch.setattr(qm.QCfg, "MIN_5M_BARS", staticmethod(lambda: 20))
     qs._evaluate_entry(DM(), SimpleNamespace(), SimpleNamespace(), now)
     assert seen and seen[0] > 0.0
+    assert updates, "structural setup detection must continue while execution book is stale"
     assert qs._entry_engine.get_signal() is None
+    assert not launched
 
 
 def test_pre_order_rejection_clears_stale_executable_decision_state():
