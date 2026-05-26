@@ -2247,14 +2247,15 @@ class QuantStrategy:
                 frame_txt, native_txt,
             )
             session_book = dict(quality.get("execution_session_book", {}) or {})
-            if str(session_book.get("execution_freshness_gate", "")) == "WEBSOCKET_TICK_REQUIRED":
+            _gate = str(session_book.get("execution_freshness_gate", ""))
+            if _gate:
                 ce = dict(session_book.get("call", {}) or {})
                 pe = dict(session_book.get("put", {}) or {})
                 ce_age = "N/A" if ce.get("ws_age_sec") is None else f"{float(ce.get('ws_age_sec')):.2f}s"
                 pe_age = "N/A" if pe.get("ws_age_sec") is None else f"{float(pe.get('ws_age_sec')):.2f}s"
                 logger.info(
-                    "📡 ICICI_EXECUTION_FRESHNESS state=%s gate=WEBSOCKET_TICK_REQUIRED | CE=%s fresh=%s age=%s prem=%s bid=%s ask=%s | PE=%s fresh=%s age=%s prem=%s bid=%s ask=%s",
-                    session_book.get("status", "MISSING"), ce.get("symbol", "n/a"), "Y" if ce.get("ws_fresh") else "N", ce_age,
+                    "📡 ICICI_EXECUTION_FRESHNESS state=%s gate=%s | CE=%s ws_fresh=%s age=%s prem=%s bid=%s ask=%s | PE=%s ws_fresh=%s age=%s prem=%s bid=%s ask=%s",
+                    session_book.get("status", "MISSING"), _gate, ce.get("symbol", "n/a"), "Y" if ce.get("ws_fresh") else "N", ce_age,
                     self._decision_fmt(ce, "live_premium", ".2f"), self._decision_fmt(ce, "live_bid", ".2f"), self._decision_fmt(ce, "live_ask", ".2f"),
                     pe.get("symbol", "n/a"), "Y" if pe.get("ws_fresh") else "N", pe_age,
                     self._decision_fmt(pe, "live_premium", ".2f"), self._decision_fmt(pe, "live_bid", ".2f"), self._decision_fmt(pe, "live_ask", ".2f"),
@@ -2397,33 +2398,42 @@ class QuantStrategy:
             return
         side = str(signal.side or "").lower()
         entry, sl, tp = float(signal.entry_price), float(signal.sl_price), float(signal.tp_price)
-        # A NIFTY structural trigger is allowed to be observed from the live
-        # underlying while CE/PE feeds are arming. It is not allowed to become
-        # an option order until both preselected execution vehicles have fresh,
-        # identity-routed websocket data. Do not queue a stale trigger for later
-        # execution: require a fresh sweep after the option book is live.
+        # NIFTY analysis is formed from the live underlying, while execution is
+        # in the selected CE/PE option. If that selected vehicle is already fresh
+        # on its identity-routed websocket, proceed. If the websocket is absent
+        # but official exact-contract commit preflight is enabled, allow this
+        # same fresh structural signal to reach _enter_trade(), where one exact
+        # NFO quote/depth check must pass immediately before GTT cover-OCO
+        # placement. There is no delayed queued signal and no stale/naked order.
         if self._analysis_unit() == "NIFTYpts" and not bool(quality.get("execution_ready_for_order", False)):
-            blocked_info = dict(info)
-            blocked_info.update({
-                "state": "EXECUTION_BLOCKED",
-                "block_reason": "ICICI_EXECUTION_VEHICLE_NOT_FRESH",
-                "trigger": "PRE_ORDER_ICICI_OPTION_WEBSOCKET_FRESHNESS",
-                "entry_5m_atr": atr,
-                "atr_percentile": self._atr_5m.get_percentile(),
-                "authority": "UNIFIED_STRUCTURAL_AUCTION",
-                "execution_status": str((quality.get("execution_status") or {}).get("status", "UNKNOWN")),
-            })
-            self._log_ict_decision_snapshot(blocked_info, price, now, force=True)
-            logger.info(
-                "NIFTY structural setup observed but option order suppressed until fresh routed CE/PE websocket data; "
-                "fresh sweep required after execution feed is armed | blockers=%s",
-                ",".join(str(x) for x in quality.get("execution_blockers", [])),
-            )
-            self._entry_engine.mark_signal_deferred(
-                side, "icici_execution_vehicle_not_fresh",
-                cooldown_sec=float(getattr(config, "ICICI_EXECUTION_SIGNAL_DEFER_COOLDOWN_SEC", 5.0) or 5.0),
-            )
-            return
+            _commit_preflight_allowed = bool(getattr(config, "ICICI_EXECUTION_PREFLIGHT_EXACT_QUOTE_ENABLED", True))
+            if _commit_preflight_allowed:
+                logger.info(
+                    "NIFTY structural setup reached execution commitment with websocket vehicle not ready; "
+                    "requiring immediate exact-contract NFO REST preflight before protected GTT cover-OCO | blockers=%s",
+                    ",".join(str(x) for x in quality.get("execution_blockers", [])),
+                )
+            else:
+                blocked_info = dict(info)
+                blocked_info.update({
+                    "state": "EXECUTION_BLOCKED",
+                    "block_reason": "ICICI_EXECUTION_VEHICLE_NOT_FRESH",
+                    "trigger": "PRE_ORDER_ICICI_OPTION_EXECUTION_FRESHNESS",
+                    "entry_5m_atr": atr,
+                    "atr_percentile": self._atr_5m.get_percentile(),
+                    "authority": "UNIFIED_STRUCTURAL_AUCTION",
+                    "execution_status": str((quality.get("execution_status") or {}).get("status", "UNKNOWN")),
+                })
+                self._log_ict_decision_snapshot(blocked_info, price, now, force=True)
+                logger.info(
+                    "NIFTY structural setup suppressed: neither fresh routed option websocket data nor exact-contract commit preflight is permitted | blockers=%s",
+                    ",".join(str(x) for x in quality.get("execution_blockers", [])),
+                )
+                self._entry_engine.mark_signal_deferred(
+                    side, "icici_execution_vehicle_not_fresh",
+                    cooldown_sec=float(getattr(config, "ICICI_EXECUTION_SIGNAL_DEFER_COOLDOWN_SEC", 5.0) or 5.0),
+                )
+                return
         rr = abs(tp - entry) / max(abs(entry - sl), 1e-12)
         correct_geometry = (side == "long" and sl < entry < tp) or (side == "short" and tp < entry < sl)
         signal_rr_floor = self._structural_rr_floor_for_signal(signal, pol)
@@ -3508,6 +3518,10 @@ class QuantStrategy:
             _active_exchange == "delta" and
             bool(getattr(config, "DELTA_REQUIRE_NATIVE_BRACKET", True))
         )
+        # ICICI NFO options must never fall back to a naked buy order.  If the
+        # official Breeze protected GTT path is disabled or rejected, the entry
+        # is refused rather than routed through standalone post-fill protection.
+        _icici_requires_protected_oco = (_active_exchange == "icici")
 
         entry_data = order_manager.place_bracket_limit_entry(
             side=side, quantity=qty,
@@ -3518,7 +3532,7 @@ class QuantStrategy:
         )
         if entry_data is not None:
             is_bracket = bool(entry_data.get("bracket_order", False))
-        elif _delta_requires_native_bracket:
+        elif _delta_requires_native_bracket or _icici_requires_protected_oco:
             _bracket_err = getattr(order_manager, "last_order_error", None)
             _err_reason = ""
             _err_stage = ""
@@ -3531,18 +3545,19 @@ class QuantStrategy:
                 _err_reason = ""
                 _err_stage = ""
 
-            if _err_stage == "delta_native_bracket_fill_timeout":
+            _protected_model = "ICICI official GTT cover-OCO" if _icici_requires_protected_oco else "Delta native bracket"
+            if "fill_timeout" in _err_stage:
                 logger.warning(
-                    "⚠️ Delta native bracket entry timed out unfilled — order was "
-                    "cancelled safely; no non-bracket fallback was used, so no "
+                    f"⚠️ {_protected_model} entry timed out unfilled — order was "
+                    "cancelled safely; no non-protected fallback was used, so no "
                     "unprotected position was opened. "
                     f"side={side} qty={qty} entry={_entry_cur}{limit_px:,.2f} "
                     f"SL={_entry_cur}{sl_price:,.2f} TP={_entry_cur}{tp_price:,.2f}{_err_reason}"
                 )
             else:
                 logger.error(
-                    "❌ Delta native bracket entry failed — refusing non-bracket fallback "
-                    "so the position is not opened without exchange-attached TP/SL. "
+                    f"❌ {_protected_model} entry failed — refusing non-protected fallback "
+                    "so the position is not opened without broker-attached TP/SL. "
                     f"side={side} qty={qty} entry={_entry_cur}{limit_px:,.2f} "
                     f"SL={_entry_cur}{sl_price:,.2f} TP={_entry_cur}{tp_price:,.2f}{_err_reason}"
                 )
@@ -3565,10 +3580,10 @@ class QuantStrategy:
             _release_icici_vehicle_if_unfilled("entry_order_not_filled_or_rejected")
             return
 
-        if _delta_requires_native_bracket and not is_bracket:
+        if (_delta_requires_native_bracket or _icici_requires_protected_oco) and not is_bracket:
             logger.error(
-                "❌ Delta entry returned without bracket_order=True — refusing to "
-                "treat it as an active position because TP/SL are not exchange-attached."
+                "❌ Protected-entry desk returned without bracket_order=True — refusing to "
+                "treat it as an active position because TP/SL are not broker-attached."
             )
             self._last_exit_time = time.time()
             return
@@ -3707,8 +3722,8 @@ class QuantStrategy:
         exit_side = "sell" if side == "long" else "buy"
 
         if is_bracket:
-            # Delta bracket: SL and TP were embedded in the entry order.
-            # Delta auto-created the child SL/TP orders on fill.
+            # Broker-protected entry: Delta uses native bracket children; ICICI
+            # uses official GTT cover-OCO target/stoploss legs.
             sl_order_id_raw = entry_data.get("bracket_sl_order_id", "")
             tp_order_id_raw = entry_data.get("bracket_tp_order_id", "")
             # Use bracket prices if we have them (queried from open_orders),
@@ -3752,14 +3767,13 @@ class QuantStrategy:
                 return
 
             if _icici_mode:
-                # Breeze has no verified reduce-only/OCO protection in this
-                # integration. Keep exactly one broker-side exit SELL live: SL.
-                # TP levels are supervised locally and executed only after SL
-                # cancellation has been acknowledged.
+                # Legacy compatibility branch only.  Default ICICI execution is
+                # mandatory official GTT cover-OCO above; it cannot fall through
+                # here while protected-entry policy is active.
                 tp_data = None
                 logger.info(
-                    "ICICI single-live-exit invariant: protective NFO STOPLOSS armed; "
-                    "TP levels are locally supervised (no parallel SELL/OCO assumption)")
+                    "ICICI LEGACY single-live-exit branch reached: protective NFO STOPLOSS armed; "
+                    "protected GTT routing should be enabled for live trading")
             else:
                 tp_data = order_manager.place_take_profit(
                     side=exit_side, quantity=qty, trigger_price=tp_price)
@@ -3778,7 +3792,7 @@ class QuantStrategy:
             tp_ladder_dicts = [l.as_dict() for l in getattr(tp_ladder_plan, "legs", [])] if tp_ladder_plan is not None else []
             tp_ladder_order_ids = []
             logger.info(
-                "ICICI TP_LADDER analytical-only: %d levels computed; no standalone broker TP sells placed while protective SL is live",
+                "ICICI TP_LADDER analytical-only: %d levels computed; official broker GTT target/stoploss remain the only exit authority",
                 len(tp_ladder_dicts))
         else:
             tp_ladder_dicts, tp_ladder_order_ids = self._place_internal_tp_ladder(
@@ -4023,10 +4037,10 @@ class QuantStrategy:
         """Manage protected exposure without introducing a second alpha authority.
 
         Delta/CoinSwitch positions are monetised through their exchange-resident
-        liquidity targets. ICICI long-premium options preserve the original
-        single-live-exit invariant: a broker STOPLOSS remains armed and the
-        locally supervised premium target triggers one priced SELL-to-close only
-        after the protective stop has been cancelled or proven terminal.
+        liquidity targets.  ICICI long-premium entries use Breeze's official
+        three-leg cover-OCO: once armed, its target and stoploss legs own normal
+        TP/SL execution.  Strategy-managed early/time exits may cancel the OCO
+        plan first, but must not race the native target on an ordinary TP touch.
         """
         pos = self._pos
         if pos.is_flat():
@@ -4051,10 +4065,20 @@ class QuantStrategy:
         tp_hit = tp > 0.0 and ((side == "long" and price >= tp) or (side == "short" and price <= tp))
         if exchange == "icici" and tp_hit and pos.phase == PositionPhase.ACTIVE:
             cur = str(getattr(pos, "currency_symbol", "") or "₹")
-            logger.info(
-                "ICICI supervised liquidity target reached: premium=%s%.4f target=%s%.4f; "
-                "cancelling protective SL before priced SELL-to-close",
-                cur, price, cur, tp)
+            protected_gtt = (
+                str(getattr(pos, "sl_order_id", "") or "").startswith("GTT:")
+                or str(getattr(pos, "tp_order_id", "") or "").startswith("GTT:")
+            )
+            if protected_gtt:
+                logger.info(
+                    "ICICI broker GTT target zone reached: premium=%s%.4f target=%s%.4f; "
+                    "cover-OCO owns normal TP execution; requesting exact reconciliation",
+                    cur, price, cur, tp)
+                self._last_reconcile_time = 0.0
+                return
+            logger.warning(
+                "ICICI legacy supervised target reached without protected GTT ids: premium=%s%.4f target=%s%.4f; "
+                "attempting protected strategy close", cur, price, cur, tp)
             self._exit_trade(order_manager, price, "liquidity_tp_hit")
             return
 

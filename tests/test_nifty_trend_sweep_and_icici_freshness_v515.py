@@ -109,7 +109,7 @@ def test_icici_session_status_never_calls_preselected_premium_fresh_without_ws_t
     assert status["call"]["ws_fresh"] is True
     assert status["put"]["ws_fresh"] is False
     assert status["status"] == "ARMED_PENDING_WEBSOCKET_TICK"
-    assert status["execution_freshness_gate"] == "WEBSOCKET_TICK_REQUIRED"
+    assert status["execution_freshness_gate"] == "WEBSOCKET_OR_EXACT_CONTRACT_COMMIT_PREFLIGHT_REQUIRED"
 
 
 def test_nifty_sweep_scalp_uses_short_intraday_time_stop(monkeypatch):

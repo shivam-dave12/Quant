@@ -82,6 +82,10 @@ class ICICIOptionDataManager:
         self._stream_armed_at = 0.0
         self._first_stream_tick = threading.Event()
         self._last_stream_repair_attempt = 0.0
+        self._stream_repair_inflight = False
+        self._last_execution_preflight_ts = 0.0
+        self._last_execution_preflight_key: tuple[str, str, float] | None = None
+        self._last_execution_quote_source = "NONE"
         # Stream-route telemetry is execution critical: the underlying quote may
         # be live while CE/PE packets are missing or cannot be unambiguously
         # associated with either preselected vehicle.
@@ -372,7 +376,12 @@ class ICICIOptionDataManager:
         if not all((expected_stock, expected_expiry, expected_right, expected_strike > 0)):
             return False
         exchange = str(row.get("exchange_code") or row.get("exchange") or "").upper()
-        if exchange and "NFO" not in exchange:
+        product = str(row.get("product_type") or row.get("product") or "").upper()
+        is_nfo_option = bool(
+            exchange == "NFO" or "FUTURES & OPTIONS" in exchange or "FUTURES&OPTIONS" in exchange
+            or product in {"OPTION", "OPTIONS"}
+        )
+        if not is_nfo_option:
             return False
         stock = str(row.get("stock_code") or row.get("stock_name") or "").upper().replace(" ", "")
         if not stock or expected_stock not in stock:
@@ -522,7 +531,7 @@ class ICICIOptionDataManager:
             with self._lock:
                 self._upsert_option_live_candle("1m", candle, store=state["candles"])
                 self._aggregate_option_live_frames(int(candle["t"]), store=state["candles"])
-        if px > 0:
+        if px > 0 or (bid > 0 and ask > 0):
             state["event"].set()
         if self._active_stream_key == key:
             self._active_stream_contract = dict(identity)
@@ -561,6 +570,14 @@ class ICICIOptionDataManager:
             return False
 
     def _repair_option_stream_if_stale(self, reason: str, *, wait_key: tuple[str, str, float] | None = None) -> bool:
+        """Repair only a failed shared transport; never block the strategy loop.
+
+        A quiet CE/PE contract is not evidence that the Breeze socket is broken.
+        If the shared NIFTY transport is still receiving ticks, reconnecting it in
+        the execution path destroys good analysis data and creates 8-12 second
+        on_tick stalls.  An exact-contract REST preflight is used only at order
+        commitment when the chosen option has no recent streamed quote.
+        """
         if not bool(_cfg("ICICI_OPTION_STREAM_ENABLED", True)) or not bool(_cfg("ICICI_OPTION_WEBSOCKET_REQUIRED", True)):
             return False
         if not self._stream_subscription_ids or self._live_hub is None:
@@ -571,36 +588,53 @@ class ICICIOptionDataManager:
         now = time.time()
         max_stale = float(_cfg("ICICI_OPTION_STREAM_MAX_STALE_SEC", 15.0))
         with self._lock:
-            if wait_key is not None and wait_key in self._book_stream_state:
-                ts = float(self._book_stream_state[wait_key].get("last_stream_tick_ts", 0.0) or 0.0)
-            else:
-                ts = float(self._last_stream_tick_ts or 0.0)
-            stream_age = now - ts if ts > 0 else 999999.0
-        if stream_age <= max_stale:
+            state = self._book_stream_state.get(wait_key, {}) if wait_key is not None else {}
+            ts = float(state.get("last_stream_tick_ts", 0.0) or self._last_stream_tick_ts or 0.0)
+            stream_age = now - ts if ts > 0 else None
+        if stream_age is not None and stream_age <= max_stale:
             return False
-        cooldown = max(1.0, float(_cfg("ICICI_WEBSOCKET_RECONNECT_COOLDOWN_SEC", 5.0)))
-        if now - float(self._last_stream_repair_attempt or 0.0) < cooldown:
+
+        hub_connected = bool(getattr(self._live_hub, "connected", False))
+        hub_ts = float(getattr(self._live_hub, "last_tick_ts", 0.0) or 0.0)
+        shared_age = now - hub_ts if hub_ts > 0 else None
+        shared_max = max(max_stale, float(_cfg("ICICI_SHARED_TRANSPORT_MAX_STALE_SEC", 20.0)))
+        if hub_connected and shared_age is not None and shared_age <= shared_max:
+            if now - float(self._stream_last_route_warning_ts or 0.0) >= 60.0:
+                self._stream_last_route_warning_ts = now
+                logger.info(
+                    "ICICI selected option has no recent routed tick but shared Breeze transport is live "
+                    "(shared_age=%.2fs); no socket recycle on strategy path; exact-contract preflight remains available at commitment",
+                    shared_age,
+                )
             return False
-        self._last_stream_repair_attempt = now
+
+        cooldown = max(5.0, float(_cfg("ICICI_WEBSOCKET_RECONNECT_COOLDOWN_SEC", 30.0)))
         with self._lock:
-            for state in self._book_stream_state.values():
-                event = state.get("event")
-                if hasattr(event, "clear"):
-                    event.clear()
-            self._first_stream_tick.clear()
+            if self._stream_repair_inflight or now - float(self._last_stream_repair_attempt or 0.0) < cooldown:
+                return False
+            self._stream_repair_inflight = True
+            self._last_stream_repair_attempt = now
         repair = getattr(self._live_hub, "reconnect_and_resubscribe", None)
         if not callable(repair):
+            with self._lock:
+                self._stream_repair_inflight = False
             return False
-        ok = bool(repair(reason=reason))
-        if ok:
-            logger.warning("ICICI option websocket repair triggered after %.1fs without a fresh execution tick; reason=%s", stream_age, reason)
-            if wait_key is not None:
-                state = self._book_stream_state.get(wait_key)
-                event = state.get("event") if isinstance(state, dict) else None
-                if hasattr(event, "wait"):
-                    timeout = max(0.0, float(_cfg("ICICI_OPTION_STREAM_FIRST_TICK_TIMEOUT_SEC", 12.0)))
-                    event.wait(timeout)
-        return ok
+
+        def _worker() -> None:
+            try:
+                ok = bool(repair(reason=reason))
+                level = logger.warning if ok else logger.error
+                level(
+                    "ICICI shared websocket asynchronous repair %s; reason=%s option_age=%s shared_age=%s",
+                    "triggered" if ok else "failed", reason,
+                    f"{stream_age:.1f}s" if stream_age is not None else "never",
+                    f"{shared_age:.1f}s" if shared_age is not None else "never",
+                )
+            finally:
+                with self._lock:
+                    self._stream_repair_inflight = False
+        threading.Thread(target=_worker, name="icici-ws-repair", daemon=True).start()
+        return True
 
     def _matches_active_option_tick(self, row: Dict[str, Any]) -> bool:
         return self._matches_option_identity_tick(row, self._active_stream_contract)
@@ -696,7 +730,7 @@ class ICICIOptionDataManager:
                 if ask_qty > 0: self._best_ask_qty = ask_qty
                 if px > 0:
                     self._trades.append({"price": px, "quantity": v, "side": "buy", "timestamp": now, "source": "icici_websocket"})
-            if px > 0:
+            if px > 0 or (bid > 0 and ask > 0):
                 self._first_stream_tick.set()
             if px > 0 and self._strategy_ref is not None:
                 callback = getattr(self._strategy_ref, "_on_realtime_quote", None)
@@ -865,13 +899,14 @@ class ICICIOptionDataManager:
         """Expose the day-start option vehicle book and its actual websocket health.
 
         Underlying NIFTY ticks are analysis data only. Option execution is ready
-        only after the direction-specific NFO vehicle has produced a fresh routed
-        websocket tick; historical/preselection premiums cannot clear this gate.
+        only from a direction-specific NFO route: either a fresh identity-routed
+        websocket quote/depth pair, or an immediate exact-contract REST preflight
+        executed at order commitment. Historical/session-book premiums cannot clear it.
         """
         raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
         book = raw.get("session_contract_book") if isinstance(raw, dict) else None
         if not isinstance(book, dict):
-            return {"status": "MISSING", "execution_freshness_gate": "WEBSOCKET_TICK_REQUIRED"}
+            return {"status": "MISSING", "execution_freshness_gate": "WEBSOCKET_OR_EXACT_CONTRACT_COMMIT_PREFLIGHT_REQUIRED"}
         now = time.time()
         max_stale = max(0.1, float(_cfg("ICICI_OPTION_STREAM_MAX_STALE_SEC", 15.0)))
 
@@ -910,14 +945,14 @@ class ICICIOptionDataManager:
         if self._active_stream_key is not None:
             active_right = str(self._active_stream_key[1]).lower()
             active = call if active_right == "call" else put if active_right == "put" else {}
-            dynamic_status = "ACTIVE_EXECUTION_VEHICLE_FRESH" if active.get("ws_fresh") and bool(feed_status.get("active_vehicle_ready")) else "ACTIVE_EXECUTION_VEHICLE_STALE"
+            dynamic_status = "ACTIVE_EXECUTION_VEHICLE_FRESH" if bool(feed_status.get("active_vehicle_ready")) else "ACTIVE_EXECUTION_VEHICLE_STALE"
         else:
             dynamic_status = "READY" if bool(feed_status.get("session_vehicle_stream_ready")) else "ARMED_PENDING_WEBSOCKET_TICK"
         return {
             "status": dynamic_status,
             "configured_status": str(raw.get("session_contract_book_status") or "READY"),
             "execution_feed_status": str(feed_status.get("status") or "UNKNOWN"),
-            "execution_freshness_gate": "WEBSOCKET_TICK_REQUIRED",
+            "execution_freshness_gate": "WEBSOCKET_OR_EXACT_CONTRACT_COMMIT_PREFLIGHT_REQUIRED",
             "max_stream_stale_sec": max_stale,
             "trade_date_ist": str(book.get("trade_date_ist") or ""),
             "built_at": float(book.get("built_at", 0.0) or 0.0),
@@ -951,9 +986,20 @@ class ICICIOptionDataManager:
         live = [row for row in state_rows if row["quote_fresh"]]
         executable = [row for row in state_rows if row["book_executable"]]
         active_row = next((row for row in state_rows if row["key"] == self._active_stream_key), None)
-        active_ready = bool(active_row and active_row["book_executable"])
-        if active_ready:
+        streamed_active_ready = bool(active_row and active_row["book_executable"])
+        with self._lock:
+            preflight_ts = float(self._last_execution_preflight_ts or 0.0)
+            preflight_key = self._last_execution_preflight_key
+        preflight_ready = bool(
+            self._active_stream_key is not None and preflight_key == self._active_stream_key and preflight_ts > 0
+            and now - preflight_ts <= float(_cfg("ICICI_EXECUTION_PREFLIGHT_QUOTE_TTL_SEC", 2.0))
+            and self._last_price > 0 and self._best_bid > 0 and self._best_ask >= self._best_bid
+        )
+        active_ready = bool(streamed_active_ready or preflight_ready)
+        if streamed_active_ready:
             status = "ACTIVE_OPTION_VEHICLE_LIVE"
+        elif preflight_ready:
+            status = "ACTIVE_OPTION_VEHICLE_EXACT_REST_PREFLIGHT_FRESH"
         elif len(executable) == len(state_rows) and state_rows:
             status = "CE_PE_PRESELECTED_LIVE_PENDING_DIRECTION"
         elif self._stream_unroutable_tick_count > 0 and not live:
@@ -966,6 +1012,9 @@ class ICICIOptionDataManager:
             "status": status,
             "session_vehicle_stream_ready": bool(active_ready or (state_rows and len(executable) == len(state_rows))),
             "active_vehicle_ready": active_ready,
+            "active_vehicle_stream_ready": streamed_active_ready,
+            "active_vehicle_preflight_ready": preflight_ready,
+            "active_execution_quote_source": "EXACT_CONTRACT_REST_PREFLIGHT" if preflight_ready and not streamed_active_ready else "BREEZE_WEBSOCKET" if streamed_active_ready else "NONE",
             "active_vehicle": self._active_stream_key,
             "preselected_vehicle_count": len(state_rows),
             "fresh_vehicle_count": len(live),
@@ -990,8 +1039,10 @@ class ICICIOptionDataManager:
         else:
             self._warmup(historical_only=False)
         # Both session vehicles are websocket-armed before signal execution.
-        # Activation routes the already-live direction-specific vehicle without
-        # waiting for a new subscription or accepting a REST-only entry price.
+        # Activation routes the direction-specific vehicle without subscribing on
+        # the latency-sensitive entry path. Websocket is primary; if the selected
+        # option has not emitted a current tick, an exact-contract REST quote is
+        # accepted only as a short-lived commit-time execution preflight.
         key = self._snapshot_key(choice)
         stream_state = self._book_stream_state.get(key)
         self._active_stream_key = key
@@ -1014,9 +1065,15 @@ class ICICIOptionDataManager:
             # Compatibility path for a direct single-contract ICICI instrument.
             if not self._start_selected_contract_stream():
                 return False
-        if self._last_price <= 0 or not self.is_price_fresh(float(_cfg("ICICI_OPTION_MAX_QUOTE_STALE_SEC", 10.0))):
+        max_quote_age = float(_cfg("ICICI_OPTION_MAX_QUOTE_STALE_SEC", 10.0))
+        if not self._execution_price_fresh(max_quote_age) and bool(_cfg("ICICI_EXECUTION_PREFLIGHT_EXACT_QUOTE_ENABLED", True)):
+            try:
+                self._refresh_quote(source="EXACT_CONTRACT_REST_PREFLIGHT")
+            except Exception as exc:
+                logger.warning("ICICI exact-contract REST preflight failed for %s: %s", getattr(choice, "selected_symbol", key), exc)
+        if self._last_price <= 0 or not self._execution_price_fresh(max_quote_age):
             logger.error(
-                "ICICI selected session vehicle has no fresh websocket execution price: %s | execution_feed=%s",
+                "ICICI selected session vehicle has no current executable quote from websocket or exact-contract preflight: %s | execution_feed=%s",
                 getattr(choice, "selected_symbol", key), self.execution_feed_status(),
             )
             return False
@@ -1061,7 +1118,7 @@ class ICICIOptionDataManager:
                 logger.warning("ICICI preselected session vehicle unavailable for %s thesis=%s reason=%s", getattr(self.instrument, "asset_id", "?"), thesis_side, status)
                 return None
         if not self._activate_session_vehicle(choice):
-            logger.error("ICICI preselected vehicle failed mandatory websocket activation: %s", choice.selected_symbol)
+            logger.error("ICICI preselected vehicle failed mandatory executable quote activation (fresh WS or exact-contract commit preflight): %s", choice.selected_symbol)
             self.release_execution_vehicle()
             return None
         # The session book was built earlier, but the final affordability and
@@ -1345,10 +1402,10 @@ class ICICIOptionDataManager:
                 pass
         return int(time.time() * 1000)
 
-    def _refresh_quote(self) -> None:
+    def _refresh_quote(self, *, source: str = "REST_RECONCILIATION") -> bool:
         raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
         if self._is_chain_mode() and not raw.get("selected_option_contract"):
-            return
+            return False
         breeze_throttle(f"quote:{getattr(self.instrument, 'asset_id', '?')}")
         q = self.api.get_quote_for_instrument(getattr(self.instrument, "primary", None))
         row = q.get("Success") if isinstance(q, dict) else {}
@@ -1358,7 +1415,7 @@ class ICICIOptionDataManager:
             row = q if isinstance(q, dict) else {}
         px = self._float_first(row, ("ltp", "last_price", "lastPrice", "close", "price"))
         if px <= 0:
-            return
+            return False
         bid = self._float_first(row, ("best_bid_price", "best_bid", "bid", "bPrice", "bid_price"))
         ask = self._float_first(row, ("best_offer_price", "best_ask_price", "best_ask", "ask", "sPrice", "ask_price", "offer_price"))
         bid_qty = self._float_first(row, ("best_bid_quantity", "bid_quantity", "bid_qty", "bQty"))
@@ -1371,7 +1428,27 @@ class ICICIOptionDataManager:
             self._best_bid_qty = bid_qty
             self._best_ask_qty = ask_qty
             self._last_quote_ts = now
-            self._trades.append({"price": px, "quantity": self._float_first(row, ("quantity", "volume", "total_quantity_traded")), "side": "buy", "timestamp": now, "source": "icici_quote"})
+            self._trades.append({"price": px, "quantity": self._float_first(row, ("quantity", "volume", "total_quantity_traded")), "side": "buy", "timestamp": now, "source": str(source).lower()})
+            if source == "EXACT_CONTRACT_REST_PREFLIGHT":
+                self._last_execution_preflight_ts = now
+                self._last_execution_preflight_key = self._active_stream_key
+                self._last_execution_quote_source = source
+        return True
+
+    def _execution_price_fresh(self, max_stale_seconds: float) -> bool:
+        now = time.time()
+        with self._lock:
+            stream_ts = float(self._last_stream_tick_ts or 0.0)
+            preflight_ts = float(self._last_execution_preflight_ts or 0.0)
+            preflight_key = self._last_execution_preflight_key
+            active_key = self._active_stream_key
+            has_book = self._best_bid > 0 and self._best_ask > 0 and self._best_ask >= self._best_bid
+            has_price = self._last_price > 0
+        max_stream = min(float(max_stale_seconds), float(_cfg("ICICI_OPTION_STREAM_MAX_STALE_SEC", 15.0)))
+        stream_ok = stream_ts > 0 and now - stream_ts <= max_stream and has_price and has_book
+        preflight_ttl = min(float(max_stale_seconds), float(_cfg("ICICI_EXECUTION_PREFLIGHT_QUOTE_TTL_SEC", 2.0)))
+        preflight_ok = bool(active_key is not None and preflight_key == active_key and preflight_ts > 0 and now - preflight_ts <= preflight_ttl and has_price and has_book)
+        return stream_ok or preflight_ok
 
     def get_last_update(self) -> float:
         with self._lock:
@@ -1403,7 +1480,12 @@ class ICICIOptionDataManager:
         # only executable size Breeze actually returned.
         stream_age = time.time() - stream_ts if stream_ts > 0 else 999999.0
         stream_fresh = bool(self._stream_subscription_ids) and stream_ts > 0 and stream_age <= float(_cfg("ICICI_OPTION_STREAM_MAX_STALE_SEC", 15.0))
-        source = "icici_breeze_websocket" if stream_fresh else "icici_breeze_websocket_stale" if self._stream_subscription_ids else "icici_rest_quote_reconcile"
+        with self._lock:
+            preflight_ts = float(self._last_execution_preflight_ts or 0.0)
+            preflight_key = self._last_execution_preflight_key
+            active_key = self._active_stream_key
+        preflight_fresh = bool(active_key is not None and preflight_key == active_key and preflight_ts > 0 and time.time() - preflight_ts <= float(_cfg("ICICI_EXECUTION_PREFLIGHT_QUOTE_TTL_SEC", 2.0)))
+        source = "icici_breeze_websocket" if stream_fresh else "icici_exact_contract_rest_preflight" if preflight_fresh else "icici_breeze_websocket_stale" if self._stream_subscription_ids else "icici_rest_quote_reconcile"
         return {"bids": [[bid, bid_qty]] if bid > 0 and bid_qty > 0 else [], "asks": [[ask, ask_qty]] if ask > 0 and ask_qty > 0 else [], "timestamp": ts, "_sources": 1, "_executable_source": source, "_stream_age_sec": stream_age}
 
     def get_recent_trades(self, limit: int = 100) -> List[Dict]:
@@ -1414,12 +1496,12 @@ class ICICIOptionDataManager:
         return self.get_recent_trades(limit)
 
     def is_price_fresh(self, max_stale_seconds: float = 90.0) -> bool:
-        self._repair_option_stream_if_stale("option_freshness_gate")
+        self._repair_option_stream_if_stale("option_freshness_gate", wait_key=self._active_stream_key)
+        if bool(_cfg("ICICI_OPTION_WEBSOCKET_REQUIRED", True)) and bool(self._stream_subscription_ids):
+            return self._execution_price_fresh(max_stale_seconds)
         with self._lock:
-            streaming_required = bool(_cfg("ICICI_OPTION_WEBSOCKET_REQUIRED", True)) and bool(self._stream_subscription_ids)
-            ts = float(self._last_stream_tick_ts if streaming_required else self._last_quote_ts or 0.0)
-        maximum = min(float(max_stale_seconds), float(_cfg("ICICI_OPTION_STREAM_MAX_STALE_SEC", 15.0))) if streaming_required else float(max_stale_seconds)
-        return ts > 0 and time.time() - ts <= maximum
+            ts = float(self._last_quote_ts or 0.0)
+        return ts > 0 and time.time() - ts <= float(max_stale_seconds)
 
     @staticmethod
     def _float_first(row: Dict[str, Any], names: tuple[str, ...]) -> float:

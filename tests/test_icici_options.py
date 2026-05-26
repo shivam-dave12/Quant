@@ -1132,11 +1132,11 @@ def test_strategy_exit_path_cancels_protection_then_records_manual_exit_order():
     assert qs._pos.phase == PositionPhase.EXITING and qs._pos.manual_exit_order_id == "exit-1"
 
 
-def test_icici_entry_source_does_not_place_parallel_tp_sells_with_broker_sl():
+def test_icici_entry_source_uses_official_gtt_oco_without_parallel_internal_tp_sells():
     from pathlib import Path
     src = Path(__file__).parents[1].joinpath("strategy", "quant_strategy.py").read_text(encoding="utf-8")
-    assert "ICICI single-live-exit invariant" in src
-    assert "ICICI TP_LADDER analytical-only" in src
+    assert "ICICI official GTT cover-OCO" in src
+    assert "official broker GTT target/stoploss remain the only exit authority" in src
 
 
 def test_portfolio_pnl_keeps_usd_and_inr_ledgers_separate():

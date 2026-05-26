@@ -906,6 +906,7 @@ class _ICICIAdapter:
         self.raw = getattr(exchange_instrument, "raw", {}) or {}
         self._last_position_filter_signature = ""
         self._last_position_filter_log_ts = 0.0
+        self._gtt_plans: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
     def _num(value: Any, default: float = 0.0) -> float:
@@ -1182,6 +1183,172 @@ class _ICICIAdapter:
                 return q
         return 0.0
 
+    def place_bracket_limit_entry(self, side: str, quantity: float, limit_price: float, sl_price: float, tp_price: float) -> Optional[Dict]:
+        """Route ICICI long-premium entries through documented three-leg cover OCO.
+
+        The strategy side identifies the underlying thesis; the option vehicle is
+        always bought.  No normal entry order is sent if protected GTT placement
+        fails.
+        """
+        if not bool(getattr(config, "ICICI_REQUIRE_GTT_COVER_OCO_PROTECTED_ENTRY", True)):
+            return {"_error": True, "_raw": {"error": "ICICI_GTT_COVER_OCO_DISABLED_FAIL_CLOSED"}}
+        self.limiter.wait()
+        try:
+            raw = self._active_raw()
+            if not self._has_contract_identity(raw):
+                raise RuntimeError("ICICI protected entry requires an exact selected NFO option contract")
+            # Reuse lot validation; this never sends an order.
+            entry_body = self._order_body(side, "LIMIT", quantity, price=limit_price, reduce_only=False)
+            qty = int(entry_body["quantity"])
+            tick = max(float(self.tick_size or 0.05), 0.01)
+            def _round_nearest(value: float) -> float:
+                return round(round(float(value) / tick) * tick, 2)
+            entry = _round_nearest(limit_price)
+            target_trigger = _round_nearest(tp_price)
+            target_limit = target_trigger
+            stop_trigger = _round_nearest(sl_price)
+            stop_limit = _round_nearest(max(tick, stop_trigger - tick))
+            if not (entry > 0 and stop_limit > 0 and stop_trigger < entry < target_trigger):
+                raise RuntimeError(
+                    f"ICICI GTT geometry invalid: stop_limit={stop_limit} stop_trigger={stop_trigger} entry={entry} target={target_trigger}"
+                )
+            ist = timezone(timedelta(hours=5, minutes=30))
+            trade_date = datetime.now(ist).strftime("%Y-%m-%dT06:00:00.000Z")
+            payload = {
+                "exchange_code": "NFO",
+                "stock_code": str(raw.get("stock_code") or raw.get("ShortName") or "").upper(),
+                "product": "options",
+                "quantity": str(qty),
+                "expiry_date": raw.get("expiry_date") or raw.get("ExpiryDate") or "",
+                "right": self.api._normalise_right(raw.get("right") or raw.get("OptionType") or ""),
+                "strike_price": str(raw.get("strike_price") or raw.get("StrikePrice") or ""),
+                "gtt_type": "cover_oco",
+                "fresh_order_action": "buy",
+                "fresh_order_price": str(entry),
+                "fresh_order_type": "limit",
+                "index_or_stock": "index",
+                "trade_date": trade_date,
+                "order_details": [
+                    {"gtt_leg_type": "target", "action": "sell", "limit_price": str(target_limit), "trigger_price": str(target_trigger)},
+                    {"gtt_leg_type": "stoploss", "action": "sell", "limit_price": str(stop_limit), "trigger_price": str(stop_trigger)},
+                ],
+            }
+            response = self.api.place_gtt_three_leg_oco(**payload)
+            success = response.get("Success") if isinstance(response, dict) else None
+            if not isinstance(success, dict):
+                return {"_raw": response, "_sc": 0, "_error": True}
+            gtt_id = str(success.get("gtt_order_id") or success.get("gttOrderId") or "").strip()
+            if not gtt_id:
+                return {"_raw": response, "_sc": 0, "_error": True}
+            oid = f"GTT:{gtt_id}"
+            self._gtt_plans[gtt_id] = {"quantity": qty, "entry": entry, "sl": stop_trigger, "tp": target_trigger, "payload": payload}
+            logger.info(
+                "ICICI protected cover-OCO accepted gtt_id=%s option=%s %s %s qty=%s entry=₹%.2f SL=₹%.2f TP=₹%.2f",
+                gtt_id, payload["stock_code"], payload["right"], payload["strike_price"], qty, entry, stop_trigger, target_trigger,
+            )
+            return {
+                "order_id": oid, "gtt_order_id": gtt_id, "status": "PENDING", "quantity": float(qty), "price": entry,
+                "bracket_order": True, "bracket_child_verified": True,
+                "bracket_sl_order_id": f"{oid}:STOPLOSS", "bracket_tp_order_id": f"{oid}:TARGET",
+                "bracket_sl_price": stop_trigger, "bracket_tp_price": target_trigger,
+                "protection_model": "ICICI_GTT_COVER_OCO", "_raw": response,
+            }
+        except Exception as exc:
+            logger.error("ICICI protected cover-OCO entry rejected before exposure: %s", exc)
+            return {"_raw": {"error": str(exc)}, "_sc": 0, "_error": True}
+
+    def _normal_order_row(self, order_id: str) -> Optional[Dict[str, Any]]:
+        """Read a normal Breeze order without invoking GTT pseudo-id routing."""
+        getter = getattr(self.api, "get_order", None) or getattr(self.api, "get_order_detail", None)
+        if not callable(getter):
+            return None
+        raw = self._active_raw()
+        try:
+            resp = getter(order_id=str(order_id), exchange_code=str(raw.get("exchange_code") or "NFO").upper())
+        except TypeError:
+            try:
+                resp = getter(str(order_id))
+            except Exception:
+                return None
+        except Exception:
+            return None
+        data = self._success_payload(resp)
+        if data:
+            data.setdefault("order_id", str(order_id))
+            return data
+        return None
+
+    def _gtt_row(self, order_id: str) -> Optional[Dict[str, Any]]:
+        """Resolve official Breeze cover-OCO pseudo ids through the GTT book.
+
+        Official GTT order-book rows identify the GTT id on each ``order_details``
+        leg and expose the immediately routed fresh-entry order as
+        ``fresh_order_id``.  It is not a top-level ``gtt_order_id`` field.
+        Therefore entry fills must be resolved through that concrete normal
+        order id; target/stoploss legs are never reported filled from planned
+        trigger/limit prices alone.
+        """
+        token = str(order_id or "")
+        if not token.startswith("GTT:"):
+            return None
+        bits = token.split(":")
+        gtt_id = bits[1] if len(bits) > 1 else ""
+        leg = bits[2].lower() if len(bits) > 2 else "fresh"
+        now = datetime.now(timezone.utc)
+        resp = self.api.get_gtt_order_book(
+            exchange_code="NFO",
+            from_date=(now - timedelta(days=2)).strftime("%Y-%m-%dT06:00:00.000Z"),
+            to_date=now.strftime("%Y-%m-%dT06:00:00.000Z"),
+        )
+        rows = resp.get("Success") if isinstance(resp, dict) else []
+        if isinstance(rows, dict):
+            rows = [rows]
+
+        def _row_gtt_ids(row: Dict[str, Any]) -> set[str]:
+            ids = {str(row.get("gtt_order_id") or row.get("gttOrderId") or "").strip()}
+            for detail in row.get("order_details") or []:
+                if isinstance(detail, dict):
+                    ids.add(str(detail.get("gtt_order_id") or detail.get("gttOrderId") or "").strip())
+            return {item for item in ids if item}
+
+        matched = next((row for row in (rows or []) if isinstance(row, dict) and gtt_id in _row_gtt_ids(row)), None)
+        if not isinstance(matched, dict):
+            return {"order_id": token, "status": "PENDING"}
+
+        fresh_order_id = str(matched.get("fresh_order_id") or matched.get("freshOrderId") or "").strip()
+        if leg == "fresh" and fresh_order_id:
+            actual = self._normal_order_row(fresh_order_id)
+            if isinstance(actual, dict):
+                actual["order_id"] = token
+                actual["broker_order_id"] = fresh_order_id
+                actual["_gtt_raw"] = matched
+                return actual
+
+        details = matched.get("order_details") or []
+        candidate = None
+        for detail in details if isinstance(details, list) else []:
+            if not isinstance(detail, dict):
+                continue
+            dleg = str(detail.get("gtt_leg_type") or "fresh").strip().lower()
+            if (leg == "fresh" and dleg in {"", "fresh", "none"}) or dleg == leg:
+                candidate = detail
+                break
+        candidate = candidate or {}
+        status = candidate.get("status") or matched.get("status") or "Pending"
+        # Never substitute the planned trigger/limit as an actual execution fill.
+        # A filled child without an exact order execution remains pending P&L reconciliation.
+        px = candidate.get("average_price") or candidate.get("execution_price") or 0.0
+        qty = candidate.get("filled_quantity") or candidate.get("executed_quantity") or matched.get("quantity") or 0.0
+        child_order_id = str(candidate.get("order_id") or candidate.get("broker_order_id") or "").strip()
+        if child_order_id:
+            actual = self._normal_order_row(child_order_id)
+            if isinstance(actual, dict):
+                actual["order_id"] = token
+                actual["broker_order_id"] = child_order_id
+                actual["_gtt_raw"] = matched
+                return actual
+        return {"order_id": token, "status": status, "average_price": px, "quantity": qty, "_raw": matched}
+
     def place_order(self, side: str, order_type: str, quantity: float,
                     price: Optional[float] = None,
                     trigger_price: Optional[float] = None,
@@ -1201,12 +1368,19 @@ class _ICICIAdapter:
     def cancel_order(self, order_id: str) -> Dict:
         self.limiter.wait()
         raw = self._active_raw()
+        token = str(order_id or "")
+        if token.startswith("GTT:"):
+            gtt_id = token.split(":")[1]
+            return self.api.cancel_gtt_three_leg_order(exchange_code="NFO", gtt_order_id=gtt_id) or {}
         try:
-            return self.api.cancel_order(order_id=str(order_id), exchange_code=str(raw.get("exchange_code") or "NFO").upper()) or {}
+            return self.api.cancel_order(order_id=token, exchange_code=str(raw.get("exchange_code") or "NFO").upper()) or {}
         except TypeError:
-            return self.api.cancel_order(order_id=str(order_id)) or {}
+            return self.api.cancel_order(order_id=token) or {}
 
     def get_order(self, order_id: str) -> Optional[Dict]:
+        if str(order_id or "").startswith("GTT:"):
+            self.limiter.wait()
+            return self._gtt_row(str(order_id))
         getter = getattr(self.api, "get_order", None) or getattr(self.api, "get_order_detail", None)
         if not callable(getter):
             return {"order_id": str(order_id), "status": "PENDING"}
@@ -1255,7 +1429,7 @@ class _ICICIAdapter:
         filled_qty = float(self.extract_filled_qty(raw_order) or 0.0)
         fee_paid, fee_exact = self._extract_paid_commission(raw_order)
         trade_getter = getattr(self.api, "get_trade_detail", None)
-        if callable(trade_getter) and status in {"FILLED", "PARTIAL_FILL"}:
+        if not oid.startswith("GTT:") and callable(trade_getter) and status in {"FILLED", "PARTIAL_FILL"}:
             try:
                 self.limiter.wait()
                 try:
@@ -2107,9 +2281,10 @@ class OrderManager:
                                   timeout_sec: float = 45.0,
                                   on_order_placed=None) -> Optional[Dict]:
         """
-        Bracket entry for Delta: places a single limit order with embedded SL + TP.
-        Polls until filled, then queries open orders to retrieve bracket child IDs.
-        Returns None for non-Delta adapters (caller falls back to regular flow).
+        Protected entry for adapters that expose broker-native protection.
+        Delta uses native bracket orders; ICICI uses documented NFO cover-OCO GTT.
+        Polls until the protected entry is filled; unprotected fallbacks are forbidden
+        by the strategy for desks that require broker-attached protection.
 
         Return dict keys on success:
           fill_price, fill_type, order_id, bracket_order=True,
@@ -2123,11 +2298,12 @@ class OrderManager:
         """
         self.last_order_error = None
         if not hasattr(self._adapter, "place_bracket_limit_entry"):
-            return None  # Non-Delta: caller uses place_limit_entry + separate SL/TP
+            return None  # Adapter does not expose protected entry routing.
 
+        cur = self._currency_symbol()
         logger.info(
-            f"[BRACKET] {side.upper()} {quantity} @ ${limit_price:.2f} "
-            f"SL=${sl_price:.2f} TP=${tp_price:.2f} (timeout={timeout_sec:.0f}s)"
+            f"[PROTECTED_ENTRY] {side.upper()} {quantity} @ {cur}{limit_price:.2f} "
+            f"SL={cur}{sl_price:.2f} TP={cur}{tp_price:.2f} (timeout={timeout_sec:.0f}s)"
         )
 
         data = self._adapter.place_bracket_limit_entry(
@@ -2139,7 +2315,7 @@ class OrderManager:
             raw = (data or {}).get("_raw", {})
             reason = self._compact_error(raw)
             self.last_order_error = {
-                "stage": "delta_native_bracket_entry",
+                "stage": "icici_gtt_cover_oco_entry" if self._exchange_name == "icici" else "delta_native_bracket_entry",
                 "status_code": sc,
                 "reason": reason,
                 "raw": raw,
@@ -2150,7 +2326,7 @@ class OrderManager:
         order_id = data.get("order_id", "")
         if not order_id:
             return None
-        logger.info(f"✅ Bracket order placed: {order_id} @ ${limit_price:.2f}")
+        logger.info(f"✅ Protected order placed: {order_id} @ {cur}{limit_price:.2f}")
 
         # BUG 2 FIX: notify the caller that the order is now on the exchange
         if on_order_placed is not None:
@@ -2180,9 +2356,20 @@ class OrderManager:
                 # Propagate exact entry fee from Delta paid_commission
                 data["paid_commission"] = float(details.get("paid_commission", 0) or 0)
                 data["paid_commission_exact"] = bool(details.get("paid_commission_exact", False))
-                logger.info(f"✅ Bracket fill: {order_id[:8]}… @ ${fill_px:.2f}"
-                            f" fee=${data['paid_commission']:.4f}"
+                logger.info(f"✅ Protected entry fill: {order_id[:8]}… @ {cur}{fill_px:.2f}"
+                            f" fee={cur}{data['paid_commission']:.4f}"
                             f" exact={data['paid_commission_exact']}")
+
+                if data.get("protection_model") == "ICICI_GTT_COVER_OCO":
+                    # Breeze accepted the entry, target and stoploss as one official
+                    # cover-OCO instruction. Child identity is the GTT leg identity;
+                    # do not search the normal order book for Delta-style children.
+                    data["bracket_child_verified"] = True
+                    logger.info(
+                        "✅ ICICI broker-protected GTT cover-OCO active: entry=%s SL-leg=%s TP-leg=%s",
+                        data.get("order_id"), data.get("bracket_sl_order_id"), data.get("bracket_tp_order_id"),
+                    )
+                    return data
 
                 # Query open orders to retrieve bracket SL/TP child order IDs.
                 # Delta creates children asynchronously after fill.
@@ -2764,6 +2951,20 @@ class OrderManager:
                                ) -> Tuple[CancelResult, CancelResult]:
         tp_result = CancelResult.NOT_FOUND
         sl_result = CancelResult.NOT_FOUND
+        sl_token = str(sl_order_id or "")
+        tp_token = str(tp_order_id or "")
+        # ICICI cover-OCO target and stoploss pseudo ids belong to the same
+        # broker-side GTT plan. Cancel that plan exactly once; two independent
+        # cancel requests create an avoidable race and burn API quota.
+        same_gtt = (
+            sl_token.startswith("GTT:") and tp_token.startswith("GTT:") and
+            sl_token.split(":")[1:2] == tp_token.split(":")[1:2]
+        )
+        if same_gtt:
+            tp_result = self.cancel_order(tp_token)
+            sl_result = tp_result
+            logger.info(f"ICICI GTT cover-OCO cancel: {tp_result.value}")
+            return sl_result, tp_result
         if tp_order_id:
             tp_result = self.cancel_order(tp_order_id)
             logger.info(f"TP cancel: {tp_result.value}")

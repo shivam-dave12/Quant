@@ -205,14 +205,93 @@ class BreezeLiveFeedHub:
         logger.info("ICICI Breeze websocket disconnected; no remaining feed subscriptions")
 
     def _dispatch(self, tick: Any) -> None:
+        """Route one official Breeze SDK packet only to its owning contract stream.
+
+        Breeze exposes multiple subscriptions through a shared ``on_ticks`` callback.
+        The SDK does not create one callback per subscription.  Forwarding every
+        incoming packet to every consumer is therefore unsafe: an NSE NIFTY spot
+        tick can otherwise be misread as an NFO CE/PE execution tick.
+        """
+        row = tick[0] if isinstance(tick, list) and tick and isinstance(tick[0], dict) else tick
+        if not isinstance(row, dict):
+            return
         with self._lock:
             self._last_tick_ts = time.time()
-            callbacks = [sub.callback for sub in self._subscriptions.values()]
-        for callback in callbacks:
+            targets = [sub.callback for sub in self._subscriptions.values() if self._matches_subscription(sub, row)]
+        if not targets:
+            logger.debug("ICICI websocket packet did not match an armed route: keys=%s", ",".join(sorted(str(k) for k in row.keys())))
+            return
+        delivered: set[int] = set()
+        for callback in targets:
+            callback_id = id(callback)
+            if callback_id in delivered:
+                continue
+            delivered.add(callback_id)
             try:
                 callback(tick)
             except Exception as exc:
                 logger.debug("ICICI websocket consumer rejected tick: %s", exc)
+
+    @staticmethod
+    def _right(value: Any) -> str:
+        raw = str(value or "").strip().lower()
+        if raw in {"c", "ce", "call"}:
+            return "call"
+        if raw in {"p", "pe", "put"}:
+            return "put"
+        return raw
+
+    @staticmethod
+    def _expiry(value: Any) -> str:
+        return str(value or "").strip().lower().replace(" ", "")
+
+    @classmethod
+    def _matches_subscription(cls, sub: _Subscription, row: dict[str, Any]) -> bool:
+        args = sub.args
+        exchange_text = str(row.get("exchange_code") or row.get("exchange") or "").upper()
+        product_text = str(row.get("product_type") or row.get("product") or "").upper()
+        stock_text = str(row.get("stock_code") or row.get("stock_name") or "").upper().replace(" ", "")
+        expected_stock = str(args.get("stock_code") or "").upper().replace(" ", "")
+        if expected_stock and expected_stock not in stock_text:
+            return False
+
+        is_option = bool(
+            exchange_text == "NFO" or "FUTURES & OPTIONS" in exchange_text or "FUTURES&OPTIONS" in exchange_text
+            or product_text in {"OPTION", "OPTIONS"}
+            or row.get("strike_price") not in (None, "")
+            or row.get("right") not in (None, "") or row.get("right_type") not in (None, "")
+        )
+        if sub.kind == "underlying_quote":
+            return not is_option
+        if not sub.kind.startswith("option_") or not is_option:
+            return False
+
+        expected_right = cls._right(args.get("right"))
+        actual_right = cls._right(row.get("right") or row.get("right_type") or row.get("option_type"))
+        if not expected_right or actual_right != expected_right:
+            return False
+        try:
+            expected_strike = float(args.get("strike_price") or 0.0)
+            actual_strike = float(row.get("strike_price") or row.get("strike") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        if expected_strike <= 0 or abs(actual_strike - expected_strike) > 1e-6:
+            return False
+        expected_expiry = cls._expiry(args.get("expiry_date"))
+        actual_expiry = cls._expiry(row.get("expiry_date") or row.get("expiry"))
+        if expected_expiry and actual_expiry and actual_expiry != expected_expiry:
+            return False
+
+        has_interval = bool(row.get("interval") or row.get("Interval"))
+        quotes_text = str(row.get("quotes") or "").strip().lower()
+        has_depth = bool(row.get("depth") or "market depth" in quotes_text)
+        if sub.kind == "option_ohlcv":
+            return has_interval
+        if sub.kind == "option_depth":
+            return has_depth and not has_interval
+        if sub.kind == "option_quote":
+            return not has_depth and not has_interval
+        return False
 
     @staticmethod
     def _safe_descriptor(args: dict[str, Any]) -> str:

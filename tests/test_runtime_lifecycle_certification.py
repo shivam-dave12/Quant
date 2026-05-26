@@ -366,14 +366,17 @@ def test_actual_nifty_entry_fill_retains_old_session_book_option_execution_and_n
         def release_icici_execution_vehicle(self): self.released = True
     class OM:
         active_exchange = "icici"; last_order_error = None
-        def __init__(self): self.entry = None; self.sl = None
-        def place_bracket_limit_entry(self, **kwargs): return None
-        def place_limit_entry(self, side, quantity, limit_price, timeout_sec, fallback_to_market, on_order_placed):
-            self.entry = (side, quantity, limit_price); on_order_placed("entry-ce")
-            return {"order_id": "entry-ce", "fill_price": limit_price, "quantity": quantity, "fill_type": "maker", "paid_commission": 2.0, "paid_commission_exact": True}
-        def cancel_symbol_conditionals(self): return {}
-        def place_stop_loss(self, side, quantity, trigger_price): self.sl = (side, quantity, trigger_price); return {"order_id": "sl-ce"}
-        def place_take_profit(self, **kwargs): raise AssertionError("ICICI must keep one live broker exit: SL only")
+        def __init__(self): self.entry = None
+        def place_bracket_limit_entry(self, **kwargs):
+            self.entry = (kwargs["side"], kwargs["quantity"], kwargs["limit_price"])
+            return {"order_id": "GTT:entry-ce", "fill_price": kwargs["limit_price"], "quantity": kwargs["quantity"],
+                    "fill_type": "maker", "paid_commission": 2.0, "paid_commission_exact": True,
+                    "bracket_order": True, "bracket_sl_order_id": "GTT:entry-ce:STOPLOSS",
+                    "bracket_tp_order_id": "GTT:entry-ce:TARGET", "bracket_sl_price": kwargs["sl_price"],
+                    "bracket_tp_price": kwargs["tp_price"], "protection_model": "ICICI_GTT_COVER_OCO"}
+        def place_limit_entry(self, **kwargs): raise AssertionError("ICICI must never route a naked option entry")
+        def place_stop_loss(self, **kwargs): raise AssertionError("GTT cover-OCO owns the protective stop")
+        def place_take_profit(self, **kwargs): raise AssertionError("GTT cover-OCO owns the target")
     class RM:
         def get_available_balance(self): return {"total": 49310.96, "available": 49310.96, "available_raw": 49310.96}
         def set_position_open(self, state): self.state = state
@@ -397,8 +400,8 @@ def test_actual_nifty_entry_fill_retains_old_session_book_option_execution_and_n
     assert qs._pos.execution_symbol == "NIFTY30JUN30CE23200"
     assert qs._pos.currency_symbol == "₹" and qs._pos.pnl_model == "linear"
     assert om.entry[0] == "long" and om.entry[1] == 50.0 and om.entry[2] == pytest.approx(72.0)
-    assert om.sl and om.sl[0] == "sell" and om.sl[1] == 50.0 and om.sl[2] < qs._pos.entry_price
-    assert qs._pos.tp_order_id == "" and qs._pos.tp_price > qs._pos.entry_price
+    assert qs._pos.sl_order_id == "GTT:entry-ce:STOPLOSS"
+    assert qs._pos.tp_order_id == "GTT:entry-ce:TARGET" and qs._pos.tp_price > qs._pos.entry_price
 
 
 def _executable_instrument(exchange: str, asset: str, symbol: str):
@@ -538,21 +541,21 @@ def test_actual_nifty_session_book_selection_protected_exit_and_reentry_runs_twi
     class OM:
         active_exchange = "icici"; last_order_error = None
         def __init__(self): self.n = 0; self.events = []
-        def place_bracket_limit_entry(self, **kwargs): return None
-        def place_limit_entry(self, side, quantity, limit_price, timeout_sec, fallback_to_market, on_order_placed):
-            self.n += 1; on_order_placed(f"entry-{self.n}"); self.events.append(("entry", limit_price))
-            return {"order_id": f"entry-{self.n}", "fill_price": limit_price, "quantity": quantity,
-                    "fill_type": "maker", "paid_commission": 2.0, "paid_commission_exact": True}
-        def cancel_symbol_conditionals(self): return {}
-        def place_stop_loss(self, side, quantity, trigger_price):
-            self.events.append(("sl", trigger_price)); return {"order_id": f"sl-{self.n}"}
-        def place_take_profit(self, **kwargs): raise AssertionError("ICICI protective SL must remain the only live exit order")
-        def cancel_all_exit_orders(self, sl, tp): self.events.append(("cancel", sl, tp)); return CancelResult.SUCCESS, CancelResult.NOT_FOUND
-        def place_market_order(self, side, quantity, reduce_only):
-            self.events.append(("marketable_limit_close", side, quantity, reduce_only)); return {"order_id": f"close-{self.n}"}
-        def get_fill_details(self, order_id):
-            return {"status": "FILLED", "fill_price": 112.0, "paid_commission": 2.5, "paid_commission_exact": True}
-        def identify_exit_order(self, **kwargs): return {"confirmed": False}
+        def place_bracket_limit_entry(self, **kwargs):
+            self.n += 1; self.events.append(("gtt_entry", kwargs["limit_price"]))
+            return {"order_id": f"GTT:{self.n}", "fill_price": kwargs["limit_price"], "quantity": kwargs["quantity"],
+                    "fill_type": "maker", "paid_commission": 2.0, "paid_commission_exact": True,
+                    "bracket_order": True, "bracket_sl_order_id": f"GTT:{self.n}:STOPLOSS",
+                    "bracket_tp_order_id": f"GTT:{self.n}:TARGET", "bracket_sl_price": kwargs["sl_price"],
+                    "bracket_tp_price": kwargs["tp_price"], "protection_model": "ICICI_GTT_COVER_OCO"}
+        def place_limit_entry(self, **kwargs): raise AssertionError("ICICI must never route a naked option entry")
+        def place_stop_loss(self, **kwargs): raise AssertionError("GTT cover-OCO owns the protective stop")
+        def place_take_profit(self, **kwargs): raise AssertionError("GTT cover-OCO owns the target")
+        def cancel_all_exit_orders(self, sl, tp): raise AssertionError("native GTT target should execute without local cancellation")
+        def place_market_order(self, **kwargs): raise AssertionError("native GTT target should execute without manual close")
+        def identify_exit_order(self, **kwargs):
+            return {"confirmed": True, "exit_type": "tp", "fill_price": 112.0, "order_id": kwargs["tp_order_id"],
+                    "fee_paid": 2.5, "fee_exact": True}
     class RM:
         def get_available_balance(self): return {"total": 49310.96, "available": 49310.96, "available_raw": 49310.96}
         def set_position_open(self, state): self.state = state
@@ -575,13 +578,12 @@ def test_actual_nifty_session_book_selection_protected_exit_and_reentry_runs_twi
         assert qs._pos.execution_symbol == "NIFTY30JUN30CE23200" and qs._pos.currency_symbol == "₹"
         dm.premium = max(112.0, qs._pos.tp_price + 0.05)
         qs._manage_active(dm, om, time.time())
-        assert qs._pos.phase is PositionPhase.EXITING and qs._pos.manual_exit_reason == "liquidity_tp_hit"
+        assert qs._pos.phase is PositionPhase.ACTIVE  # broker GTT target owns ordinary TP execution
         qs._record_exchange_exit({"size": 0.0})
         assert qs._pos.phase is PositionPhase.FLAT
     assert qs._total_trades == 2 and qs._winning_trades == 2
-    assert all(t["currency"] == "₹" and t["execution_symbol"] == "NIFTY30JUN30CE23200" and t["reason"] == "liquidity_tp_hit" for t in qs._trade_history)
-    assert len([event for event in om.events if event[0] == "entry"]) == 2
-    assert len([event for event in om.events if event[0] == "marketable_limit_close"]) == 2
+    assert all(t["currency"] == "₹" and t["execution_symbol"] == "NIFTY30JUN30CE23200" and t["reason"] == "tp_hit" for t in qs._trade_history)
+    assert len([event for event in om.events if event[0] == "gtt_entry"]) == 2
 
 
 def test_router_switch_to_icici_reports_inr_not_usd():

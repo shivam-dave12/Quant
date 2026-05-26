@@ -371,6 +371,49 @@ class BreezeRestClient:
     def get_trade_detail(self, **kwargs) -> Dict[str, Any]:
         return self.request("GET", "/trades", self._ordered_body(kwargs, ("exchange_code", "order_id")))
 
+    def _official_sdk_client(self):
+        """Create an authenticated official Breeze SDK client for GTT endpoints.
+
+        GTT is exposed by the official SDK as dedicated methods.  Do not guess
+        an undocumented REST path for a protected live order.
+        """
+        try:
+            from breeze_connect import BreezeConnect  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("ICICI GTT protected entry requires the official breeze-connect dependency") from exc
+        session = self.auth.get_session(force_refresh=False)
+        api_session = str(getattr(session, "api_session", "") or "").strip()
+        if not api_session:
+            configured = getattr(self.auth, "_configured_api_session", None)
+            api_session = str(configured() if callable(configured) else "").strip()
+        if not api_session:
+            raise RuntimeError("ICICI GTT protected entry requires today's API_Session")
+        client = BreezeConnect(api_key=self.auth.api_key)
+        client.generate_session(api_secret=self.auth.secret_key, session_token=api_session)
+        return client
+
+    def place_gtt_three_leg_oco(self, **kwargs) -> Dict[str, Any]:
+        """Place official NFO option cover-OCO: entry + target + stoploss."""
+        if str(kwargs.get("exchange_code") or "").upper() != "NFO" or str(kwargs.get("product") or "").lower() != "options":
+            raise RuntimeError("ICICI GTT protection supports exact NFO options only")
+        if str(kwargs.get("fresh_order_type") or "").lower() != "limit":
+            raise RuntimeError("ICICI Breeze GTT guard: the fresh order must be LIMIT; market orders are prohibited")
+        if str(kwargs.get("gtt_type") or "").lower() != "cover_oco":
+            raise RuntimeError("ICICI Breeze GTT guard: protected entry must use cover_oco")
+        details = kwargs.get("order_details")
+        if not isinstance(details, list) or {str(x.get("gtt_leg_type") or "").lower() for x in details if isinstance(x, dict)} != {"target", "stoploss"}:
+            raise RuntimeError("ICICI Breeze GTT guard: cover_oco requires target and stoploss legs")
+        body = dict(kwargs)
+        body["expiry_date"] = self._normalise_expiry(body.get("expiry_date"))
+        body["right"] = self._normalise_right(body.get("right"))
+        return self._official_sdk_client().gtt_three_leg_place_order(**self._compact_body(body))
+
+    def get_gtt_order_book(self, *, exchange_code: str = "NFO", from_date: str, to_date: str) -> Dict[str, Any]:
+        return self._official_sdk_client().gtt_order_book(exchange_code=exchange_code, from_date=from_date, to_date=to_date)
+
+    def cancel_gtt_three_leg_order(self, *, exchange_code: str, gtt_order_id: str) -> Dict[str, Any]:
+        return self._official_sdk_client().gtt_three_leg_cancel_order(exchange_code=exchange_code, gtt_order_id=gtt_order_id)
+
     @staticmethod
     def _download_security_master(url: str, timeout: float) -> bytes:
         resp = requests.get(url, timeout=timeout)

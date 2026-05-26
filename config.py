@@ -428,6 +428,10 @@ SUSPENDED_ASSET_CLASSES = ("equity", "index")
 # bullish NIFTY thesis -> buy CE, bearish NIFTY thesis -> buy PE.
 ICICI_LONG_PREMIUM_ONLY = True
 ICICI_OPTIONS_ONLY = True
+# Official Breeze exposes NFO options protected entry as three-leg GTT cover-OCO.
+# Never degrade to a naked buy followed by local-only TP/SL supervision.  Setting
+# this false disables ICICI option entry; it never enables naked-order fallback.
+ICICI_REQUIRE_GTT_COVER_OCO_PROTECTED_ENTRY = os.getenv("ICICI_REQUIRE_GTT_COVER_OCO_PROTECTED_ENTRY", "true").lower() in ("1", "true", "yes", "on")
 # Discovery is config-backed and auth-independent, matching the working V83
 # ICICI desk design: NIFTY must enter the universe before Breeze session
 # generation. Protected Breeze endpoints are touched later by the ICICI runtime
@@ -493,7 +497,8 @@ ICICI_INDEX_STREAM_ENABLED = os.getenv("ICICI_INDEX_STREAM_ENABLED", "true").low
 ICICI_INDEX_WEBSOCKET_REQUIRED = os.getenv("ICICI_INDEX_WEBSOCKET_REQUIRED", "true").lower() in ("1", "true", "yes", "on")
 ICICI_INDEX_STREAM_FIRST_TICK_TIMEOUT_SEC = float(os.getenv("ICICI_INDEX_STREAM_FIRST_TICK_TIMEOUT_SEC", "12.0"))
 ICICI_INDEX_STREAM_MAX_STALE_SEC = float(os.getenv("ICICI_INDEX_STREAM_MAX_STALE_SEC", "15.0"))
-ICICI_WEBSOCKET_RECONNECT_COOLDOWN_SEC = float(os.getenv("ICICI_WEBSOCKET_RECONNECT_COOLDOWN_SEC", "5.0"))
+ICICI_WEBSOCKET_RECONNECT_COOLDOWN_SEC = float(os.getenv("ICICI_WEBSOCKET_RECONNECT_COOLDOWN_SEC", "30.0"))
+ICICI_SHARED_TRANSPORT_MAX_STALE_SEC = float(os.getenv("ICICI_SHARED_TRANSPORT_MAX_STALE_SEC", "20.0"))
 ICICI_REQUIRE_UNDERLYING_ANALYSIS_FEED = True
 # Official Breeze SDK resolves tokens dynamically from exchange/stock descriptors;
 # static script-code maps are deliberately not used.
@@ -578,6 +583,11 @@ ICICI_OPTION_EXECUTION_ATR_PERIOD = 14
 ICICI_OPTION_MAX_SPREAD_TO_1M_ATR = 0.35
 ICICI_SECURITY_MASTER_REQUIRE_TODAY = True
 ICICI_OPTION_MAX_QUOTE_STALE_SEC = 10.0
+# Commit-time quote verification: an exact selected CE/PE REST quote may authorise
+# a limit order only for a very short window when the option stream is quiet.
+# Signals always remain underlying/stream driven; this is execution validation only.
+ICICI_EXECUTION_PREFLIGHT_EXACT_QUOTE_ENABLED = os.getenv("ICICI_EXECUTION_PREFLIGHT_EXACT_QUOTE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+ICICI_EXECUTION_PREFLIGHT_QUOTE_TTL_SEC = float(os.getenv("ICICI_EXECUTION_PREFLIGHT_QUOTE_TTL_SEC", "2.0"))
 ICICI_UNDERLYING_REST_REFRESH_SEC = 30.0
 # Slow authoritative REST reconciliation while Breeze websocket is healthy; faster REST repair runs only during faults.
 ICICI_UNDERLYING_REST_RECONCILE_SEC = 900.0
