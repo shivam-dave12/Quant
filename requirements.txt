@@ -1,0 +1,12 @@
+requests>=2.32,<3
+websockets>=15,<16
+growwapi==1.5.0
+pyotp>=2.9,<3
+python-socketio[asyncio_client]>=5.11,<6
+cryptography>=42,<46
+numpy>=2.0,<3
+scipy>=1.13,<2
+scikit-learn>=1.5,<2
+lightgbm>=4.5,<5
+joblib>=1.4,<2
+pandas>=2.2,<3
