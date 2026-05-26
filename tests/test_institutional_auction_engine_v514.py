@@ -183,7 +183,7 @@ def test_uncalibrated_fee_floor_is_probability_neutral_and_runtime_safe():
 def test_all_streaming_venues_wake_single_authority_outside_feed_callbacks():
     delta_src = inspect.getsource(DeltaDataManager._on_orderbook) + inspect.getsource(DeltaDataManager._on_trade)
     coinswitch_src = (ROOT / "exchanges" / "coinswitch" / "data_manager.py").read_text()
-    icici_src = (ROOT / "exchanges" / "icici" / "underlying_data_manager.py").read_text()
+    groww_src = (ROOT / "exchanges" / "groww" / "underlying_data_manager.py").read_text()
     assert "_on_realtime_quote" in delta_src and "_on_realtime_trade" in delta_src
     assert "_on_realtime_quote" in coinswitch_src and "_on_realtime_trade" in coinswitch_src
-    assert "_on_realtime_quote" in icici_src and "_on_stream_candle" in icici_src
+    assert "_on_realtime_quote" in groww_src and "_on_stream_candle" in groww_src

@@ -104,7 +104,7 @@ def test_groww_exchange_enum_and_registry_discovery():
     nifty = next(inst for inst in report.matched if inst.asset_id == "NIFTY")
     assert nifty.primary_exchange is ExchangeName.GROWW
     assert ExchangeName.GROWW in nifty.by_exchange
-    assert "icici" not in {ex.value for ex in nifty.by_exchange}
+    assert {ex.value for ex in nifty.by_exchange} == {"groww"}
 
 
 def test_groww_order_body_uses_official_sdk_fields():

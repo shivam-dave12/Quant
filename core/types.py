@@ -15,7 +15,6 @@ from typing import Dict, List, Optional
 class Exchange(str, Enum):
     DELTA      = "delta"
     COINSWITCH = "coinswitch"
-    ICICI      = "icici"
     GROWW      = "groww"
 
     @classmethod
@@ -25,12 +24,10 @@ class Exchange(str, Enum):
             return cls.DELTA
         if v in ("coinswitch", "cs", "cs_pro"):
             return cls.COINSWITCH
-        if v in ("icici", "breeze", "icicidirect"):
-            return cls.ICICI
         if v in ("groww", "growwapi", "growwtrade"):
             return cls.GROWW
         raise ValueError(
-            f"Unknown exchange {value!r}. Valid values: 'delta', 'coinswitch', 'icici', 'groww'."
+            f"Unknown exchange {value!r}. Valid values: 'delta', 'coinswitch', 'groww'."
         )
 
 

@@ -146,8 +146,8 @@ def test_live_stale_analysis_quote_blocks_structural_authority_even_with_valid_b
     assert quality["lineage"]["execution_domain"] == "OPTION_PREMIUM"
 
 
-def test_icici_activation_surface_discloses_live_option_fundamentals_and_execution_metrics():
-    src = (ROOT / "exchanges" / "icici" / "data_manager.py").read_text()
+def test_groww_activation_surface_discloses_live_option_fundamentals_and_execution_metrics():
+    src = (ROOT / "exchanges" / "groww" / "data_manager.py").read_text()
     for field in ("delta=%+.3f", "theta/prem=%.4f", "spread/ATR1m=%.3f", "visible_depth=%.0f", "quote=FRESH execution=APPROVED"):
         assert field in src
 
@@ -156,5 +156,5 @@ def test_dormant_and_uninitialised_desks_never_render_zero_as_market_data():
     osrc = (ROOT / "orchestration" / "multi_asset_bot.py").read_text()
     assert 'state = "DORMANT"' in osrc
     assert 'px_txt = f"{px:,.4f}" if px is not None and px > 0.0 else "N/A"' in osrc
-    assert 'unit = "NIFTYpts" if is_icici or' in osrc
+    assert 'unit = "NIFTYpts" if is_groww or' in osrc
     assert 'mark_txt = f"{self._esc(unit)}{mark:,.4f}" if mark is not None else "N/A"' in osrc

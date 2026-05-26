@@ -198,7 +198,7 @@ def _round_structural_levels(pos_side: str, sl_price: float, tp_price: float) ->
             round(math.ceil(tp_price / tick) * tick, 10))
 
 
-def _icici_primary_raw(instrument: Any = None) -> Dict[str, Any]:
+def _groww_primary_raw(instrument: Any = None) -> Dict[str, Any]:
     inst = instrument if instrument is not None else current_instrument()
     try:
         raw = getattr(getattr(inst, "primary", None), "raw", {}) or {}
@@ -207,7 +207,7 @@ def _icici_primary_raw(instrument: Any = None) -> Dict[str, Any]:
         return {}
 
 
-def _icici_exchange_name(instrument: Any = None) -> str:
+def _groww_exchange_name(instrument: Any = None) -> str:
     inst = instrument if instrument is not None else current_instrument()
     try:
         return str(getattr(getattr(inst, "primary_exchange", ""), "value", getattr(inst, "primary_exchange", ""))).lower()
@@ -215,28 +215,28 @@ def _icici_exchange_name(instrument: Any = None) -> str:
         return ""
 
 
-def _is_icici_underlying_chain_instrument(instrument: Any = None) -> bool:
-    raw = _icici_primary_raw(instrument)
+def _is_groww_underlying_chain_instrument(instrument: Any = None) -> bool:
+    raw = _groww_primary_raw(instrument)
     return bool(
-        _icici_exchange_name(instrument) == "icici"
-        and raw.get("icici_underlying_desk")
+        _groww_exchange_name(instrument) == "groww"
+        and raw.get("groww_underlying_desk")
         and str(raw.get("contract_selector_mode") or "").lower() == "session_preselected_execution"
         and not raw.get("selected_option_contract")
     )
 
 
-def _is_icici_option_instrument(instrument: Any = None) -> bool:
-    raw = _icici_primary_raw(instrument)
-    if _icici_exchange_name(instrument) != "icici":
+def _is_groww_option_instrument(instrument: Any = None) -> bool:
+    raw = _groww_primary_raw(instrument)
+    if _groww_exchange_name(instrument) != "groww":
         return False
     if raw.get("selected_option_contract"):
         return True
     txt = " ".join(str(raw.get(k, "")) for k in ("product_type", "product", "contract_type", "right", "option_type", "OptionType"))
-    return "option" in txt.lower() or _icici_option_right(raw) in ("call", "put")
+    return "option" in txt.lower() or _groww_option_right(raw) in ("call", "put")
 
 
-def _icici_selected_contract_dict(instrument: Any = None) -> Dict[str, Any]:
-    raw = _icici_primary_raw(instrument)
+def _groww_selected_contract_dict(instrument: Any = None) -> Dict[str, Any]:
+    raw = _groww_primary_raw(instrument)
     selected = raw.get("selected_option_contract")
     if isinstance(selected, dict):
         merged = dict(raw)
@@ -248,8 +248,8 @@ def _icici_selected_contract_dict(instrument: Any = None) -> Dict[str, Any]:
     return raw
 
 
-def _icici_option_right(raw_or_instrument: Any = None) -> str:
-    raw = raw_or_instrument if isinstance(raw_or_instrument, dict) else _icici_selected_contract_dict(raw_or_instrument)
+def _groww_option_right(raw_or_instrument: Any = None) -> str:
+    raw = raw_or_instrument if isinstance(raw_or_instrument, dict) else _groww_selected_contract_dict(raw_or_instrument)
     value = str(
         raw.get("right")
         or raw.get("option_type")
@@ -265,9 +265,9 @@ def _icici_option_right(raw_or_instrument: Any = None) -> str:
     return ""
 
 
-def _icici_allowed_thesis_side(instrument: Any, thesis_side: str) -> bool:
+def _groww_allowed_thesis_side(instrument: Any, thesis_side: str) -> bool:
     side = str(thesis_side or "").lower()
-    right = _icici_option_right(instrument)
+    right = _groww_option_right(instrument)
     if right == "call":
         return side == "long"
     if right == "put":
@@ -275,7 +275,7 @@ def _icici_allowed_thesis_side(instrument: Any, thesis_side: str) -> bool:
     return side in ("long", "short")
 
 
-def _icici_float(value: Any, default: float = 0.0) -> float:
+def _groww_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None:
             return default
@@ -289,44 +289,44 @@ def _icici_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _icici_selected_delta(instrument: Any = None) -> float:
-    raw = _icici_selected_contract_dict(instrument)
+def _groww_selected_delta(instrument: Any = None) -> float:
+    raw = _groww_selected_contract_dict(instrument)
     for key in ("delta", "Delta", "bs_delta", "runtime_delta"):
-        v = _icici_float(raw.get(key), 0.0)
+        v = _groww_float(raw.get(key), 0.0)
         if abs(v) > 0.01:
             return abs(v)
-    target = _icici_float(_cfg("ICICI_INDEX_OPTION_TARGET_ABS_DELTA", 0.45), 0.45)
+    target = _groww_float(_cfg("GROWW_INDEX_OPTION_TARGET_ABS_DELTA", 0.45), 0.45)
     return max(0.05, min(0.95, abs(target)))
 
 
-def _icici_runtime_lot_size(instrument: Any = None) -> float:
-    raw = _icici_selected_contract_dict(instrument)
+def _groww_runtime_lot_size(instrument: Any = None) -> float:
+    raw = _groww_selected_contract_dict(instrument)
     for key in ("runtime_lot_size", "LotSize", "lot_size", "lotSize", "MinimumLotQty", "min_qty"):
-        lot = _icici_float(raw.get(key), 0.0)
+        lot = _groww_float(raw.get(key), 0.0)
         if lot > 0:
             return lot
-    return max(0.0, _icici_float(_cfg("ICICI_OPTION_DEFAULT_LOT_SIZE", 0.0), 0.0))
+    return max(0.0, _groww_float(_cfg("GROWW_OPTION_DEFAULT_LOT_SIZE", 0.0), 0.0))
 
 
-def _icici_selected_premium(instrument: Any = None, fallback: float = 0.0) -> float:
-    raw = _icici_selected_contract_dict(instrument)
+def _groww_selected_premium(instrument: Any = None, fallback: float = 0.0) -> float:
+    raw = _groww_selected_contract_dict(instrument)
     for key in ("selected_entry_premium", "ltp", "last_price", "lastPrice", "close", "price", "settlement_price"):
-        px = _icici_float(raw.get(key), 0.0)
+        px = _groww_float(raw.get(key), 0.0)
         if px > 0:
             return px
     return float(fallback or 0.0)
 
 
-def _icici_contract_identity_ok(raw: Dict[str, Any]) -> bool:
+def _groww_contract_identity_ok(raw: Dict[str, Any]) -> bool:
     if not isinstance(raw, dict):
         return False
-    strike = _icici_float(raw.get("strike_price") or raw.get("StrikePrice") or raw.get("strike"), 0.0)
+    strike = _groww_float(raw.get("strike_price") or raw.get("StrikePrice") or raw.get("strike"), 0.0)
     expiry = str(raw.get("expiry_date") or raw.get("ExpiryDate") or raw.get("expiry") or "").strip()
-    right = _icici_option_right(raw)
+    right = _groww_option_right(raw)
     return bool(strike > 0 and expiry and right in ("call", "put"))
 
 
-def _icici_contract_from_position(ex_pos: Any) -> Dict[str, Any]:
+def _groww_contract_from_position(ex_pos: Any) -> Dict[str, Any]:
     if not isinstance(ex_pos, dict):
         return {}
     merged: Dict[str, Any] = {}
@@ -337,17 +337,17 @@ def _icici_contract_from_position(ex_pos: Any) -> Dict[str, Any]:
     return merged
 
 
-def _icici_ensure_adoptable_contract(instrument: Any, ex_pos: Any) -> bool:
-    """Ensure ICICI recovery has an exact option vehicle before adoption."""
-    if _icici_contract_identity_ok(_icici_selected_contract_dict(instrument)):
+def _groww_ensure_adoptable_contract(instrument: Any, ex_pos: Any) -> bool:
+    """Ensure GROWW recovery has an exact option vehicle before adoption."""
+    if _groww_contract_identity_ok(_groww_selected_contract_dict(instrument)):
         return True
-    pos_contract = _icici_contract_from_position(ex_pos)
-    if not _icici_contract_identity_ok(pos_contract):
+    pos_contract = _groww_contract_from_position(ex_pos)
+    if not _groww_contract_identity_ok(pos_contract):
         return False
-    raw = _icici_primary_raw(instrument)
+    raw = _groww_primary_raw(instrument)
     if not isinstance(raw, dict):
         return False
-    entry_px = _icici_float(
+    entry_px = _groww_float(
         pos_contract.get("entry_price")
         or pos_contract.get("average_price")
         or pos_contract.get("avg_price")
@@ -359,7 +359,7 @@ def _icici_ensure_adoptable_contract(instrument: Any, ex_pos: Any) -> bool:
     selected.setdefault("raw", dict(pos_contract))
     if entry_px > 0:
         selected.setdefault("selected_entry_premium", entry_px)
-    right = _icici_option_right(pos_contract)
+    right = _groww_option_right(pos_contract)
     raw["selected_option_contract"] = selected
     raw["stock_code"] = pos_contract.get("stock_code") or pos_contract.get("StockCode") or raw.get("stock_code") or raw.get("underlying")
     raw["exchange_code"] = pos_contract.get("exchange_code") or pos_contract.get("ExchangeCode") or raw.get("exchange_code") or "NFO"
@@ -375,7 +375,7 @@ def _icici_ensure_adoptable_contract(instrument: Any, ex_pos: Any) -> bool:
         or pos_contract.get("symbol")
         or raw.get("TradingSymbol")
     )
-    lot = _icici_float(
+    lot = _groww_float(
         pos_contract.get("runtime_lot_size")
         or pos_contract.get("LotSize")
         or pos_contract.get("lot_size")
@@ -388,10 +388,10 @@ def _icici_ensure_adoptable_contract(instrument: Any, ex_pos: Any) -> bool:
         raw["selected_entry_premium"] = entry_px
     # Recovery may identify a real broker option position, but automated order
     # management cannot safely route until its exact NFO lot is known.
-    return _icici_contract_identity_ok(raw) and _icici_runtime_lot_size(instrument) > 0
+    return _groww_contract_identity_ok(raw) and _groww_runtime_lot_size(instrument) > 0
 
 
-def _icici_select_contract_for_thesis(
+def _groww_select_contract_for_thesis(
     instrument: Any,
     data_manager: Any,
     thesis_side: str,
@@ -410,7 +410,7 @@ def _icici_select_contract_for_thesis(
     )
 
 
-def _icici_execution_atr(data_manager: Any, entry_premium: float = 0.0, period: int = 14) -> float:
+def _groww_execution_atr(data_manager: Any, entry_premium: float = 0.0, period: int = 14) -> float:
     try:
         getter = getattr(data_manager, "get_execution_candles", None) or getattr(data_manager, "get_candles", None)
         candles = getter("5m", max(period + 2, 60)) if callable(getter) else []
@@ -418,9 +418,9 @@ def _icici_execution_atr(data_manager: Any, entry_premium: float = 0.0, period: 
         rows = rows[:-1] if len(rows) > 1 else []  # the option feed includes a forming bar
         trs: List[float] = []
         for i in range(1, len(rows)):
-            h = _icici_float(rows[i].get("h", rows[i].get("high")), 0.0)
-            l = _icici_float(rows[i].get("l", rows[i].get("low")), 0.0)
-            prev_close = _icici_float(rows[i - 1].get("c", rows[i - 1].get("close")), 0.0)
+            h = _groww_float(rows[i].get("h", rows[i].get("high")), 0.0)
+            l = _groww_float(rows[i].get("l", rows[i].get("low")), 0.0)
+            prev_close = _groww_float(rows[i - 1].get("c", rows[i - 1].get("close")), 0.0)
             if h <= 0 or l <= 0 or prev_close <= 0 or h < l:
                 continue
             trs.append(max(h - l, abs(h - prev_close), abs(l - prev_close)))
@@ -432,19 +432,19 @@ def _icici_execution_atr(data_manager: Any, entry_premium: float = 0.0, period: 
     except Exception:
         pass
     prem = float(entry_premium or 0.0)
-    return prem * max(0.02, _icici_float(_cfg("ICICI_OPTION_MIN_PREMIUM_RISK_PCT", 0.14), 0.14) * 0.50) if prem > 0 else 0.0
+    return prem * max(0.02, _groww_float(_cfg("GROWW_OPTION_MIN_PREMIUM_RISK_PCT", 0.14), 0.14) * 0.50) if prem > 0 else 0.0
 
 
-def _icici_market_session_open() -> tuple[bool, str]:
+def _groww_market_session_open() -> tuple[bool, str]:
     try:
-        from exchanges.icici.market_session import icici_market_session_state
-        state = icici_market_session_state()
+        from exchanges.groww.market_session import groww_market_session_state
+        state = groww_market_session_state()
         return bool(state.is_open), str(state.reason)
     except Exception as exc:
-        return False, f"ICICI market session unavailable: {exc}"
+        return False, f"GROWW market session unavailable: {exc}"
 
 
-def _icici_option_premium_levels(
+def _groww_option_premium_levels(
     *,
     thesis_side: str,
     premium_entry: float,
@@ -465,12 +465,12 @@ def _icici_option_premium_levels(
     if side == "short" and not (u_tp < u_entry < u_sl):
         return None, None, "bearish_underlying_levels_not_protective"
 
-    delta_abs = _icici_selected_delta(instrument)
-    mult = max(0.25, _icici_float(_cfg("ICICI_OPTION_SLTP_DELTA_MULT", 1.0), 1.0))
-    convex_bonus = max(0.0, _icici_float(_cfg("ICICI_OPTION_PREMIUM_TP_CONVEXITY_BONUS", 0.08), 0.08))
-    min_risk_pct = max(0.01, _icici_float(_cfg("ICICI_OPTION_MIN_PREMIUM_RISK_PCT", 0.14), 0.14))
-    max_risk_pct = max(min_risk_pct, _icici_float(_cfg("ICICI_OPTION_MAX_PREMIUM_RISK_PCT", 0.58), 0.58))
-    min_tp_pct = max(0.01, _icici_float(_cfg("ICICI_OPTION_MIN_TP_PREMIUM_PCT", 0.18), 0.18))
+    delta_abs = _groww_selected_delta(instrument)
+    mult = max(0.25, _groww_float(_cfg("GROWW_OPTION_SLTP_DELTA_MULT", 1.0), 1.0))
+    convex_bonus = max(0.0, _groww_float(_cfg("GROWW_OPTION_PREMIUM_TP_CONVEXITY_BONUS", 0.08), 0.08))
+    min_risk_pct = max(0.01, _groww_float(_cfg("GROWW_OPTION_MIN_PREMIUM_RISK_PCT", 0.14), 0.14))
+    max_risk_pct = max(min_risk_pct, _groww_float(_cfg("GROWW_OPTION_MAX_PREMIUM_RISK_PCT", 0.58), 0.58))
+    min_tp_pct = max(0.01, _groww_float(_cfg("GROWW_OPTION_MIN_TP_PREMIUM_PCT", 0.18), 0.18))
     min_rr = max(1.0, float(policy_value("min_rr", _cfg("MIN_RISK_REWARD_RATIO", 1.6), instrument)))
     max_rr = max(min_rr, float(policy_value("max_rr", _cfg("QUANT_TP_MAX_RR", 4.0), instrument)))
 
@@ -481,7 +481,7 @@ def _icici_option_premium_levels(
     sl_dist = max(prem * min_risk_pct, min(sl_dist, prem * max_risk_pct))
     tp_dist = max(tp_dist, prem * min_tp_pct, sl_dist * min_rr)
     tp_dist = min(tp_dist, sl_dist * max_rr)
-    tick = max(QCfg.TICK_SIZE(), _icici_float(_cfg("ICICI_OPTION_TICK_SIZE", 0.05), 0.05), 1e-9)
+    tick = max(QCfg.TICK_SIZE(), _groww_float(_cfg("GROWW_OPTION_TICK_SIZE", 0.05), 0.05), 1e-9)
     sl = prem - sl_dist
     if sl <= tick:
         return None, None, "option_premium_stop_would_be_near_zero"
@@ -806,7 +806,7 @@ class PositionState:
     pnl_model: str = "linear"          # linear | inverse_btcusd
     quantity_unit: str = "units"
     # Signal-domain state for derivatives whose execution mark is a premium
-    # but whose liquidity thesis is formed on an underlying (ICICI NFO options).
+    # but whose liquidity thesis is formed on an underlying (GROWW NFO options).
     thesis_side: str = ""
     analysis_entry_price: float = 0.0
     analysis_sl_price: float = 0.0
@@ -1130,7 +1130,7 @@ class QuantStrategy:
             asset = getattr(inst, "asset_id", QCfg.SYMBOL())
             venues = ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in getattr(inst, "by_exchange", {}).items()) if inst is not None else QCfg.EXCHANGE().upper()
             logger.info(f"   {asset} | {QCfg.SYMBOL()} | venues={venues} | leverage_cap={QCfg.LEVERAGE()}x | margin_policy={QCfg.MARGIN_PCT():.0%}")
-        _is_nifty_profile = str(getattr(inst, "asset_id", "") or "").upper() in {"NIFTY", "NIFTY50", "CNXNIFTY"} and str(QCfg.EXCHANGE()).lower() == "icici"
+        _is_nifty_profile = str(getattr(inst, "asset_id", "") or "").upper() in {"NIFTY", "NIFTY50", "CNXNIFTY"} and str(QCfg.EXCHANGE()).lower() == "groww"
         if _is_nifty_profile:
             logger.info(f"   EntryAuthority: {'ACTIVE' if self._entry_engine is not None else 'UNAVAILABLE'} | NIFTY intraday phase → same-direction 1m/5m liquidity-sweep reclaim")
             logger.info(f"   LiquidityMap: {'ACTIVE' if self._liq_map is not None else 'UNAVAILABLE'} | fast cash-out targets=nearest real 5m/15m+ directional pool")
@@ -1304,7 +1304,7 @@ class QuantStrategy:
             # Fast Indian-index option booking: nearest live liquidity pool is
             # the objective. Premium-side fee/viability validation still runs
             # after the actual CE/PE vehicle is activated.
-            floor = max(1.0, float(getattr(config, "ICICI_NIFTY_TREND_SWEEP_MIN_RR", 1.15) or 1.15))
+            floor = max(1.0, float(getattr(config, "GROWW_NIFTY_TREND_SWEEP_MIN_RR", 1.15) or 1.15))
         return floor
 
     def _target_pool_realism(self, signal, liq_snapshot, side: str,
@@ -1987,7 +1987,7 @@ class QuantStrategy:
     def _analysis_unit(self) -> str:
         try:
             ctx = self._position_accounting_context()
-            if str(ctx.get("exchange", "")).lower() == "icici":
+            if str(ctx.get("exchange", "")).lower() == "groww":
                 return "NIFTYpts"
             return str(ctx.get("currency_symbol", "$"))
         except Exception:
@@ -2005,7 +2005,7 @@ class QuantStrategy:
     def _audit_structural_inputs(self, data_manager, candles_by_tf: Dict[str, List[Dict]], price: float, now: float) -> Dict[str, Any]:
         """Validate analysis lineage while exposing execution-domain readiness separately.
 
-        ICICI is deliberately dual-domain: NIFTY underlying bars may remain live
+        GROWW is deliberately dual-domain: NIFTY underlying bars may remain live
         while the selected CE/PE vehicle is not executable. Structural awareness
         continues, but an option order can never inherit a false PASS from the
         underlying feed.
@@ -2055,7 +2055,7 @@ class QuantStrategy:
         execution_blockers: List[str] = []
         execution_snapshot_fresh = execution_fresh
         preselected_ready = bool(execution_status.get("session_vehicle_stream_ready", False))
-        # ICICI is dual-domain: REST/prewarm premiums and the live NIFTY
+        # GROWW is dual-domain: REST/prewarm premiums and the live NIFTY
         # underlying may both be fresh while neither selected option vehicle has
         # emitted an identity-routed websocket tick. For order readiness, a live
         # CE/PE websocket route is authoritative; REST snapshot freshness must
@@ -2254,7 +2254,7 @@ class QuantStrategy:
                 ce_age = "N/A" if ce.get("ws_age_sec") is None else f"{float(ce.get('ws_age_sec')):.2f}s"
                 pe_age = "N/A" if pe.get("ws_age_sec") is None else f"{float(pe.get('ws_age_sec')):.2f}s"
                 logger.info(
-                    "📡 ICICI_EXECUTION_FRESHNESS state=%s gate=%s | CE=%s ws_fresh=%s age=%s prem=%s bid=%s ask=%s | PE=%s ws_fresh=%s age=%s prem=%s bid=%s ask=%s",
+                    "📡 GROWW_EXECUTION_FRESHNESS state=%s gate=%s | CE=%s ws_fresh=%s age=%s prem=%s bid=%s ask=%s | PE=%s ws_fresh=%s age=%s prem=%s bid=%s ask=%s",
                     session_book.get("status", "MISSING"), _gate, ce.get("symbol", "n/a"), "Y" if ce.get("ws_fresh") else "N", ce_age,
                     self._decision_fmt(ce, "live_premium", ".2f"), self._decision_fmt(ce, "live_bid", ".2f"), self._decision_fmt(ce, "live_ask", ".2f"),
                     pe.get("symbol", "n/a"), "Y" if pe.get("ws_fresh") else "N", pe_age,
@@ -2367,7 +2367,7 @@ class QuantStrategy:
             return
         pol = active_policy(getattr(self, "_instrument", None))
         structural_min_rr = (
-            max(1.0, float(getattr(config, "ICICI_NIFTY_TREND_SWEEP_MIN_RR", 1.15) or 1.15))
+            max(1.0, float(getattr(config, "GROWW_NIFTY_TREND_SWEEP_MIN_RR", 1.15) or 1.15))
             if self._analysis_unit() == "NIFTYpts" else float(pol.min_rr)
         )
         self._entry_engine.set_structural_delivery_policy(structural_min_rr, float(pol.max_rr))
@@ -2406,7 +2406,7 @@ class QuantStrategy:
         # NFO quote/depth check must pass immediately before GTT cover-OCO
         # placement. There is no delayed queued signal and no stale/naked order.
         if self._analysis_unit() == "NIFTYpts" and not bool(quality.get("execution_ready_for_order", False)):
-            _commit_preflight_allowed = bool(getattr(config, "ICICI_EXECUTION_PREFLIGHT_EXACT_QUOTE_ENABLED", True))
+            _commit_preflight_allowed = bool(getattr(config, "GROWW_EXECUTION_PREFLIGHT_EXACT_QUOTE_ENABLED", True))
             if _commit_preflight_allowed:
                 logger.info(
                     "NIFTY structural setup reached execution commitment with websocket vehicle not ready; "
@@ -2417,8 +2417,8 @@ class QuantStrategy:
                 blocked_info = dict(info)
                 blocked_info.update({
                     "state": "EXECUTION_BLOCKED",
-                    "block_reason": "ICICI_EXECUTION_VEHICLE_NOT_FRESH",
-                    "trigger": "PRE_ORDER_ICICI_OPTION_EXECUTION_FRESHNESS",
+                    "block_reason": "GROWW_EXECUTION_VEHICLE_NOT_FRESH",
+                    "trigger": "PRE_ORDER_GROWW_OPTION_EXECUTION_FRESHNESS",
                     "entry_5m_atr": atr,
                     "atr_percentile": self._atr_5m.get_percentile(),
                     "authority": "UNIFIED_STRUCTURAL_AUCTION",
@@ -2430,8 +2430,8 @@ class QuantStrategy:
                     ",".join(str(x) for x in quality.get("execution_blockers", [])),
                 )
                 self._entry_engine.mark_signal_deferred(
-                    side, "icici_execution_vehicle_not_fresh",
-                    cooldown_sec=float(getattr(config, "ICICI_EXECUTION_SIGNAL_DEFER_COOLDOWN_SEC", 5.0) or 5.0),
+                    side, "groww_execution_vehicle_not_fresh",
+                    cooldown_sec=float(getattr(config, "GROWW_EXECUTION_SIGNAL_DEFER_COOLDOWN_SEC", 5.0) or 5.0),
                 )
                 return
         rr = abs(tp - entry) / max(abs(entry - sl), 1e-12)
@@ -2443,7 +2443,7 @@ class QuantStrategy:
             return
         realism, realism_notes, realism_rejects = self._target_pool_realism(signal, snapshot, side, entry, tp, sl, atr)
         min_realism = (
-            float(getattr(config, "ICICI_NIFTY_TREND_SWEEP_MIN_TARGET_REALISM", 0.42) or 0.42)
+            float(getattr(config, "GROWW_NIFTY_TREND_SWEEP_MIN_TARGET_REALISM", 0.42) or 0.42)
             if self._is_nifty_trend_sweep_signal(signal) else float(getattr(config, "ICT_MIN_TARGET_REALISM_SCORE", 0.58) or 0.58)
         )
         if realism_rejects or realism < min_realism:
@@ -2981,11 +2981,11 @@ class QuantStrategy:
     def _position_accounting_context(self) -> Dict[str, str]:
         """Instrument-scoped settlement metadata for every simultaneous desk."""
         inst = getattr(self, "_instrument", None) or current_instrument()
-        ex = _icici_exchange_name(inst)
+        ex = _groww_exchange_name(inst)
         symbol = str(getattr(inst, "execution_symbol", "") or getattr(inst, "display_symbol", "") or QCfg.SYMBOL())
-        is_inr = ex == "icici"
+        is_inr = ex == "groww"
         if is_inr:
-            selected = _icici_selected_contract_dict(inst)
+            selected = _groww_selected_contract_dict(inst)
             symbol = str(
                 selected.get("selected_symbol")
                 or selected.get("TradingSymbol")
@@ -3015,53 +3015,53 @@ class QuantStrategy:
         sizing, venue leverage constraints, bracket placement and fill adoption.
         """
         self._last_execution_viability = None
-        _icici_chain_mode = bool(getattr(config, "ICICI_LONG_PREMIUM_ONLY", True)) and _is_icici_underlying_chain_instrument(self._instrument)
-        _icici_option_mode = bool(getattr(config, "ICICI_LONG_PREMIUM_ONLY", True)) and _is_icici_option_instrument(self._instrument)
-        _icici_mode = bool(_icici_chain_mode or _icici_option_mode)
-        _icici_thesis_side = str(side or "").lower()
-        _icici_underlying_entry = float(getattr(self._last_entry_signal, "entry_price", 0.0) or 0.0)
-        _icici_selected_choice = None
+        _groww_chain_mode = bool(getattr(config, "GROWW_LONG_PREMIUM_ONLY", True)) and _is_groww_underlying_chain_instrument(self._instrument)
+        _groww_option_mode = bool(getattr(config, "GROWW_LONG_PREMIUM_ONLY", True)) and _is_groww_option_instrument(self._instrument)
+        _groww_mode = bool(_groww_chain_mode or _groww_option_mode)
+        _groww_thesis_side = str(side or "").lower()
+        _groww_underlying_entry = float(getattr(self._last_entry_signal, "entry_price", 0.0) or 0.0)
+        _groww_selected_choice = None
         _accounting = self._position_accounting_context()
         _entry_cur = str(_accounting.get("currency_symbol", "$"))
-        _icici_underlying_atr = 0.0
+        _groww_underlying_atr = 0.0
 
-        def _release_icici_vehicle_if_unfilled(rejection: str) -> None:
+        def _release_groww_vehicle_if_unfilled(rejection: str) -> None:
             # Contract activation switches the primary feed from underlying-mode
             # to option-premium execution-mode.  If the entry is rejected before
             # any fill, restore underlying-mode immediately; otherwise later scans
             # could evaluate NIFTY structure against an option premium.
-            if _icici_selected_choice is None:
+            if _groww_selected_choice is None:
                 return
-            releaser = getattr(data_manager, "release_icici_execution_vehicle", None)
+            releaser = getattr(data_manager, "release_groww_execution_vehicle", None)
             if callable(releaser):
                 try:
                     releaser()
-                    logger.info("ICICI preselected vehicle released before fill: %s", rejection)
+                    logger.info("GROWW preselected vehicle released before fill: %s", rejection)
                 except Exception as exc:
-                    logger.error("ICICI pre-fill vehicle release failed [%s]: %s", rejection, exc)
-        if _icici_mode:
-            _session_open, _session_reason = _icici_market_session_open()
+                    logger.error("GROWW pre-fill vehicle release failed [%s]: %s", rejection, exc)
+        if _groww_mode:
+            _session_open, _session_reason = _groww_market_session_open()
             if not _session_open:
-                logger.info("ICICI options entry skipped: %s", _session_reason)
+                logger.info("GROWW options entry skipped: %s", _session_reason)
                 with self._lock:
                     self._last_tp_gate_rejection = time.time()
                 return
-            if _icici_option_mode and not _icici_chain_mode and not _icici_allowed_thesis_side(self._instrument, _icici_thesis_side):
+            if _groww_option_mode and not _groww_chain_mode and not _groww_allowed_thesis_side(self._instrument, _groww_thesis_side):
                 logger.info(
-                    "ICICI options entry skipped: selected %s does not match %s underlying thesis",
-                    _icici_option_right(self._instrument) or "unknown",
-                    _icici_thesis_side or "unknown",
+                    "GROWW options entry skipped: selected %s does not match %s underlying thesis",
+                    _groww_option_right(self._instrument) or "unknown",
+                    _groww_thesis_side or "unknown",
                 )
                 with self._lock:
                     self._last_tp_gate_rejection = time.time()
                 return
         price = data_manager.get_last_price()
-        _min_price = max(QCfg.TICK_SIZE(), 1e-6) if _icici_mode else 1.0
+        _min_price = max(QCfg.TICK_SIZE(), 1e-6) if _groww_mode else 1.0
         if price < _min_price: return
         atr = self._atr_5m.atr
         if atr < 1e-10: return
-        if _icici_mode:
-            _icici_underlying_atr = float(atr)
+        if _groww_mode:
+            _groww_underlying_atr = float(atr)
 
         # ── Risk gate ─────────────────────────────────────────────────────────────
         # Bug #5 fix: reuse prefetched balance when available; only call the REST
@@ -3074,51 +3074,51 @@ class QuantStrategy:
         if bal_info is None: return
         total_bal = float(bal_info.get("total", bal_info.get("available", 0.0)))
         self._risk_gate.set_opening_balance(total_bal)
-        if _icici_chain_mode:
+        if _groww_chain_mode:
             available_funds = float(bal_info.get("available_raw", bal_info.get("available", 0.0)) or 0.0)
-            if _icici_underlying_entry <= 0.0:
-                _icici_underlying_entry = float(data_manager.get_last_price() or 0.0)
-            _icici_selected_choice = _icici_select_contract_for_thesis(
+            if _groww_underlying_entry <= 0.0:
+                _groww_underlying_entry = float(data_manager.get_last_price() or 0.0)
+            _groww_selected_choice = _groww_select_contract_for_thesis(
                 self._instrument,
                 data_manager,
-                _icici_thesis_side,
-                underlying_spot=_icici_underlying_entry,
+                _groww_thesis_side,
+                underlying_spot=_groww_underlying_entry,
                 available_funds=available_funds,
             )
-            if _icici_selected_choice is None:
+            if _groww_selected_choice is None:
                 logger.info(
-                    "ICICI options entry rejected: no affordable %s contract fit live F&O funds %.2f",
-                    "call" if _icici_thesis_side == "long" else "put" if _icici_thesis_side == "short" else "option",
+                    "GROWW options entry rejected: no affordable %s contract fit live F&O funds %.2f",
+                    "call" if _groww_thesis_side == "long" else "put" if _groww_thesis_side == "short" else "option",
                     available_funds,
                 )
                 with self._lock:
                     self._last_tp_gate_rejection = time.time()
                 return
-            _verified_icici_lot = _icici_runtime_lot_size(self._instrument)
-            if _verified_icici_lot <= 0:
+            _verified_groww_lot = _groww_runtime_lot_size(self._instrument)
+            if _verified_groww_lot <= 0:
                 logger.critical(
-                    "ICICI options entry rejected: selected contract has no verified NFO lot size; refusing unsafe sizing/routing")
+                    "GROWW options entry rejected: selected contract has no verified NFO lot size; refusing unsafe sizing/routing")
                 with self._lock:
                     self._last_tp_gate_rejection = time.time()
                 return
             side = "long"
-            price = _icici_selected_premium(self._instrument, fallback=0.0)
+            price = _groww_selected_premium(self._instrument, fallback=0.0)
             if price <= max(QCfg.TICK_SIZE(), 1e-6):
                 try:
                     rows = list(data_manager.get_execution_candles("1m", 3) or [])
                     for candle in reversed(rows):
-                        px = _icici_float(candle.get("c", candle.get("close")), 0.0)
+                        px = _groww_float(candle.get("c", candle.get("close")), 0.0)
                         if px > max(QCfg.TICK_SIZE(), 1e-6):
                             price = px
                             break
                 except Exception:
                     pass
             if price <= max(QCfg.TICK_SIZE(), 1e-6):
-                logger.info("ICICI options entry rejected: selected option premium is unavailable after contract selection")
+                logger.info("GROWW options entry rejected: selected option premium is unavailable after contract selection")
                 with self._lock:
                     self._last_tp_gate_rejection = time.time()
                 return
-            exec_atr = _icici_execution_atr(data_manager, entry_premium=price)
+            exec_atr = _groww_execution_atr(data_manager, entry_premium=price)
             if exec_atr > 1e-10:
                 atr = exec_atr
             # Contract activation changes the executable instrument identity from
@@ -3127,17 +3127,17 @@ class QuantStrategy:
             _accounting = self._position_accounting_context()
             _entry_cur = str(_accounting.get("currency_symbol", "₹"))
             logger.info(
-                "ICICI preselected session execution vehicle activated: %s %s strike=%s expiry=%s live_premium=%.2f lot=%.0f live_cost=%.2f funds=%.2f",
-                getattr(_icici_selected_choice, "right", ""),
-                getattr(_icici_selected_choice, "selected_symbol", ""),
-                getattr(_icici_selected_choice, "strike", 0.0),
-                getattr(_icici_selected_choice, "expiry", ""),
+                "GROWW preselected session execution vehicle activated: %s %s strike=%s expiry=%s live_premium=%.2f lot=%.0f live_cost=%.2f funds=%.2f",
+                getattr(_groww_selected_choice, "right", ""),
+                getattr(_groww_selected_choice, "selected_symbol", ""),
+                getattr(_groww_selected_choice, "strike", 0.0),
+                getattr(_groww_selected_choice, "expiry", ""),
                 price,
-                _icici_runtime_lot_size(self._instrument),
-                _icici_runtime_lot_size(self._instrument) * price,
+                _groww_runtime_lot_size(self._instrument),
+                _groww_runtime_lot_size(self._instrument) * price,
                 available_funds,
             )
-        elif _icici_option_mode:
+        elif _groww_option_mode:
             side = "long"
         # NOTE: risk gate already checked in _evaluate_entry — no duplicate check here
 
@@ -3155,8 +3155,8 @@ class QuantStrategy:
         offset    = float(getattr(config, 'LIMIT_ORDER_OFFSET_TICKS', 3)) * tick
 
         _sig_entry = getattr(self._last_entry_signal, 'entry_price', 0.0) or 0.0
-        if _icici_mode:
-            # The signal entry is the NIFTY underlying FVG rebalance level. ICICI routing
+        if _groww_mode:
+            # The signal entry is the NIFTY underlying FVG rebalance level. GROWW routing
             # must price the selected option premium, not send an index level as
             # an option limit.
             _sig_entry = 0.0
@@ -3202,9 +3202,9 @@ class QuantStrategy:
                 f"— falling back to live book. Signal may be from a prior tick."
             )
 
-        if _icici_mode:
+        if _groww_mode:
             limit_px = _round_to_tick(max(price, QCfg.TICK_SIZE()))
-            mt_reason = f"icici_option_limit_premium={limit_px:.2f}"
+            mt_reason = f"groww_option_limit_premium={limit_px:.2f}"
             use_maker = True
 
         # Keep fee engine updated for diagnostics and TP gate
@@ -3219,7 +3219,7 @@ class QuantStrategy:
         # Bug #34 fix: for book-offset entries, query the fee engine
         # to decide maker vs taker.  structural repricing entries always remain maker
         # (they're limit orders by construction).
-        if not _icici_mode and not _sig_is_valid and self._fee_engine is not None and self._fee_engine.is_warmed_up():
+        if not _groww_mode and not _sig_is_valid and self._fee_engine is not None and self._fee_engine.is_warmed_up():
             try:
                 # Queue urgency is neutral until a replay-calibrated probability exists.
                 # A structural evidence score is not allowed to alter routing cost assumptions.
@@ -3236,7 +3236,7 @@ class QuantStrategy:
             except Exception as _fe_err:
                 logger.debug(f"FeeEngine.decide_entry_type error (non-fatal): {_fe_err}")
 
-        if _icici_mode and limit_px > 0:
+        if _groww_mode and limit_px > 0:
             limit_px = _round_to_tick(max(limit_px, QCfg.TICK_SIZE()))
         entry_ref = limit_px if limit_px > 0 else price
         logger.info(f"Entry routing: {'LIMIT/maker' if use_maker else 'MARKET/taker'} | {mt_reason}")
@@ -3253,29 +3253,29 @@ class QuantStrategy:
         # execution cannot overwrite this geometry.
         _force_sl = getattr(self, '_force_sl', None)
         _force_tp = getattr(self, '_force_tp', None)
-        _analysis_sl_level = float(_force_sl or 0.0) if _icici_mode else 0.0
-        _analysis_tp_level = float(_force_tp or 0.0) if _icici_mode else 0.0
+        _analysis_sl_level = float(_force_sl or 0.0) if _groww_mode else 0.0
+        _analysis_tp_level = float(_force_tp or 0.0) if _groww_mode else 0.0
         _using_force_levels = False
         if _force_sl is not None and _force_tp is not None and _force_sl > 0 and _force_tp > 0:
-            if _icici_mode:
-                _conv_sl, _conv_tp, _conv_reason = _icici_option_premium_levels(
-                    thesis_side=_icici_thesis_side,
+            if _groww_mode:
+                _conv_sl, _conv_tp, _conv_reason = _groww_option_premium_levels(
+                    thesis_side=_groww_thesis_side,
                     premium_entry=entry_ref,
-                    underlying_entry=_icici_underlying_entry,
+                    underlying_entry=_groww_underlying_entry,
                     underlying_sl=float(_force_sl),
                     underlying_tp=float(_force_tp),
                     instrument=self._instrument,
                 )
                 if _conv_sl is None or _conv_tp is None:
-                    logger.info("ICICI options entry rejected: cannot convert NIFTY SL/TP to premium levels (%s)", _conv_reason)
+                    logger.info("GROWW options entry rejected: cannot convert NIFTY SL/TP to premium levels (%s)", _conv_reason)
                     self._force_sl = None
                     self._force_tp = None
                     with self._lock:
                         self._last_tp_gate_rejection = time.time()
-                    _release_icici_vehicle_if_unfilled("premium_sltp_conversion_rejected")
+                    _release_groww_vehicle_if_unfilled("premium_sltp_conversion_rejected")
                     return
                 _fsl, _ftp = _round_structural_levels("long", _conv_sl, _conv_tp)
-                logger.info("ICICI premium SL/TP converted from NIFTY structure: %s", _conv_reason)
+                logger.info("GROWW premium SL/TP converted from NIFTY structure: %s", _conv_reason)
             else:
                 _fsl, _ftp = _round_structural_levels(side, _force_sl, _force_tp)
             _dir_ok = False
@@ -3297,7 +3297,7 @@ class QuantStrategy:
                 "liquidity TP + ICT/liquidity SL levels; refusing entry")
             with self._lock:
                 self._last_tp_gate_rejection = time.time()
-            _release_icici_vehicle_if_unfilled("no_executable_structural_levels")
+            _release_groww_vehicle_if_unfilled("no_executable_structural_levels")
             return
         else:
             # Force levels active; fee/slippage expectancy is a hard execution gate.
@@ -3315,20 +3315,20 @@ class QuantStrategy:
                             f"< required {_min_tp:.0f} after fees/slippage")
                         with self._lock:
                             self._last_tp_gate_rejection = time.time()
-                        _release_icici_vehicle_if_unfilled("fee_floor_rejected")
+                        _release_groww_vehicle_if_unfilled("fee_floor_rejected")
                         return
                 except Exception:
                     pass
         if sl_price is None:
             with self._lock:
                 self._last_tp_gate_rejection = time.time()
-            _release_icici_vehicle_if_unfilled("sl_missing")
+            _release_groww_vehicle_if_unfilled("sl_missing")
             return
 
         sd = abs(entry_ref - sl_price)
         td = abs(entry_ref - tp_price)
         if sd < 1e-10:
-            _release_icici_vehicle_if_unfilled("zero_stop_distance")
+            _release_groww_vehicle_if_unfilled("zero_stop_distance")
             return
         rr = td / sd
         _execution_policy = active_policy(getattr(self, "_instrument", None))
@@ -3339,10 +3339,10 @@ class QuantStrategy:
                 rr, _execution_min_rr)
             with self._lock:
                 self._last_tp_gate_rejection = time.time()
-            _release_icici_vehicle_if_unfilled("post_rounding_rr_below_floor")
+            _release_groww_vehicle_if_unfilled("post_rounding_rr_below_floor")
             return
-        if _icici_mode:
-            logger.info("ICICI long-premium option: liquidation guard skipped; paid premium is the maximum loss envelope")
+        if _groww_mode:
+            logger.info("GROWW long-premium option: liquidation guard skipped; paid premium is the maximum loss envelope")
 
         # ── Structural order sequence: size from exact invalidation distance ──────────────────────
         # Now that sl_price is known, size from dollar risk / actual SL distance.
@@ -3377,7 +3377,7 @@ class QuantStrategy:
         sd = abs(entry_ref - sl_price)
         td = abs(entry_ref - tp_price)
         if sd < 1e-10:
-            _release_icici_vehicle_if_unfilled("post_surface_zero_stop_distance")
+            _release_groww_vehicle_if_unfilled("post_surface_zero_stop_distance")
             return
         rr = td / sd
         executed_viability = self._execution_viability_model(
@@ -3391,7 +3391,7 @@ class QuantStrategy:
                 f"{executed_viability.net_win_r:.2f}" if executed_viability.utility_known else "N/A",
                 f"{executed_viability.expected_net_utility_r:+.2f}R" if executed_viability.utility_known else "N/A",
                 executed_viability.fee_to_risk, executed_viability.reason)
-            _release_icici_vehicle_if_unfilled("execution_cost_geometry_rejected")
+            _release_groww_vehicle_if_unfilled("execution_cost_geometry_rejected")
             return
         if executed_viability.utility_known and executed_viability.expected_net_utility_r <= 0.0:
             logger.info(
@@ -3416,11 +3416,11 @@ class QuantStrategy:
             # evaluation appears to stop after a minimum-lot sizing reject.
             with self._lock:
                 self._last_tp_gate_rejection = time.time()
-            _release_icici_vehicle_if_unfilled("sizing_rejected")
+            _release_groww_vehicle_if_unfilled("sizing_rejected")
             return
 
         _actual_entry_lev = float(getattr(self, "_active_effective_leverage", QCfg.LEVERAGE()) or QCfg.LEVERAGE())
-        if not _icici_mode:
+        if not _groww_mode:
             _liq_ok, _liq_px, _liq_guard, _liq_reason = self._sl_liquidation_sanity(
                 side, entry_ref, sl_price, leverage_override=_actual_entry_lev)
             if not _liq_ok:
@@ -3518,10 +3518,10 @@ class QuantStrategy:
             _active_exchange == "delta" and
             bool(getattr(config, "DELTA_REQUIRE_NATIVE_BRACKET", True))
         )
-        # ICICI NFO options must never fall back to a naked buy order.  If the
-        # official Breeze protected GTT path is disabled or rejected, the entry
+        # GROWW NFO options must never fall back to a naked buy order.  If the
+        # official Groww protected GTT path is disabled or rejected, the entry
         # is refused rather than routed through standalone post-fill protection.
-        _icici_requires_protected_oco = (_active_exchange == "icici")
+        _groww_requires_protected_oco = (_active_exchange == "groww")
 
         entry_data = order_manager.place_bracket_limit_entry(
             side=side, quantity=qty,
@@ -3532,7 +3532,7 @@ class QuantStrategy:
         )
         if entry_data is not None:
             is_bracket = bool(entry_data.get("bracket_order", False))
-        elif _delta_requires_native_bracket or _icici_requires_protected_oco:
+        elif _delta_requires_native_bracket or _groww_requires_protected_oco:
             _bracket_err = getattr(order_manager, "last_order_error", None)
             _err_reason = ""
             _err_stage = ""
@@ -3545,7 +3545,7 @@ class QuantStrategy:
                 _err_reason = ""
                 _err_stage = ""
 
-            _protected_model = "ICICI official GTT cover-OCO" if _icici_requires_protected_oco else "Delta native bracket"
+            _protected_model = "GROWW official GTT cover-OCO" if _groww_requires_protected_oco else "Delta native bracket"
             if "fill_timeout" in _err_stage:
                 logger.warning(
                     f"⚠️ {_protected_model} entry timed out unfilled — order was "
@@ -3577,10 +3577,10 @@ class QuantStrategy:
         if not entry_data:
             logger.error("❌ Entry order failed")
             self._last_exit_time = time.time()  # engage cooldown — prevents hammer-retrying
-            _release_icici_vehicle_if_unfilled("entry_order_not_filled_or_rejected")
+            _release_groww_vehicle_if_unfilled("entry_order_not_filled_or_rejected")
             return
 
-        if (_delta_requires_native_bracket or _icici_requires_protected_oco) and not is_bracket:
+        if (_delta_requires_native_bracket or _groww_requires_protected_oco) and not is_bracket:
             logger.error(
                 "❌ Protected-entry desk returned without bracket_order=True — refusing to "
                 "treat it as an active position because TP/SL are not broker-attached."
@@ -3722,7 +3722,7 @@ class QuantStrategy:
         exit_side = "sell" if side == "long" else "buy"
 
         if is_bracket:
-            # Broker-protected entry: Delta uses native bracket children; ICICI
+            # Broker-protected entry: Delta uses native bracket children; GROWW
             # uses official GTT cover-OCO target/stoploss legs.
             sl_order_id_raw = entry_data.get("bracket_sl_order_id", "")
             tp_order_id_raw = entry_data.get("bracket_tp_order_id", "")
@@ -3766,13 +3766,13 @@ class QuantStrategy:
                 self._last_exit_time = time.time()
                 return
 
-            if _icici_mode:
-                # Legacy compatibility branch only.  Default ICICI execution is
+            if _groww_mode:
+                # Legacy compatibility branch only.  Default GROWW execution is
                 # mandatory official GTT cover-OCO above; it cannot fall through
                 # here while protected-entry policy is active.
                 tp_data = None
                 logger.info(
-                    "ICICI LEGACY single-live-exit branch reached: protective NFO STOPLOSS armed; "
+                    "GROWW LEGACY single-live-exit branch reached: protective NFO STOPLOSS armed; "
                     "protected GTT routing should be enabled for live trading")
             else:
                 tp_data = order_manager.place_take_profit(
@@ -3788,11 +3788,11 @@ class QuantStrategy:
             side=side, entry_price=fill_price, sl_price=sl_price,
             final_tp=tp_price, quantity=qty, atr=atr,
             use_maker_entry=(str(actual_fill_type or "").lower() == "maker"))
-        if _icici_mode:
+        if _groww_mode:
             tp_ladder_dicts = [l.as_dict() for l in getattr(tp_ladder_plan, "legs", [])] if tp_ladder_plan is not None else []
             tp_ladder_order_ids = []
             logger.info(
-                "ICICI TP_LADDER analytical-only: %d levels computed; official broker GTT target/stoploss remain the only exit authority",
+                "GROWW TP_LADDER analytical-only: %d levels computed; official broker GTT target/stoploss remain the only exit authority",
                 len(tp_ladder_dicts))
         else:
             tp_ladder_dicts, tp_ladder_order_ids = self._place_internal_tp_ladder(
@@ -3883,11 +3883,11 @@ class QuantStrategy:
             currency_symbol = str(_accounting.get("currency_symbol", "$")),
             pnl_model = str(_accounting.get("pnl_model", "linear")),
             quantity_unit = str(_accounting.get("quantity_unit", "units")),
-            thesis_side = (_icici_thesis_side if _icici_mode else side),
-            analysis_entry_price = (_icici_underlying_entry if _icici_mode else fill_price),
-            analysis_sl_price = (_analysis_sl_level if _icici_mode else sl_price),
-            analysis_tp_price = (_analysis_tp_level if _icici_mode else tp_price),
-            analysis_atr = (_icici_underlying_atr if _icici_mode else float(self._atr_5m.atr or 0.0)),
+            thesis_side = (_groww_thesis_side if _groww_mode else side),
+            analysis_entry_price = (_groww_underlying_entry if _groww_mode else fill_price),
+            analysis_sl_price = (_analysis_sl_level if _groww_mode else sl_price),
+            analysis_tp_price = (_analysis_tp_level if _groww_mode else tp_price),
+            analysis_atr = (_groww_underlying_atr if _groww_mode else float(self._atr_5m.atr or 0.0)),
         )
         # ── Reconcile safety: discard any in-flight reconcile data ────────────────
         self._reconcile_data        = None
@@ -4000,7 +4000,7 @@ class QuantStrategy:
             and str(getattr(pos, "archetype", "") or "").upper() == "NIFTY_TREND_SWEEP_SCALP"
         )
         if nifty_fast_exit:
-            max_hold = min(max_hold, float(getattr(config, "ICICI_NIFTY_TREND_SWEEP_MAX_HOLD_SEC", 720.0) or 720.0))
+            max_hold = min(max_hold, float(getattr(config, "GROWW_NIFTY_TREND_SWEEP_MAX_HOLD_SEC", 720.0) or 720.0))
         init_r = float(getattr(pos, "initial_sl_dist", 0.0) or 0.0)
         if init_r <= 1e-10:
             init_r = abs(float(getattr(pos, "entry_price", 0.0) or 0.0) - float(getattr(pos, "sl_price", 0.0) or 0.0))
@@ -4013,11 +4013,11 @@ class QuantStrategy:
         age = max(0.0, float(now) - entry_time)
 
         if nifty_fast_exit:
-            early_frac = float(getattr(config, "ICICI_NIFTY_TREND_SWEEP_FAILED_AUCTION_FRACTION", 0.35) or 0.35)
-            failed_r = float(getattr(config, "ICICI_NIFTY_TREND_SWEEP_FAILED_AUCTION_R", -0.15) or -0.15)
-            failed_mfe_r = float(getattr(config, "ICICI_NIFTY_TREND_SWEEP_FAILED_AUCTION_MAX_MFE_R", 0.30) or 0.30)
-            min_delivery_r = float(getattr(config, "ICICI_NIFTY_TREND_SWEEP_MIN_PROGRESS_R", 0.15) or 0.15)
-            hard_mult = float(getattr(config, "ICICI_NIFTY_TREND_SWEEP_HARD_MAX_MULT", 1.0) or 1.0)
+            early_frac = float(getattr(config, "GROWW_NIFTY_TREND_SWEEP_FAILED_AUCTION_FRACTION", 0.35) or 0.35)
+            failed_r = float(getattr(config, "GROWW_NIFTY_TREND_SWEEP_FAILED_AUCTION_R", -0.15) or -0.15)
+            failed_mfe_r = float(getattr(config, "GROWW_NIFTY_TREND_SWEEP_FAILED_AUCTION_MAX_MFE_R", 0.30) or 0.30)
+            min_delivery_r = float(getattr(config, "GROWW_NIFTY_TREND_SWEEP_MIN_PROGRESS_R", 0.15) or 0.15)
+            hard_mult = float(getattr(config, "GROWW_NIFTY_TREND_SWEEP_HARD_MAX_MULT", 1.0) or 1.0)
         else:
             early_frac = float(getattr(config, "QUANT_TIME_STOP_EARLY_FRACTION", 0.55) or 0.55)
             failed_r = float(getattr(config, "QUANT_TIME_STOP_FAILED_AUCTION_R", -0.35) or -0.35)
@@ -4037,7 +4037,7 @@ class QuantStrategy:
         """Manage protected exposure without introducing a second alpha authority.
 
         Delta/CoinSwitch positions are monetised through their exchange-resident
-        liquidity targets.  ICICI long-premium entries use Breeze's official
+        liquidity targets.  GROWW long-premium entries use Groww's official
         three-leg cover-OCO: once armed, its target and stoploss legs own normal
         TP/SL execution.  Strategy-managed early/time exits may cancel the OCO
         plan first, but must not race the native target on an ordinary TP touch.
@@ -4063,7 +4063,7 @@ class QuantStrategy:
         side = str(getattr(pos, "side", "") or "").lower()
         tp = float(getattr(pos, "tp_price", 0.0) or 0.0)
         tp_hit = tp > 0.0 and ((side == "long" and price >= tp) or (side == "short" and price <= tp))
-        if exchange == "icici" and tp_hit and pos.phase == PositionPhase.ACTIVE:
+        if exchange == "groww" and tp_hit and pos.phase == PositionPhase.ACTIVE:
             cur = str(getattr(pos, "currency_symbol", "") or "₹")
             protected_gtt = (
                 str(getattr(pos, "sl_order_id", "") or "").startswith("GTT:")
@@ -4071,13 +4071,13 @@ class QuantStrategy:
             )
             if protected_gtt:
                 logger.info(
-                    "ICICI broker GTT target zone reached: premium=%s%.4f target=%s%.4f; "
+                    "GROWW broker GTT target zone reached: premium=%s%.4f target=%s%.4f; "
                     "cover-OCO owns normal TP execution; requesting exact reconciliation",
                     cur, price, cur, tp)
                 self._last_reconcile_time = 0.0
                 return
             logger.warning(
-                "ICICI legacy supervised target reached without protected GTT ids: premium=%s%.4f target=%s%.4f; "
+                "GROWW legacy supervised target reached without protected GTT ids: premium=%s%.4f target=%s%.4f; "
                 "attempting protected strategy close", cur, price, cur, tp)
             self._exit_trade(order_manager, price, "liquidity_tp_hit")
             return
@@ -4099,7 +4099,7 @@ class QuantStrategy:
         if pos is None or pos.is_flat() or pos.phase != PositionPhase.ACTIVE:
             return False
         exit_side = "sell" if pos.side == "long" else "buy"
-        cur = str(getattr(pos, "currency_symbol", "") or ("₹" if _icici_exchange_name(getattr(self, "_instrument", None)) == "icici" else "$"))
+        cur = str(getattr(pos, "currency_symbol", "") or ("₹" if _groww_exchange_name(getattr(self, "_instrument", None)) == "groww" else "$"))
         with self._lock:
             if self._pos.phase != PositionPhase.ACTIVE:
                 return False
@@ -4180,7 +4180,7 @@ class QuantStrategy:
           - fee_breakdown.exact_fees = True signals that exit side is exact
         """
         pos = self._pos
-        _cur = str(getattr(pos, "currency_symbol", "") or ("₹" if _icici_exchange_name(getattr(self, "_instrument", None)) == "icici" else "$"))
+        _cur = str(getattr(pos, "currency_symbol", "") or ("₹" if _groww_exchange_name(getattr(self, "_instrument", None)) == "groww" else "$"))
         if pos.phase == PositionPhase.FLAT:
             logger.debug("_record_exchange_exit skipped — already FLAT")
             return
@@ -4346,7 +4346,7 @@ class QuantStrategy:
             exit_reason = "protective_sl_hit"; is_tp_hit = False; is_sl_hit = True
         elif exit_type == "manual_exit":
             # Preserve the broker-confirmed supervised-close reason. A locally
-            # supervised ICICI liquidity target is economically a TP even though
+            # supervised GROWW liquidity target is economically a TP even though
             # the broker sees one explicit priced SELL-to-close after SL cancel.
             exit_reason = str(exit_info.get('exit_reason') or getattr(pos, 'manual_exit_reason', '') or 'manual_exit')
             is_tp_hit = exit_reason in ("liquidity_tp_hit", "tp_hit", "final_tp_hit")
@@ -4383,7 +4383,7 @@ class QuantStrategy:
             inverse=bool(_is_inverse and fill_price > 0),
         )
 
-        # Fees are booked only when returned by the venue.  CoinSwitch and ICICI
+        # Fees are booked only when returned by the venue.  CoinSwitch and GROWW
         # charges must not be guessed using Delta/global commission constants.
         if not bool(getattr(pos, "entry_fee_exact", False)):
             entry_order_id = str(getattr(pos, "entry_order_id", "") or "").strip()
@@ -4641,13 +4641,13 @@ class QuantStrategy:
                 rm.set_position_open(False)
         except Exception as exc:
             logger.debug("risk-manager flat notification skipped: %s", exc)
-        if _icici_exchange_name(getattr(self, "_instrument", None)) == "icici":
+        if _groww_exchange_name(getattr(self, "_instrument", None)) == "groww":
             try:
-                releaser = getattr(getattr(self, "_dm", None), "release_icici_execution_vehicle", None)
+                releaser = getattr(getattr(self, "_dm", None), "release_groww_execution_vehicle", None)
                 if callable(releaser):
                     releaser()
             except Exception as exc:
-                logger.exception("ICICI execution-vehicle release failed: %s", exc)
+                logger.exception("GROWW execution-vehicle release failed: %s", exc)
         self._pos = PositionState()
         self._last_exit_time = time.time()
         self.current_sl_price = 0.0
@@ -4834,15 +4834,15 @@ class QuantStrategy:
         max_qty = max(min_qty, float(QCfg.MAX_QTY()))
         leverage = max(float(QCfg.LEVERAGE()), 1.0)
         _inst_for_sizing = getattr(self, "_instrument", None)
-        is_icici_option = _is_icici_option_instrument(_inst_for_sizing) or _is_icici_underlying_chain_instrument(_inst_for_sizing)
-        if is_icici_option:
-            lot = _icici_runtime_lot_size(_inst_for_sizing)
+        is_groww_option = _is_groww_option_instrument(_inst_for_sizing) or _is_groww_underlying_chain_instrument(_inst_for_sizing)
+        if is_groww_option:
+            lot = _groww_runtime_lot_size(_inst_for_sizing)
             if lot <= 0:
-                logger.critical("_compute_quantity: ICICI option contract lacks verified NFO lot size — no allocation")
+                logger.critical("_compute_quantity: GROWW option contract lacks verified NFO lot size — no allocation")
                 return None
             step = max(step, lot)
             min_qty = max(min_qty, lot)
-            max_qty = max(min_qty, float(_cfg("ICICI_OPTION_MAX_QTY", 1000000.0)))
+            max_qty = max(min_qty, float(_cfg("GROWW_OPTION_MAX_QTY", 1000000.0)))
             leverage = 1.0
 
         # ── Institutional risk boundary ───────────────────────────────────────
@@ -5401,7 +5401,7 @@ class QuantStrategy:
                            "TAKE_PROFIT_MARKET_ORDER","TAKE_PROFIT_ORDER") or
                     ("PROFIT" in ot or "TAKE_PROFIT" in ot))
         if (phase == PositionPhase.FLAT and ex_size < QCfg.MIN_QTY()
-                and _icici_exchange_name(getattr(self, "_instrument", None)) == "icici"
+                and _groww_exchange_name(getattr(self, "_instrument", None)) == "groww"
                 and bool(ex_pos.get("position_scope_verified"))):
             # A strict NFO PortfolioPositions verification supersedes any stale
             # ghost/unmanaged alarm retained from an earlier malformed response.
@@ -5418,19 +5418,19 @@ class QuantStrategy:
                     settle_sec,
                 )
                 return
-            _is_icici_reconcile = _icici_exchange_name(getattr(self, "_instrument", None)) == "icici"
-            if _is_icici_reconcile:
-                _session_open, _session_reason = _icici_market_session_open()
+            _is_groww_reconcile = _groww_exchange_name(getattr(self, "_instrument", None)) == "groww"
+            if _is_groww_reconcile:
+                _session_open, _session_reason = _groww_market_session_open()
                 if not _session_open:
                     self._last_unmanaged_external_position = dict(ex_pos)
                     logger.critical(
-                        "ICICI reconcile found a broker position while NSE/NFO is closed (%s); "
+                        "GROWW reconcile found a broker position while NSE/NFO is closed (%s); "
                         "refusing bot adoption/analysis. Manual broker review required.",
                         _session_reason,
                     )
                     try:
                         self._send_telegram(
-                            "🚨 <b>ICICI POSITION NOT ADOPTED</b>\n"
+                            "🚨 <b>GROWW POSITION NOT ADOPTED</b>\n"
                             "<b>NIFTY option desk is closed</b>\n"
                             f"Reason: <code>{_session_reason}</code>\n"
                             "The bot will not analyse or manage this after-hours position automatically. "
@@ -5444,14 +5444,14 @@ class QuantStrategy:
                 if bool(ex_pos.get("unadoptable")):
                     self._last_unmanaged_external_position = dict(ex_pos)
                     logger.critical(
-                        "ICICI reconcile found broker position qty=%.8g entry=%.2f but Breeze did not provide "
+                        "GROWW reconcile found broker position qty=%.8g entry=%.2f but Groww did not provide "
                         "exact strike/right/expiry; refusing adoption to avoid ghost position.",
                         ex_size,
                         float(ex_pos.get("entry_price", 0.0) or 0.0),
                     )
                     try:
                         self._send_telegram(
-                            "🚨 <b>ICICI POSITION NOT ADOPTED</b>\n"
+                            "🚨 <b>GROWW POSITION NOT ADOPTED</b>\n"
                             "Broker position detected, but exact option identity is missing.\n"
                             f"Qty: <code>{ex_size:.8g}</code> · Entry: <code>₹{float(ex_pos.get('entry_price', 0.0) or 0.0):,.2f}</code>\n"
                             "Required fields: <code>strike/right/expiry</code>. No order will be sent.",
@@ -5461,16 +5461,16 @@ class QuantStrategy:
                         pass
                     self._last_exit_time = time.time()
                     return
-                if not _icici_ensure_adoptable_contract(getattr(self, "_instrument", None), ex_pos):
+                if not _groww_ensure_adoptable_contract(getattr(self, "_instrument", None), ex_pos):
                     self._last_unmanaged_external_position = dict(ex_pos)
                     logger.critical(
-                        "ICICI reconcile found a broker position but exact option contract metadata "
+                        "GROWW reconcile found a broker position but exact option contract metadata "
                         "(strike/right/expiry) is missing; refusing adoption to avoid wrong-contract "
                         "protection or failed flatten."
                     )
                     try:
                         self._send_telegram(
-                            "🚨 <b>ICICI POSITION NOT ADOPTED</b>\n"
+                            "🚨 <b>GROWW POSITION NOT ADOPTED</b>\n"
                             "Exact option vehicle metadata is missing: <code>strike/right/expiry</code>.\n"
                             "The bot will not guess the contract. Manual broker review is required.",
                             event_type="reconcile_guard",
@@ -5482,7 +5482,7 @@ class QuantStrategy:
             ex_entry=float(ex_pos.get("entry_price",0.0)); ex_upnl=float(ex_pos.get("unrealized_pnl",0.0))
             # Guard: CoinSwitch sometimes returns entry_price=0 for a position that
             # has been filled but not yet fully settled in the position feed.
-            _min_adopt_entry = max(QCfg.TICK_SIZE(), 1e-6) if _is_icici_reconcile else 1.0
+            _min_adopt_entry = max(QCfg.TICK_SIZE(), 1e-6) if _is_groww_reconcile else 1.0
             if ex_entry < _min_adopt_entry:
                 logger.warning(
                     f"Reconcile: skipping adoption of {ex_side} size={ex_size} "
@@ -5590,7 +5590,7 @@ class QuantStrategy:
                 logger.debug(f"risk_manager.set_position_open(True) adoption error (non-fatal): {_rm_adopt_e}")
             # Reset duplicate guards for the newly adopted position
             self._exit_completed = False
-            _adopt_cur = "₹" if _is_icici_reconcile else "$"
+            _adopt_cur = "₹" if _is_groww_reconcile else "$"
             logger.warning(f"⚡ RECONCILE: adopted {iside.upper()} @ {_adopt_cur}{ex_entry:,.2f}")
             self._send_telegram(
                 f"⚡ <b>POSITION ADOPTED</b>\n"
@@ -5605,7 +5605,7 @@ class QuantStrategy:
             # from the recovered SL/TP.  SL price remains fixed; internal legs
             # are reduce-only monetisation orders only.
             try:
-                if (not _is_icici_reconcile) and sl_oid and tp_oid and sl_p > 0.0 and tp_p > 0.0 and _adopt_atr > 0.0:
+                if (not _is_groww_reconcile) and sl_oid and tp_oid and sl_p > 0.0 and tp_p > 0.0 and _adopt_atr > 0.0:
                     _adopt_ladder = self._build_tp_ladder_plan(
                         side=iside,
                         entry_price=ex_entry,
@@ -5697,7 +5697,7 @@ class QuantStrategy:
                             if self._pos.initial_sl_dist == 0 and _ep > 0:
                                 self._pos.initial_sl_dist = abs(_ep - trig)
                         logger.info(f"Reconcile: recovered SL order {o['order_id'][:8]}… @ {trig:.2f}")
-                    elif (not _is_icici_reconcile) and not self._pos.tp_order_id and _is_tp(ot):
+                    elif (not _is_groww_reconcile) and not self._pos.tp_order_id and _is_tp(ot):
                         # Bug #8 fix: same atomic write for TP fields.
                         with self._lock:
                             self._pos.tp_order_id  = o["order_id"]

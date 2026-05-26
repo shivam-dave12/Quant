@@ -1,6 +1,6 @@
 """Institutional Indian options selection and Black-Scholes diagnostics.
 
-This module never fabricates prices or Greeks. When Breeze does not provide a
+This module never fabricates prices or Greeks. When Groww does not provide a
 quote/chain row, the option receives a low/coverage score instead of synthetic
 market data. Greeks are computed only from actual strike/expiry/underlying/option
 price inputs and are used as risk diagnostics for theta, gamma and moneyness.
@@ -88,7 +88,7 @@ def _is_index_option_row(raw: Mapping[str, Any]) -> bool:
         return True
     if "OPTSTK" in text or "STOCKOPTION" in text or "STOCKOPTIONS" in text:
         return False
-    # BFO listed options are index derivatives in the ICICI master; NFO can be
+    # BFO listed options are index derivatives in the GROWW master; NFO can be
     # index or stock and should be resolved by product/instrument metadata.
     return "BFO" in text
 
@@ -263,7 +263,7 @@ class BlackScholesModel:
 
 class IndianOptionsDesk:
     def desk_id_for_row(self, raw: Mapping[str, Any]) -> str:
-        return "ICICI_INDEX_OPTIONS" if _is_index_option_row(raw) else "ICICI_STOCK_OPTIONS"
+        return "GROWW_INDEX_OPTIONS" if _is_index_option_row(raw) else "GROWW_STOCK_OPTIONS"
 
     def desk_id_for_underlying(self, underlying: str, raw: Optional[Mapping[str, Any]] = None) -> str:
         return self.desk_id_for_row(raw or {})
@@ -273,7 +273,7 @@ class IndianOptionsDesk:
         if quote:
             raw.update(dict(quote))
         underlying = normalise_symbol(raw.get("stock_code") or raw.get("underlying") or raw.get("Underlying") or raw.get("UnderlyingSymbol") or getattr(inst, "asset_id", ""))
-        if raw.get("icici_underlying_desk"):
+        if raw.get("groww_underlying_desk"):
             quality = raw.get("chain_quality") if isinstance(raw.get("chain_quality"), dict) else {}
             q = float(quality.get("score", raw.get("underlying_chain_quality_score", 0.0)) or 0.0)
             rows = int(quality.get("rows", len(raw.get("chain_candidates") or [])) or 0)
@@ -301,10 +301,10 @@ class IndianOptionsDesk:
                 reasons=reasons,
             )
         structural = _structural_tokens(raw)
-        if bool(_cfg("ICICI_OPTION_REJECT_STRUCTURAL_UNDERLYING", True)) and (not underlying or underlying in structural):
+        if bool(_cfg("GROWW_OPTION_REJECT_STRUCTURAL_UNDERLYING", True)) and (not underlying or underlying in structural):
             return OptionSelectionScore(
                 score=0.0,
-                desk_id="ICICI_REJECT_CORRUPT_OPTION",
+                desk_id="GROWW_REJECT_CORRUPT_OPTION",
                 underlying=underlying,
                 option_type=_right(raw),
                 strike=safe_float(raw.get("strike_price") or raw.get("StrikePrice") or raw.get("strike") or raw.get("Strike"), 0.0),
@@ -332,17 +332,17 @@ class IndianOptionsDesk:
         # stress input, and mark the reason so it cannot be mistaken for live IV.
         iv_is_live = iv > 0
         if iv <= 0:
-            iv = float(_cfg("ICICI_OPTION_IV_STRESS_PRIOR", 0.24))
+            iv = float(_cfg("GROWW_OPTION_IV_STRESS_PRIOR", 0.24))
         rate = float(_cfg("INDIA_RISK_FREE_RATE", 0.065))
         bs = BlackScholesModel.greeks(right or "call", spot, strike, dte, rate, iv, premium=option_px)
 
-        min_dte = float(_cfg("ICICI_OPTION_MIN_DTE", 2.0))
-        max_dte = float(_cfg("ICICI_OPTION_MAX_DTE", 21.0))
+        min_dte = float(_cfg("GROWW_OPTION_MIN_DTE", 2.0))
+        max_dte = float(_cfg("GROWW_OPTION_MAX_DTE", 21.0))
         desk_id = self.desk_id_for_underlying(underlying, raw)
-        target_delta = float(_cfg("ICICI_INDEX_OPTION_TARGET_ABS_DELTA", 0.45) if desk_id == "ICICI_INDEX_OPTIONS" else _cfg("ICICI_STOCK_OPTION_TARGET_ABS_DELTA", 0.50))
-        delta_band = float(_cfg("ICICI_OPTION_DELTA_BAND", 0.22))
-        max_theta_premium = float(_cfg("ICICI_OPTION_MAX_THETA_TO_PREMIUM", 0.08))
-        max_spread_bps = float(_cfg("ICICI_OPTION_MAX_SPREAD_BPS", 180.0))
+        target_delta = float(_cfg("GROWW_INDEX_OPTION_TARGET_ABS_DELTA", 0.45) if desk_id == "GROWW_INDEX_OPTIONS" else _cfg("GROWW_STOCK_OPTION_TARGET_ABS_DELTA", 0.50))
+        delta_band = float(_cfg("GROWW_OPTION_DELTA_BAND", 0.22))
+        max_theta_premium = float(_cfg("GROWW_OPTION_MAX_THETA_TO_PREMIUM", 0.08))
+        max_spread_bps = float(_cfg("GROWW_OPTION_MAX_SPREAD_BPS", 180.0))
 
         dte_score = clamp(1.0 - abs(((min_dte + max_dte) / 2.0) - dte) / max(1.0, (max_dte - min_dte))) if dte > 0 else 0.0
         spread_bps = ((ask - bid) / mid * 10000.0) if ask > 0 and bid > 0 and mid > 0 else 0.0
@@ -357,9 +357,9 @@ class IndianOptionsDesk:
             # Avoid deep OTM lottery and deep ITM capital lock; prefer tradable ATM/near-ATM alpha.
             moneyness_score = clamp(1.0 - abs(bs.moneyness - 1.0) / 0.08)
             bs_score = 0.42 * delta_score + 0.36 * theta_score + 0.22 * moneyness_score
-        live_score = 1.0 if quote else 0.0 if bool(_cfg("ICICI_OPTION_REQUIRE_LIVE_QUOTE", True)) else 0.45
+        live_score = 1.0 if quote else 0.0 if bool(_cfg("GROWW_OPTION_REQUIRE_LIVE_QUOTE", True)) else 0.45
         score = clamp(0.35 * bs_score + 0.25 * dte_score + 0.20 * spread_score + 0.20 * live_score)
-        if bool(_cfg("ICICI_OPTION_REQUIRE_LIVE_QUOTE", True)) and not quote:
+        if bool(_cfg("GROWW_OPTION_REQUIRE_LIVE_QUOTE", True)) and not quote:
             score = 0.0
 
         reasons: list[str] = [desk_id.lower(), f"underlying={underlying}"]
@@ -379,8 +379,8 @@ class IndianOptionsDesk:
         if spread_bps > max_spread_bps:
             reasons.append("wide_option_spread")
         if quote:
-            reasons.append("breeze_quote")
-        elif bool(_cfg("ICICI_OPTION_REQUIRE_LIVE_QUOTE", True)):
+            reasons.append("groww_quote")
+        elif bool(_cfg("GROWW_OPTION_REQUIRE_LIVE_QUOTE", True)):
             reasons.append("live_quote_required")
 
         return OptionSelectionScore(

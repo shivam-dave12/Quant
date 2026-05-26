@@ -58,10 +58,10 @@ def _signal(now: float):
     return engine, signal
 
 
-def _minimal_icici_instrument():
-    raw = {"icici_underlying_desk": True, "contract_selector_mode": "session_preselected_execution"}
+def _minimal_groww_instrument():
+    raw = {"groww_underlying_desk": True, "contract_selector_mode": "session_preselected_execution"}
     primary = SimpleNamespace(raw=raw, display_symbol="NIFTY", symbol="NIFTY")
-    return SimpleNamespace(asset_id="NIFTY", primary_exchange=SimpleNamespace(value="icici"), primary=primary, by_exchange={})
+    return SimpleNamespace(asset_id="NIFTY", primary_exchange=SimpleNamespace(value="groww"), primary=primary, by_exchange={})
 
 
 def _strategy_for_reconciliation(instrument):
@@ -111,8 +111,8 @@ def test_runtime_contract_fixes_match_live_crash_sites(monkeypatch):
         "strategy/quant_strategy.py", "main.py", "telegram/controller.py"))
     assert "analysis_info()" not in source
     import orchestration.multi_asset_bot as module
-    monkeypatch.setattr(module, "icici_market_session_state", lambda: SimpleNamespace(is_open=True, reason="synthetic_open"))
-    assert module.MultiAssetQuantBot._icici_market_open() == (True, "synthetic_open")
+    monkeypatch.setattr(module, "groww_market_session_state", lambda: SimpleNamespace(is_open=True, reason="synthetic_open"))
+    assert module.MultiAssetQuantBot._groww_market_open() == (True, "synthetic_open")
 
 
 def test_daily_risk_gate_locks_out_after_single_realised_loss():
@@ -126,8 +126,8 @@ def test_daily_risk_gate_locks_out_after_single_realised_loss():
     assert "Loss lockout" in reason
 
 
-def test_icici_supervised_premium_tp_completes_two_full_cycles_with_exact_fill_ledger():
-    qs = _strategy_for_reconciliation(_minimal_icici_instrument())
+def test_groww_supervised_premium_tp_completes_two_full_cycles_with_exact_fill_ledger():
+    qs = _strategy_for_reconciliation(_minimal_groww_instrument())
     notices = []
     qs._send_telegram = lambda message, *args, **kwargs: notices.append(message)
     broker = _ManualFillBroker(fill_price=112.0)
@@ -139,7 +139,7 @@ def test_icici_supervised_premium_tp_completes_two_full_cycles_with_exact_fill_l
         qs._pos = PositionState(
             phase=PositionPhase.ACTIVE, side="long", quantity=50, entry_price=72.0,
             sl_price=55.0, tp_price=110.0, sl_order_id=f"sl-{cycle}", tp_order_id="",
-            entry_time=time.time() + cycle + 1.0, exchange="icici", execution_symbol="NIFTYCE",
+            entry_time=time.time() + cycle + 1.0, exchange="groww", execution_symbol="NIFTYCE",
             asset_id="NIFTY", pnl_model="linear", currency_symbol="₹", currency_code="INR",
             quantity_unit="contracts", entry_fee_paid=2.0, entry_fee_exact=True, entry_leverage=1.0,
         )
@@ -155,14 +155,14 @@ def test_icici_supervised_premium_tp_completes_two_full_cycles_with_exact_fill_l
     assert all(r["exact_fees"] is True and r["pnl"] > 0 for r in qs._trade_history)
 
 
-def test_icici_order_manager_routes_supervised_close_as_priced_limit(monkeypatch):
+def test_groww_order_manager_routes_supervised_close_as_priced_limit(monkeypatch):
     raw = {"selected_option_contract": {"right": "call", "stock_code": "NIFTY", "exchange_code": "NFO", "product_type": "Options", "strike_price": 23200, "expiry_date": "2026-06-02"}}
-    inst = SimpleNamespace(asset_id="NIFTY", primary=SimpleNamespace(raw=raw), primary_exchange=SimpleNamespace(value="icici"))
-    om = OrderManager(SimpleNamespace(), exchange_name="icici", instrument=inst)
+    inst = SimpleNamespace(asset_id="NIFTY", primary=SimpleNamespace(raw=raw), primary_exchange=SimpleNamespace(value="groww"))
+    om = OrderManager(SimpleNamespace(), exchange_name="groww", instrument=inst)
     om.get_open_position = lambda: {"size": 50, "entry_price": 72.0, "raw": {"ltp": 110.0}}
     sent = []
     om.place_limit_order = lambda side, quantity, price, reduce_only=False: sent.append((side, quantity, price, reduce_only)) or {"order_id": "priced-limit"}
-    monkeypatch.setattr("execution.order_manager.config.ICICI_EMERGENCY_EXIT_LIMIT_BUFFER_PCT", 0.10, raising=False)
+    monkeypatch.setattr("execution.order_manager.config.GROWW_EMERGENCY_EXIT_LIMIT_BUFFER_PCT", 0.10, raising=False)
     result = om.place_market_order("sell", 50, reduce_only=True)
     assert result["order_id"] == "priced-limit"
     assert sent and sent[0][0].lower() == "sell" and sent[0][3] is True
@@ -189,7 +189,7 @@ def test_recent_trade_tape_preserves_inr_option_currency_without_usd_relabel():
     from orchestration.multi_asset_bot import MultiAssetQuantBot
     bot = MultiAssetQuantBot.__new__(MultiAssetQuantBot)
     bot._all_trade_records = lambda: [{
-        "desk": "ICICI_INDEX_OPTIONS", "asset": "NIFTY", "side": "long",
+        "desk": "GROWW_INDEX_OPTIONS", "asset": "NIFTY", "side": "long",
         "entry": 72.0, "exit": 112.0, "pnl": 1995.5, "gross_pnl": 2000.0,
         "total_fees": 4.5, "currency": "₹", "timestamp": time.time(), "reason": "liquidity_tp_hit",
     }]
@@ -228,7 +228,7 @@ def _venue_instrument(exchange: str, asset: str, symbol: str):
     ("delta", "SILVER", "SLVONUSD", "linear", "$"),
     ("coinswitch", "BTC", "BTCUSDT", "linear", "$"),
 ])
-def test_broker_protected_tp_reconciliation_completes_two_cycles_for_non_icici_desks(exchange, asset, symbol, model, currency):
+def test_broker_protected_tp_reconciliation_completes_two_cycles_for_non_groww_desks(exchange, asset, symbol, model, currency):
     qs = _strategy_for_reconciliation(_venue_instrument(exchange, asset, symbol))
     qs._om = _ChildFillBroker(fill_price=105.0)
     for cycle in range(2):
@@ -335,22 +335,22 @@ def test_real_strategy_handoff_executes_new_entry_engine_property_contract(monke
 
 def _nifty_session_instrument():
     from datetime import datetime, timedelta, timezone
-    from agents.icici_chain_architect import build_underlying_payload
+    from agents.groww_chain_architect import build_underlying_payload
     from core.instruments import AssetClass, ExchangeInstrument, ExchangeName, TradableInstrument
     expiry = (datetime.now(timezone.utc) + timedelta(days=10)).strftime("%Y-%m-%d")
     chain = [
         {"TradingSymbol": "NIFTY30JUN30CE23200", "right": "Call", "strike_price": 23200, "expiry_date": expiry, "ltp": 72.0, "best_bid_price": 71.75, "best_offer_price": 72.25, "best_bid_quantity": 200, "best_offer_quantity": 200, "LotSize": 50, "stock_code": "NIFTY", "exchange_code": "NFO", "product_type": "Options"},
         {"TradingSymbol": "NIFTY30JUN30PE23000", "right": "Put", "strike_price": 23000, "expiry_date": expiry, "ltp": 78.0, "best_bid_price": 77.75, "best_offer_price": 78.25, "best_bid_quantity": 200, "best_offer_quantity": 200, "LotSize": 50, "stock_code": "NIFTY", "exchange_code": "NFO", "product_type": "Options"},
     ]
-    raw = build_underlying_payload("NIFTY", "ICICI_INDEX_OPTIONS", [])
+    raw = build_underlying_payload("NIFTY", "GROWW_INDEX_OPTIONS", [])
     raw.update({"chain_candidates": chain, "chain_candidates_deferred": False})
-    ei = ExchangeInstrument(exchange=ExchangeName.ICICI, symbol="NIFTY", ws_symbol="NIFTY", display_symbol="NIFTY", asset_id="NIFTY", asset_class=AssetClass.OPTION, quote_asset="INR", base_asset="NIFTY", contract_type="option_chain", status="active", tick_size=0.05, lot_step=1.0, min_qty=1.0, max_leverage=1.0, raw=raw)
-    return TradableInstrument("NIFTY", "NIFTY options", AssetClass.OPTION, ExchangeName.ICICI, {ExchangeName.ICICI: ei})
+    ei = ExchangeInstrument(exchange=ExchangeName.GROWW, symbol="NIFTY", ws_symbol="NIFTY", display_symbol="NIFTY", asset_id="NIFTY", asset_class=AssetClass.OPTION, quote_asset="INR", base_asset="NIFTY", contract_type="option_chain", status="active", tick_size=0.05, lot_step=1.0, min_qty=1.0, max_leverage=1.0, raw=raw)
+    return TradableInstrument("NIFTY", "NIFTY options", AssetClass.OPTION, ExchangeName.GROWW, {ExchangeName.GROWW: ei})
 
 
 def test_actual_nifty_entry_fill_retains_old_session_book_option_execution_and_new_strategy_thesis(monkeypatch):
     import strategy.quant_strategy as qm
-    from agents.icici_chain_architect import apply_contract_choice, build_session_contract_book, select_contract_from_session_book
+    from agents.groww_chain_architect import apply_contract_choice, build_session_contract_book, select_contract_from_session_book
     from core.instruments import instrument_scope
     inst = _nifty_session_instrument()
     assert build_session_contract_book(inst, underlying_spot=23100.0, available_funds=49310.96) is not None
@@ -363,9 +363,9 @@ def test_actual_nifty_entry_fill_retains_old_session_book_option_execution_and_n
         def get_last_price(self): return 72.0 if self.selected else 23100.0
         def get_orderbook(self): return {"bids": [[71.95, 200]], "asks": [[72.05, 200]]}
         def get_execution_candles(self, tf, limit=25): return [{"h": 73.0, "l": 71.0, "c": 72.0}] * max(25, limit)
-        def release_icici_execution_vehicle(self): self.released = True
+        def release_groww_execution_vehicle(self): self.released = True
     class OM:
-        active_exchange = "icici"; last_order_error = None
+        active_exchange = "groww"; last_order_error = None
         def __init__(self): self.entry = None
         def place_bracket_limit_entry(self, **kwargs):
             self.entry = (kwargs["side"], kwargs["quantity"], kwargs["limit_price"])
@@ -373,8 +373,8 @@ def test_actual_nifty_entry_fill_retains_old_session_book_option_execution_and_n
                     "fill_type": "maker", "paid_commission": 2.0, "paid_commission_exact": True,
                     "bracket_order": True, "bracket_sl_order_id": "GTT:entry-ce:STOPLOSS",
                     "bracket_tp_order_id": "GTT:entry-ce:TARGET", "bracket_sl_price": kwargs["sl_price"],
-                    "bracket_tp_price": kwargs["tp_price"], "protection_model": "ICICI_GTT_COVER_OCO"}
-        def place_limit_entry(self, **kwargs): raise AssertionError("ICICI must never route a naked option entry")
+                    "bracket_tp_price": kwargs["tp_price"], "protection_model": "GROWW_GTT_COVER_OCO"}
+        def place_limit_entry(self, **kwargs): raise AssertionError("GROWW must never route a naked option entry")
         def place_stop_loss(self, **kwargs): raise AssertionError("GTT cover-OCO owns the protective stop")
         def place_take_profit(self, **kwargs): raise AssertionError("GTT cover-OCO owns the target")
     class RM:
@@ -392,7 +392,7 @@ def test_actual_nifty_entry_fill_retains_old_session_book_option_execution_and_n
     qs._build_tp_ladder_plan = lambda **kwargs: None
     qs._send_telegram = lambda *args, **kwargs: None
     qs._risk_manager_ref = rm
-    monkeypatch.setattr(qm, "_icici_market_session_open", lambda: (True, "synthetic_session"))
+    monkeypatch.setattr(qm, "_groww_market_session_open", lambda: (True, "synthetic_session"))
     with instrument_scope(inst):
         qs._enter_trade(dm, om, rm, "long", SimpleNamespace(vwap_price=0.0), prefetched_bal_info=rm.get_available_balance())
     assert qs._pos.phase is PositionPhase.ACTIVE
@@ -471,7 +471,7 @@ class _ExecutableLifecycleBroker:
     ("delta", "SILVER", "SLVONUSD", "linear"),
     ("coinswitch", "BTC", "BTCUSDT", "linear"),
 ])
-def test_actual_non_icici_protected_entry_exit_reentry_runs_twice(exchange, asset, symbol, model):
+def test_actual_non_groww_protected_entry_exit_reentry_runs_twice(exchange, asset, symbol, model):
     from core.instruments import instrument_scope
     inst = _executable_instrument(exchange, asset, symbol)
     broker = _ExecutableLifecycleBroker(exchange)
@@ -524,7 +524,7 @@ def test_liquidity_target_ladder_numeric_clamp_is_runtime_callable():
 
 def test_actual_nifty_session_book_selection_protected_exit_and_reentry_runs_twice(monkeypatch):
     import strategy.quant_strategy as qm
-    from agents.icici_chain_architect import apply_contract_choice, build_session_contract_book, select_contract_from_session_book
+    from agents.groww_chain_architect import apply_contract_choice, build_session_contract_book, select_contract_from_session_book
     from core.instruments import instrument_scope
     inst = _nifty_session_instrument()
     assert build_session_contract_book(inst, underlying_spot=23100.0, available_funds=49310.96) is not None
@@ -537,9 +537,9 @@ def test_actual_nifty_session_book_selection_protected_exit_and_reentry_runs_twi
         def get_last_price(self): return self.premium if self.selected else 23100.0
         def get_orderbook(self): return {"bids": [[self.premium - 0.05, 200]], "asks": [[self.premium + 0.05, 200]]}
         def get_execution_candles(self, tf, limit=25): return [{"h": self.premium + 1, "l": self.premium - 1, "c": self.premium}] * max(25, limit)
-        def release_icici_execution_vehicle(self): self.selected = False
+        def release_groww_execution_vehicle(self): self.selected = False
     class OM:
-        active_exchange = "icici"; last_order_error = None
+        active_exchange = "groww"; last_order_error = None
         def __init__(self): self.n = 0; self.events = []
         def place_bracket_limit_entry(self, **kwargs):
             self.n += 1; self.events.append(("gtt_entry", kwargs["limit_price"]))
@@ -547,8 +547,8 @@ def test_actual_nifty_session_book_selection_protected_exit_and_reentry_runs_twi
                     "fill_type": "maker", "paid_commission": 2.0, "paid_commission_exact": True,
                     "bracket_order": True, "bracket_sl_order_id": f"GTT:{self.n}:STOPLOSS",
                     "bracket_tp_order_id": f"GTT:{self.n}:TARGET", "bracket_sl_price": kwargs["sl_price"],
-                    "bracket_tp_price": kwargs["tp_price"], "protection_model": "ICICI_GTT_COVER_OCO"}
-        def place_limit_entry(self, **kwargs): raise AssertionError("ICICI must never route a naked option entry")
+                    "bracket_tp_price": kwargs["tp_price"], "protection_model": "GROWW_GTT_COVER_OCO"}
+        def place_limit_entry(self, **kwargs): raise AssertionError("GROWW must never route a naked option entry")
         def place_stop_loss(self, **kwargs): raise AssertionError("GTT cover-OCO owns the protective stop")
         def place_take_profit(self, **kwargs): raise AssertionError("GTT cover-OCO owns the target")
         def cancel_all_exit_orders(self, sl, tp): raise AssertionError("native GTT target should execute without local cancellation")
@@ -565,7 +565,7 @@ def test_actual_nifty_session_book_selection_protected_exit_and_reentry_runs_twi
     qs._atr_5m._atr = 50.0; qs._compute_quantity = lambda *args, **kwargs: 50.0
     qs._repair_execution_geometry = lambda side, entry_price, sl_price, tp_price, atr, use_maker_entry, delivery_probability: (sl_price, tp_price, False)
     qs._build_tp_ladder_plan = lambda **kwargs: None; qs._send_telegram = lambda *args, **kwargs: None; qs._risk_manager_ref = rm
-    monkeypatch.setattr(qm, "_icici_market_session_open", lambda: (True, "synthetic_session"))
+    monkeypatch.setattr(qm, "_groww_market_session_open", lambda: (True, "synthetic_session"))
     for cycle in range(2):
         dm.premium = 72.0
         qs._force_sl = 23000.0; qs._force_tp = 23300.0
@@ -586,13 +586,13 @@ def test_actual_nifty_session_book_selection_protected_exit_and_reentry_runs_twi
     assert len([event for event in om.events if event[0] == "gtt_entry"]) == 2
 
 
-def test_router_switch_to_icici_reports_inr_not_usd():
+def test_router_switch_to_groww_reports_inr_not_usd():
     from execution.router import ExecutionRouter
     class BalOM:
         def get_balance(self): return {"available": 49310.96}
     router = ExecutionRouter(BalOM(), BalOM(), BalOM(), default="delta")
-    ok, text = router.switch("icici")
-    assert ok is True and "₹49,310.96" in text and "INR NFO available" in text and "$" not in text
+    ok, text = router.switch("groww")
+    assert ok is True and "₹49,310.96" in text and "INR FNO available" in text and "$" not in text
 
 
 def test_decision_tape_emits_transition_and_slow_snapshot_without_tick_spam(caplog):

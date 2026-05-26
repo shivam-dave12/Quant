@@ -1,7 +1,7 @@
 """Official Groww Trading API compatibility wrapper.
 
 The strategy already has a broker-agnostic option-desk flow, but parts of the
-Indian options runtime expect Breeze-like method names.  This wrapper maps those
+Indian options runtime expect Groww-like method names.  This wrapper maps those
 calls to Groww's documented SDK methods while keeping order/data payloads in
 Groww's official field vocabulary.
 """
@@ -93,14 +93,12 @@ class GrowwRestClient:
 
                 attempts.extend([
                     {"api_key": self.api_key, "totp": pyotp.TOTP(self.totp_secret).now()},
-                    {"api_key": self.api_key, "otp": pyotp.TOTP(self.totp_secret).now()},
                 ])
             except Exception:
                 pass
         if self.api_secret:
             attempts.extend([
                 {"api_key": self.api_key, "secret": self.api_secret},
-                {"api_key": self.api_key, "api_secret": self.api_secret},
             ])
         getter = getattr(GrowwAPI, "get_access_token", None)
         if not callable(getter):

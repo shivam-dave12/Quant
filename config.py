@@ -31,25 +31,6 @@ def _first_env(*names: str) -> str:
             return str(value).strip()
     return ""
 
-BREEZE_API_KEY = _first_env(
-    "BREEZE_API_KEY",
-    "ICICI_API_KEY",
-    "ICICI_BREEZE_API_KEY",
-    "BREEZE_APP_KEY",
-    "ICICI_APP_KEY",
-)
-BREEZE_SECRET_KEY = _first_env(
-    "BREEZE_SECRET_KEY",
-    "ICICI_SECRET_KEY",
-    "ICICI_API_SECRET",
-    "BREEZE_API_SECRET",
-    "BREEZE_SECRET",
-    "ICICI_BREEZE_SECRET_KEY",
-    "ICICI_APP_SECRET",
-)
-ICICI_CLIENT_ID           = os.getenv("ICICI_CLIENT_ID", "")
-ICICI_PASSWORD            = os.getenv("ICICI_PASSWORD", "")
-ICICI_ENABLED             = os.getenv("ICICI_ENABLED", "true" if BREEZE_API_KEY else "false").lower() in ("1", "true", "yes", "on")
 GROWW_ACCESS_TOKEN        = _first_env("GROWW_ACCESS_TOKEN", "GROWW_API_AUTH_TOKEN", "GROWW_TOKEN")
 GROWW_API_KEY             = _first_env("GROWW_API_KEY", "GROWW_APP_KEY")
 GROWW_API_SECRET          = _first_env("GROWW_API_SECRET", "GROWW_SECRET_KEY", "GROWW_SECRET")
@@ -61,8 +42,8 @@ GROWW_ENABLED             = os.getenv(
 TELEGRAM_BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID          = os.getenv("TELEGRAM_CHAT_ID",   "")
 
-if not DELTA_API_KEY and not COINSWITCH_API_KEY and not BREEZE_API_KEY and not (GROWW_ACCESS_TOKEN or GROWW_API_KEY):
-    raise ValueError("No exchange credentials in .env. Set DELTA_API_KEY, COINSWITCH_API_KEY, BREEZE_API_KEY, or GROWW_ACCESS_TOKEN/GROWW_API_KEY.")
+if not DELTA_API_KEY and not COINSWITCH_API_KEY and not (GROWW_ACCESS_TOKEN or GROWW_API_KEY):
+    raise ValueError("No exchange credentials in .env. Set DELTA_API_KEY, COINSWITCH_API_KEY, GROWW_ACCESS_TOKEN, or GROWW_API_KEY/GROWW_TOTP_SECRET.")
 
 # ── Symbol / Leverage ─────────────────────────────────────────────────────────
 SYMBOL                   = "BTCUSDT"
@@ -108,7 +89,6 @@ MAX_RR_RATIO             = 20.0
 TICK_SIZE                        = 0.5 if EXECUTION_EXCHANGE == "delta" else 0.1
 TICK_SIZE_DELTA                  = 0.5
 TICK_SIZE_COINSWITCH             = 0.1
-TICK_SIZE_ICICI                  = 0.05
 TICK_SIZE_GROWW                  = 0.05
 LIMIT_ORDER_OFFSET_TICKS         = 3
 ORDER_TIMEOUT_SECONDS            = 600
@@ -197,8 +177,6 @@ def get_tick_size(exchange: str | None = None) -> float:
         return float(TICK_SIZE_DELTA)
     if ex == "coinswitch":
         return float(TICK_SIZE_COINSWITCH)
-    if ex == "icici":
-        return float(TICK_SIZE_ICICI)
     if ex == "groww":
         return float(TICK_SIZE_GROWW)
     return float(TICK_SIZE)
@@ -282,7 +260,7 @@ MARKET_STATE_FIRM_PARENT_MIN_QUALITY = 0.60
 MARKET_STATE_AGGRESSIVE_MIN_CLARITY = 0.62
 
 # Structural zone graph is the common entry/SL/TP authority for BTC, SILVER,
-# commodities and the ICICI profile. It ranks competing FVG/order-block zones,
+# commodities and the GROWW profile. It ranks competing FVG/order-block zones,
 # protects SL beyond relevant same-side liquidity clusters and selects TP by
 # observable multi-timeframe liquidity concentration. It does not add a stack
 # of arbitrary trade filters; weak zones remain visible as noise telemetry.
@@ -435,213 +413,117 @@ STOCK_DESK_TRADING_ENABLED = False
 SUSPENDED_TRADING_DESKS = ("STOCKS",)
 SUSPENDED_ASSET_CLASSES = ("equity", "index")
 
-# ICICI / Indian index options desk. Only long premium options are routed:
-# bullish NIFTY thesis -> buy CE, bearish NIFTY thesis -> buy PE.
-ICICI_LONG_PREMIUM_ONLY = True
-ICICI_OPTIONS_ONLY = True
-# Official Breeze exposes NFO options protected entry as three-leg GTT cover-OCO.
-# Never degrade to a naked buy followed by local-only TP/SL supervision.  Setting
-# this false disables ICICI option entry; it never enables naked-order fallback.
-ICICI_REQUIRE_GTT_COVER_OCO_PROTECTED_ENTRY = os.getenv("ICICI_REQUIRE_GTT_COVER_OCO_PROTECTED_ENTRY", "true").lower() in ("1", "true", "yes", "on")
-# Discovery is config-backed and auth-independent, matching the working V83
-# ICICI desk design: NIFTY must enter the universe before Breeze session
-# generation. Protected Breeze endpoints are touched later by the ICICI runtime
-# data/execution adapters.
-ICICI_DISCOVERY_ENABLED = os.getenv("ICICI_DISCOVERY_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-ICICI_OPTIONS_RUNTIME_ENABLED = ICICI_ENABLED
-ICICI_INDEX_OPTIONS_FROM_CONFIG_ONLY = True
-# Official Breeze stock_code for NIFTY 50 is NIFTY. Keep common aliases only in
-# the mapping layer; do not let .env override the institutional desk universe.
-ICICI_INDEX_UNDERLYINGS = "NIFTY"
-# Breeze's documented NIFTY 50 code is stock_code="NIFTY".  Accept common
-# aliases in config, but always route Breeze underlying/option-chain calls with
-# the ICICI stock_code expected by historicalcharts/OptionChain.
-ICICI_INDEX_BREEZE_STOCK_CODE_BY_UNDERLYING = {
-    "NIFTY": "NIFTY",
-    "NIFTY50": "NIFTY",
-    "CNXNIFTY": "NIFTY",
-}
-ICICI_API_SESSION_PATH = os.getenv("ICICI_API_SESSION_PATH", "data/icici_api_session.txt")
-BREEZE_API_SESSION = os.getenv("BREEZE_API_SESSION", os.getenv("ICICI_API_SESSION", ""))
-BREEZE_SESSION_TOKEN = os.getenv("BREEZE_SESSION_TOKEN", "")
-ICICI_ALLOW_MANUAL_SESSION_TOKEN_OVERRIDE = os.getenv("ICICI_ALLOW_MANUAL_SESSION_TOKEN_OVERRIDE", "false").lower() in ("1", "true", "yes", "on")
-ICICI_API_SESSION_FILE_MUST_BE_TODAY = os.getenv("ICICI_API_SESSION_FILE_MUST_BE_TODAY", "true").lower() in ("1", "true", "yes", "on")
-ICICI_SESSION_CACHE_PATH = os.getenv("ICICI_SESSION_CACHE_PATH", "data/icici_breeze_session.json")
-ICICI_SESSION_TTL_SEC = 6 * 60 * 60
-ICICI_SESSION_EXPIRES_DAILY = True
-ICICI_SESSION_TIMEZONE_OFFSET_MIN = 330
-# Telegram /start must generate/validate the Breeze session before ICICI
-# data managers touch protected Breeze endpoints. API_Session/SessionToken
-# are runtime artifacts, not .env requirements.
-ICICI_BREEZE_PREFLIGHT_ON_STARTUP = True
-ICICI_AUTO_TOKEN_GENERATOR_ON_STARTUP = True
-ICICI_AUTH_REQUIRED_FOR_DETAILS = True
-ICICI_TOKEN_GENERATOR_HEADLESS = os.getenv("ICICI_TOKEN_GENERATOR_HEADLESS", "true").lower() in ("1", "true", "yes", "on")
-ICICI_PLAYWRIGHT_AUTO_INSTALL = os.getenv("ICICI_PLAYWRIGHT_AUTO_INSTALL", "true").lower() in ("1", "true", "yes", "on")
-ICICI_OTP_WAIT_SEC = 180.0
-ICICI_STARTUP_TOKEN_WAIT_SEC = 300.0
-ICICI_PREMARKET_TOKEN_REFRESH_ENABLED = os.getenv("ICICI_PREMARKET_TOKEN_REFRESH_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-ICICI_PREMARKET_TOKEN_REFRESH_TIME = os.getenv("ICICI_PREMARKET_TOKEN_REFRESH_TIME", "08:30")
-ICICI_PREMARKET_TOKEN_REFRESH_WINDOW_MIN = float(os.getenv("ICICI_PREMARKET_TOKEN_REFRESH_WINDOW_MIN", "90.0"))
-ICICI_DORMANT_START_RETRY_SEC = float(os.getenv("ICICI_DORMANT_START_RETRY_SEC", "30.0"))
-ICICI_FAILED_START_RETRY_SEC = float(os.getenv("ICICI_FAILED_START_RETRY_SEC", "180.0"))
-ICICI_DEBUG_DIR = os.getenv("ICICI_DEBUG_DIR", "data/icici_debug")
-ICICI_MARKET_SESSION_GUARD_ENABLED = True
-ICICI_MARKET_OPEN_TIME = "09:15"
-ICICI_MARKET_CLOSE_TIME = "15:30"
-ICICI_MARKET_HOLIDAYS = tuple(x.strip() for x in os.getenv("ICICI_MARKET_HOLIDAYS", "").split(",") if x.strip())
-ICICI_ANALYZE_ONLY_DURING_MARKET_SESSION = os.getenv("ICICI_ANALYZE_ONLY_DURING_MARKET_SESSION", "true").lower() in ("1", "true", "yes", "on")
-ICICI_BREEZE_THROTTLE_ENABLED = True
-# Breeze docs publish 100 calls/minute account-wide; keep a small buffer under
-# that ceiling because option-chain, quote fallback and historical warmups share
-# the same API key.
-ICICI_BREEZE_MIN_CALL_GAP_SEC = 0.65
-ICICI_SECURITY_MASTER_CACHE_PATH = os.getenv("ICICI_SECURITY_MASTER_CACHE_PATH", "data/icici_security_master.zip")
-ICICI_SECURITY_MASTER_URL = os.getenv("ICICI_SECURITY_MASTER_URL", "https://directlink.icicidirect.com/NewSecurityMaster/SecurityMaster.zip")
-ICICI_ALLOW_CLOSED_MARKET_HISTORICAL_WARMUP = True
-ICICI_ALLOW_CLOSED_MARKET_WARMUP = False
-ICICI_CLOSED_MARKET_QUOTE_PROBE = False
-ICICI_HISTORICAL_V2_FALLBACK = True
-# Live NIFTY data is mandatory for the ICICI options desk.  Breeze WebSocket is
-# the primary signal transport; REST remains startup/reconciliation only.
-ICICI_INDEX_STREAM_ENABLED = os.getenv("ICICI_INDEX_STREAM_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-ICICI_INDEX_WEBSOCKET_REQUIRED = os.getenv("ICICI_INDEX_WEBSOCKET_REQUIRED", "true").lower() in ("1", "true", "yes", "on")
-ICICI_INDEX_STREAM_FIRST_TICK_TIMEOUT_SEC = float(os.getenv("ICICI_INDEX_STREAM_FIRST_TICK_TIMEOUT_SEC", "12.0"))
-ICICI_INDEX_STREAM_MAX_STALE_SEC = float(os.getenv("ICICI_INDEX_STREAM_MAX_STALE_SEC", "15.0"))
-ICICI_WEBSOCKET_RECONNECT_COOLDOWN_SEC = float(os.getenv("ICICI_WEBSOCKET_RECONNECT_COOLDOWN_SEC", "30.0"))
-ICICI_SHARED_TRANSPORT_MAX_STALE_SEC = float(os.getenv("ICICI_SHARED_TRANSPORT_MAX_STALE_SEC", "20.0"))
-ICICI_REQUIRE_UNDERLYING_ANALYSIS_FEED = True
-# Official Breeze SDK resolves tokens dynamically from exchange/stock descriptors;
-# static script-code maps are deliberately not used.
-ICICI_INDEX_STREAM_CHANNELS = "LIVE_QUOTE"
-ICICI_INDEX_STREAM_SCRIPT_CODES = {}
-ICICI_OPTION_STREAM_ENABLED = os.getenv("ICICI_OPTION_STREAM_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-ICICI_OPTION_WEBSOCKET_REQUIRED = os.getenv("ICICI_OPTION_WEBSOCKET_REQUIRED", "true").lower() in ("1", "true", "yes", "on")
-# Startup may scan the live NIFTY underlying while CE/PE option sockets are still
-# waiting for their first tick; actual order activation remains hard-blocked by
-# ICICI_OPTION_WEBSOCKET_REQUIRED until the selected premium vehicle is fresh.
-ICICI_SESSION_BOOK_REQUIRE_FIRST_OPTION_TICK_ON_STARTUP = os.getenv("ICICI_SESSION_BOOK_REQUIRE_FIRST_OPTION_TICK_ON_STARTUP", "false").lower() in ("1", "true", "yes", "on")
-ICICI_OPTION_STREAM_FIRST_TICK_TIMEOUT_SEC = float(os.getenv("ICICI_OPTION_STREAM_FIRST_TICK_TIMEOUT_SEC", "12.0"))
-ICICI_OPTION_STREAM_MAX_STALE_SEC = float(os.getenv("ICICI_OPTION_STREAM_MAX_STALE_SEC", "15.0"))
-
-# NIFTY intraday execution profile: use liquidity sweeps as fast trend-continuation
-# entries under an observed directional auction phase. This is an entry archetype,
-# not an additional filter stack: balance/transition phases simply have no trend
-# impulse to buy options against, while directional phases monetize nearby real
-# liquidity quickly to respect Indian-index chop and premium decay.
-ICICI_NIFTY_TREND_SWEEP_ENABLED = os.getenv("ICICI_NIFTY_TREND_SWEEP_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-ICICI_NIFTY_TREND_SWEEP_MIN_PHASE_SCORE = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_MIN_PHASE_SCORE", "0.30"))
-ICICI_NIFTY_TREND_SWEEP_AGGRESSIVE_PHASE_SCORE = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_AGGRESSIVE_PHASE_SCORE", "0.58"))
-ICICI_NIFTY_TREND_SWEEP_MIN_RR = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_MIN_RR", "1.15"))
-ICICI_NIFTY_TREND_SWEEP_MAX_RR = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_MAX_RR", "2.40"))
-ICICI_NIFTY_TREND_SWEEP_MAX_TARGET_ATR = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_MAX_TARGET_ATR", "2.75"))
-ICICI_NIFTY_TREND_SWEEP_MAX_RECLAIM_EXTENSION_ATR = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_MAX_RECLAIM_EXTENSION_ATR", "0.65"))
-# NIFTY enters off a closed 1m or 5m underlying sweep reclaim; the shorter
-# lifetime prevents an old pullback signal being monetised after the move left.
-ICICI_NIFTY_TREND_SWEEP_1M_MAX_AGE_SEC = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_1M_MAX_AGE_SEC", "90.0"))
-ICICI_NIFTY_TREND_SWEEP_5M_MAX_AGE_SEC = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_5M_MAX_AGE_SEC", "360.0"))
-ICICI_NIFTY_TREND_SWEEP_STOP_BASE_ATR = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_STOP_BASE_ATR", "0.08"))
-ICICI_NIFTY_TREND_SWEEP_STOP_PCTL_SLOPE_ATR = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_STOP_PCTL_SLOPE_ATR", "0.10"))
-ICICI_NIFTY_TREND_SWEEP_MIN_TARGET_REALISM = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_MIN_TARGET_REALISM", "0.42"))
-ICICI_NIFTY_TREND_SWEEP_MAX_HOLD_SEC = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_MAX_HOLD_SEC", "720.0"))
-ICICI_NIFTY_TREND_SWEEP_FAILED_AUCTION_FRACTION = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_FAILED_AUCTION_FRACTION", "0.35"))
-ICICI_NIFTY_TREND_SWEEP_FAILED_AUCTION_R = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_FAILED_AUCTION_R", "-0.15"))
-ICICI_NIFTY_TREND_SWEEP_FAILED_AUCTION_MAX_MFE_R = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_FAILED_AUCTION_MAX_MFE_R", "0.30"))
-ICICI_NIFTY_TREND_SWEEP_MIN_PROGRESS_R = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_MIN_PROGRESS_R", "0.15"))
-ICICI_NIFTY_TREND_SWEEP_HARD_MAX_MULT = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_HARD_MAX_MULT", "1.0"))
-
-ICICI_OPTION_TICK_SIZE = 0.05
-# Safety invariant: never assume a one-unit NFO option lot.  Contract routing
-# is disabled until Breeze/security-master supplies the exact current lot size.
-ICICI_OPTION_DEFAULT_LOT_SIZE = 0.0
-ICICI_OPTION_MIN_DTE = 1.0
-ICICI_OPTION_MAX_DTE = 21.0
-ICICI_INDEX_OPTION_TARGET_ABS_DELTA = 0.45
-ICICI_STOCK_OPTION_TARGET_ABS_DELTA = 0.50
-ICICI_OPTION_DELTA_BAND = 0.22
-ICICI_OPTION_MAX_THETA_TO_PREMIUM = 0.08
-ICICI_OPTION_IV_STRESS_PRIOR = 0.24
-ICICI_OPTION_MIN_IMPLIED_VOL = 0.03
-ICICI_OPTION_MAX_IMPLIED_VOL = 1.50
-INDIA_RISK_FREE_RATE = 0.065
-ICICI_OPTION_MAX_FUNDS_FRACTION_PER_TRADE = 0.42
-ICICI_OPTION_MIN_CASH_BUFFER_INR = 0.0
-ICICI_OPTION_MIN_READY_1M_BARS = 20
-ICICI_UNDERLYING_MIN_READY_1M_BARS = 20
-# REST quote pull is reconciliation only; websocket supplies live option prices.
-ICICI_OPTION_QUOTE_POLL_SEC = 30.0
-# Session-start execution universe: preselect one verified CE and one verified PE
-# after F&O funds + NIFTY underlying warmup.  Direction remains live-thesis driven.
-ICICI_SESSION_CONTRACT_BOOK_ENABLED = True
-ICICI_SESSION_BOOK_MAX_EXPIRIES = 2
-ICICI_SESSION_BOOK_PREWARM_EXECUTION_DATA = True
-# Circuit-breaker only; normal intraday reselection is delta-band driven.
-ICICI_SESSION_BOOK_MAX_SPOT_DRIFT_PCT = 0.008
-ICICI_SESSION_BOOK_DELTA_RESELECT_BAND = 0.18
-ICICI_SESSION_BOOK_MIN_REFRESH_SEC = 900.0
-# Delta/spot-invalidated vehicles may refresh sooner, with anti-thrash protection.
-ICICI_SESSION_BOOK_URGENT_REFRESH_COOLDOWN_SEC = 30.0
-# A session-book vehicle must be executable now, not just theoretically cheap.
-ICICI_SESSION_BOOK_REQUIRE_TWO_SIDED_QUOTE = True
-ICICI_OPTION_MAX_SELECTION_SPREAD_BPS = 120.0
-ICICI_OPTION_MIN_BOOK_LOTS = 1.0
-ICICI_SESSION_BOOK_QUOTES_FALLBACK_ENABLED = True
-ICICI_SESSION_BOOK_QUOTE_FALLBACK_STRIKES_PER_SIDE = 10
-ICICI_SESSION_BOOK_QUOTE_FALLBACK_MAX_CONTRACTS = 60
-# Dynamic execution-cost guard: the live spread cannot consume more than this
-# share of the vehicle's observed 1-minute premium ATR.
-ICICI_OPTION_EXECUTION_ATR_PERIOD = 14
-ICICI_OPTION_MAX_SPREAD_TO_1M_ATR = 0.35
-ICICI_SECURITY_MASTER_REQUIRE_TODAY = True
-ICICI_OPTION_MAX_QUOTE_STALE_SEC = 10.0
-# Commit-time quote verification: an exact selected CE/PE REST quote may authorise
-# a limit order only for a very short window when the option stream is quiet.
-# Signals always remain underlying/stream driven; this is execution validation only.
-ICICI_EXECUTION_PREFLIGHT_EXACT_QUOTE_ENABLED = os.getenv("ICICI_EXECUTION_PREFLIGHT_EXACT_QUOTE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-ICICI_EXECUTION_PREFLIGHT_QUOTE_TTL_SEC = float(os.getenv("ICICI_EXECUTION_PREFLIGHT_QUOTE_TTL_SEC", "2.0"))
-ICICI_UNDERLYING_REST_REFRESH_SEC = 30.0
-# Slow authoritative REST reconciliation while Breeze websocket is healthy; faster REST repair runs only during faults.
-ICICI_UNDERLYING_REST_RECONCILE_SEC = 900.0
-ICICI_OPTION_SLTP_DELTA_MULT = 1.00
-ICICI_OPTION_MIN_PREMIUM_RISK_PCT = 0.14
-ICICI_OPTION_MAX_PREMIUM_RISK_PCT = 0.58
-ICICI_OPTION_MIN_TP_PREMIUM_PCT = 0.18
-ICICI_OPTION_PREMIUM_TP_CONVEXITY_BONUS = 0.08
-
-# Groww / Indian index options desk. Strategy flow is intentionally inherited
-# from the Indian options desk: bullish underlying thesis buys CE, bearish buys
-# PE. Only the broker transport, instrument source and order schema change.
+# Groww / Indian index options desk. Strategy flow remains unchanged:
+# bullish NIFTY thesis buys CE, bearish NIFTY thesis buys PE. Authentication
+# follows Groww's official SDK: access token directly, or API key + TOTP secret.
 GROWW_LONG_PREMIUM_ONLY = True
 GROWW_OPTIONS_ONLY = True
+GROWW_REQUIRE_GTT_COVER_OCO_PROTECTED_ENTRY = os.getenv("GROWW_REQUIRE_GTT_COVER_OCO_PROTECTED_ENTRY", "true").lower() in ("1", "true", "yes", "on")
 GROWW_REQUIRE_SMART_GTT_PROTECTED_ENTRY = os.getenv("GROWW_REQUIRE_SMART_GTT_PROTECTED_ENTRY", "true").lower() in ("1", "true", "yes", "on")
-GROWW_DISCOVERY_ENABLED = os.getenv("GROWW_DISCOVERY_ENABLED", "true" if GROWW_ENABLED else "false").lower() in ("1", "true", "yes", "on")
+GROWW_DISCOVERY_ENABLED = os.getenv("GROWW_DISCOVERY_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 GROWW_OPTIONS_RUNTIME_ENABLED = GROWW_ENABLED
 GROWW_INDEX_OPTIONS_FROM_CONFIG_ONLY = True
 GROWW_INDEX_UNDERLYINGS = os.getenv("GROWW_INDEX_UNDERLYINGS", "NIFTY")
+GROWW_INDEX_STOCK_CODE_BY_UNDERLYING = {"NIFTY": "NIFTY", "NIFTY50": "NIFTY", "CNXNIFTY": "NIFTY"}
 GROWW_OPTION_PRODUCT_TYPE = os.getenv("GROWW_OPTION_PRODUCT_TYPE", "NRML").upper()
 GROWW_OPTION_TICK_SIZE = 0.05
 GROWW_MIN_CALL_GAP_SEC = float(os.getenv("GROWW_MIN_CALL_GAP_SEC", "0.25"))
 GROWW_INSTRUMENTS_CSV_URL = os.getenv("GROWW_INSTRUMENTS_CSV_URL", "https://growwapi-assets.groww.in/instruments/instrument.csv")
 GROWW_INSTRUMENT_CACHE_TTL_SEC = float(os.getenv("GROWW_INSTRUMENT_CACHE_TTL_SEC", "1800.0"))
 GROWW_USE_OPTION_CHAIN_FOR_SELECTION = os.getenv("GROWW_USE_OPTION_CHAIN_FOR_SELECTION", "false").lower() in ("1", "true", "yes", "on")
-GROWW_MARKET_SESSION_GUARD_ENABLED = ICICI_MARKET_SESSION_GUARD_ENABLED
-GROWW_ANALYZE_ONLY_DURING_MARKET_SESSION = ICICI_ANALYZE_ONLY_DURING_MARKET_SESSION
+GROWW_SECURITY_MASTER_CACHE_PATH = os.getenv("GROWW_SECURITY_MASTER_CACHE_PATH", "data/groww_instruments.csv")
+GROWW_SECURITY_MASTER_REQUIRE_TODAY = False
+GROWW_MARKET_SESSION_GUARD_ENABLED = True
+GROWW_MARKET_OPEN_TIME = "09:15"
+GROWW_MARKET_CLOSE_TIME = "15:30"
+GROWW_MARKET_HOLIDAYS = tuple(x.strip() for x in os.getenv("GROWW_MARKET_HOLIDAYS", "").split(",") if x.strip())
+GROWW_ANALYZE_ONLY_DURING_MARKET_SESSION = os.getenv("GROWW_ANALYZE_ONLY_DURING_MARKET_SESSION", "true").lower() in ("1", "true", "yes", "on")
+GROWW_ALLOW_CLOSED_MARKET_HISTORICAL_WARMUP = True
+GROWW_ALLOW_CLOSED_MARKET_WARMUP = False
+GROWW_CLOSED_MARKET_QUOTE_PROBE = False
+GROWW_HISTORICAL_V2_FALLBACK = True
 GROWW_INDEX_STREAM_ENABLED = os.getenv("GROWW_INDEX_STREAM_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 GROWW_INDEX_WEBSOCKET_REQUIRED = os.getenv("GROWW_INDEX_WEBSOCKET_REQUIRED", "true").lower() in ("1", "true", "yes", "on")
 GROWW_INDEX_STREAM_FIRST_TICK_TIMEOUT_SEC = float(os.getenv("GROWW_INDEX_STREAM_FIRST_TICK_TIMEOUT_SEC", "12.0"))
 GROWW_INDEX_STREAM_MAX_STALE_SEC = float(os.getenv("GROWW_INDEX_STREAM_MAX_STALE_SEC", "15.0"))
+GROWW_WEBSOCKET_RECONNECT_COOLDOWN_SEC = float(os.getenv("GROWW_WEBSOCKET_RECONNECT_COOLDOWN_SEC", "30.0"))
+GROWW_SHARED_TRANSPORT_MAX_STALE_SEC = float(os.getenv("GROWW_SHARED_TRANSPORT_MAX_STALE_SEC", "20.0"))
+GROWW_REQUIRE_UNDERLYING_ANALYSIS_FEED = True
+GROWW_INDEX_STREAM_CHANNELS = "LIVE_QUOTE"
+GROWW_INDEX_STREAM_SCRIPT_CODES = {}
 GROWW_OPTION_STREAM_ENABLED = os.getenv("GROWW_OPTION_STREAM_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 GROWW_OPTION_WEBSOCKET_REQUIRED = os.getenv("GROWW_OPTION_WEBSOCKET_REQUIRED", "true").lower() in ("1", "true", "yes", "on")
 GROWW_SESSION_BOOK_REQUIRE_FIRST_OPTION_TICK_ON_STARTUP = os.getenv("GROWW_SESSION_BOOK_REQUIRE_FIRST_OPTION_TICK_ON_STARTUP", "false").lower() in ("1", "true", "yes", "on")
 GROWW_OPTION_STREAM_FIRST_TICK_TIMEOUT_SEC = float(os.getenv("GROWW_OPTION_STREAM_FIRST_TICK_TIMEOUT_SEC", "12.0"))
 GROWW_OPTION_STREAM_MAX_STALE_SEC = float(os.getenv("GROWW_OPTION_STREAM_MAX_STALE_SEC", "15.0"))
-GROWW_WEBSOCKET_RECONNECT_COOLDOWN_SEC = float(os.getenv("GROWW_WEBSOCKET_RECONNECT_COOLDOWN_SEC", "30.0"))
 GROWW_EMERGENCY_EXIT_LIMIT_BUFFER_PCT = float(os.getenv("GROWW_EMERGENCY_EXIT_LIMIT_BUFFER_PCT", "0.10"))
+
+GROWW_NIFTY_TREND_SWEEP_ENABLED = os.getenv("GROWW_NIFTY_TREND_SWEEP_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+GROWW_NIFTY_TREND_SWEEP_MIN_PHASE_SCORE = float(os.getenv("GROWW_NIFTY_TREND_SWEEP_MIN_PHASE_SCORE", "0.30"))
+GROWW_NIFTY_TREND_SWEEP_AGGRESSIVE_PHASE_SCORE = float(os.getenv("GROWW_NIFTY_TREND_SWEEP_AGGRESSIVE_PHASE_SCORE", "0.58"))
+GROWW_NIFTY_TREND_SWEEP_MIN_RR = float(os.getenv("GROWW_NIFTY_TREND_SWEEP_MIN_RR", "1.15"))
+GROWW_NIFTY_TREND_SWEEP_MAX_RR = float(os.getenv("GROWW_NIFTY_TREND_SWEEP_MAX_RR", "2.40"))
+GROWW_NIFTY_TREND_SWEEP_MAX_TARGET_ATR = float(os.getenv("GROWW_NIFTY_TREND_SWEEP_MAX_TARGET_ATR", "2.75"))
+GROWW_NIFTY_TREND_SWEEP_MAX_RECLAIM_EXTENSION_ATR = float(os.getenv("GROWW_NIFTY_TREND_SWEEP_MAX_RECLAIM_EXTENSION_ATR", "0.65"))
+GROWW_NIFTY_TREND_SWEEP_1M_MAX_AGE_SEC = float(os.getenv("GROWW_NIFTY_TREND_SWEEP_1M_MAX_AGE_SEC", "90.0"))
+GROWW_NIFTY_TREND_SWEEP_5M_MAX_AGE_SEC = float(os.getenv("GROWW_NIFTY_TREND_SWEEP_5M_MAX_AGE_SEC", "360.0"))
+GROWW_NIFTY_TREND_SWEEP_STOP_BASE_ATR = float(os.getenv("GROWW_NIFTY_TREND_SWEEP_STOP_BASE_ATR", "0.08"))
+GROWW_NIFTY_TREND_SWEEP_STOP_PCTL_SLOPE_ATR = float(os.getenv("GROWW_NIFTY_TREND_SWEEP_STOP_PCTL_SLOPE_ATR", "0.10"))
+GROWW_NIFTY_TREND_SWEEP_MIN_TARGET_REALISM = float(os.getenv("GROWW_NIFTY_TREND_SWEEP_MIN_TARGET_REALISM", "0.42"))
+GROWW_NIFTY_TREND_SWEEP_MAX_HOLD_SEC = float(os.getenv("GROWW_NIFTY_TREND_SWEEP_MAX_HOLD_SEC", "720.0"))
+GROWW_NIFTY_TREND_SWEEP_FAILED_AUCTION_FRACTION = float(os.getenv("GROWW_NIFTY_TREND_SWEEP_FAILED_AUCTION_FRACTION", "0.35"))
+GROWW_NIFTY_TREND_SWEEP_FAILED_AUCTION_R = float(os.getenv("GROWW_NIFTY_TREND_SWEEP_FAILED_AUCTION_R", "-0.15"))
+GROWW_NIFTY_TREND_SWEEP_FAILED_AUCTION_MAX_MFE_R = float(os.getenv("GROWW_NIFTY_TREND_SWEEP_FAILED_AUCTION_MAX_MFE_R", "0.30"))
+GROWW_NIFTY_TREND_SWEEP_MIN_PROGRESS_R = float(os.getenv("GROWW_NIFTY_TREND_SWEEP_MIN_PROGRESS_R", "0.15"))
+GROWW_NIFTY_TREND_SWEEP_HARD_MAX_MULT = float(os.getenv("GROWW_NIFTY_TREND_SWEEP_HARD_MAX_MULT", "1.0"))
+
+GROWW_OPTION_DEFAULT_LOT_SIZE = 0.0
+GROWW_OPTION_MIN_DTE = 1.0
+GROWW_OPTION_MAX_DTE = 21.0
+GROWW_INDEX_OPTION_TARGET_ABS_DELTA = 0.45
+GROWW_STOCK_OPTION_TARGET_ABS_DELTA = 0.50
+GROWW_OPTION_DELTA_BAND = 0.22
+GROWW_OPTION_MAX_THETA_TO_PREMIUM = 0.08
+GROWW_OPTION_IV_STRESS_PRIOR = 0.24
+GROWW_OPTION_MIN_IMPLIED_VOL = 0.03
+GROWW_OPTION_MAX_IMPLIED_VOL = 1.50
+INDIA_RISK_FREE_RATE = 0.065
+GROWW_OPTION_MAX_FUNDS_FRACTION_PER_TRADE = 0.42
+GROWW_OPTION_MIN_CASH_BUFFER_INR = 0.0
+GROWW_OPTION_MIN_READY_1M_BARS = 20
+GROWW_UNDERLYING_MIN_READY_1M_BARS = 20
+GROWW_OPTION_QUOTE_POLL_SEC = 30.0
+GROWW_SESSION_CONTRACT_BOOK_ENABLED = True
+GROWW_SESSION_BOOK_MAX_EXPIRIES = 2
+GROWW_SESSION_BOOK_PREWARM_EXECUTION_DATA = True
+GROWW_SESSION_BOOK_MAX_SPOT_DRIFT_PCT = 0.008
+GROWW_SESSION_BOOK_DELTA_RESELECT_BAND = 0.18
+GROWW_SESSION_BOOK_MIN_REFRESH_SEC = 900.0
+GROWW_SESSION_BOOK_URGENT_REFRESH_COOLDOWN_SEC = 30.0
+GROWW_SESSION_BOOK_REQUIRE_TWO_SIDED_QUOTE = True
+GROWW_OPTION_MAX_SELECTION_SPREAD_BPS = 120.0
+GROWW_OPTION_MIN_BOOK_LOTS = 1.0
+GROWW_SESSION_BOOK_QUOTES_FALLBACK_ENABLED = True
+GROWW_SESSION_BOOK_QUOTE_FALLBACK_STRIKES_PER_SIDE = 10
+GROWW_SESSION_BOOK_QUOTE_FALLBACK_MAX_CONTRACTS = 60
+GROWW_OPTION_EXECUTION_ATR_PERIOD = 14
+GROWW_OPTION_MAX_SPREAD_TO_1M_ATR = 0.35
+GROWW_OPTION_MAX_QUOTE_STALE_SEC = 10.0
+GROWW_EXECUTION_PREFLIGHT_EXACT_QUOTE_ENABLED = os.getenv("GROWW_EXECUTION_PREFLIGHT_EXACT_QUOTE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+GROWW_EXECUTION_PREFLIGHT_QUOTE_TTL_SEC = float(os.getenv("GROWW_EXECUTION_PREFLIGHT_QUOTE_TTL_SEC", "2.0"))
+GROWW_EXECUTION_SIGNAL_DEFER_COOLDOWN_SEC = float(os.getenv("GROWW_EXECUTION_SIGNAL_DEFER_COOLDOWN_SEC", "5.0"))
+GROWW_UNDERLYING_REST_REFRESH_SEC = 30.0
+GROWW_UNDERLYING_REST_RECONCILE_SEC = 900.0
+GROWW_OPTION_SLTP_DELTA_MULT = 1.00
+GROWW_OPTION_MIN_PREMIUM_RISK_PCT = 0.14
+GROWW_OPTION_MAX_PREMIUM_RISK_PCT = 0.58
+GROWW_OPTION_MIN_TP_PREMIUM_PCT = 0.18
+GROWW_OPTION_PREMIUM_TP_CONVEXITY_BONUS = 0.08
 
 INDIAN_NO_FRESH_ENTRY_AFTER_CLOSE_BUFFER_MIN = 25
 UNIVERSE_INCLUDE_EXCHANGES = os.getenv(
     "UNIVERSE_INCLUDE_EXCHANGES",
-    "delta,coinswitch,groww" if (GROWW_ENABLED or GROWW_DISCOVERY_ENABLED) else "delta,coinswitch,icici" if (ICICI_ENABLED or ICICI_DISCOVERY_ENABLED) else "delta,coinswitch",
+    "delta,coinswitch,groww" if (GROWW_ENABLED or GROWW_DISCOVERY_ENABLED) else "delta,coinswitch",
 )
 
 # Portfolio slots: the bot may hold multiple contracts at once, but each
@@ -802,7 +684,7 @@ TRADING_DESKS = {
         "sl_buffer_atr": 0.75,
     },
     "OPTIONS": {
-        "enabled": ICICI_OPTIONS_RUNTIME_ENABLED or GROWW_OPTIONS_RUNTIME_ENABLED,
+        "enabled": GROWW_OPTIONS_RUNTIME_ENABLED,
         "display_name": "NIFTY Options Desk",
         "strategy": STRATEGY_CORE_NAME,
         "asset_ids": ("NIFTY",),

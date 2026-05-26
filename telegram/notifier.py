@@ -881,7 +881,7 @@ def _tg_currency_symbol(venue: str = "", inst: Any = None) -> str:
             text += " " + str(getattr(getattr(inst, "primary", None), "quote_asset", "")).lower()
         except Exception:
             pass
-    if "icici" in text or "inr" in text:
+    if "groww" in text or "inr" in text:
         return "\u20b9"
     return "$"
 

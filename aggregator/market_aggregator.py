@@ -143,11 +143,11 @@ class MarketAggregator:
         )
 
     def _requires_analysis_feed(self) -> bool:
-        """ICICI options must never infer NIFTY structure from option premium candles."""
+        """GROWW options must never infer NIFTY structure from option premium candles."""
         exchange = getattr(getattr(self.instrument, "primary_exchange", None), "value", None)
         if exchange is None:
             exchange = getattr(self.instrument, "primary_exchange", "")
-        return str(exchange or "").lower() == "icici" and bool(getattr(config, "ICICI_REQUIRE_UNDERLYING_ANALYSIS_FEED", True))
+        return str(exchange or "").lower() == "groww" and bool(getattr(config, "GROWW_REQUIRE_UNDERLYING_ANALYSIS_FEED", True))
 
     # ── Internal: secondary trade tap ────────────────────────────────────────
 
@@ -259,7 +259,7 @@ class MarketAggregator:
 
         if self._analysis and not analysis_ok[0]:
             if self._requires_analysis_feed():
-                logger.error("ICICI analysis websocket unavailable; desk is fail-closed because underlying structural feed is mandatory")
+                logger.error("GROWW analysis websocket unavailable; desk is fail-closed because underlying structural feed is mandatory")
                 return False
             logger.warning("Analysis DM unavailable; primary candles will be used for structure")
 
@@ -306,11 +306,11 @@ class MarketAggregator:
                 try:
                     analysis_ready = bool(self._analysis.wait_until_ready(min(timeout_sec, 30.0)))
                     if self._requires_analysis_feed() and not analysis_ready:
-                        logger.error("ICICI mandatory underlying analysis feed did not become ready")
+                        logger.error("GROWW mandatory underlying analysis feed did not become ready")
                         return False
                 except Exception as exc:
                     if self._requires_analysis_feed():
-                        logger.error("ICICI mandatory underlying analysis readiness failed: %s", exc)
+                        logger.error("GROWW mandatory underlying analysis readiness failed: %s", exc)
                         return False
             return True
 
@@ -321,11 +321,11 @@ class MarketAggregator:
                 try:
                     analysis_ready = bool(self._analysis.wait_until_ready(min(timeout_sec, 30.0)))
                     if self._requires_analysis_feed() and not analysis_ready:
-                        logger.error("ICICI mandatory underlying analysis feed did not become ready")
+                        logger.error("GROWW mandatory underlying analysis feed did not become ready")
                         return False
                 except Exception as exc:
                     if self._requires_analysis_feed():
-                        logger.error("ICICI mandatory underlying analysis readiness failed: %s", exc)
+                        logger.error("GROWW mandatory underlying analysis readiness failed: %s", exc)
                         return False
             return True
 
@@ -377,10 +377,10 @@ class MarketAggregator:
         logger.error("❌ Both data managers not ready — bot cannot trade safely")
         return False
 
-    def prepare_icici_session_contract_book(self, available_funds: float) -> bool:
+    def prepare_groww_session_contract_book(self, available_funds: float) -> bool:
         """Preselect CE/PE execution vehicles after underlying warmup.
 
-        This delegates only for the ICICI option-primary manager.  Structural
+        This delegates only for the GROWW option-primary manager.  Structural
         analysis remains on the underlying feed; no direction is forecast here.
         """
         preparer = getattr(self._primary, "prepare_session_contract_book", None)
@@ -399,11 +399,7 @@ class MarketAggregator:
                 spot = 0.0
         return bool(preparer(spot, float(available_funds or 0.0), reason="session_start"))
 
-    def prepare_groww_session_contract_book(self, available_funds: float) -> bool:
-        """Preselect Groww CE/PE execution vehicles with the same strategy flow."""
-        return self.prepare_icici_session_contract_book(available_funds)
-
-    def release_icici_execution_vehicle(self) -> None:
+    def release_groww_execution_vehicle(self) -> None:
         releaser = getattr(self._primary, "release_execution_vehicle", None)
         if callable(releaser):
             releaser()
@@ -420,7 +416,7 @@ class MarketAggregator:
     def get_execution_feed_status(self) -> Dict:
         """Expose the orderable instrument feed separately from analysis feed.
 
-        For ICICI, analysis remains NIFTY underlying while execution is CE/PE
+        For GROWW, analysis remains NIFTY underlying while execution is CE/PE
         premium/depth.  This prevents a healthy underlying tick from masking an
         unarmed or stale option vehicle.
         """
@@ -464,7 +460,7 @@ class MarketAggregator:
     # ── Price — weighted average (display only) ────────────────────────────
 
     def get_last_price(self) -> float:
-        """Executable instrument mark price (option premium once ICICI vehicle is activated)."""
+        """Executable instrument mark price (option premium once GROWW vehicle is activated)."""
         price = self._primary.get_last_price()
         if price > 0:
             return price
@@ -478,7 +474,7 @@ class MarketAggregator:
     def get_analysis_price(self) -> float:
         """Price in the structural-analysis domain.
 
-        For ICICI long-premium execution, ``get_last_price`` changes to the
+        For GROWW long-premium execution, ``get_last_price`` changes to the
         selected option premium after contract activation, while liquidity/ICT
         state remains in underlying-index units.  Exposing this separately
         prevents premium prices being compared with NIFTY liquidity pools.

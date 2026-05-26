@@ -80,12 +80,12 @@ def _repair_mojibake(text: str) -> str:
 
 
 def _currency_for_strategy(strat) -> str:
-    """Currency used by the selected instrument; never infer ICICI values as USD."""
+    """Currency used by the selected instrument; never infer GROWW values as USD."""
     try:
         inst = getattr(strat, "_instrument", None)
         ex = str(getattr(getattr(inst, "primary_exchange", ""), "value", getattr(inst, "primary_exchange", ""))).lower()
         existing = str(getattr(getattr(strat, "_pos", None), "currency_symbol", "") or "")
-        return existing or ("₹" if ex == "icici" else "$")
+        return existing or ("₹" if ex == "groww" else "$")
     except Exception:
         return "$"
 
@@ -164,12 +164,12 @@ class TelegramBotController:
         self._getupdates_http_failures: int = 0
         self._getupdates_backoff_base: float = float(getattr(config, "TELEGRAM_GETUPDATES_BACKOFF_BASE_SEC", 2.0))
         self._getupdates_backoff_max: float = float(getattr(config, "TELEGRAM_GETUPDATES_BACKOFF_MAX_SEC", 30.0))
-        self._icici_otp_cv = threading.Condition()
-        self._icici_pending_otp: str = ""
-        self._icici_waiting_for_otp: bool = False
-        self._icici_refresh_thread: Optional[threading.Thread] = None
-        self._icici_refresh_result: str = ""
-        self._icici_premarket_refresh_day: str = ""
+        self._groww_otp_cv = threading.Condition()
+        self._groww_pending_otp: str = ""
+        self._groww_waiting_for_otp: bool = False
+        self._groww_refresh_thread: Optional[threading.Thread] = None
+        self._groww_refresh_result: str = ""
+        self._groww_premarket_refresh_day: str = ""
 
         if not self.bot_token or not self.chat_id:
             raise ValueError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set")
@@ -332,8 +332,7 @@ class TelegramBotController:
             "watchdog", "watchdog_status", "watchdog_heal",
             "watchdog_heal_on", "watchdog_heal_off",
             "watchdog_freeze", "watchdog_unfreeze",
-            "icici", "icici_status", "icici_token", "icici_refresh",
-            "icici_login", "icici_otp",
+            "groww", "groww_status",
         }
         if not t.startswith("/"):
             parts = t.split(None, 1)
@@ -351,10 +350,10 @@ class TelegramBotController:
         try:
             if cmd and not str(cmd).startswith("/"):
                 maybe_otp = re.sub(r"\D", "", str(cmd or ""))
-                with self._icici_otp_cv:
-                    waiting_for_icici_otp = bool(self._icici_waiting_for_otp)
-                if waiting_for_icici_otp and len(maybe_otp) == 6:
-                    return self._cmd_icici_otp(maybe_otp)
+                with self._groww_otp_cv:
+                    waiting_for_groww_otp = bool(self._groww_waiting_for_otp)
+                if waiting_for_groww_otp and len(maybe_otp) == 6:
+                    return self._cmd_groww_otp(maybe_otp)
             if   cmd in ("/help", "/commands"): return self._cmd_help()
             elif cmd == "/start":               return self._cmd_start()
             elif cmd == "/stop":                return self._cmd_stop()
@@ -392,12 +391,10 @@ class TelegramBotController:
                 return self._cmd_watchdog_freeze()
             elif cmd == "/watchdog_unfreeze":
                 return self._cmd_watchdog_unfreeze()
-            elif cmd in ("/icici", "/icici_status"):
-                return self._cmd_icici_status()
-            elif cmd in ("/icici_token", "/icici_refresh", "/icici_login"):
-                return self._cmd_icici_token()
-            elif cmd == "/icici_otp":
-                return self._cmd_icici_otp(args)
+            elif cmd in ("/groww", "/groww_status"):
+                return self._cmd_groww_status()
+            elif cmd in ("/groww_token", "/groww_refresh", "/groww_login", "/groww_otp"):
+                return self._cmd_groww_token()
             else:
                 return f"Unknown command: {cmd}\n\n" + self._cmd_help()
         except Exception as e:
@@ -405,116 +402,36 @@ class TelegramBotController:
             return f"❌ Error in {_esc(cmd)}: {_esc(e)}"
 
     # ================================================================
-    # ICICI / Breeze token flow
+    # GROWW / Groww token flow
     # ================================================================
 
-    def _icici_otp_getter(self) -> str:
-        timeout_sec = self._icici_otp_timeout_sec()
-        with self._icici_otp_cv:
-            self._icici_waiting_for_otp = True
-            self._icici_pending_otp = ""
-        self.send_message(
-            "🔐 <b>ICICI Breeze OTP Required</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"⏳ Window: <code>{timeout_sec:.0f}s</code>\n"
-            "📲 Reply with <code>/icici_otp 123456</code> or just the six-digit OTP.",
-            parse_mode="HTML",
-        )
-        deadline = time.time() + timeout_sec
-        with self._icici_otp_cv:
-            while not self._icici_pending_otp and time.time() < deadline:
-                self._icici_otp_cv.wait(timeout=max(0.5, min(5.0, deadline - time.time())))
-            otp = self._icici_pending_otp.strip()
-            self._icici_pending_otp = ""
-            self._icici_waiting_for_otp = False
-        if not otp:
-            raise RuntimeError("ICICI OTP wait timed out")
-        return otp
-
-    def _cmd_icici_status(self) -> str:
-        try:
-            from exchanges.icici.breeze_auth import BreezeTokenService
-            svc = BreezeTokenService()
-            status = svc.session_status()
-            configured = svc.has_minimum_config()
-            refreshable = svc.can_refresh_without_operator()
-            valid = bool(status.get("valid"))
-            reason = str(status.get("reason") or "")
-            age = status.get("age_sec")
-            age_txt = "n/a" if age is None else f"{float(age):.0f}s"
-            state_icon = "🟢" if valid else "🟠"
-            return (
-                f"{state_icon} <b>ICICI Breeze Desk</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                f"🧩 Configured: <code>{configured}</code>\n"
-                f"🔑 Session valid: <code>{valid}</code>  <i>{_esc(reason)}</i>\n"
-                f"⏱ Age: <code>{_esc(age_txt)}</code>\n"
-                f"📅 Same trading day: <code>{bool(status.get('same_trading_day'))}</code>\n"
-                f"🔄 Operator-free refresh: <code>{refreshable}</code>\n"
-                f"🕘 Created: <code>{_esc(status.get('created_local') or '')}</code>\n"
-                f"🕒 Now: <code>{_esc(status.get('now_local') or '')}</code>"
-            )
-        except Exception as e:
-            return f"⚠️ <b>ICICI status error</b>\n<code>{_esc(e)}</code>"
-
-    def _cmd_icici_token(self) -> str:
-        if self._icici_refresh_thread is not None and self._icici_refresh_thread.is_alive():
-            return (
-                "🔄 <b>ICICI token refresh already running</b>\n"
-                "If it is waiting for OTP, send <code>/icici_otp 123456</code>."
-            )
-
-        def _worker():
-            try:
-                from exchanges.icici.breeze_auth import BreezeTokenService
-                from exchanges.icici.daily_token_guard import mark_valid
-                from exchanges.icici.token_generator import assert_playwright_chromium_runtime_ready
-                svc = BreezeTokenService()
-                svc.require_configured(for_login=True)
-                assert_playwright_chromium_runtime_ready(
-                    auto_install=bool(getattr(config, "ICICI_PLAYWRIGHT_AUTO_INSTALL", True)),
-                    headless=bool(getattr(config, "ICICI_TOKEN_GENERATOR_HEADLESS", True)),
-                )
-                session = svc.get_session(force_refresh=True, otp_getter=self._icici_otp_getter)
-                status = svc.session_status(session)
-                mark_valid(self._icici_auth_now().date().isoformat(), "telegram_token_worker")
-                self._icici_refresh_result = (
-                    "✅ <b>ICICI Breeze Session Refreshed</b>\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🔑 Valid: <code>{bool(status.get('valid'))}</code>\n"
-                    f"🧾 Reason: <code>{_esc(status.get('reason') or '')}</code>\n"
-                    f"🕘 Created: <code>{_esc(status.get('created_local') or '')}</code>"
-                )
-            except Exception as e:
-                try:
-                    from exchanges.icici.daily_token_guard import mark_failed
-                    mark_failed(self._icici_auth_now().date().isoformat(), "telegram_token_worker")
-                except Exception:
-                    pass
-                self._icici_refresh_result = f"❌ <b>ICICI Breeze Refresh Failed</b>\n<code>{_esc(e)}</code>"
-            try:
-                self.send_message(self._icici_refresh_result, parse_mode="HTML")
-            except Exception:
-                pass
-
-        self._icici_refresh_result = "running"
-        self._icici_refresh_thread = threading.Thread(target=_worker, name="icici-token-refresh", daemon=True)
-        self._icici_refresh_thread.start()
+    def _cmd_groww_status(self) -> str:
+        access = bool(getattr(config, "GROWW_ACCESS_TOKEN", ""))
+        api_key = bool(getattr(config, "GROWW_API_KEY", ""))
+        totp = bool(getattr(config, "GROWW_TOTP_SECRET", ""))
+        ready = access or (api_key and totp)
+        mode = "access-token" if access else "api-key+totp" if api_key and totp else "missing"
+        icon = "??" if ready else "??"
         return (
-            "🚀 <b>ICICI Breeze token refresh started</b>\n"
-            "🧪 Chromium preflight runs first. If ICICI asks for OTP, I will prompt here."
+            f"{icon} <b>Groww Desk</b>\n"
+            "????????????????????\n"
+            f"Mode: <code>{mode}</code>\n"
+            f"Access token: <code>{access}</code>\n"
+            f"API key: <code>{api_key}</code>\n"
+            f"TOTP secret: <code>{totp}</code>\n"
+            "The 6-digit TOTP is generated locally at login time from the .env secret."
         )
 
-    def _cmd_icici_otp(self, args: str) -> str:
-        otp = re.sub(r"\D", "", str(args or ""))
-        if len(otp) != 6:
-            return "Send the OTP like: <code>/icici_otp 123456</code>"
-        with self._icici_otp_cv:
-            waiting = bool(self._icici_waiting_for_otp)
-            self._icici_pending_otp = otp
-            self._icici_waiting_for_otp = False
-            self._icici_otp_cv.notify_all()
-        return "ICICI OTP received. Continuing Breeze session refresh." if waiting else "ICICI OTP captured. Waiting token generator will consume it if login is pending."
+    def _cmd_groww_token(self) -> str:
+        return (
+            "Groww does not use the old Telegram OTP browser flow.\n"
+            "Set <code>GROWW_API_KEY</code> and <code>GROWW_TOTP_SECRET</code> in .env, "
+            "or set <code>GROWW_ACCESS_TOKEN</code>."
+        )
+
+    def _cmd_groww_otp(self, args: str) -> str:
+        _ = args
+        return self._cmd_groww_token()
 
     # /help
     # ================================================================
@@ -1305,216 +1222,23 @@ class TelegramBotController:
 
 
     # ================================================================
-    # ICICI Breeze auth preflight before data managers start
+    # GROWW Groww auth preflight before data managers start
     # ================================================================
 
-    def _icici_otp_timeout_sec(self) -> float:
-        return max(45.0, float(getattr(config, "ICICI_OTP_WAIT_SEC", 180.0) or 180.0))
+    def _maybe_run_groww_premarket_refresh(self, now: Optional[datetime] = None) -> None:
+        _ = now
+        return
 
-    def _clear_icici_pending_otp(self) -> None:
-        with self._icici_otp_cv:
-            self._icici_pending_otp = ""
-            self._icici_waiting_for_otp = False
+    def _should_auto_groww_token_on_start(self) -> bool:
+        return False
 
-    def _icici_auth_tz(self) -> timezone:
-        offset_min = int(getattr(config, "ICICI_SESSION_TIMEZONE_OFFSET_MIN", 330) or 330)
-        return timezone(timedelta(minutes=offset_min))
-
-    def _icici_auth_now(self) -> datetime:
-        return datetime.now(self._icici_auth_tz())
-
-    def _icici_local_now(self, now: Optional[datetime] = None) -> datetime:
-        if now is None:
-            return self._icici_auth_now()
-        if now.tzinfo is None:
-            return now.replace(tzinfo=self._icici_auth_tz())
-        return now.astimezone(self._icici_auth_tz())
-
-    def _parse_icici_premarket_time_min(self) -> int:
-        raw = str(getattr(config, "ICICI_PREMARKET_TOKEN_REFRESH_TIME", "08:30") or "08:30").strip()
-        match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", raw)
-        if not match:
-            logger.warning("Invalid ICICI_PREMARKET_TOKEN_REFRESH_TIME=%r; falling back to 08:30", raw)
-            return 8 * 60 + 30
-        return int(match.group(1)) * 60 + int(match.group(2))
-
-    def _icici_same_day_session_ready(self) -> bool:
-        try:
-            from exchanges.icici.breeze_auth import BreezeTokenService
-            svc = BreezeTokenService()
-            status = svc.session_status()
-            return bool(status.get("valid") and status.get("same_trading_day"))
-        except Exception as exc:
-            logger.info("ICICI premarket session status unavailable; daily refresh will run: %s", exc)
-            return False
-
-    def _maybe_run_icici_premarket_refresh(self, now: Optional[datetime] = None) -> None:
-        """Once per trading day, ensure Breeze auth is ready before NIFTY opens."""
-        if not bool(getattr(config, "ICICI_PREMARKET_TOKEN_REFRESH_ENABLED", True)):
-            return
-        if not self._should_auto_icici_token_on_start():
-            return
-
-        local_now = self._icici_local_now(now)
-        day_key = local_now.date().isoformat()
-        if getattr(self, "_icici_premarket_refresh_day", "") == day_key:
-            return
-
-        refresh_min = self._parse_icici_premarket_time_min()
-        window_min = max(1.0, float(getattr(config, "ICICI_PREMARKET_TOKEN_REFRESH_WINDOW_MIN", 90.0) or 90.0))
-        current_min = local_now.hour * 60 + local_now.minute + local_now.second / 60.0
-        if current_min < refresh_min or current_min > refresh_min + window_min:
-            return
-
-        self._icici_premarket_refresh_day = day_key
-        try:
-            from exchanges.icici.daily_token_guard import claim_login_attempt, claim_notice, mark_valid
-            if self._icici_same_day_session_ready():
-                if not claim_notice(day_key, "telegram_premarket", "passed_notice"):
-                    return
-                mark_valid(day_key, "telegram_premarket")
-                logger.info("ICICI premarket token check passed for %s; same-day Breeze session is valid.", day_key)
-                self.send_message(
-                    "ICICI premarket check passed.\n"
-                    "Same-day Breeze session is valid; NIFTY options scanner may trade after market open."
-                )
-                return
-
-            if not claim_login_attempt(day_key, "telegram_premarket"):
-                logger.info("ICICI premarket token refresh already owned for %s; suppressing duplicate request.", day_key)
-                return
-            self.send_message(
-                "ICICI daily premarket login required.\n"
-                "No valid same-day Breeze session was found before NIFTY open. Starting token generation now."
-            )
-            self._cmd_icici_token()
-        except Exception as exc:
-            logger.error("ICICI premarket token refresh failed: %s", exc, exc_info=True)
-            self.send_message(
-                "ICICI premarket token refresh failed.\n"
-                f"Reason: <code>{_esc(exc)}</code>\n"
-                "Use <code>/icici_token</code> to retry before NIFTY trading."
-            )
-
-    def _format_icici_session_ok(self, session) -> str:
-        try:
-            status = session.masked()
-            session_token = status.get("session_token", "***")
-        except Exception:
-            session_token = "***"
-        try:
-            from exchanges.icici.breeze_auth import BreezeTokenService
-            svc = BreezeTokenService()
-            st = svc.session_status(session)
-            day = "same-day" if st.get("same_trading_day") else "stale-day"
-        except Exception:
-            day = "unknown"
-        try:
-            age = int(session.age_sec())
-        except Exception:
-            age = 0
-        return (
-            "✅ <b>ICICI Breeze Ready</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔑 Session age: <code>{age}s</code>\n"
-            f"📅 Trading day: <code>{_esc(day)}</code>\n"
-            f"🧷 SessionToken: <code>{_esc(session_token)}</code>\n"
-            "🟢 NIFTY options scanner may start."
-        )
-
-    def _format_icici_preflight_ok(self, details: dict) -> str:
-        browser_path = str((details or {}).get("browser_path") or "")
-        runtime_path = str((details or {}).get("playwright_browsers_path") or "")
-        return (
-            "🧪 <b>ICICI Browser Preflight Passed</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"🌐 Chromium: <code>{_esc(browser_path[-72:] or 'ready')}</code>\n"
-            f"📦 Runtime: <code>{_esc(runtime_path[-72:] or 'ready')}</code>\n"
-            "🔐 Safe to request Breeze OTP."
-        )
-
-    def _should_auto_icici_token_on_start(self) -> bool:
-        if not bool(getattr(config, "ICICI_AUTO_TOKEN_GENERATOR_ON_STARTUP", True)):
-            return False
-        return bool(
-            getattr(config, "ICICI_OPTIONS_RUNTIME_ENABLED", False)
-            or getattr(config, "ICICI_ENABLED", False)
-            or getattr(config, "ICICI_BREEZE_PREFLIGHT_ON_STARTUP", True)
-        )
-
-    def _ensure_icici_session_before_bot_start(self) -> None:
-        """Generate/validate Breeze token before ICICI DMs touch protected endpoints.
-
-        This is intentionally in Telegram /start rather than the data manager:
-        the controller owns the OTP conversation, while data managers must stay
-        deterministic and never block mid-start waiting for operator input.
-        """
-        if not self._should_auto_icici_token_on_start():
-            return
-        try:
-            from exchanges.icici.daily_token_guard import current_state, claim_login_attempt, mark_failed, mark_valid
-            day_key = self._icici_auth_now().date().isoformat()
-            if self._icici_refresh_thread is not None and self._icici_refresh_thread.is_alive():
-                wait_sec = max(
-                    self._icici_otp_timeout_sec() + 60.0,
-                    float(getattr(config, "ICICI_STARTUP_TOKEN_WAIT_SEC", 300.0) or 300.0),
-                )
-                self.send_message(
-                    "🔐 <b>ICICI Breeze token refresh already running</b>\n"
-                    "Startup will wait for the active renewal instead of launching a second login."
-                )
-                self._icici_refresh_thread.join(timeout=wait_sec)
-                if self._icici_refresh_thread.is_alive():
-                    raise RuntimeError("ICICI token refresh did not complete before startup wait timeout")
-
-            from exchanges.icici.breeze_auth import BreezeTokenService
-            svc = BreezeTokenService()
-            svc.require_configured(for_login=False)
-
-            # Fast path: valid same-day cached session, current API_Session file,
-            # or an explicit emergency SessionToken override. No .env session is
-            # required for the normal path.
-            try:
-                session = svc.get_session(force_refresh=False)
-                mark_valid(day_key, "telegram_start_cached")
-                self.send_message(self._format_icici_session_ok(session))
-                return
-            except Exception as first_exc:
-                logger.info("ICICI Breeze session not ready; launching Telegram OTP login before scanner start: %s", first_exc)
-
-            svc.require_configured(for_login=True)
-            if not claim_login_attempt(day_key, "telegram_start"):
-                logger.info("ICICI startup login already owned for %s; suppressing duplicate startup token generation.", day_key)
-                return
-            self._clear_icici_pending_otp()
-            from exchanges.icici.token_generator import assert_playwright_chromium_runtime_ready
-            preflight = assert_playwright_chromium_runtime_ready(
-                auto_install=bool(getattr(config, "ICICI_PLAYWRIGHT_AUTO_INSTALL", True)),
-                headless=bool(getattr(config, "ICICI_TOKEN_GENERATOR_HEADLESS", True)),
-            )
-            self.send_message(self._format_icici_preflight_ok(preflight))
-            self.send_message(
-                "🔐 <b>ICICI Breeze Login Required</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                "📉 NIFTY chart analysis is paused until the same-day Breeze session is ready.\n"
-                "📲 I am launching the token generator now; send only the OTP when requested."
-            )
-            session = svc.refresh(otp_getter=self._icici_otp_getter)
-            mark_valid(day_key, "telegram_start")
-            self.send_message(self._format_icici_session_ok(session))
-        except Exception as exc:
-            try:
-                mark_failed(day_key, "telegram_start")
-            except Exception:
-                pass
-            msg = f"ICICI Breeze startup token generation failed: {exc}"
-            logger.error(msg, exc_info=True)
-            if bool(getattr(config, "ICICI_AUTH_REQUIRED_FOR_DETAILS", True)):
-                raise RuntimeError(msg) from exc
-            self.send_message(
-                "⚠️ <b>ICICI auth unavailable</b>; continuing without authenticated ICICI data.\n"
-                f"Reason: <code>{_esc(exc)}</code>"
-            )
+    def _ensure_groww_session_before_bot_start(self) -> None:
+        access = bool(getattr(config, "GROWW_ACCESS_TOKEN", ""))
+        api_key = bool(getattr(config, "GROWW_API_KEY", ""))
+        totp = bool(getattr(config, "GROWW_TOTP_SECRET", ""))
+        if bool(getattr(config, "GROWW_OPTIONS_RUNTIME_ENABLED", False)) and not (access or (api_key and totp)):
+            raise RuntimeError("Groww credentials missing: set GROWW_ACCESS_TOKEN or GROWW_API_KEY plus GROWW_TOTP_SECRET.")
+        return
 
     # ================================================================
     # BOT THREAD
@@ -1537,7 +1261,7 @@ class TelegramBotController:
             # without this, multi-asset Telegram starts used controller-only logs.
             import main as _main_logging_bootstrap  # noqa: F401
             import config as _cfg
-            self._ensure_icici_session_before_bot_start()
+            self._ensure_groww_session_before_bot_start()
             if bool(getattr(_cfg, "MULTI_ASSET_ENABLED", True)):
                 from orchestration.multi_asset_bot import MultiAssetQuantBot
                 logger.info("Telegram /start selected MultiAssetQuantBot (MULTI_ASSET_ENABLED=True)")
@@ -1585,7 +1309,7 @@ class TelegramBotController:
             if bot_starting and thread_alive:
                 return (
                     "⏳ <b>Startup already in progress</b>\n"
-                    "Current boot path: <code>ICICI auth → browser preflight → universe → data warmup → scanner</code>"
+                    "Current boot path: <code>Groww credentials ? universe ? data warmup ? scanner</code>"
                 )
             bot_starting = True
             bot_last_start_error = ""
@@ -1600,8 +1324,7 @@ class TelegramBotController:
             return (
                 "🚀 <b>Boot sequence started</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
-                "🔐 ICICI Breeze/session readiness\n"
-                "🧪 Chromium runtime preflight\n"
+                "?? Groww credential readiness\n"
                 "📡 Live universe + data warmup\n"
                 "🛡️ Risk/execution wiring\n"
                 "Use /status in 30s."
@@ -1634,15 +1357,14 @@ class TelegramBotController:
             "⚡ <b>Institutional Quant Controller Ready</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "🏦 Execution: <code>" + getattr(config, "EXECUTION_EXCHANGE", "?").upper() + "</code>\n"
-            "🔐 ICICI startup auth preflight: <code>" + str(bool(getattr(config, "ICICI_BREEZE_PREFLIGHT_ON_STARTUP", True))) + "</code>\n"
-            "🧪 Playwright runtime preflight: <code>enabled</code>\n\n"
+            "?? Groww credentials: <code>" + ("ready" if (getattr(config, "GROWW_ACCESS_TOKEN", "") or (getattr(config, "GROWW_API_KEY", "") and getattr(config, "GROWW_TOTP_SECRET", ""))) else "missing") + "</code>\n\n"
             + self._cmd_help())
         logger.info("Telegram controller started")
-        self._maybe_run_icici_premarket_refresh()
+        self._maybe_run_groww_premarket_refresh()
 
         while self.running:
             try:
-                self._maybe_run_icici_premarket_refresh()
+                self._maybe_run_groww_premarket_refresh()
                 updates = self.get_updates(timeout=10)
                 for upd in updates:
                     self.last_update_id = upd.get("update_id", self.last_update_id)

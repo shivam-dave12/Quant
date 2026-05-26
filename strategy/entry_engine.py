@@ -73,7 +73,7 @@ class EntryType(Enum):
     LIQUIDITY_RAID_REVERSAL = "LIQUIDITY_RAID_REVERSAL"
     DISPLACEMENT_CONTINUATION = "DISPLACEMENT_CONTINUATION"
     LIQUIDITY_EXPANSION_RETEST = "LIQUIDITY_EXPANSION_RETEST"
-    # ICICI NIFTY profile: intraday trend pullback is entered at a freshly
+    # GROWW NIFTY profile: intraday trend pullback is entered at a freshly
     # reclaimed liquidity sweep and monetised into the nearest live pool.
     NIFTY_TREND_SWEEP_SCALP = "NIFTY_TREND_SWEEP_SCALP"
     # Compatibility name retained for historical trade records only.
@@ -498,9 +498,9 @@ class ICTLiquidityEntryEngine:
         exchange_obj = getattr(instrument, "primary_exchange", "")
         self._exchange = str(getattr(exchange_obj, "value", exchange_obj) or "").lower()
         self._nifty_trend_sweep_profile = bool(
-            _cfg_bool("ICICI_NIFTY_TREND_SWEEP_ENABLED", True)
+            _cfg_bool("GROWW_NIFTY_TREND_SWEEP_ENABLED", True)
             and self._asset_id in {"NIFTY", "NIFTY50", "CNXNIFTY"}
-            and (not self._exchange or self._exchange == "icici")
+            and (not self._exchange or self._exchange == "groww")
         )
         # Every instrument uses the same auction-control / structural-zone
         # authority.  BTC and SILVER are named explicitly in telemetry because
@@ -595,8 +595,8 @@ class ICTLiquidityEntryEngine:
         else:
             score = 0.70 * ctx15.signed_score + 0.30 * ctx4.signed_score
         strength = abs(score)
-        threshold = _cfg_float("ICICI_NIFTY_TREND_SWEEP_MIN_PHASE_SCORE", 0.30)
-        aggressive_threshold = _cfg_float("ICICI_NIFTY_TREND_SWEEP_AGGRESSIVE_PHASE_SCORE", 0.58)
+        threshold = _cfg_float("GROWW_NIFTY_TREND_SWEEP_MIN_PHASE_SCORE", 0.30)
+        aggressive_threshold = _cfg_float("GROWW_NIFTY_TREND_SWEEP_AGGRESSIVE_PHASE_SCORE", 0.58)
         direction = "long" if score >= threshold else ("short" if score <= -threshold else "")
         if not direction or ctx15.side == 0:
             return _IntradayRegime("BALANCE_OR_TRANSITION", "", score, strength, "WAIT", "15m delivery not directional")
@@ -628,9 +628,9 @@ class ICTLiquidityEntryEngine:
         if risk <= _EPS:
             return None
         pools = list(snap.bsl_pools if side == "long" else snap.ssl_pools)
-        min_rr = max(1.0, _cfg_float("ICICI_NIFTY_TREND_SWEEP_MIN_RR", 1.15))
-        max_rr = max(min_rr, _cfg_float("ICICI_NIFTY_TREND_SWEEP_MAX_RR", 2.40))
-        max_dist_atr = max(0.75, _cfg_float("ICICI_NIFTY_TREND_SWEEP_MAX_TARGET_ATR", 2.75))
+        min_rr = max(1.0, _cfg_float("GROWW_NIFTY_TREND_SWEEP_MIN_RR", 1.15))
+        max_rr = max(min_rr, _cfg_float("GROWW_NIFTY_TREND_SWEEP_MAX_RR", 2.40))
+        max_dist_atr = max(0.75, _cfg_float("GROWW_NIFTY_TREND_SWEEP_MAX_TARGET_ATR", 2.75))
         rows: List[Dict[str, Any]] = []
         for target in pools:
             pool = getattr(target, "pool", None)
@@ -754,14 +754,14 @@ class ICTLiquidityEntryEngine:
             return False
         reclaim = (side == "long" and price > swept_level) or (side == "short" and price < swept_level)
         extension_atr = abs(price - swept_level) / max(atr, _EPS)
-        max_extension = max(0.20, _cfg_float("ICICI_NIFTY_TREND_SWEEP_MAX_RECLAIM_EXTENSION_ATR", 0.65))
+        max_extension = max(0.20, _cfg_float("GROWW_NIFTY_TREND_SWEEP_MAX_RECLAIM_EXTENSION_ATR", 0.65))
         if not reclaim:
             self._record_block("NIFTY_TREND_SWEEP_NOT_RECLAIMED", trigger="WAIT_FOR_SWEEP_RECLAIM")
             return False
         if extension_atr > max_extension:
             self._record_block("NIFTY_TREND_SWEEP_RECLAIM_TOO_EXTENDED", trigger="WAIT_FOR_NEW_PULLBACK_SWEEP", reclaim_extension_atr=extension_atr)
             return False
-        clearance = atr * (_cfg_float("ICICI_NIFTY_TREND_SWEEP_STOP_BASE_ATR", 0.08) + _cfg_float("ICICI_NIFTY_TREND_SWEEP_STOP_PCTL_SLOPE_ATR", 0.10) * self._atr_pctile)
+        clearance = atr * (_cfg_float("GROWW_NIFTY_TREND_SWEEP_STOP_BASE_ATR", 0.08) + _cfg_float("GROWW_NIFTY_TREND_SWEEP_STOP_PCTL_SLOPE_ATR", 0.10) * self._atr_pctile)
         raw_sl = wick - clearance if side == "long" else wick + clearance
         stop_plan = self._sweep_reclaim_protected_stop(side, price, wick, raw_sl, snap, atr)
         sl = stop_plan.price
@@ -1304,8 +1304,8 @@ class ICTLiquidityEntryEngine:
         event once it is reclaimed in an already observed intraday trend.
         """
         age_limit = {
-            "1m": max(30.0, _cfg_float("ICICI_NIFTY_TREND_SWEEP_1M_MAX_AGE_SEC", 90.0)),
-            "5m": max(60.0, _cfg_float("ICICI_NIFTY_TREND_SWEEP_5M_MAX_AGE_SEC", 360.0)),
+            "1m": max(30.0, _cfg_float("GROWW_NIFTY_TREND_SWEEP_1M_MAX_AGE_SEC", 90.0)),
+            "5m": max(60.0, _cfg_float("GROWW_NIFTY_TREND_SWEEP_5M_MAX_AGE_SEC", 360.0)),
         }
         out: List[SweepResult] = []
         for sw in list(getattr(snap, "recent_sweeps", []) or []):

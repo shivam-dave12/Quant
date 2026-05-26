@@ -4,8 +4,8 @@ from types import SimpleNamespace
 
 os.environ.setdefault("DELTA_API_KEY", "test")
 os.environ.setdefault("DELTA_SECRET_KEY", "test")
-os.environ.setdefault("BREEZE_API_KEY", "test")
-os.environ.setdefault("BREEZE_SECRET_KEY", "test")
+os.environ.setdefault("GROWW_API_KEY", "test")
+os.environ.setdefault("GROWW_SECRET_KEY", "test")
 
 from core.instruments import AssetClass, ExchangeName, ExchangeInstrument, TradableInstrument
 from execution.order_manager import OrderManager
@@ -15,22 +15,22 @@ from aggregator.market_aggregator import MarketAggregator
 
 def _instrument(exchange: ExchangeName, symbol: str, asset: str, asset_class=AssetClass.COMMODITY):
     raw = {}
-    if exchange == ExchangeName.ICICI:
+    if exchange == ExchangeName.GROWW:
         raw = {
             "stock_code": "NIFTY", "strike_price": 24000, "expiry_date": "2026-06-02",
             "right": "call", "exchange_code": "NFO", "product_type": "Options",
         }
     ei = ExchangeInstrument(
         exchange=exchange, symbol=symbol, ws_symbol=symbol, display_symbol=symbol,
-        asset_id=asset, asset_class=asset_class, quote_asset="INR" if exchange == ExchangeName.ICICI else "USD",
-        status="active", tick_size=0.05 if exchange == ExchangeName.ICICI else 0.01,
+        asset_id=asset, asset_class=asset_class, quote_asset="INR" if exchange == ExchangeName.GROWW else "USD",
+        status="active", tick_size=0.05 if exchange == ExchangeName.GROWW else 0.01,
         lot_step=1.0, min_qty=1.0, raw=raw,
     )
     return TradableInstrument(asset, asset, asset_class, exchange, {exchange: ei})
 
 
-def test_icici_stop_fill_is_reconciled_from_tracked_order_and_trade_vwap():
-    inst = _instrument(ExchangeName.ICICI, "NIFTY02JUN202624000CE", "NIFTY", AssetClass.OPTION)
+def test_groww_stop_fill_is_reconciled_from_tracked_order_and_trade_vwap():
+    inst = _instrument(ExchangeName.GROWW, "NIFTY02JUN202624000CE", "NIFTY", AssetClass.OPTION)
 
     class API:
         def get_order(self, order_id=None, exchange_code=None):
@@ -41,12 +41,12 @@ def test_icici_stop_fill_is_reconciled_from_tracked_order_and_trade_vwap():
                 {"trade_price": "65.20", "quantity": "25", "total_charges": "3.75"},
             ]}
 
-    om = OrderManager(API(), exchange_name="icici", instrument=inst)
+    om = OrderManager(API(), exchange_name="groww", instrument=inst)
     om._adapter.limiter.wait = lambda: None
-    result = om.identify_exit_order("sl-icici-1", None)
+    result = om.identify_exit_order("sl-groww-1", None)
     assert result["confirmed"] is True
     assert result["exit_type"] == "sl"
-    assert result["order_id"] == "sl-icici-1"
+    assert result["order_id"] == "sl-groww-1"
     assert abs(result["fill_price"] - ((64.80 * 40 + 65.20 * 25) / 65)) < 1e-9
     assert result["fee_paid"] == 3.75
     assert result["fee_exact"] is True
@@ -74,7 +74,7 @@ def test_unrealised_pnl_accepts_portfolio_snapshot_dictionary():
     assert qs._unrealised_pnl_usd(104.0, live_snapshot) == 0.0
 
 
-def test_icici_analysis_price_remains_underlying_after_option_activation():
+def test_groww_analysis_price_remains_underlying_after_option_activation():
     option_dm = SimpleNamespace(get_last_price=lambda: 146.15)
     underlying_dm = SimpleNamespace(get_last_price=lambda: 23811.70)
     agg = MarketAggregator(option_dm, None, analysis_dm=underlying_dm)

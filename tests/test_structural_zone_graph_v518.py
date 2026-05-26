@@ -9,8 +9,8 @@ import pytest
 
 os.environ.setdefault("DELTA_API_KEY", "test")
 os.environ.setdefault("DELTA_SECRET_KEY", "test")
-os.environ.setdefault("BREEZE_API_KEY", "test")
-os.environ.setdefault("BREEZE_SECRET_KEY", "test")
+os.environ.setdefault("GROWW_API_KEY", "test")
+os.environ.setdefault("GROWW_SECRET_KEY", "test")
 
 from strategy.entry_engine import EntryEngine, EntryType, _FVG, _Thesis, _TrendContext
 from strategy.liquidity_map import LiquidityMapSnapshot, LiquidityPool, PoolSide, PoolStatus, PoolTarget, SweepResult

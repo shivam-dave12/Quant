@@ -235,7 +235,7 @@ def build_instrument_policy(inst: Optional[TradableInstrument]) -> InstrumentPol
             spread_max_ticks=_f('QUANT_MAX_SPREAD_TICKS_OPTION', 20.0),
             spread_min_size_mult=_f('QUANT_SPREAD_MIN_SIZE_MULT', 0.35),
             spread_haircut_max=_f('QUANT_SPREAD_SIZE_HAIRCUT_MAX', 0.65),
-            notes='ICICI long-premium options policy; underlying-first, premium-funded',
+            notes='GROWW long-premium options policy; underlying-first, premium-funded',
             **desk_fields,
         )
 

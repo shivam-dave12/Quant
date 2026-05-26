@@ -103,7 +103,6 @@ class _RateLimiter:
 # Global limiters — one per exchange (shared across all OrderManager instances)
 _CS_LIMITER    = _RateLimiter(min_interval_sec=3.0)
 _DELTA_LIMITER = _RateLimiter(min_interval_sec=0.25)
-_ICICI_LIMITER = _RateLimiter(min_interval_sec=0.75)
 _GROWW_LIMITER = _RateLimiter(min_interval_sec=float(getattr(config, "GROWW_MIN_CALL_GAP_SEC", 0.25)))
 
 # Also keep a module-level alias for compatibility imports (quant_strategy does
@@ -886,17 +885,17 @@ class _DeltaAdapter:
 
 # ── Main OrderManager ─────────────────────────────────────────────────────────
 
-class _ICICIAdapter:
-    """Long-premium ICICI options adapter.
+class _GrowwBaseAdapter:
+    """Long-premium GROWW options adapter.
 
     Opening orders are always buy-to-open limit orders. Exits are sell-to-close
-    limit or official Breeze stoploss orders. No market orders, no option writing,
+    limit or official Groww stoploss orders. No market orders, no option writing,
     no leverage. Portfolio state is created only from exact NFO option rows.
     """
 
     def __init__(self, api, exchange_instrument=None) -> None:
         self.api = api
-        self.limiter = _ICICI_LIMITER
+        self.limiter = _GROWW_LIMITER
         self.exchange_instrument = exchange_instrument
         self.symbol = (exchange_instrument.symbol if exchange_instrument is not None else "")
         self.display_symbol = (exchange_instrument.display_symbol if exchange_instrument is not None else self.symbol)
@@ -970,7 +969,7 @@ class _ICICIAdapter:
         return (stock, strike, str(expiry).strip().lower(), right)
 
     def _signed_position_qty(self, row: Dict[str, Any]) -> float:
-        # Breeze PortfolioPositions officially returns `quantity`; aliases are
+        # Groww PortfolioPositions officially returns `quantity`; aliases are
         # retained only for backward-compatible broker response variants.
         for key in ("quantity", "qty", "open_quantity", "open_qty", "net_quantity", "net_qty"):
             if key in row and row.get(key) not in (None, ""):
@@ -986,7 +985,7 @@ class _ICICIAdapter:
         segment = str(row.get("segment") or row.get("Segment") or "").strip().lower()
         product = str(row.get("product_type") or row.get("product") or row.get("ProductType") or "").strip().lower()
         exchange = str(row.get("exchange_code") or row.get("ExchangeCode") or "").strip().upper()
-        # Breeze response variants may omit `segment`; never invent a position,
+        # Groww response variants may omit `segment`; never invent a position,
         # but do not ignore an exact NFO Options contract solely because this
         # optional discriminator is absent. Explicit non-F&O values still fail.
         if segment and segment not in {"fno", "nfo"}:
@@ -1048,7 +1047,7 @@ class _ICICIAdapter:
         self._last_position_filter_signature = signature
         self._last_position_filter_log_ts = now
         logger.info(
-            "ICICI F&O position filter ignored %d non-executable broker row(s) [%s]; "
+            "GROWW F&O position filter ignored %d non-executable broker row(s) [%s]; "
             "only exact NFO Options rows can create position state",
             len(ignored), ",".join(sorted(set(ignored)))
         )
@@ -1084,7 +1083,7 @@ class _ICICIAdapter:
             out["requires_contract_reconstruction"] = True
         if signed_qty < 0:
             out["unadoptable"] = True
-            out["reason"] = "short_icici_option_outside_long_premium_policy"
+            out["reason"] = "short_groww_option_outside_long_premium_policy"
         return out
 
     def _lot_size(self) -> float:
@@ -1103,29 +1102,29 @@ class _ICICIAdapter:
         order_type_u = str(order_type or "").upper()
         stop_order_type = str(kwargs.get("stop_order_type") or "").lower()
         if "MARKET" in order_type_u and not reduce_only:
-            raise RuntimeError("ICICI options guard: market entries are disabled; use limit orders")
+            raise RuntimeError("GROWW options guard: market entries are disabled; use limit orders")
         raw = self._active_raw()
         if not self._has_contract_identity(raw):
-            raise RuntimeError("ICICI options guard: exact NFO option identity is required before routing an order")
+            raise RuntimeError("GROWW options guard: exact NFO option identity is required before routing an order")
         exchange_code = str(raw.get("exchange_code") or "NFO").upper()
         if exchange_code != "NFO":
-            raise RuntimeError(f"ICICI options guard: expected NFO option contract, received exchange={exchange_code}")
+            raise RuntimeError(f"GROWW options guard: expected NFO option contract, received exchange={exchange_code}")
         action = "sell" if reduce_only else "buy"
         px = price if price is not None else trigger_price
         if (px is None or float(px or 0.0) <= 0) and reduce_only:
             px = raw.get("selected_entry_premium") or raw.get("ltp") or raw.get("last_price") or raw.get("close")
         if px is None or float(px or 0.0) <= 0:
-            raise RuntimeError("ICICI options guard: executable limit price is required")
+            raise RuntimeError("GROWW options guard: executable limit price is required")
         lot_raw = float(self._lot_size() or 0.0)
         if lot_raw <= 0:
-            raise RuntimeError("ICICI options guard: verified NFO option lot size is required before routing an order")
+            raise RuntimeError("GROWW options guard: verified NFO option lot size is required before routing an order")
         lot = int(round(lot_raw))
         if lot <= 0 or abs(lot_raw - lot) > 1e-9:
-            raise RuntimeError(f"ICICI options guard: invalid NFO option lot size={lot_raw!r}")
+            raise RuntimeError(f"GROWW options guard: invalid NFO option lot size={lot_raw!r}")
         requested = float(quantity or 0.0)
         lots = int(math.floor((requested / lot) + 1e-9))
         if lots < 1:
-            raise RuntimeError(f"ICICI options guard: requested quantity={requested:g} does not fit one lot={lot}")
+            raise RuntimeError(f"GROWW options guard: requested quantity={requested:g} does not fit one lot={lot}")
         qty = int(lots * lot)
         is_stop = order_type_u.startswith("STOP") or stop_order_type == "stop_loss_order"
         body = {
@@ -1143,7 +1142,7 @@ class _ICICIAdapter:
         }
         if is_stop:
             if trigger_price is None or float(trigger_price or 0.0) <= 0:
-                raise RuntimeError("ICICI options guard: stoploss order requires a positive trigger price")
+                raise RuntimeError("GROWW options guard: stoploss order requires a positive trigger price")
             body["stoploss"] = str(trigger_price)
         return {k: v for k, v in body.items() if v not in (None, "")}
 
@@ -1185,19 +1184,19 @@ class _ICICIAdapter:
         return 0.0
 
     def place_bracket_limit_entry(self, side: str, quantity: float, limit_price: float, sl_price: float, tp_price: float) -> Optional[Dict]:
-        """Route ICICI long-premium entries through documented three-leg cover OCO.
+        """Route GROWW long-premium entries through documented three-leg cover OCO.
 
         The strategy side identifies the underlying thesis; the option vehicle is
         always bought.  No normal entry order is sent if protected GTT placement
         fails.
         """
-        if not bool(getattr(config, "ICICI_REQUIRE_GTT_COVER_OCO_PROTECTED_ENTRY", True)):
-            return {"_error": True, "_raw": {"error": "ICICI_GTT_COVER_OCO_DISABLED_FAIL_CLOSED"}}
+        if not bool(getattr(config, "GROWW_REQUIRE_GTT_COVER_OCO_PROTECTED_ENTRY", True)):
+            return {"_error": True, "_raw": {"error": "GROWW_GTT_COVER_OCO_DISABLED_FAIL_CLOSED"}}
         self.limiter.wait()
         try:
             raw = self._active_raw()
             if not self._has_contract_identity(raw):
-                raise RuntimeError("ICICI protected entry requires an exact selected NFO option contract")
+                raise RuntimeError("GROWW protected entry requires an exact selected NFO option contract")
             # Reuse lot validation; this never sends an order.
             entry_body = self._order_body(side, "LIMIT", quantity, price=limit_price, reduce_only=False)
             qty = int(entry_body["quantity"])
@@ -1211,7 +1210,7 @@ class _ICICIAdapter:
             stop_limit = _round_nearest(max(tick, stop_trigger - tick))
             if not (entry > 0 and stop_limit > 0 and stop_trigger < entry < target_trigger):
                 raise RuntimeError(
-                    f"ICICI GTT geometry invalid: stop_limit={stop_limit} stop_trigger={stop_trigger} entry={entry} target={target_trigger}"
+                    f"GROWW GTT geometry invalid: stop_limit={stop_limit} stop_trigger={stop_trigger} entry={entry} target={target_trigger}"
                 )
             ist = timezone(timedelta(hours=5, minutes=30))
             trade_date = datetime.now(ist).strftime("%Y-%m-%dT06:00:00.000Z")
@@ -1244,7 +1243,7 @@ class _ICICIAdapter:
             oid = f"GTT:{gtt_id}"
             self._gtt_plans[gtt_id] = {"quantity": qty, "entry": entry, "sl": stop_trigger, "tp": target_trigger, "payload": payload}
             logger.info(
-                "ICICI protected cover-OCO accepted gtt_id=%s option=%s %s %s qty=%s entry=₹%.2f SL=₹%.2f TP=₹%.2f",
+                "GROWW protected cover-OCO accepted gtt_id=%s option=%s %s %s qty=%s entry=₹%.2f SL=₹%.2f TP=₹%.2f",
                 gtt_id, payload["stock_code"], payload["right"], payload["strike_price"], qty, entry, stop_trigger, target_trigger,
             )
             return {
@@ -1252,14 +1251,14 @@ class _ICICIAdapter:
                 "bracket_order": True, "bracket_child_verified": True,
                 "bracket_sl_order_id": f"{oid}:STOPLOSS", "bracket_tp_order_id": f"{oid}:TARGET",
                 "bracket_sl_price": stop_trigger, "bracket_tp_price": target_trigger,
-                "protection_model": "ICICI_GTT_COVER_OCO", "_raw": response,
+                "protection_model": "GROWW_GTT_COVER_OCO", "_raw": response,
             }
         except Exception as exc:
-            logger.error("ICICI protected cover-OCO entry rejected before exposure: %s", exc)
+            logger.error("GROWW protected cover-OCO entry rejected before exposure: %s", exc)
             return {"_raw": {"error": str(exc)}, "_sc": 0, "_error": True}
 
     def _normal_order_row(self, order_id: str) -> Optional[Dict[str, Any]]:
-        """Read a normal Breeze order without invoking GTT pseudo-id routing."""
+        """Read a normal Groww order without invoking GTT pseudo-id routing."""
         getter = getattr(self.api, "get_order", None) or getattr(self.api, "get_order_detail", None)
         if not callable(getter):
             return None
@@ -1280,7 +1279,7 @@ class _ICICIAdapter:
         return None
 
     def _gtt_row(self, order_id: str) -> Optional[Dict[str, Any]]:
-        """Resolve official Breeze cover-OCO pseudo ids through the GTT book.
+        """Resolve official Groww cover-OCO pseudo ids through the GTT book.
 
         Official GTT order-book rows identify the GTT id on each ``order_details``
         leg and expose the immediately routed fresh-entry order as
@@ -1418,7 +1417,7 @@ class _ICICIAdapter:
         return 0.0, False
 
     def resolve_order_execution(self, order_id: str) -> Optional[Dict]:
-        """Resolve an NFO close from exact Breeze order/trade records when exposed."""
+        """Resolve an NFO close from exact Groww order/trade records when exposed."""
         oid = str(order_id or "").strip()
         if not oid:
             return None
@@ -1461,7 +1460,7 @@ class _ICICIAdapter:
                 if exact_fee_seen:
                     fee_paid, fee_exact = exact_fees, True
             except Exception as exc:
-                logger.debug("ICICI get_trade_detail execution resolution unavailable for %s: %s", oid, exc)
+                logger.debug("GROWW get_trade_detail execution resolution unavailable for %s: %s", oid, exc)
         return {
             "status": status,
             "fill_price": float(fill_price or 0.0),
@@ -1484,7 +1483,7 @@ class _ICICIAdapter:
                 to_date=now.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
             )
         except Exception as exc:
-            logger.warning("ICICI NFO open-order recovery unavailable: %s", exc)
+            logger.warning("GROWW NFO open-order recovery unavailable: %s", exc)
             return []
         rows = resp.get("Success") if isinstance(resp, dict) else resp
         rows = rows if isinstance(rows, list) else []
@@ -1513,9 +1512,9 @@ class _ICICIAdapter:
             return self.api.get_portfolio_positions()
         except Exception as exc:
             if "no positions available" in str(exc).lower():
-                logger.info("ICICI NFO PortfolioPositions verified flat: %s", exc)
+                logger.info("GROWW NFO PortfolioPositions verified flat: %s", exc)
                 return {"Success": [], "Status": 200, "Error": None, "_empty_positions": True}
-            logger.error("ICICI NFO PortfolioPositions fetch failed: %s", exc)
+            logger.error("GROWW NFO PortfolioPositions fetch failed: %s", exc)
             return None
 
     def normalise_position(self, raw) -> Optional[Dict]:
@@ -1548,7 +1547,7 @@ class _ICICIAdapter:
             first["reason"] = "exact_nfo_option_does_not_match_selected_contract"
             first["external_positions"] = normalised
             logger.critical(
-                "ICICI exact NFO option position exists but does not match selected vehicle: "
+                "GROWW exact NFO option position exists but does not match selected vehicle: "
                 "symbol=%s right=%s strike=%s expiry=%s qty=%.8g",
                 first.get("TradingSymbol") or first.get("stock_code") or "-",
                 first.get("right") or "-", first.get("strike_price") or "-",
@@ -1559,7 +1558,7 @@ class _ICICIAdapter:
         if len(normalised) == 1:
             position = normalised[0]
             logger.warning(
-                "ICICI exact NFO option position detected before a selected option vehicle exists: "
+                "GROWW exact NFO option position detected before a selected option vehicle exists: "
                 "symbol=%s right=%s strike=%s expiry=%s qty=%.8g",
                 position.get("TradingSymbol") or position.get("stock_code") or "-",
                 position.get("right") or "-", position.get("strike_price") or "-",
@@ -1573,7 +1572,7 @@ class _ICICIAdapter:
         first["unrealized_pnl"] = sum(float(p.get("unrealized_pnl", 0.0) or 0.0) for p in normalised)
         first["unadoptable"] = True
         first["reason"] = "multiple_exact_nfo_option_positions_require_manual_selection"
-        logger.critical("ICICI multiple exact NFO option positions found; refusing automatic adoption")
+        logger.critical("GROWW multiple exact NFO option positions found; refusing automatic adoption")
         return first
 
     def _parse_fno_funds(self, resp: Dict[str, Any]) -> Dict[str, Any]:
@@ -1639,14 +1638,14 @@ class _ICICIAdapter:
             out["warning"] = "; ".join(errors)
             if not funds_resp and not margin_resp:
                 out["error"] = out["warning"]
-        logger.info("ICICI F&O balance source=%s available=%.2f allocated=%.2f blocked=%.2f nfo_cash_limit=%.2f unallocated=%.2f", out["source"], out["available"], out["fno_allocated"], out["fno_blocked"], out["nfo_cash_limit"], out["unallocated_balance"])
+        logger.info("GROWW F&O balance source=%s available=%.2f allocated=%.2f blocked=%.2f nfo_cash_limit=%.2f unallocated=%.2f", out["source"], out["available"], out["fno_allocated"], out["fno_blocked"], out["nfo_cash_limit"], out["unallocated_balance"])
         return out
 
     def set_leverage(self, leverage: int, product_id: Optional[int] = None) -> Dict:
-        return {"success": True, "leverage": 1, "message": "ICICI long-premium options are fully funded; leverage is not applicable"}
+        return {"success": True, "leverage": 1, "message": "GROWW long-premium options are fully funded; leverage is not applicable"}
 
 
-class _GrowwAdapter(_ICICIAdapter):
+class _GrowwAdapter(_GrowwBaseAdapter):
     """Long-premium Groww F&O options adapter using official SDK fields."""
 
     def __init__(self, api, exchange_instrument=None) -> None:
@@ -1941,10 +1940,34 @@ class _GrowwAdapter(_ICICIAdapter):
         if str(order_id or "").startswith("GROWWGTT:"):
             self.limiter.wait()
             return self._smart_row(str(order_id))
+        getter = getattr(self.api, "get_order_detail", None) or getattr(self.api, "get_order", None)
+        if not callable(getter):
+            return {"order_id": str(order_id), "status": "PENDING"}
         try:
             self.limiter.wait()
-            data = self.api.get_order_detail(groww_order_id=str(order_id), segment=self.api.const("SEGMENT_FNO", "FNO"))
+            segment = self.api.const("SEGMENT_FNO", "FNO") if hasattr(self.api, "const") else "FNO"
+            data = getter(groww_order_id=str(order_id), segment=segment)
             return data if isinstance(data, dict) else {"order_id": str(order_id), "status": "PENDING"}
+        except TypeError:
+            try:
+                data = getter(order_id=str(order_id), exchange_code="NFO")
+                payload = self._success_payload(data)
+                if payload:
+                    payload.setdefault("order_id", str(order_id))
+                    return payload
+                return data if isinstance(data, dict) else {"order_id": str(order_id), "status": "PENDING"}
+            except TypeError:
+                try:
+                    data = getter(str(order_id))
+                    payload = self._success_payload(data)
+                    if payload:
+                        payload.setdefault("order_id", str(order_id))
+                        return payload
+                    return data if isinstance(data, dict) else {"order_id": str(order_id), "status": "PENDING"}
+                except Exception:
+                    return {"order_id": str(order_id), "status": "PENDING"}
+            except Exception:
+                return {"order_id": str(order_id), "status": "PENDING"}
         except Exception:
             return {"order_id": str(order_id), "status": "PENDING"}
 
@@ -1968,12 +1991,19 @@ class _GrowwAdapter(_ICICIAdapter):
                 "raw_order": raw_order,
             }
         trade_getter = getattr(self.api, "get_trade_detail", None)
+        fee_paid, fee_exact = self._extract_paid_commission(raw_order)
         if callable(trade_getter) and status in {"FILLED", "PARTIAL_FILL"}:
             try:
                 self.limiter.wait()
-                resp = trade_getter(order_id=oid, segment=self.api.const("SEGMENT_FNO", "FNO"))
-                rows = resp.get("trade_list") or resp.get("trades") or resp.get("data") or [] if isinstance(resp, dict) else []
+                try:
+                    segment = self.api.const("SEGMENT_FNO", "FNO") if hasattr(self.api, "const") else "FNO"
+                    resp = trade_getter(order_id=oid, segment=segment)
+                except TypeError:
+                    resp = trade_getter(order_id=oid, exchange_code="NFO")
+                rows = resp.get("trade_list") or resp.get("trades") or resp.get("data") or resp.get("Success") or [] if isinstance(resp, dict) else []
                 num = den = 0.0
+                exact_fees = 0.0
+                exact_fee_seen = False
                 for row in rows if isinstance(rows, list) else []:
                     if not isinstance(row, dict):
                         continue
@@ -1982,17 +2012,23 @@ class _GrowwAdapter(_ICICIAdapter):
                     if px > 0 and qty > 0:
                         num += px * qty
                         den += qty
+                    row_fee, row_fee_exact = self._extract_paid_commission(row)
+                    if row_fee_exact:
+                        exact_fees += row_fee
+                        exact_fee_seen = True
                 if den > 0:
                     fill_price = num / den
                     filled_qty = den
+                if exact_fee_seen:
+                    fee_paid, fee_exact = exact_fees, True
             except Exception as exc:
                 logger.debug("Groww trade-list execution resolution unavailable for %s: %s", oid, exc)
         return {
             "status": status,
             "fill_price": fill_price,
             "filled_qty": filled_qty,
-            "paid_commission": 0.0,
-            "paid_commission_exact": False,
+            "paid_commission": float(fee_paid or 0.0),
+            "paid_commission_exact": bool(fee_exact),
             "raw_order": raw_order,
         }
 
@@ -2085,8 +2121,6 @@ class OrderManager:
                 exchange_instrument = None
         if exch == "delta":
             self._adapter = _DeltaAdapter(api, exchange_instrument=exchange_instrument)
-        elif exch == "icici":
-            self._adapter = _ICICIAdapter(api, exchange_instrument=exchange_instrument)
         elif exch == "groww":
             self._adapter = _GrowwAdapter(api, exchange_instrument=exchange_instrument)
         else:
@@ -2166,7 +2200,7 @@ class OrderManager:
         raise ValueError(f"Invalid side '{side}'")
 
     def _currency_symbol(self) -> str:
-        return "₹" if str(getattr(self, "_exchange_name", "")).lower() in {"icici", "groww"} else "$"
+        return "₹" if str(getattr(self, "_exchange_name", "")).lower() in {"groww", "groww"} else "$"
 
     def _active_tick_size(self) -> float:
         """Return the executable tick size for the active contract.
@@ -2455,7 +2489,7 @@ class OrderManager:
             if not self._check_window_rate_limit():
                 return None
             api_side = self._normalize_side(side)
-            if self._exchange_name in {"icici", "groww"}:
+            if self._exchange_name in {"groww", "groww"}:
                 if not reduce_only:
                     logger.error("%s options guard: market entry rejected; F&O options require a priced LIMIT entry", self._exchange_name.upper())
                     return None
@@ -2468,12 +2502,12 @@ class OrderManager:
                 if ref <= 0:
                     logger.critical("%s emergency close refused: no reference premium available for priced exit", self._exchange_name.upper())
                     return None
-                # Breeze prohibits market orders. For an emergency close, send an
+                # Groww prohibits market orders. For an emergency close, send an
                 # aggressively marketable priced limit while retaining exact contract scope.
                 slippage_pct = (
-                    float(getattr(config, "GROWW_EMERGENCY_EXIT_LIMIT_BUFFER_PCT", getattr(config, "ICICI_EMERGENCY_EXIT_LIMIT_BUFFER_PCT", 0.10)))
+                    float(getattr(config, "GROWW_EMERGENCY_EXIT_LIMIT_BUFFER_PCT", getattr(config, "GROWW_EMERGENCY_EXIT_LIMIT_BUFFER_PCT", 0.10)))
                     if self._exchange_name == "groww"
-                    else float(getattr(config, "ICICI_EMERGENCY_EXIT_LIMIT_BUFFER_PCT", 0.10))
+                    else float(getattr(config, "GROWW_EMERGENCY_EXIT_LIMIT_BUFFER_PCT", 0.10))
                 )
                 tick = max(float(getattr(self._adapter, "tick_size", 0.05) or 0.05), 0.01)
                 if str(api_side).lower() == "sell":
@@ -2575,7 +2609,7 @@ class OrderManager:
             if not self._check_window_rate_limit():
                 return None
             api_side = self._normalize_side(side)
-            cur = "₹" if self._exchange_name in {"icici", "groww"} else "$"
+            cur = "₹" if self._exchange_name in {"groww", "groww"} else "$"
             logger.info(f"LIMIT {side} qty={quantity} @ {cur}{price:,.2f}")
             data = self._place_with_retry(
                 side=api_side, order_type="LIMIT",
@@ -2604,7 +2638,7 @@ class OrderManager:
           the REST call returns a valid order_id. Used by the strategy
           watchdog to switch from Stage-A to Stage-B timing. Never raises.
         """
-        cur = "₹" if self._exchange_name in {"icici", "groww"} else "$"
+        cur = "₹" if self._exchange_name in {"groww", "groww"} else "$"
         logger.info(f"🎯 Maker entry: {side} {quantity} @ {cur}{limit_price:.2f} "
                     f"(timeout={timeout_sec:.0f}s)")
 
@@ -2705,7 +2739,7 @@ class OrderManager:
                                   on_order_placed=None) -> Optional[Dict]:
         """
         Protected entry for adapters that expose broker-native protection.
-        Delta uses native bracket orders; ICICI uses documented NFO cover-OCO GTT.
+        Delta uses native bracket orders; GROWW uses documented NFO cover-OCO GTT.
         Polls until the protected entry is filled; unprotected fallbacks are forbidden
         by the strategy for desks that require broker-attached protection.
 
@@ -2738,7 +2772,7 @@ class OrderManager:
             raw = (data or {}).get("_raw", {})
             reason = self._compact_error(raw)
             stage = (
-                "icici_gtt_cover_oco_entry" if self._exchange_name == "icici"
+                "groww_gtt_cover_oco_entry" if self._exchange_name == "groww"
                 else "groww_smart_gtt_bracket_entry" if self._exchange_name == "groww"
                 else "delta_native_bracket_entry"
             )
@@ -2788,8 +2822,8 @@ class OrderManager:
                             f" fee={cur}{data['paid_commission']:.4f}"
                             f" exact={data['paid_commission_exact']}")
 
-                if data.get("protection_model") in {"ICICI_GTT_COVER_OCO", "GROWW_SMART_GTT_BRACKET"}:
-                    # Breeze accepted the entry, target and stoploss as one official
+                if data.get("protection_model") in {"GROWW_GTT_COVER_OCO", "GROWW_SMART_GTT_BRACKET"}:
+                    # Groww accepted the entry, target and stoploss as one official
                     # cover-OCO instruction. Child identity is the GTT leg identity;
                     # do not search the normal order book for Delta-style children.
                     data["bracket_child_verified"] = True
@@ -3381,7 +3415,7 @@ class OrderManager:
         sl_result = CancelResult.NOT_FOUND
         sl_token = str(sl_order_id or "")
         tp_token = str(tp_order_id or "")
-        # ICICI cover-OCO target and stoploss pseudo ids belong to the same
+        # GROWW cover-OCO target and stoploss pseudo ids belong to the same
         # broker-side GTT plan. Cancel that plan exactly once; two independent
         # cancel requests create an avoidable race and burn API quota.
         same_gtt = (
@@ -3391,7 +3425,7 @@ class OrderManager:
         if same_gtt:
             tp_result = self.cancel_order(tp_token)
             sl_result = tp_result
-            logger.info(f"ICICI GTT cover-OCO cancel: {tp_result.value}")
+            logger.info(f"GROWW GTT cover-OCO cancel: {tp_result.value}")
             return sl_result, tp_result
         if tp_order_id:
             tp_result = self.cancel_order(tp_order_id)
@@ -3525,7 +3559,7 @@ class OrderManager:
     ) -> Dict:
         """Resolve a closing execution by its tracked order ids only.
 
-        Delta, CoinSwitch and ICICI all route through ``get_fill_details``.
+        Delta, CoinSwitch and GROWW all route through ``get_fill_details``.
         A broker-flat position is not sufficient evidence for realised P&L: an
         exit is confirmed only when a known closing order is filled and exposes
         an execution price.  This prevents zero/mark-price P&L from polluting

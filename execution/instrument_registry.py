@@ -22,7 +22,7 @@ try:
 except Exception:  # pragma: no cover
     config = None  # type: ignore
 try:
-    from agents.icici_chain_architect import build_underlying_payload
+    from agents.groww_chain_architect import build_underlying_payload
 except Exception:  # pragma: no cover
     build_underlying_payload = None  # type: ignore
 
@@ -79,16 +79,16 @@ def _allow_value(value: str, allowed: set[str]) -> bool:
     return not allowed or "all" in allowed or str(value or "").lower() in allowed
 
 
-def _icici_breeze_code(underlying: str) -> str:
+def _groww_code(underlying: str) -> str:
     key = normalise_symbol(underlying)
-    raw = _cfg("ICICI_INDEX_BREEZE_STOCK_CODE_BY_UNDERLYING", {})
+    raw = _cfg("GROWW_INDEX_STOCK_CODE_BY_UNDERLYING", {})
     if isinstance(raw, dict):
         for k, v in raw.items():
             if normalise_symbol(str(k)) == key and normalise_symbol(str(v)):
                 return normalise_symbol(str(v))
-    # ICICI Breeze uses stock_code="NIFTY" for the NIFTY 50 index and NFO
+    # Groww uses stock_code="NIFTY" for the NIFTY 50 index and NFO
     # option chain.  Keep operator-facing aliases accepted, but never send
-    # NIFTY50/CNXNIFTY as the Breeze stock_code.
+    # NIFTY50/CNXNIFTY as the Groww stock_code.
     if key in {"NIFTY50", "CNXNIFTY", "NIFTYINDEX"}:
         return "NIFTY"
     return key
@@ -259,7 +259,6 @@ class InstrumentRegistry:
             self.execution_preference = ExchangeName.DELTA
         self.delta: Dict[str, ExchangeInstrument] = {}
         self.coinswitch: Dict[str, ExchangeInstrument] = {}
-        self.icici: Dict[str, ExchangeInstrument] = {}
         self.groww: Dict[str, ExchangeInstrument] = {}
         self.report = DiscoveryReport()
 
@@ -388,79 +387,6 @@ class InstrumentRegistry:
         self.coinswitch = out
         return out
 
-    def load_icici(self, api, *, security_master_url: str | None = None) -> Dict[str, ExchangeInstrument]:
-        """Load configured ICICI index-option desk instruments.
-
-        v508 uses the underlying-thesis path for NIFTY: one desk instrument is
-        discovered now; after session/F&O preflight, one executable CE and one
-        executable PE vehicle are prepared before scanning.  A later bullish or
-        bearish NIFTY thesis activates the matching preselected vehicle.
-
-        This discovery stage is intentionally auth-free.  Breeze protected
-        endpoints are touched only when the ICICI data managers start, so NIFTY
-        must not disappear from the universe just because the runtime session
-        token has not been generated yet.
-        """
-        out: Dict[str, ExchangeInstrument] = {}
-        config_only = bool(_cfg("ICICI_INDEX_OPTIONS_FROM_CONFIG_ONLY", True))
-        discovery_enabled = bool(_cfg("ICICI_DISCOVERY_ENABLED", False))
-        runtime_enabled = bool(_cfg("ICICI_ENABLED", False) or _cfg("ICICI_OPTIONS_RUNTIME_ENABLED", False))
-        if not (discovery_enabled or runtime_enabled):
-            self.icici = out
-            return out
-        # Configured-index discovery is intentionally auth-independent. This is
-        # the V83-compatible guardrail that prevents NIFTY from vanishing just
-        # because the Breeze API_Session has not been generated yet.
-        if api is None and not config_only:
-            self.icici = out
-            return out
-        underlyings = _csv_symbols(_cfg("ICICI_INDEX_UNDERLYINGS", "NIFTY"))
-        if not underlyings:
-            underlyings = ["NIFTY"]
-        if build_underlying_payload is None:
-            logger.warning("ICICI discovery skipped: agents.icici_chain_architect unavailable")
-            self.icici = out
-            return out
-        for priority, underlying in enumerate(underlyings, 1):
-            breeze_code = _icici_breeze_code(underlying)
-            raw = build_underlying_payload(breeze_code, "ICICI_INDEX_OPTIONS", [])
-            raw["underlying_display"] = underlying
-            raw["configured_underlying"] = underlying
-            raw["breeze_stock_code"] = breeze_code
-            raw["stock_code"] = breeze_code
-            raw["underlying_stock_code"] = breeze_code
-            raw["underlying_exchange_code"] = "NSE"
-            raw["exchange_code"] = "NFO"
-            raw["chain_source"] = "configured_index"
-            raw["chain_candidates_deferred"] = True
-            ei = ExchangeInstrument(
-                exchange=ExchangeName.ICICI,
-                symbol=breeze_code,
-                ws_symbol=breeze_code,
-                display_symbol=breeze_code,
-                asset_id=breeze_code,
-                asset_class=AssetClass.OPTION,
-                product_id=None,
-                quote_asset="INR",
-                base_asset=breeze_code,
-                contract_type="option_chain",
-                status="active",
-                tick_size=float(_cfg("ICICI_OPTION_TICK_SIZE", 0.05)),
-                lot_step=1.0,
-                min_qty=1.0,
-                max_leverage=1.0,
-                raw={**raw, "configured_priority": priority},
-            )
-            # Match both the operator-facing config alias (e.g. NIFTY50) and the
-            # real Breeze/NFO stock_code (NIFTY).  Both keys point to the same
-            # object, so raw_counts still reports one ICICI instrument.
-            for key in {normalise_symbol(underlying), normalise_symbol(breeze_code), "NIFTY50" if breeze_code == "NIFTY" else ""}:
-                if key:
-                    out[key] = ei
-        self.icici = out
-        logger.info("ICICI configured-index discovery active: underlyings=%s", ",".join(out.keys()) or "none")
-        return out
-
     def load_groww(self, api, *, security_master_url: str | None = None) -> Dict[str, ExchangeInstrument]:
         """Load configured Groww index-option desk instruments.
 
@@ -479,7 +405,7 @@ class InstrumentRegistry:
         if not underlyings:
             underlyings = ["NIFTY"]
         if build_underlying_payload is None:
-            logger.warning("Groww discovery skipped: agents.icici_chain_architect unavailable")
+            logger.warning("Groww discovery skipped: agents.groww_chain_architect unavailable")
             self.groww = out
             return out
         for priority, underlying in enumerate(underlyings, 1):
@@ -601,9 +527,7 @@ class InstrumentRegistry:
     # ──────────────────────────────────────────────────────────────────────
     def discover(self, delta_api=None, coinswitch_api=None, requested=None,
                  max_active: int = 12, require_primary: bool = True,
-                 include_exchanges=None, icici_api=None,
-                 icici_security_master_url: str | None = None,
-                 groww_api=None,
+                 include_exchanges=None, groww_api=None,
                  groww_security_master_url: str | None = None) -> DiscoveryReport:
         intents = configured_asset_intents(requested)
         include_exs = _parse_csv_set(include_exchanges)
@@ -611,12 +535,10 @@ class InstrumentRegistry:
         coins = self.load_coinswitch(coinswitch_api) if _allow_value("coinswitch", include_exs) else {}
         if _allow_value("coinswitch", include_exs):
             coins = self._augment_coinswitch_from_requested(coins, coinswitch_api, intents)
-        icici = self.load_icici(icici_api, security_master_url=icici_security_master_url) if _allow_value("icici", include_exs) else {}
         groww = self.load_groww(groww_api, security_master_url=groww_security_master_url) if _allow_value("groww", include_exs) else {}
         self.report = DiscoveryReport(requested=intents, raw_counts={
             "delta": len(delta),
             "coinswitch": len({id(v) for v in coins.values()}),
-            "icici": len({id(v) for v in icici.values()}),
             "groww": len({id(v) for v in groww.values()}),
         })
 
@@ -626,18 +548,15 @@ class InstrumentRegistry:
             by_ex: Dict[ExchangeName, ExchangeInstrument] = {}
             dmatch = self._match_one(delta, aliases)
             cmatch = self._match_one(coins, aliases)
-            imatch = self._match_one(icici, aliases)
             gmatch = self._match_one(groww, aliases)
             if dmatch is not None:
                 by_ex[ExchangeName.DELTA] = self._retag(dmatch, intent)
             if cmatch is not None:
                 by_ex[ExchangeName.COINSWITCH] = self._retag(cmatch, intent)
-            if imatch is not None:
-                by_ex[ExchangeName.ICICI] = self._retag(imatch, intent)
             if gmatch is not None:
                 by_ex[ExchangeName.GROWW] = self._retag(gmatch, intent)
             if not by_ex:
-                self.report.unavailable[intent.asset_id] = "not present in live Delta/CoinSwitch/ICICI/Groww catalog; not traded"
+                self.report.unavailable[intent.asset_id] = "not present in live Delta/CoinSwitch/Groww catalog; not traded"
                 continue
             primary = self.execution_preference if self.execution_preference in by_ex else next(iter(by_ex.keys()))
             if require_primary and self.execution_preference not in by_ex:
