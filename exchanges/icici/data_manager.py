@@ -382,16 +382,36 @@ class ICICIOptionDataManager:
                 candles = {tf: deque(rows, maxlen=600) for tf, rows in (snapshot.get("candles") or {}).items()}
                 for tf in ("1m", "5m", "15m", "1h", "4h", "1d"):
                     candles.setdefault(tf, deque(maxlen=600))
-                self._book_stream_state[key] = {"identity": identity, "event": event, "last_stream_tick_ts": 0.0, "last_price": 0.0, "best_bid": 0.0, "best_ask": 0.0, "best_bid_qty": 0.0, "best_ask_qty": 0.0, "candles": candles}
+                self._book_stream_state[key] = {
+                    "identity": identity, "event": event, "last_stream_tick_ts": 0.0,
+                    "last_quote_ts": float(snapshot.get("last_quote_ts", 0.0) or 0.0),
+                    "last_price": float(snapshot.get("last_price", 0.0) or 0.0),
+                    "best_bid": float(snapshot.get("best_bid", 0.0) or 0.0),
+                    "best_ask": float(snapshot.get("best_ask", 0.0) or 0.0),
+                    "best_bid_qty": float(snapshot.get("best_bid_qty", 0.0) or 0.0),
+                    "best_ask_qty": float(snapshot.get("best_ask_qty", 0.0) or 0.0),
+                    "stream_pending": True, "candles": candles,
+                }
                 callback = lambda data, stream_key=key, stream_identity=identity: self._on_session_book_option_tick(stream_key, stream_identity, data)
                 ids = hub.subscribe_option_quotes_and_ohlcv(stock_code=identity["stock_code"], expiry_date=identity["expiry"], strike_price=str(identity["strike"]), right=identity["right"], callback=callback)
                 self._book_stream_subscription_ids[key] = list(ids)
                 self._stream_subscription_ids.extend(ids)
             if bool(_cfg("ICICI_OPTION_WEBSOCKET_REQUIRED", True)) and timeout > 0:
                 deadline = time.time() + timeout
+                missing = []
                 for key, state in self._book_stream_state.items():
                     if not state["event"].wait(max(0.0, deadline - time.time())):
-                        raise RuntimeError(f"no first live option tick within {timeout:.1f}s for session vehicle {key}")
+                        missing.append(key)
+                if missing:
+                    msg = f"no first live option tick within {timeout:.1f}s for session vehicle(s) {missing}"
+                    if bool(_cfg("ICICI_SESSION_BOOK_REQUIRE_FIRST_OPTION_TICK_ON_STARTUP", False)):
+                        raise RuntimeError(msg)
+                    logger.warning(
+                        "ICICI CE/PE session vehicles subscribed but awaiting first option websocket tick: %s. "
+                        "NIFTY analysis remains live; order activation stays blocked until the selected vehicle is fresh.",
+                        msg,
+                    )
+                    return True
             logger.info("ICICI CE/PE session vehicles websocket LIVE before signal execution; streamed_contracts=%d", len(self._book_stream_state))
             return True
         except Exception as exc:
@@ -422,6 +442,7 @@ class ICICIOptionDataManager:
             state["best_bid_qty"] = bid_qty
         if ask_qty > 0:
             state["best_ask_qty"] = ask_qty
+        state["stream_pending"] = False
         interval = str(row.get("interval") or row.get("Interval") or "").lower()
         if px > 0 and interval in {"1minute", "1min", "1m"}:
             o = self._float_first(row, ("open", "Open", "o")) or px
@@ -754,15 +775,19 @@ class ICICIOptionDataManager:
         raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
         if not isinstance(raw, dict):
             return False
+        stream_ready = all(
+            float(state.get("last_stream_tick_ts", 0.0) or 0.0) > 0.0
+            for state in self._book_stream_state.values()
+        ) if self._book_stream_state else False
         raw["session_contract_book"] = book.as_dict()
-        raw["session_contract_book_status"] = "READY"
+        raw["session_contract_book_status"] = "READY" if stream_ready else "ARMED_PENDING_WEBSOCKET_TICK"
         raw["session_contract_book_mode"] = "preselected_call_and_put_live_direction"
         self._session_book_last_refresh_ts = time.time()
         logger.info(
-            "ICICI SESSION CONTRACT BOOK READY [%s] reason=%s spot=%.2f funds=₹%.2f | "
+            "ICICI SESSION CONTRACT BOOK %s [%s] reason=%s spot=%.2f funds=₹%.2f | "
             "CE=%s strike=%.2f expiry=%s lot=%.0f prem=₹%.2f score=%.3f delta=%+.3f theta/prem=%.4f | "
             "PE=%s strike=%.2f expiry=%s lot=%.0f prem=₹%.2f score=%.3f delta=%+.3f theta/prem=%.4f",
-            book.trade_date_ist, reason, underlying_spot, available_funds,
+            raw["session_contract_book_status"], book.trade_date_ist, reason, underlying_spot, available_funds,
             book.call.selected_symbol, book.call.strike, book.call.expiry, float(book.call.raw.get("runtime_lot_size", 0.0) or 0.0), float(book.call.raw.get("selected_entry_premium", 0.0) or 0.0), book.call.score, book.call.delta, book.call.theta_to_premium,
             book.put.selected_symbol, book.put.strike, book.put.expiry, float(book.put.raw.get("runtime_lot_size", 0.0) or 0.0), float(book.put.raw.get("selected_entry_premium", 0.0) or 0.0), book.put.score, book.put.delta, book.put.theta_to_premium,
         )
@@ -828,8 +853,9 @@ class ICICIOptionDataManager:
             with self._lock:
                 self._active_stream_contract = dict(stream_state.get("identity") or {})
                 self._last_price = float(stream_state.get("last_price", 0.0) or 0.0)
-                self._last_quote_ts = float(stream_state.get("last_stream_tick_ts", 0.0) or 0.0)
-                self._last_stream_tick_ts = self._last_quote_ts
+                stream_ts = float(stream_state.get("last_stream_tick_ts", 0.0) or 0.0)
+                self._last_quote_ts = float(stream_ts or stream_state.get("last_quote_ts", 0.0) or 0.0)
+                self._last_stream_tick_ts = stream_ts
                 self._best_bid = float(stream_state.get("best_bid", 0.0) or 0.0)
                 self._best_ask = float(stream_state.get("best_ask", 0.0) or 0.0)
                 self._best_bid_qty = float(stream_state.get("best_bid_qty", 0.0) or 0.0)
@@ -1205,12 +1231,14 @@ class ICICIOptionDataManager:
             return list(self._candles.get(timeframe, deque()))[-int(limit):]
 
     def get_last_price(self) -> float:
-        self._repair_option_stream_if_stale("option_last_price_request")
+        if self._active_stream_key is not None:
+            self._repair_option_stream_if_stale("option_last_price_request", wait_key=self._active_stream_key)
         with self._lock:
             return float(self._last_price or 0.0)
 
     def get_orderbook(self) -> Dict:
-        self._repair_option_stream_if_stale("option_orderbook_request")
+        if self._active_stream_key is not None:
+            self._repair_option_stream_if_stale("option_orderbook_request", wait_key=self._active_stream_key)
         # No synthetic orderbook: only return bid/ask levels that Breeze actually
         # provided in the latest quote payload.
         with self._lock:

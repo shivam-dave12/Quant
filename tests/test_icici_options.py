@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -679,6 +680,59 @@ def test_scanner_start_accepts_only_dormant_icici_context(monkeypatch):
     assert bot.start() is True
     assert bot.running is True
     assert sent == ["startup"]
+
+
+def test_icici_start_keeps_context_not_ready_until_contract_book_verified():
+    from orchestration.multi_asset_bot import MultiAssetQuantBot
+
+    bot = MultiAssetQuantBot.__new__(MultiAssetQuantBot)
+    bot.guard = SimpleNamespace(report_line=lambda ctx: "policy=option")
+    bot._is_icici_context = lambda ctx: True
+    bot._icici_market_open = lambda: (True, "open")
+    bot._icici_account_preflight = lambda ctx: True
+    inst = _nifty_inst(_chain())
+
+    class DM:
+        def start(self): return True
+        def wait_until_ready(self, timeout_sec=0): return True
+        def prepare_icici_session_contract_book(self, available_funds): return False
+        def get_last_price(self): return 24000.0
+
+    ctx = SimpleNamespace(
+        instrument=inst,
+        data_manager=DM(),
+        risk_manager=SimpleNamespace(get_available_balance=lambda: {"available": 10000.0}),
+        ready=False,
+        start_state="",
+        last_start_attempt_sec=0.0,
+        start_attempt_count=0,
+    )
+
+    assert bot._start_one_context(ctx) is False
+    assert ctx.ready is False
+    assert ctx.start_state == "ICICI_CONTRACT_BOOK_FAILED"
+
+
+def test_icici_failed_start_uses_slow_retry_cooldown(monkeypatch):
+    from orchestration.multi_asset_bot import MultiAssetQuantBot
+    import orchestration.multi_asset_bot as mab
+
+    bot = MultiAssetQuantBot.__new__(MultiAssetQuantBot)
+    bot._is_icici_context = lambda ctx: True
+    bot._icici_market_open = lambda: (True, "open")
+    bot._log_throttled_asset = lambda ctx, msg: None
+    bot._start_one_context = lambda ctx: (_ for _ in ()).throw(AssertionError("must not hammer failed ICICI startup"))
+    monkeypatch.setattr(mab.config, "ICICI_FAILED_START_RETRY_SEC", 180.0, raising=False)
+    ctx = SimpleNamespace(
+        ready=False,
+        starting=False,
+        start_state="ICICI_CONTRACT_BOOK_FAILED",
+        last_start_attempt_sec=time.time(),
+        start_attempt_count=2,
+        instrument=SimpleNamespace(asset_id="NIFTY"),
+    )
+
+    assert bot._maybe_start_dormant_icici_context(ctx) is False
 
 
 def test_breeze_token_service_refreshes_stale_daily_session_cache(tmp_path):

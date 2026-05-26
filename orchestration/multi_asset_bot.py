@@ -1109,8 +1109,8 @@ class MultiAssetQuantBot:
                     logger.error("%s data stream start failed", inst.asset_id)
                     return False
                 ready = ctx.data_manager.wait_until_ready(timeout_sec=float(getattr(config, "READY_TIMEOUT_SEC", 180)))
-                ctx.ready = bool(ready)
                 if not ready:
+                    ctx.ready = False
                     ctx.start_state = "DATA_NOT_READY"
                     logger.error("%s data manager not ready", inst.asset_id)
                     return False
@@ -1123,6 +1123,7 @@ class MultiAssetQuantBot:
                         logger.error("%s ICICI desk disabled: session CE/PE execution contract book could not be verified", inst.asset_id)
                         return False
                 venues = ", ".join(f"{ex.value}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items())
+                ctx.ready = True
                 ctx.start_state = "READY"
                 logger.info("✅ %s ready @ %.4f | venues=%s | %s", inst.asset_id, ctx.data_manager.get_last_price(), venues, self.guard.report_line(ctx))
                 return True
@@ -1145,10 +1146,14 @@ class MultiAssetQuantBot:
             )
             return False
         now = time.time()
-        retry_sec = max(5.0, float(getattr(config, "ICICI_DORMANT_START_RETRY_SEC", 30.0) or 30.0))
+        closed_state = ctx.start_state in ("", "ICICI_MARKET_CLOSED")
+        retry_default = "ICICI_DORMANT_START_RETRY_SEC" if closed_state else "ICICI_FAILED_START_RETRY_SEC"
+        retry_fallback = 30.0 if closed_state else 180.0
+        retry_sec = max(5.0, float(getattr(config, retry_default, retry_fallback) or retry_fallback))
         if ctx.last_start_attempt_sec > 0 and now - ctx.last_start_attempt_sec < retry_sec:
             return False
 
+        previous_state = ctx.start_state or "NOT_READY"
         ctx.starting = True
         ctx.start_state = "STARTING_AFTER_MARKET_OPEN"
 
@@ -1156,9 +1161,10 @@ class MultiAssetQuantBot:
             ok = False
             try:
                 logger.warning(
-                    "%s ICICI market open; starting previously dormant NIFTY desk attempt=%d",
+                    "%s ICICI market open; starting NIFTY desk attempt=%d previous_state=%s",
                     ctx.instrument.asset_id,
                     ctx.start_attempt_count + 1,
+                    previous_state,
                 )
                 ok = self._start_one_context(ctx)
             finally:

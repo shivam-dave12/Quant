@@ -143,3 +143,47 @@ def test_session_book_arms_both_option_websocket_vehicles_before_entry(monkeypat
     assert len(hub.calls) == 2
     assert len(dm._book_stream_state) == 2
     assert all(state["last_stream_tick_ts"] > 0 for state in dm._book_stream_state.values())
+
+
+def test_session_book_can_scan_while_option_ticks_are_pending(monkeypatch):
+    import exchanges.icici.data_manager as dm_module
+
+    class API:
+        @staticmethod
+        def _normalise_right(value):
+            return str(value).lower()
+
+    class Hub:
+        def __init__(self):
+            self.calls = []
+        def subscribe_option_quotes_and_ohlcv(self, **kwargs):
+            self.calls.append(kwargs)
+            return [f"{kwargs['right']}:quote", f"{kwargs['right']}:depth", f"{kwargs['right']}:ohlcv"]
+        def unsubscribe(self, ids):
+            raise AssertionError("pending first tick must keep subscriptions armed")
+
+    hub = Hub()
+    monkeypatch.setattr(dm_module, "hub_for_api", lambda api: hub)
+    monkeypatch.setattr(dm_module.config, "ICICI_OPTION_WEBSOCKET_REQUIRED", True, raising=False)
+    monkeypatch.setattr(dm_module.config, "ICICI_OPTION_STREAM_FIRST_TICK_TIMEOUT_SEC", 0.01, raising=False)
+    monkeypatch.setattr(dm_module.config, "ICICI_SESSION_BOOK_REQUIRE_FIRST_OPTION_TICK_ON_STARTUP", False, raising=False)
+    dm = ICICIOptionDataManager(_nifty_instrument(), api=API())
+    call = SimpleNamespace(expiry="02-Jun-2026", right="call", strike=24100.0, selected_symbol="NIFTYCE", raw={"stock_code": "NIFTY", "expiry_date": "02-Jun-2026", "right": "call", "strike_price": 24100.0})
+    put = SimpleNamespace(expiry="02-Jun-2026", right="put", strike=23950.0, selected_symbol="NIFTYPE", raw={"stock_code": "NIFTY", "expiry_date": "02-Jun-2026", "right": "put", "strike_price": 23950.0})
+
+    assert dm._arm_session_book_streams(SimpleNamespace(call=call, put=put)) is True
+    assert len(hub.calls) == 2
+    assert len(dm._stream_subscription_ids) == 6
+    assert all(state["last_stream_tick_ts"] == 0.0 for state in dm._book_stream_state.values())
+
+
+def test_icici_option_book_request_does_not_reconnect_without_active_vehicle():
+    dm = ICICIOptionDataManager(_nifty_instrument(), api=SimpleNamespace())
+    calls = []
+    dm._stream_subscription_ids = ["session-call", "session-put"]
+    dm._live_hub = SimpleNamespace(reconnect_and_resubscribe=lambda reason: calls.append(reason) or True)
+
+    book = dm.get_orderbook()
+
+    assert calls == []
+    assert book["bids"] == [] and book["asks"] == []
