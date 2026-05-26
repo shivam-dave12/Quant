@@ -987,7 +987,7 @@ class QuantStrategy:
         with instrument_scope(instrument):
             pass
         self._liq_map = LiquidityMap() if _LIQ_MAP_AVAILABLE else None
-        self._entry_engine = EntryEngine(on_self_recovery=self._on_entry_engine_self_recovery) if _ENTRY_ENGINE_AVAILABLE else None
+        self._entry_engine = EntryEngine(on_self_recovery=self._on_entry_engine_self_recovery, instrument=instrument) if _ENTRY_ENGINE_AVAILABLE else None
         self._pos = PositionState()
         self._last_sig = StructuralEntrySummary()
         self._last_entry_signal = None
@@ -1130,11 +1130,19 @@ class QuantStrategy:
             asset = getattr(inst, "asset_id", QCfg.SYMBOL())
             venues = ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in getattr(inst, "by_exchange", {}).items()) if inst is not None else QCfg.EXCHANGE().upper()
             logger.info(f"   {asset} | {QCfg.SYMBOL()} | venues={venues} | leverage_cap={QCfg.LEVERAGE()}x | margin_policy={QCfg.MARGIN_PCT():.0%}")
-        logger.info(f"   EntryAuthority: {'ACTIVE' if self._entry_engine is not None else 'UNAVAILABLE'} | 4H/15m DOL → 5m raid/MSS/FVG")
-        logger.info(f"   LiquidityMap: {'ACTIVE' if self._liq_map is not None else 'UNAVAILABLE'} | targets=opposing 15m/4H/1D liquidity")
-        logger.info("   Context: ACTIVE (4H/15m DOL bias, no trend-permission gate) | Trigger: ACTIVE (5m raid→MSS→FVG)")
-        logger.info("   Execution: venue lot rules + structural SL risk + bracket protection + exact-fill reconciliation")
-        logger.info("   ExitModel: structural SL + opposing 15m/4H/1D liquidity targets")
+        _is_nifty_profile = str(getattr(inst, "asset_id", "") or "").upper() in {"NIFTY", "NIFTY50", "CNXNIFTY"} and str(QCfg.EXCHANGE()).lower() == "icici"
+        if _is_nifty_profile:
+            logger.info(f"   EntryAuthority: {'ACTIVE' if self._entry_engine is not None else 'UNAVAILABLE'} | NIFTY intraday phase → same-direction 1m/5m liquidity-sweep reclaim")
+            logger.info(f"   LiquidityMap: {'ACTIVE' if self._liq_map is not None else 'UNAVAILABLE'} | fast cash-out targets=nearest real 5m/15m+ directional pool")
+            logger.info("   Context: ACTIVE (15m tempo + 1h auction + 4h location) | Trigger: ACTIVE (trend-direction 1m/5m pullback sweep reclaim; no forced FVG wait)")
+            logger.info("   Execution: fresh CE/PE websocket vehicle required at activation + premium-native SL/TP + exact-fill reconciliation")
+            logger.info("   ExitModel: compact structural invalidation + nearest liquidity target + NIFTY failed-auction/time stop")
+        else:
+            logger.info(f"   EntryAuthority: {'ACTIVE' if self._entry_engine is not None else 'UNAVAILABLE'} | 4H/15m DOL → 5m raid/MSS/FVG")
+            logger.info(f"   LiquidityMap: {'ACTIVE' if self._liq_map is not None else 'UNAVAILABLE'} | targets=opposing 15m/4H/1D liquidity")
+            logger.info("   Context: ACTIVE (market-phase delivery; dominant intraday tempo cannot be faded by weak split-HTF location) | Trigger: ACTIVE (5m raid→MSS→FVG)")
+            logger.info("   Execution: venue lot rules + structural SL risk + bracket protection + exact-fill reconciliation")
+            logger.info("   ExitModel: structural SL + opposing 15m/4H/1D liquidity targets")
         logger.info("=" * 80)
 
     @staticmethod
@@ -1285,6 +1293,20 @@ class QuantStrategy:
             return True, liq_price, guard, ""
         return False, 0.0, 0.0, "unknown side"
 
+    @staticmethod
+    def _is_nifty_trend_sweep_signal(signal) -> bool:
+        return str(getattr(signal, "archetype", "") or getattr(getattr(signal, "entry_type", None), "value", "") or "").upper() == "NIFTY_TREND_SWEEP_SCALP"
+
+    def _structural_rr_floor_for_signal(self, signal, policy=None) -> float:
+        pol = policy or active_policy(getattr(self, "_instrument", None))
+        floor = float(getattr(pol, "min_rr", 1.0) or 1.0)
+        if self._is_nifty_trend_sweep_signal(signal):
+            # Fast Indian-index option booking: nearest live liquidity pool is
+            # the objective. Premium-side fee/viability validation still runs
+            # after the actual CE/PE vehicle is activated.
+            floor = max(1.0, float(getattr(config, "ICICI_NIFTY_TREND_SWEEP_MIN_RR", 1.15) or 1.15))
+        return floor
+
     def _target_pool_realism(self, signal, liq_snapshot, side: str,
                              entry: float, tp: float, sl: float, atr: float):
         reasons = []
@@ -1405,19 +1427,28 @@ class QuantStrategy:
                         book_status = dict(status_fn() or {})
                     except Exception:
                         book_status = {}
-                if str(book_status.get("status") or "").upper() == "READY":
+                session_state = str(book_status.get("status") or "").upper()
+                # A day-start CE/PE book is valid context even while option
+                # websocket ticks are pending. It is not considered executable:
+                # pre-order gating and activation both require routed live ticks.
+                if session_state in {"READY", "ARMED_PENDING_WEBSOCKET_TICK"}:
                     call = dict(book_status.get("call") or {})
                     put = dict(book_status.get("put") or {})
                     self._last_spread_gate_context = {
                         "book_status": "SESSION_PRESELECTED",
+                        "execution_session_status": session_state,
                         "hard_fail": False,
                         "session_trade_date": book_status.get("trade_date_ist"),
                         "session_call_symbol": call.get("symbol"),
                         "session_call_cost": call.get("cost"),
                         "session_call_delta": call.get("delta"),
+                        "session_call_ws_fresh": bool(call.get("ws_fresh", False)),
+                        "session_call_ws_age_sec": call.get("ws_age_sec"),
                         "session_put_symbol": put.get("symbol"),
                         "session_put_cost": put.get("cost"),
                         "session_put_delta": put.get("delta"),
+                        "session_put_ws_fresh": bool(put.get("ws_fresh", False)),
+                        "session_put_ws_age_sec": put.get("ws_age_sec"),
                     }
                 else:
                     self._last_spread_gate_context = {"book_status": "NO_EXECUTABLE_BOOK", "hard_fail": False}
@@ -1972,16 +2003,33 @@ class QuantStrategy:
             return 0.0
 
     def _audit_structural_inputs(self, data_manager, candles_by_tf: Dict[str, List[Dict]], price: float, now: float) -> Dict[str, Any]:
-        """Validate and expose the exact data domain admitted to entry authority."""
+        """Validate analysis lineage while exposing execution-domain readiness separately.
+
+        ICICI is deliberately dual-domain: NIFTY underlying bars may remain live
+        while the selected CE/PE vehicle is not executable. Structural awareness
+        continues, but an option order can never inherit a false PASS from the
+        underlying feed.
+        """
         lineage_getter = getattr(data_manager, "get_data_lineage", None)
         lineage = lineage_getter() if callable(lineage_getter) else {
             "analysis_source": type(data_manager).__name__, "execution_source": type(data_manager).__name__,
             "analysis_domain": "EXECUTION_INSTRUMENT", "execution_domain": "EXECUTION_INSTRUMENT",
         }
         strict_live = callable(lineage_getter)
-        quote_fn = getattr(data_manager, "is_analysis_price_fresh", None) or getattr(data_manager, "is_price_fresh", None)
-        quote_fresh = bool(quote_fn(float(getattr(config, "PRICE_STALE_SECONDS", 90.0)))) if callable(quote_fn) else not strict_live
+        stale_sec = float(getattr(config, "PRICE_STALE_SECONDS", 90.0))
+        analysis_fn = getattr(data_manager, "is_analysis_price_fresh", None) or getattr(data_manager, "is_price_fresh", None)
+        analysis_fresh = bool(analysis_fn(stale_sec)) if callable(analysis_fn) else not strict_live
+        execution_fn = getattr(data_manager, "is_execution_price_fresh", None) or getattr(data_manager, "is_price_fresh", None)
+        execution_fresh = bool(execution_fn(stale_sec)) if callable(execution_fn) else analysis_fresh
+        session_book_status = {}
+        status_fn = getattr(data_manager, "get_session_contract_book_status", None)
+        if callable(status_fn):
+            try:
+                session_book_status = dict(status_fn() or {})
+            except Exception as exc:
+                session_book_status = {"status": "ERROR", "error": str(exc)}
         update_age = None
+        execution_update_age = None
         try:
             analysis_update = getattr(data_manager, "get_analysis_last_update", None)
             updated = float((analysis_update() if callable(analysis_update) else data_manager.get_last_update()) or 0.0)
@@ -1989,6 +2037,36 @@ class QuantStrategy:
                 update_age = max(0.0, now - updated)
         except Exception:
             pass
+        try:
+            execution_update = getattr(data_manager, "get_execution_last_update", None)
+            updated = float((execution_update() if callable(execution_update) else data_manager.get_last_update()) or 0.0)
+            if updated > 0:
+                execution_update_age = max(0.0, now - updated)
+        except Exception:
+            pass
+        execution_status_fn = getattr(data_manager, "get_execution_feed_status", None)
+        execution_status = {}
+        if callable(execution_status_fn):
+            try:
+                execution_status = dict(execution_status_fn() or {})
+            except Exception as exc:
+                execution_status = {"status": "STATUS_ERROR", "error": str(exc)}
+        dual_domain = str(lineage.get("analysis_domain", "")) != str(lineage.get("execution_domain", ""))
+        execution_blockers: List[str] = []
+        execution_snapshot_fresh = execution_fresh
+        preselected_ready = bool(execution_status.get("session_vehicle_stream_ready", False))
+        # ICICI is dual-domain: REST/prewarm premiums and the live NIFTY
+        # underlying may both be fresh while neither selected option vehicle has
+        # emitted an identity-routed websocket tick. For order readiness, a live
+        # CE/PE websocket route is authoritative; REST snapshot freshness must
+        # never clear this gate.
+        if dual_domain:
+            execution_fresh = preselected_ready
+            if not preselected_ready:
+                execution_blockers.append("EXECUTION_VEHICLE_WEBSOCKET_NOT_READY")
+                execution_blockers.append(str(execution_status.get("status", "EXECUTION_VEHICLE_NOT_STREAMING")))
+        elif not execution_fresh:
+            execution_blockers.append("EXECUTION_QUOTE_STALE")
         continuous = str(QCfg.EXCHANGE()).lower() in ("delta", "coinswitch")
         tf_rules = {"5m": (QCfg.MIN_5M_BARS(), 300), "15m": (20, 900), "4h": (20, 14400)}
         frames: Dict[str, Dict[str, Any]] = {}
@@ -2015,11 +2093,17 @@ class QuantStrategy:
             if invalid: blockers.append(f"{tf}_INVALID_OHLC")
             if gaps: blockers.append(f"{tf}_GAP")
             if strict_live and (not ts or stale): blockers.append(f"{tf}_STALE_OR_UNTIMESTAMPED")
-        if strict_live and bool(getattr(config, "DATA_INTEGRITY_REQUIRE_FRESH_QUOTES", True)) and not quote_fresh:
+        if strict_live and bool(getattr(config, "DATA_INTEGRITY_REQUIRE_FRESH_QUOTES", True)) and not analysis_fresh:
             blockers.append("ANALYSIS_QUOTE_STALE")
         return {
             "ok": not blockers and price > 0.0, "blockers": blockers or ["NONE"], "lineage": lineage,
-            "analysis_price": price, "analysis_quote_fresh": quote_fresh, "last_update_age_sec": update_age,
+            "analysis_price": price, "analysis_quote_fresh": analysis_fresh, "last_update_age_sec": update_age,
+            "execution_quote_fresh": execution_fresh, "execution_snapshot_fresh": execution_snapshot_fresh,
+            "execution_last_update_age_sec": execution_update_age,
+            "execution_ready_for_order": not execution_blockers, "execution_blockers": execution_blockers or ["NONE"],
+            "execution_status": execution_status,
+            "execution_session_status": str(session_book_status.get("status") or "DIRECT"),
+            "execution_session_book": session_book_status,
             "frames": frames, "strict_live": strict_live,
         }
 
@@ -2028,6 +2112,8 @@ class QuantStrategy:
             str(info.get("state", "SCANNING")), str(info.get("block_reason", "")),
             str(info.get("context_4h", "")), str(info.get("context_15m", "")),
             str(info.get("context_direction", "")), str(info.get("trigger", "")),
+            str(info.get("market_phase", "")), str(info.get("auction_control_side", "")),
+            str(info.get("execution_posture", "")), round(self._decision_num(info, "auction_control_score"), 4),
             str(info.get("context_bias_path", "")),
             round(self._decision_num(info, "context_delivery_score"), 4),
             str(info.get("side", info.get("raid_side", ""))),
@@ -2083,7 +2169,7 @@ class QuantStrategy:
             "🧭 AUCTION_DECISION %s state=%s block=%s archetype=%s | domain=%s mark=%s ATR5=%s pct=%s%% | "
             "4H=%s score=%s=[slope%s+struct%s] threshold=±%s ATR=%s | "
             "15m=%s score=%s=[slope%s+struct%s] threshold=±%s ATR=%s | "
-            "bias=%s dir=%s score=%s strict=%s raids=fresh5m:%d parent_htf:%d accepted:%d opposed:%d invalid:%d accepted=%s parent=%s | cost=%s",
+            "phase=%s control=%s(%s) posture=%s risk×%s nifty=%s/%s(%s) | bias=%s dir=%s score=%s strict=%s raids=fresh5m:%d parent_htf:%d accepted:%d opposed:%d invalid:%d accepted=%s parent=%s | cost=%s",
             mode, info.get("state", "SCANNING"), info.get("block_reason", "UNKNOWN"),
             str(info.get("candidate_archetype", info.get("archetype", "-") or "-")), self._analysis_unit(),
             self._decision_fmt({"v": price}, "v"), self._decision_fmt(info,"entry_5m_atr"),
@@ -2094,6 +2180,11 @@ class QuantStrategy:
             info.get("context_15m", "WAIT"), self._decision_fmt(info,"context_15m_score","+.3f"),
             self._decision_fmt(info,"context_15m_slope_component","+.3f"), self._decision_fmt(info,"context_15m_structure_component","+.3f"),
             self._decision_fmt(info,"context_direction_threshold",".2f"), self._decision_fmt(info,"context_15m_atr"),
+            info.get("market_phase", "UNCLASSIFIED"), info.get("auction_control_side", "none"),
+            self._decision_fmt(info, "auction_control_score", "+.2f"), info.get("execution_posture", "OBSERVE"),
+            self._decision_fmt(info, "auction_risk_scalar", ".2f"),
+            info.get("nifty_intraday_phase", "-"), info.get("nifty_intraday_aggression", "-"),
+            self._decision_fmt(info, "nifty_intraday_score", "+.2f"),
             info.get("context_bias_path", "AWAITING_5M_DOL"), info.get("context_direction", "none"),
             self._decision_fmt(info, "context_delivery_score", ".2f"),
             "Y" if info.get("context_aligned") else "N",
@@ -2101,6 +2192,23 @@ class QuantStrategy:
             int(info.get("aligned_5m_raid_count",0) or 0), int(info.get("opposed_5m_raid_count",0) or 0),
             int(info.get("invalid_5m_raid_count",0) or 0), raid, parent_raid, spread_txt,
         )
+        if (changed or force) and info.get("entry_zone_selection_model"):
+            logger.info(
+                "🧱 ZONE_AUTHORITY profile=%s model=%s | ENTRY=%s[%s-%s] score=%s OB×=%s raidFuel=%s candidates=%s noise=%s | "
+                "SL=%s anchor=%s outerLiq=%s protectedPools=%s mass=%s | TP=%s tf=%s liqMass=%s cluster=%s pathImbalance=%s penalty=%s",
+                info.get("execution_profile", "AUCTION_CONTROL_ZONE_GRAPH"), info.get("entry_zone_selection_model", "?"),
+                info.get("entry_zone_selected_tf", "?"), self._decision_fmt(info, "entry_zone_low"),
+                self._decision_fmt(info, "entry_zone_high"), self._decision_fmt(info, "entry_zone_score", ".2f"),
+                self._decision_fmt(info, "entry_zone_order_block_overlap", ".2f"),
+                self._decision_fmt(info, "entry_zone_raid_fuel_score", ".2f"),
+                int(info.get("entry_zone_candidate_count", 0) or 0), int(info.get("entry_zone_noise_count", 0) or 0),
+                self._decision_fmt(info, "structural_stop"), self._decision_fmt(info, "stop_structural_anchor"),
+                self._decision_fmt(info, "stop_outer_protected_liquidity"), int(info.get("stop_protected_pool_count", 0) or 0),
+                self._decision_fmt(info, "stop_protected_cluster_mass", ".2f"), self._decision_fmt(info, "tp"),
+                info.get("target_timeframe", "?"), self._decision_fmt(info, "target_structural_liquidity_mass", ".2f"),
+                int(info.get("target_liquidity_cluster_count", 0) or 0), int(info.get("target_path_imbalance_count", 0) or 0),
+                self._decision_fmt(info, "target_path_imbalance_penalty", ".2f"),
+            )
         lineage = dict(quality.get("lineage", {}) or {})
         frames = dict(quality.get("frames", {}) or {})
         if quality and (changed or periodic):
@@ -2124,13 +2232,33 @@ class QuantStrategy:
             native = getattr(getattr(self, "_liq_map", None), "_native_atr_by_tf", {}) or {}
             native_txt = ",".join(f"{tf}={float(native.get(tf,0.0)):.4f}" for tf in ("5m","15m","4h") if tf in native) or "pending"
             logger.info(
-                "🔗 DATA_LINEAGE integrity=%s blockers=%s | analysis=%s/%s execution=%s/%s quote_fresh=%s update_age=%s | %s | native_ATR[%s]",
+                "🔗 DATA_LINEAGE analysis_integrity=%s blockers=%s | analysis=%s/%s fresh=%s age=%s | execution=%s/%s fresh=%s ready=%s blockers=%s status=%s session=%s age=%s | %s | native_ATR[%s]",
                 "PASS" if quality.get("ok") else "BLOCK", ",".join(quality.get("blockers", [])),
                 lineage.get("analysis_source","?"), lineage.get("analysis_domain","?"),
-                lineage.get("execution_source","?"), lineage.get("execution_domain","?"),
                 "Y" if quality.get("analysis_quote_fresh") else "N",
-                "N/A" if quality.get("last_update_age_sec") is None else f"{float(quality.get('last_update_age_sec')):.2f}s", frame_txt, native_txt,
+                "N/A" if quality.get("last_update_age_sec") is None else f"{float(quality.get('last_update_age_sec')):.2f}s",
+                lineage.get("execution_source","?"), lineage.get("execution_domain","?"),
+                "Y" if quality.get("execution_quote_fresh", quality.get("analysis_quote_fresh")) else "N",
+                "Y" if quality.get("execution_ready_for_order", True) else "N",
+                ",".join(quality.get("execution_blockers", ["NONE"])),
+                str(dict(quality.get("execution_status", {}) or {}).get("status", "DIRECT")),
+                quality.get("execution_session_status", "DIRECT"),
+                "N/A" if quality.get("execution_last_update_age_sec") is None else f"{float(quality.get('execution_last_update_age_sec')):.2f}s",
+                frame_txt, native_txt,
             )
+            session_book = dict(quality.get("execution_session_book", {}) or {})
+            if str(session_book.get("execution_freshness_gate", "")) == "WEBSOCKET_TICK_REQUIRED":
+                ce = dict(session_book.get("call", {}) or {})
+                pe = dict(session_book.get("put", {}) or {})
+                ce_age = "N/A" if ce.get("ws_age_sec") is None else f"{float(ce.get('ws_age_sec')):.2f}s"
+                pe_age = "N/A" if pe.get("ws_age_sec") is None else f"{float(pe.get('ws_age_sec')):.2f}s"
+                logger.info(
+                    "📡 ICICI_EXECUTION_FRESHNESS state=%s gate=WEBSOCKET_TICK_REQUIRED | CE=%s fresh=%s age=%s prem=%s bid=%s ask=%s | PE=%s fresh=%s age=%s prem=%s bid=%s ask=%s",
+                    session_book.get("status", "MISSING"), ce.get("symbol", "n/a"), "Y" if ce.get("ws_fresh") else "N", ce_age,
+                    self._decision_fmt(ce, "live_premium", ".2f"), self._decision_fmt(ce, "live_bid", ".2f"), self._decision_fmt(ce, "live_ask", ".2f"),
+                    pe.get("symbol", "n/a"), "Y" if pe.get("ws_fresh") else "N", pe_age,
+                    self._decision_fmt(pe, "live_premium", ".2f"), self._decision_fmt(pe, "live_bid", ".2f"), self._decision_fmt(pe, "live_ask", ".2f"),
+                )
         if changed and info.get("raid_side"):
             if not info.get("mss_broken"):
                 logger.info(
@@ -2237,7 +2365,11 @@ class QuantStrategy:
             logger.warning("Liquidity map refresh blocked: %s", exc)
             return
         pol = active_policy(getattr(self, "_instrument", None))
-        self._entry_engine.set_structural_delivery_policy(float(pol.min_rr), float(pol.max_rr))
+        structural_min_rr = (
+            max(1.0, float(getattr(config, "ICICI_NIFTY_TREND_SWEEP_MIN_RR", 1.15) or 1.15))
+            if self._analysis_unit() == "NIFTYpts" else float(pol.min_rr)
+        )
+        self._entry_engine.set_structural_delivery_policy(structural_min_rr, float(pol.max_rr))
         analysis_unit = self._analysis_unit()
         if analysis_unit == "NIFTYpts":
             estimated_cost_pts, estimated_cost_bps = 0.0, 0.0
@@ -2255,7 +2387,8 @@ class QuantStrategy:
             micro = None
         self._entry_engine.update(
             snapshot, price, atr, now, candles_5m=c5, candles_15m=c15, candles_4h=c4h,
-            candles_1h=candles_by_tf.get("1h", []), micro_state=micro,
+            candles_1h=candles_by_tf.get("1h", []), candles_1d=candles_by_tf.get("1d", []),
+            micro_state=micro,
         )
         signal = self._entry_engine.get_signal()
         info = self._entry_engine.analysis_info or {}
@@ -2264,14 +2397,45 @@ class QuantStrategy:
             return
         side = str(signal.side or "").lower()
         entry, sl, tp = float(signal.entry_price), float(signal.sl_price), float(signal.tp_price)
+        # A NIFTY structural trigger is allowed to be observed from the live
+        # underlying while CE/PE feeds are arming. It is not allowed to become
+        # an option order until both preselected execution vehicles have fresh,
+        # identity-routed websocket data. Do not queue a stale trigger for later
+        # execution: require a fresh sweep after the option book is live.
+        if self._analysis_unit() == "NIFTYpts" and not bool(quality.get("execution_ready_for_order", False)):
+            blocked_info = dict(info)
+            blocked_info.update({
+                "state": "EXECUTION_BLOCKED",
+                "block_reason": "ICICI_EXECUTION_VEHICLE_NOT_FRESH",
+                "trigger": "PRE_ORDER_ICICI_OPTION_WEBSOCKET_FRESHNESS",
+                "entry_5m_atr": atr,
+                "atr_percentile": self._atr_5m.get_percentile(),
+                "authority": "UNIFIED_STRUCTURAL_AUCTION",
+                "execution_status": str((quality.get("execution_status") or {}).get("status", "UNKNOWN")),
+            })
+            self._log_ict_decision_snapshot(blocked_info, price, now, force=True)
+            logger.info(
+                "NIFTY structural setup observed but option order suppressed until fresh routed CE/PE websocket data; "
+                "fresh sweep required after execution feed is armed | blockers=%s",
+                ",".join(str(x) for x in quality.get("execution_blockers", [])),
+            )
+            self._entry_engine.mark_signal_deferred(
+                side, "icici_execution_vehicle_not_fresh",
+                cooldown_sec=float(getattr(config, "ICICI_EXECUTION_SIGNAL_DEFER_COOLDOWN_SEC", 5.0) or 5.0),
+            )
+            return
         rr = abs(tp - entry) / max(abs(entry - sl), 1e-12)
         correct_geometry = (side == "long" and sl < entry < tp) or (side == "short" and tp < entry < sl)
-        if not correct_geometry or rr < float(pol.min_rr):
+        signal_rr_floor = self._structural_rr_floor_for_signal(signal, pol)
+        if not correct_geometry or rr < signal_rr_floor:
             self._entry_engine.mark_signal_deferred(side, "invalid_structural_geometry_or_policy_rr", cooldown_sec=30.0)
-            logger.info("ICT_LIQUIDITY ticket rejected: geometry=%s RR=%.2f floor=%.2f", correct_geometry, rr, float(pol.min_rr))
+            logger.info("ICT_LIQUIDITY ticket rejected: geometry=%s RR=%.2f floor=%.2f", correct_geometry, rr, signal_rr_floor)
             return
         realism, realism_notes, realism_rejects = self._target_pool_realism(signal, snapshot, side, entry, tp, sl, atr)
-        min_realism = float(getattr(config, "ICT_MIN_TARGET_REALISM_SCORE", 0.58) or 0.58)
+        min_realism = (
+            float(getattr(config, "ICICI_NIFTY_TREND_SWEEP_MIN_TARGET_REALISM", 0.42) or 0.42)
+            if self._is_nifty_trend_sweep_signal(signal) else float(getattr(config, "ICT_MIN_TARGET_REALISM_SCORE", 0.58) or 0.58)
+        )
         if realism_rejects or realism < min_realism:
             self._entry_engine.mark_signal_deferred(side, "target_realism_rejected", cooldown_sec=45.0)
             logger.info(
@@ -2320,6 +2484,9 @@ class QuantStrategy:
             logger.info("ICT_LIQUIDITY account control rejected setup: %s", reason)
             return
         self._force_sl, self._force_tp, self._last_entry_signal = sl, tp, signal
+        self._active_auction_risk_scalar = max(0.05, min(1.0, float((getattr(signal, "quality", {}) or {}).get("auction_risk_scalar", 1.0) or 1.0)))
+        self._active_auction_posture = str((getattr(signal, "quality", {}) or {}).get("execution_posture", "NORMAL") or "NORMAL")
+        self._active_market_phase = str((getattr(signal, "quality", {}) or {}).get("market_phase", "UNCLASSIFIED") or "UNCLASSIFIED")
         sig = StructuralEntrySummary()
         sig.atr = atr
         sig.delivery_score = float(getattr(signal, "delivery_score", 0.0) or 0.0)
@@ -2333,7 +2500,7 @@ class QuantStrategy:
             "estNetWinR=%s deliveryScore=%s calibratedP=%s target=%s@%.4f | account_balance=%s%.2f execution_conversion=%s evalSource=%s eventDelayMs=%.2f | %s",
             str(getattr(signal, "archetype", "") or getattr(signal.entry_type, "value", "STRUCTURAL")),
             "UNDERLYING" if unit == "NIFTYpts" else "EXECUTION_INSTRUMENT", side.upper(), unit, entry, unit, sl, unit, tp,
-            abs(entry-sl), abs(tp-entry), rr, float(pol.min_rr),
+            abs(entry-sl), abs(tp-entry), rr, signal_rr_floor,
             f"{float(info.get('target_net_win_r')):.2f}" if info.get('target_net_win_r') is not None else "PREMIUM_PENDING" if unit == "NIFTYpts" else "N/A",
             f"{float(info.get('delivery_score')):.2f}" if info.get('delivery_score') is not None else "N/A",
             "Y" if bool(info.get("probability_calibrated")) else "N/A",
@@ -3155,7 +3322,7 @@ class QuantStrategy:
             return
         rr = td / sd
         _execution_policy = active_policy(getattr(self, "_instrument", None))
-        _execution_min_rr = float(getattr(_execution_policy, "min_rr", 1.0) or 1.0)
+        _execution_min_rr = self._structural_rr_floor_for_signal(getattr(self, "_last_entry_signal", None), _execution_policy)
         if rr + 1e-12 < _execution_min_rr:
             logger.info(
                 "AUCTION_EXECUTION_REJECT grossRR=%.2f floor=%.2f | conservative tick/premium conversion no longer clears structural R:R floor",
@@ -3814,6 +3981,12 @@ class QuantStrategy:
             max_hold = float(getattr(config, "QUANT_MAX_HOLD_SEC", 3600) or 0.0)
         if max_hold <= 0.0:
             return ""
+        nifty_fast_exit = (
+            str(getattr(pos, "asset_id", "") or "").upper() in {"NIFTY", "NIFTY50", "CNXNIFTY"}
+            and str(getattr(pos, "archetype", "") or "").upper() == "NIFTY_TREND_SWEEP_SCALP"
+        )
+        if nifty_fast_exit:
+            max_hold = min(max_hold, float(getattr(config, "ICICI_NIFTY_TREND_SWEEP_MAX_HOLD_SEC", 720.0) or 720.0))
         init_r = float(getattr(pos, "initial_sl_dist", 0.0) or 0.0)
         if init_r <= 1e-10:
             init_r = abs(float(getattr(pos, "entry_price", 0.0) or 0.0) - float(getattr(pos, "sl_price", 0.0) or 0.0))
@@ -3825,11 +3998,18 @@ class QuantStrategy:
         mfe_r = float(getattr(pos, "peak_profit", 0.0) or 0.0) / init_r
         age = max(0.0, float(now) - entry_time)
 
-        early_frac = float(getattr(config, "QUANT_TIME_STOP_EARLY_FRACTION", 0.55) or 0.55)
-        failed_r = float(getattr(config, "QUANT_TIME_STOP_FAILED_AUCTION_R", -0.35) or -0.35)
-        failed_mfe_r = float(getattr(config, "QUANT_TIME_STOP_FAILED_AUCTION_MAX_MFE_R", 0.50) or 0.50)
-        min_delivery_r = float(getattr(config, "QUANT_TIME_STOP_MIN_PROGRESS_R", 0.20) or 0.20)
-        hard_mult = float(getattr(config, "QUANT_TIME_STOP_HARD_MAX_MULT", 1.35) or 1.35)
+        if nifty_fast_exit:
+            early_frac = float(getattr(config, "ICICI_NIFTY_TREND_SWEEP_FAILED_AUCTION_FRACTION", 0.35) or 0.35)
+            failed_r = float(getattr(config, "ICICI_NIFTY_TREND_SWEEP_FAILED_AUCTION_R", -0.15) or -0.15)
+            failed_mfe_r = float(getattr(config, "ICICI_NIFTY_TREND_SWEEP_FAILED_AUCTION_MAX_MFE_R", 0.30) or 0.30)
+            min_delivery_r = float(getattr(config, "ICICI_NIFTY_TREND_SWEEP_MIN_PROGRESS_R", 0.15) or 0.15)
+            hard_mult = float(getattr(config, "ICICI_NIFTY_TREND_SWEEP_HARD_MAX_MULT", 1.0) or 1.0)
+        else:
+            early_frac = float(getattr(config, "QUANT_TIME_STOP_EARLY_FRACTION", 0.55) or 0.55)
+            failed_r = float(getattr(config, "QUANT_TIME_STOP_FAILED_AUCTION_R", -0.35) or -0.35)
+            failed_mfe_r = float(getattr(config, "QUANT_TIME_STOP_FAILED_AUCTION_MAX_MFE_R", 0.50) or 0.50)
+            min_delivery_r = float(getattr(config, "QUANT_TIME_STOP_MIN_PROGRESS_R", 0.20) or 0.20)
+            hard_mult = float(getattr(config, "QUANT_TIME_STOP_HARD_MAX_MULT", 1.35) or 1.35)
 
         if age >= max_hold * max(1.0, hard_mult):
             return "time_stop_hard_max_hold"
@@ -4653,7 +4833,14 @@ class QuantStrategy:
         except Exception:
             policy_risk_mult = 1.0
         probability_scalar = (self._capital_allocation_scalar(calibrated_p, 1.0) if calibrated_p is not None else 1.0)
-        allocation_scalar = max(0.05, min(1.0, probability_scalar * spread_cost_mult * policy_risk_mult))
+        auction_scalar = max(0.05, min(1.0, float(getattr(self, "_active_auction_risk_scalar", 1.0) or 1.0)))
+        allocation_scalar = max(0.05, min(1.0, probability_scalar * spread_cost_mult * policy_risk_mult * auction_scalar))
+        logger.info(
+            "Auction capital posture phase=%s posture=%s risk_scalar=%.2f execution_cost_scalar=%.2f policy_scalar=%.2f allocation_scalar=%.2f",
+            str(getattr(self, "_active_market_phase", "UNCLASSIFIED")),
+            str(getattr(self, "_active_auction_posture", "NORMAL")),
+            auction_scalar, spread_cost_mult, policy_risk_mult, allocation_scalar,
+        )
 
         # ── Available balance (reuse prefetched — SIG-8 fix) ─────────────────
         bal = prefetched_bal_info if prefetched_bal_info is not None else risk_manager.get_available_balance()

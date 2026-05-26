@@ -13,6 +13,7 @@ def test_single_order_authority_exposes_multiple_structural_archetypes():
         EntryType.LIQUIDITY_RAID_REVERSAL,
         EntryType.DISPLACEMENT_CONTINUATION,
         EntryType.LIQUIDITY_EXPANSION_RETEST,
+        EntryType.NIFTY_TREND_SWEEP_SCALP,
     ]
     assert EntryType.ICT_LIQUIDITY is EntryType.LIQUIDITY_RAID_REVERSAL
     src = inspect.getsource(QuantStrategy._evaluate_entry)
@@ -335,7 +336,9 @@ def test_setup_dossier_blocks_low_combined_quality_before_ticket(monkeypatch):
     assert dossier.as_payload()["setup_dossier_model"] == "STRUCTURE_PD_ARRAY_LIQUIDITY_NETR_GAUNTLET_FLOW"
 
 
-def test_pd_array_guard_blocks_long_entry_chasing_premium_after_raid():
+def test_legacy_pd_array_guard_can_be_explicitly_reenabled_for_replay_compatibility(monkeypatch):
+    import strategy.entry_engine as entry_module
+    monkeypatch.setattr(entry_module.config, "ICT_LEGACY_FILTER_COMPATIBILITY_ENABLED", True, raising=False)
     now = time.time()
     c15 = _bounded_up_candles(33, start=88.0, step=0.24)
     c4h = _trend_candles(1.40, 28)
@@ -428,7 +431,9 @@ def test_ranging_4h_with_15m_dol_can_approve_short_external_liquidity_raid():
     assert info["block_reason"] == "NONE"
 
 
-def test_counter_delivery_raid_is_blocked_by_institutional_selectivity():
+def test_legacy_counter_delivery_selectivity_can_be_explicitly_reenabled(monkeypatch):
+    import strategy.entry_engine as entry_module
+    monkeypatch.setattr(entry_module.config, "ICT_LEGACY_FILTER_COMPATIBILITY_ENABLED", True, raising=False)
     now = time.time()
     c4h = _ranging_candles(30)
     c15 = _trend_candles(0.70, 34)

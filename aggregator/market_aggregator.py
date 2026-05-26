@@ -413,6 +413,24 @@ class MarketAggregator:
                 return {"status": "ERROR"}
         return {"status": "UNSUPPORTED"}
 
+    def get_execution_feed_status(self) -> Dict:
+        """Expose the orderable instrument feed separately from analysis feed.
+
+        For ICICI, analysis remains NIFTY underlying while execution is CE/PE
+        premium/depth.  This prevents a healthy underlying tick from masking an
+        unarmed or stale option vehicle.
+        """
+        status_fn = getattr(self._primary, "execution_feed_status", None)
+        if callable(status_fn):
+            try:
+                return dict(status_fn() or {})
+            except Exception as exc:
+                return {"status": "ERROR", "session_vehicle_stream_ready": False, "error": str(exc)}
+        return {
+            "status": "DIRECT_EXECUTION_FEED",
+            "session_vehicle_stream_ready": bool(self.is_execution_price_fresh(float(getattr(config, "PRICE_STALE_SECONDS", 90.0)))),
+        }
+
     def register_strategy(self, strategy) -> None:
         self._strategy_ref = strategy
         self._primary.register_strategy(strategy)

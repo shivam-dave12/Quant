@@ -40,6 +40,11 @@ except ImportError:  # pragma: no cover
     from auction_state import DeliveryEvidence, MicrostructureState, build_delivery_evidence, robust_displacement_body_threshold  # type: ignore
 
 try:
+    from strategy.market_state import AuctionNarrative, build_auction_narrative
+except ImportError:  # pragma: no cover
+    from market_state import AuctionNarrative, build_auction_narrative  # type: ignore
+
+try:
     from strategy.liquidity_map import (
         LiquidityMapSnapshot, PoolTarget, SweepResult, TF_HIERARCHY,
         SWEEP_CONFIRMATION_WINDOW_SEC_BY_TF, STRUCTURAL_RAID_CONFIRMATION_WINDOW_SEC,
@@ -68,6 +73,9 @@ class EntryType(Enum):
     LIQUIDITY_RAID_REVERSAL = "LIQUIDITY_RAID_REVERSAL"
     DISPLACEMENT_CONTINUATION = "DISPLACEMENT_CONTINUATION"
     LIQUIDITY_EXPANSION_RETEST = "LIQUIDITY_EXPANSION_RETEST"
+    # ICICI NIFTY profile: intraday trend pullback is entered at a freshly
+    # reclaimed liquidity sweep and monetised into the nearest live pool.
+    NIFTY_TREND_SWEEP_SCALP = "NIFTY_TREND_SWEEP_SCALP"
     # Compatibility name retained for historical trade records only.
     ICT_LIQUIDITY = "LIQUIDITY_RAID_REVERSAL"
 
@@ -123,6 +131,16 @@ class _FVG:
 
 
 @dataclass(frozen=True)
+class _IntradayRegime:
+    label: str
+    side: str
+    signed_score: float
+    strength: float
+    aggression: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class _ContextDecision:
     side: str
     allowed: bool
@@ -152,6 +170,12 @@ class _Thesis:
     invalidation_anchor: float = 0.0
     evidence_score: float = 0.0
     structural_origin: str = "RAID_WICK"
+    market_phase: str = "UNCLASSIFIED"
+    auction_control_side: str = "none"
+    auction_control_score: float = 0.0
+    execution_posture: str = "OBSERVE"
+    auction_risk_scalar: float = 0.35
+    market_state_thesis: str = ""
     last_reason: str = "waiting for FVG repricing"
 
 
@@ -172,6 +196,95 @@ class _PDArrayConfluence:
     order_block_score: float
     killzone_label: str
     killzone_score: float
+
+
+@dataclass(frozen=True)
+class _EntryZoneCandidate:
+    """Observable repricing area ranked inside the current auction thesis.
+
+    A zone is not accepted merely because an FVG or candle-labelled order block
+    exists.  It must explain where displacement originated, whether the recent
+    liquidity raid funded that move, whether an order-block origin overlaps the
+    imbalance, and whether price is actually repricing there.  The score is a
+    relative structural ranking, never a win probability.
+    """
+    fvg: _FVG
+    timeframe: str
+    order_block_low: float
+    order_block_high: float
+    displacement_score: float
+    order_block_overlap: float
+    higher_tf_overlap: float
+    raid_fuel_score: float
+    freshness_score: float
+    phase_alignment: float
+    reprice_score: float
+    structural_score: float
+    classification: str
+    reason: str
+
+    @property
+    def low(self) -> float:
+        return self.fvg.low
+
+    @property
+    def high(self) -> float:
+        return self.fvg.high
+
+    @property
+    def equilibrium(self) -> float:
+        return self.fvg.equilibrium
+
+    def payload(self, selected: bool = False) -> Dict[str, Any]:
+        return {
+            "zone_type": "FVG_OB_REPRICING_ZONE",
+            "timeframe": self.timeframe,
+            "side": self.fvg.side,
+            "low": self.low,
+            "high": self.high,
+            "equilibrium": self.equilibrium,
+            "order_block_low": self.order_block_low,
+            "order_block_high": self.order_block_high,
+            "displacement_atr": self.fvg.displacement_atr,
+            "displacement_score": self.displacement_score,
+            "order_block_overlap": self.order_block_overlap,
+            "higher_tf_overlap": self.higher_tf_overlap,
+            "raid_fuel_score": self.raid_fuel_score,
+            "freshness_score": self.freshness_score,
+            "phase_alignment": self.phase_alignment,
+            "reprice_score": self.reprice_score,
+            "structural_score": self.structural_score,
+            "classification": self.classification,
+            "reason": self.reason,
+            "selected": bool(selected),
+        }
+
+
+@dataclass(frozen=True)
+class _StopPlan:
+    price: float
+    structural_anchor: float
+    outer_protected_liquidity: float
+    clearance: float
+    protected_cluster_mass: float
+    selected_pools: Tuple[Dict[str, Any], ...]
+    noise_pools: Tuple[Dict[str, Any], ...]
+    model: str = "LIQUIDITY_PROTECTED_INVALIDATION_CLUSTER"
+
+    def payload(self) -> Dict[str, Any]:
+        return {
+            "stop_selection_model": self.model,
+            "structural_stop": self.price,
+            "stop_structural_anchor": self.structural_anchor,
+            "stop_outer_protected_liquidity": self.outer_protected_liquidity,
+            "stop_outer_clearance": self.clearance,
+            "stop_clearance": abs(self.price - self.structural_anchor),
+            "stop_protected_cluster_mass": self.protected_cluster_mass,
+            "stop_protected_pool_count": len(self.selected_pools),
+            "stop_noise_pool_count": len(self.noise_pools),
+            "stop_protected_pools": list(self.selected_pools),
+            "stop_noise_pools": list(self.noise_pools),
+        }
 
 
 @dataclass(frozen=True)
@@ -379,7 +492,27 @@ def _row_ts_sec(row: Dict[str, Any]) -> float:
 class ICTLiquidityEntryEngine:
     """Unified institutional structural authority; all desks share one candidate ledger."""
 
-    def __init__(self, on_self_recovery=None) -> None:
+    def __init__(self, on_self_recovery=None, instrument=None) -> None:
+        self._instrument = instrument
+        self._asset_id = str(getattr(instrument, "asset_id", "") or "").upper()
+        exchange_obj = getattr(instrument, "primary_exchange", "")
+        self._exchange = str(getattr(exchange_obj, "value", exchange_obj) or "").lower()
+        self._nifty_trend_sweep_profile = bool(
+            _cfg_bool("ICICI_NIFTY_TREND_SWEEP_ENABLED", True)
+            and self._asset_id in {"NIFTY", "NIFTY50", "CNXNIFTY"}
+            and (not self._exchange or self._exchange == "icici")
+        )
+        # Every instrument uses the same auction-control / structural-zone
+        # authority.  BTC and SILVER are named explicitly in telemetry because
+        # their 24x7 and thin-book behaviour made the former one-pattern path
+        # especially misleading in live diagnosis.
+        self._zone_graph_profile = bool(_cfg_bool("ICT_STRUCTURAL_ZONE_GRAPH_ENABLED", True))
+        self._desk_profile = (
+            "NIFTY_TREND_SWEEP_ZONE_GRAPH" if self._nifty_trend_sweep_profile else
+            "BTC_AUCTION_CONTROL_ZONE_GRAPH" if self._asset_id == "BTC" else
+            "SILVER_AUCTION_CONTROL_ZONE_GRAPH" if self._asset_id == "SILVER" else
+            "AUCTION_CONTROL_ZONE_GRAPH"
+        )
         self._state = EngineState.SCANNING
         self._state_entered = time.time()
         self._on_self_recovery = on_self_recovery
@@ -389,6 +522,7 @@ class ICTLiquidityEntryEngine:
         self._processed: Dict[tuple, float] = {}
         self._last_analysis: Dict[str, Any] = {}
         self._last_pool_plan: Optional[Dict[str, Any]] = None
+        self._last_entry_zone_plan: Optional[Dict[str, Any]] = None
         self._last_scan_skip: Dict[str, int] = {}
         self._atr_pctile: float = 0.5
         self._min_structural_rr: float = 1.0
@@ -397,6 +531,7 @@ class ICTLiquidityEntryEngine:
         self._execution_cost_bps: float = 0.0
         self._last_microstructure: MicrostructureState = MicrostructureState.empty()
         self._delivery_evidence: Optional[DeliveryEvidence] = None
+        self._market_state: Optional[AuctionNarrative] = None
         self._candidate_replacements: int = 0
         self._stop_clearance_base_atr: float = float(getattr(config, "ICT_STOP_CLEARANCE_BASE_ATR", 0.10) if config is not None else 0.10)
         self._stop_clearance_pctile_slope_atr: float = float(getattr(config, "ICT_STOP_CLEARANCE_PCTL_SLOPE_ATR", 0.18) if config is not None else 0.18)
@@ -444,19 +579,277 @@ class ICTLiquidityEntryEngine:
         side = str(side or "").lower()
         return 1 if side == "long" else (-1 if side == "short" else 0)
 
-    def _context_decision_for_raid(self, side: str, ctx4: _TrendContext,
-                                   ctx15: _TrendContext, sweep_quality: float) -> _ContextDecision:
-        """Classify HTF context without using trend alignment as an entry gate.
+    def _nifty_intraday_regime(self, ctx4: _TrendContext, ctx1h: _TrendContext,
+                               ctx15: _TrendContext) -> _IntradayRegime:
+        """Execution-time market phase for NIFTY long-premium trading.
 
-        The executable evidence is still the 5m raid -> MSS/displacement -> FVG
-        repricing sequence.  4H/15m context supplies draw-on-liquidity bias and
-        delivery evidence. Only a unanimous, explicit HTF delivery against the raid is
-        blocked before the 5m proof sequence can finish.
+        NIFTY options are an intraday vehicle: 15m delivery is the tempo, 1h
+        is the intraday auction backdrop, and 4h supplies only background
+        location.  This prevents a distant 4h opinion from forcing a slow
+        counter-tempo reversal in a choppy session.
+        """
+        if not self._nifty_trend_sweep_profile:
+            return _IntradayRegime("GENERIC", "", 0.0, 0.0, "STANDARD", "generic multi-asset profile")
+        if ctx1h.side:
+            score = 0.56 * ctx15.signed_score + 0.29 * ctx1h.signed_score + 0.15 * ctx4.signed_score
+        else:
+            score = 0.70 * ctx15.signed_score + 0.30 * ctx4.signed_score
+        strength = abs(score)
+        threshold = _cfg_float("ICICI_NIFTY_TREND_SWEEP_MIN_PHASE_SCORE", 0.30)
+        aggressive_threshold = _cfg_float("ICICI_NIFTY_TREND_SWEEP_AGGRESSIVE_PHASE_SCORE", 0.58)
+        direction = "long" if score >= threshold else ("short" if score <= -threshold else "")
+        if not direction or ctx15.side == 0:
+            return _IntradayRegime("BALANCE_OR_TRANSITION", "", score, strength, "WAIT", "15m delivery not directional")
+        direction_int = self._direction_int(direction)
+        if ctx15.side != direction_int:
+            return _IntradayRegime("TRANSITION", "", score, strength, "WAIT", "15m tempo conflicts with composite phase")
+        # A forceful opposing 4h trend means the intraday move is corrective;
+        # keep the phase visible but do not chase an aggressive option scalp.
+        if ctx4.side == -direction_int and abs(ctx4.signed_score) >= 0.70 and strength < aggressive_threshold:
+            return _IntradayRegime("HTF_COUNTERTREND_CORRECTION", "", score, strength, "WAIT", "opposing 4h delivery dominates")
+        aggressive = strength >= aggressive_threshold and (ctx1h.side in (0, direction_int))
+        return _IntradayRegime(
+            "DIRECTIONAL_EXPANSION" if aggressive else "ORDERFLOW_TREND", direction, score, strength,
+            "AGGRESSIVE" if aggressive else "FAST_SCALP",
+            "15m-led intraday delivery aligned with composite auction phase",
+        )
+
+    def _select_nifty_fast_target(self, side: str, entry: float, sl: float,
+                                  snap: LiquidityMapSnapshot, atr: float
+                                  ) -> Optional[Tuple[PoolTarget, float, float, float, float]]:
+        """Select the nearest real intraday liquidity cash-out for NIFTY.
+
+        Unlike the swing/crypto model, the options scalp does not hold for a
+        remote 4h/1d pool while theta and chop accumulate.  Target remains an
+        observable pool, but 5m pools are eligible and nearest executable
+        delivery outranks distant theoretical payoff.
+        """
+        risk = abs(entry - sl)
+        if risk <= _EPS:
+            return None
+        pools = list(snap.bsl_pools if side == "long" else snap.ssl_pools)
+        min_rr = max(1.0, _cfg_float("ICICI_NIFTY_TREND_SWEEP_MIN_RR", 1.15))
+        max_rr = max(min_rr, _cfg_float("ICICI_NIFTY_TREND_SWEEP_MAX_RR", 2.40))
+        max_dist_atr = max(0.75, _cfg_float("ICICI_NIFTY_TREND_SWEEP_MAX_TARGET_ATR", 2.75))
+        rows: List[Dict[str, Any]] = []
+        for target in pools:
+            pool = getattr(target, "pool", None)
+            px = _f(getattr(pool, "price", 0.0))
+            tf = str(getattr(pool, "timeframe", "") or "")
+            rank = TF_HIERARCHY.get(tf, 1)
+            if rank < TF_HIERARCHY.get("5m", 2):
+                continue
+            if px <= 0 or (side == "long" and px <= entry) or (side == "short" and px >= entry):
+                continue
+            distance = abs(px - entry)
+            if distance / max(atr, _EPS) > max_dist_atr:
+                continue
+            sig = max(0.01, _f(getattr(target, "significance", 0.0), 0.01))
+            buffer = min(0.10 * atr, max(0.02 * atr, 0.025 * atr * math.log1p(sig)))
+            tp = px - buffer if side == "long" else px + buffer
+            rr = abs(tp - entry) / risk
+            if not ((side == "long" and tp > entry) or (side == "short" and tp < entry)):
+                continue
+            if rr < min_rr:
+                continue
+            # max_rr is a ranking reference, not a hard veto. A nearby real
+            # liquidity pool must not be rejected solely because compact sweep
+            # invalidation creates unusually high payoff geometry.
+            delivery = _clamp(0.55 + 0.25 * min(1.0, sig / 6.0) + 0.20 * (1.0 - min(1.0, distance / max(atr * max_dist_atr, _EPS))))
+            cluster = self._target_cluster_metrics(target, pools, atr)
+            target_quality = _clamp(0.62 * delivery + 0.38 * float(cluster["cluster_score"]))
+            noise_penalty = 0.62 if bool(cluster["noise"]) else 1.0
+            rank_score = target_quality * min(rr, max_rr) * noise_penalty / (1.0 + 0.08 * distance / max(atr, _EPS))
+            rows.append({"target": target, "tp": tp, "rr": rr, "distance": distance, "distance_atr": distance / max(atr, _EPS), "delivery": target_quality, "rank_score": rank_score, "buffer": buffer,
+                         "cluster_mass": float(cluster["cluster_mass"]), "cluster_score": float(cluster["cluster_score"]),
+                         "cluster_count": int(cluster["cluster_count"]), "classification": "NOISE" if cluster["noise"] else "VALID_TARGET_LIQUIDITY",
+                         "noise_reason": str(cluster["noise_reason"])})
+        if not rows:
+            self._last_analysis.update({
+                "target_block": "NO_NEARBY_NIFTY_INTRADAY_LIQUIDITY_CASHOUT",
+                "target_selection_model": "NIFTY_NEAREST_REAL_LIQUIDITY_CASHOUT",
+                "target_min_rr": min_rr, "target_max_rr_reference": max_rr, "target_max_atr": max_dist_atr,
+            })
+            return None
+        best = max(rows, key=lambda row: (row["rank_score"], row["cluster_mass"], -row["distance"]))
+        target = best["target"]
+        self._last_pool_plan = {
+            "ts": time.time(), "role": "TP", "side": side,
+            "summary": f"NIFTY_INTRADAY_LIQUIDITY_CONCENTRATION {target.pool.timeframe}@{target.pool.price:.4f} mass={best['cluster_mass']:.2f} grossRR={best['rr']:.2f}",
+            "selected": {"pool_price": target.pool.price, "timeframe": target.pool.timeframe, "tp_price": best["tp"], "gross_rr": best["rr"], "structural_liquidity_mass": best["cluster_mass"], "selected": True},
+            "candidates": [{"pool_price": r["target"].pool.price, "timeframe": r["target"].pool.timeframe, "tp_price": r["tp"], "gross_rr": r["rr"], "distance_atr": r["distance_atr"], "structural_liquidity_mass": r["cluster_mass"], "liquidity_cluster_score": r["cluster_score"], "classification": r["classification"], "noise_reason": r["noise_reason"], "selected": r is best} for r in rows],
+        }
+        self._last_analysis.update({
+            "target_timeframe": str(target.pool.timeframe), "target_pool_price": _f(target.pool.price),
+            "target_tp_buffer": best["buffer"], "target_distance_atr": best["distance_atr"],
+            "target_significance": _f(getattr(target, "significance", 0.0)), "target_rr": best["rr"],
+            "target_gross_rr": best["rr"], "target_net_win_r": best["rr"],
+            "target_selection_model": "NIFTY_NEAREST_REAL_LIQUIDITY_CASHOUT",
+            "target_selection_authority": "NIFTY_INTRADAY_LIQUIDITY_CONCENTRATION_GRAPH",
+            "target_structural_liquidity_mass": best["cluster_mass"],
+            "target_liquidity_cluster_score": best["cluster_score"],
+            "target_liquidity_cluster_count": best["cluster_count"],
+            "delivery_score": best["delivery"], "target_rank_score": best["rank_score"],
+            "probability_calibrated": False,
+        })
+        return target, float(best["tp"]), float(best["rr"]), float(best["rank_score"]), float(best["delivery"])
+
+    def _sweep_reclaim_protected_stop(self, side: str, entry: float, wick: float, raw_stop: float,
+                                      snap: LiquidityMapSnapshot, atr: float) -> _StopPlan:
+        """Fast-profile stop that still refuses to sit on live liquidity."""
+        pools = list(snap.ssl_pools if side == "long" else snap.bsl_pools)
+        clarity = _f(getattr(self._market_state, "clarity", 0.0), 0.0)
+        envelope_atr = 0.32 + 0.55 * self._atr_pctile + 0.22 * clarity
+        selected_rows: List[Dict[str, Any]] = []
+        noise_rows: List[Dict[str, Any]] = []
+        mass, outer = 0.0, wick
+        for target in pools:
+            pool = getattr(target, "pool", None)
+            px = _f(getattr(pool, "price", 0.0), 0.0)
+            sig = max(0.0, _f(getattr(target, "significance", 0.0), 0.0))
+            on_stop_side = (side == "long" and px < entry) or (side == "short" and px > entry)
+            if not on_stop_side or px <= 0:
+                continue
+            distance_atr = abs(px - wick) / max(atr, _EPS)
+            relevance = math.tanh(sig / 4.0) * math.exp(-distance_atr / max(envelope_atr, _EPS))
+            row = {"pool_price": px, "timeframe": str(getattr(pool, "timeframe", "") or ""),
+                   "significance": sig, "distance_from_anchor_atr": distance_atr, "relevance": relevance}
+            if distance_atr <= envelope_atr and relevance >= 0.10:
+                row["classification"] = "PROTECTED_BEYOND_STOP"
+                selected_rows.append(row)
+                mass += sig * max(0.05, relevance)
+                outer = min(outer, px) if side == "long" else max(outer, px)
+            else:
+                row["classification"] = "NOISE_OUTSIDE_INVALIDATION_CLUSTER"
+                noise_rows.append(row)
+        base_clearance = abs(raw_stop - wick)
+        clearance = base_clearance + atr * min(0.16, 0.04 * math.log1p(max(0.0, mass)))
+        stop = min(raw_stop, outer - clearance) if side == "long" else max(raw_stop, outer + clearance)
+        return _StopPlan(price=stop, structural_anchor=wick, outer_protected_liquidity=outer,
+                         clearance=clearance, protected_cluster_mass=mass,
+                         selected_pools=tuple(selected_rows), noise_pools=tuple(noise_rows),
+                         model="NIFTY_SWEEP_RECLAIM_LIQUIDITY_PROTECTED_STOP")
+
+    def _try_nifty_trend_sweep_signal(self, sweep: SweepResult, regime: _IntradayRegime,
+                                      snap: LiquidityMapSnapshot, price: float, atr: float, now: float) -> bool:
+        side = str(getattr(sweep, "direction", "") or "").lower()
+        if not regime.side or side != regime.side:
+            return False
+        # NIFTY is faster, not blind. A local pullback sweep may trigger entry
+        # inside the intraday trend, but cannot override a live higher-timeframe
+        # liquidity-transfer owner without an actual control transfer.
+        if (self._market_state is not None and self._market_state.has_firm_parent_control
+                and not self._market_state.owns(side)):
+            self._record_block(
+                "NIFTY_SWEEP_OPPOSES_AUCTION_CONTROL", trigger="WAIT_FOR_CONTROL_TRANSFER",
+                controlling_side=self._market_state.control_side,
+                controlling_parent_tf=self._market_state.parent_timeframe,
+                controlling_parent_quality=self._market_state.parent_quality,
+            )
+            return False
+        pool = getattr(sweep, "pool", None)
+        swept_level = _f(getattr(pool, "price", 0.0))
+        wick = _f(getattr(sweep, "wick_extreme", 0.0))
+        if swept_level <= 0 or wick <= 0:
+            return False
+        reclaim = (side == "long" and price > swept_level) or (side == "short" and price < swept_level)
+        extension_atr = abs(price - swept_level) / max(atr, _EPS)
+        max_extension = max(0.20, _cfg_float("ICICI_NIFTY_TREND_SWEEP_MAX_RECLAIM_EXTENSION_ATR", 0.65))
+        if not reclaim:
+            self._record_block("NIFTY_TREND_SWEEP_NOT_RECLAIMED", trigger="WAIT_FOR_SWEEP_RECLAIM")
+            return False
+        if extension_atr > max_extension:
+            self._record_block("NIFTY_TREND_SWEEP_RECLAIM_TOO_EXTENDED", trigger="WAIT_FOR_NEW_PULLBACK_SWEEP", reclaim_extension_atr=extension_atr)
+            return False
+        clearance = atr * (_cfg_float("ICICI_NIFTY_TREND_SWEEP_STOP_BASE_ATR", 0.08) + _cfg_float("ICICI_NIFTY_TREND_SWEEP_STOP_PCTL_SLOPE_ATR", 0.10) * self._atr_pctile)
+        raw_sl = wick - clearance if side == "long" else wick + clearance
+        stop_plan = self._sweep_reclaim_protected_stop(side, price, wick, raw_sl, snap, atr)
+        sl = stop_plan.price
+        self._last_analysis.update(stop_plan.payload())
+        if not ((side == "long" and sl < price) or (side == "short" and sl > price)):
+            return False
+        selected = self._select_nifty_fast_target(side, price, sl, snap, atr)
+        if selected is None:
+            self._record_block("AWAITING_NEARBY_NIFTY_INTRADAY_LIQUIDITY_TARGET", trigger="FAST_TP_ZONE_REQUIRED")
+            return False
+        target_obj, tp, rr, rank_score, delivery_score = selected
+        narrative = self._market_state
+        quality = {
+            "context_delivery_score": regime.strength, "delivery_score": delivery_score,
+            "target_rank_score": rank_score, "raid_quality": _f(getattr(sweep, "quality", 0.0)),
+            "nifty_intraday_phase_score": regime.signed_score, "fast_exit_profile": 1.0,
+            "probability_calibrated": False, "archetype": EntryType.NIFTY_TREND_SWEEP_SCALP.value,
+            "market_phase": narrative.phase if narrative else regime.label,
+            "auction_control_side": narrative.control_side if narrative else regime.side,
+            "auction_control_score": narrative.control_score if narrative else regime.signed_score,
+            "execution_posture": narrative.posture if narrative else regime.aggression,
+            "auction_risk_scalar": narrative.risk_scalar if narrative else (1.0 if regime.aggression == "AGGRESSIVE" else 0.72),
+        }
+        explanation = (
+            f"NIFTY phase={regime.label}/{regime.aggression} score={regime.signed_score:+.2f} | "
+            f"fresh {str(getattr(pool, 'timeframe', 'LTF')).upper()} {side.upper()} pullback liquidity sweep reclaimed @ {swept_level:.2f} | "
+            f"entry at reclaim; nearest live {target_obj.pool.timeframe} cash-out @ {target_obj.pool.price:.2f}; grossRR={rr:.2f}"
+        )
+        self._signal = EntrySignal(
+            side=side, entry_type=EntryType.NIFTY_TREND_SWEEP_SCALP, entry_price=price, sl_price=sl, tp_price=tp,
+            rr_ratio=rr, target_pool=target_obj, sweep_result=sweep, delivery_probability=0.0,
+            delivery_score=delivery_score, probability_calibrated=False, archetype=EntryType.NIFTY_TREND_SWEEP_SCALP.value,
+            reason=explanation, structural_validation="NIFTY_TREND_SWEEP_SCALP: live intraday trend phase / fresh same-direction pullback sweep reclaim / nearest real liquidity cash-out",
+            quality=quality, analysis_domain="UNDERLYING",
+        )
+        self._state = EngineState.EXECUTABLE
+        self._state_entered = now
+        self._last_analysis.update({
+            "state": self._state.value, "side": side, "archetype": EntryType.NIFTY_TREND_SWEEP_SCALP.value,
+            "candidate_archetype": EntryType.NIFTY_TREND_SWEEP_SCALP.value, "trigger": "EXECUTABLE_NIFTY_TREND_SWEEP_RECLAIM",
+            "block_reason": "NONE", "raid_side": side, "raid_price": swept_level, "raid_wick": wick,
+            "raid_quality": _f(getattr(sweep, "quality", 0.0)), "raid_age_sec": max(0.0, now - _f(getattr(sweep, "detected_at", now))),
+            "entry": price, "sl": sl, "tp": tp, "rr": rr, "gross_rr": rr,
+            "context_bias_path": "NIFTY_INTRADAY_TREND_SWEEP", "context_direction": side,
+            "context_delivery_score": regime.strength, "context_permission": True, "context_aligned": True,
+            "entry_sweep_timeframe": str(getattr(pool, "timeframe", "") or ""),
+            "delivery_score": delivery_score, "target_rank_score": rank_score, "probability_calibrated": False,
+            "entry_zone_selection_model": "NIFTY_TREND_SWEEP_RECLAIM_ZONE",
+            "entry_zone_selected_tf": str(getattr(pool, "timeframe", "") or ""),
+            "entry_zone_low": min(wick, swept_level), "entry_zone_high": max(wick, swept_level),
+            "entry_zone_equilibrium": swept_level, "entry_zone_score": _f(getattr(sweep, "quality", 0.0)),
+            "entry_zone_order_block_overlap": 0.0, "entry_zone_raid_fuel_score": _f(getattr(sweep, "quality", 0.0)),
+            "entry_zone_candidate_count": 1, "entry_zone_noise_count": 0,
+            "stop_clearance": abs(sl - wick), "stop_clearance_atr": abs(sl - wick) / max(atr, _EPS),
+            "market_phase": quality.get("market_phase", "UNCLASSIFIED"),
+            "auction_control_side": quality.get("auction_control_side", "none"),
+            "auction_control_score": quality.get("auction_control_score", 0.0),
+            "execution_posture": quality.get("execution_posture", "FAST_SCALP"),
+            "auction_risk_scalar": quality.get("auction_risk_scalar", 0.72),
+        })
+        logger.info("NIFTY TREND-SWEEP ENTRY READY %s @ %.4f | trigger=%s sweep phase=%s/%s score=%+.3f SL=%.4f TP=%.4f grossRR=%.2f target=%s@%.4f", side.upper(), price, str(getattr(pool, "timeframe", "LTF")).upper(), regime.label, regime.aggression, regime.signed_score, sl, tp, rr, target_obj.pool.timeframe, target_obj.pool.price)
+        return True
+
+    def _context_decision_for_raid(self, side: str, ctx4: _TrendContext,
+                                   ctx15: _TrendContext, sweep_quality: float,
+                                   narrative: Optional[AuctionNarrative] = None) -> _ContextDecision:
+        """Classify structural raid context under the active auction owner.
+
+        The generic executable evidence remains 5m raid -> MSS/displacement ->
+        FVG repricing. 4H/15m context supplies draw-on-liquidity bias, but a
+        strongly dominant opposing 15m auction cannot be faded merely because
+        the slower 4h location points the other way.
         """
         direction = self._direction_int(side)
         if direction == 0:
             return _ContextDecision(side, False, "INVALID_RAID_DIRECTION",
                                     "INVALID_RAID_DIRECTION", 0.0, False, 0, 0, 0)
+        # Market-state ownership replaces the former filter stack as the core
+        # decision. A local 5m reversal cannot override a fresh 1H+ liquidity
+        # transfer until the delivery process actually changes owner.
+        if (narrative is not None and narrative.has_firm_parent_control
+                and narrative.control_side in ("long", "short")
+                and side != narrative.control_side):
+            score = max(0.0, 0.15 * _f(sweep_quality) + 0.10 * (1.0 - narrative.clarity))
+            return _ContextDecision(
+                side, False, "COUNTER_AUCTION_WAIT_CONTROL_TRANSFER",
+                "AUCTION_CONTROL_REMAINS_OPPOSING_SIDE", score, False, 0, 1, 0,
+            )
         contexts = (ctx4, ctx15)
         supporting = sum(1 for ctx in contexts if ctx.side == direction)
         opposing = sum(1 for ctx in contexts if ctx.side == -direction)
@@ -478,12 +871,21 @@ class ICTLiquidityEntryEngine:
         elif supporting == 1 and ranging == 1:
             path = "PARTIAL_HTF_DOL"
         elif supporting == 1 and opposing == 1:
+            # Split context is a transition phase, not blanket permission to fade
+            # the active intraday auction. A dominant 15m delivery owns timing;
+            # 4h location alone must not validate a counter-tempo reversal.
+            if ctx15.side == -direction and abs(ctx15.signed_score) >= max(0.42, abs(ctx4.signed_score) + 0.15):
+                score = max(0.0, 0.12 + 0.18 * _f(sweep_quality) - 0.22 * ctx15.confidence)
+                return _ContextDecision(side, False, "SPLIT_HTF_TACTICAL_DELIVERY_OPPOSES_RAID",
+                                        "SPLIT_HTF_TACTICAL_DELIVERY_OPPOSES_RAID", score, False,
+                                        supporting, opposing, ranging)
             path = "MITIGATION_RAID_WITH_SPLIT_HTF"
         elif ranging == 2:
             path = "BALANCED_RANGE_EXTERNAL_RAID"
         elif ranging == 1 and opposing == 1:
             path = "COUNTER_DELIVERY_RAID_REQUIRES_5M_PROOF"
-            if (_cfg_bool("ICT_SELECTIVITY_MODE", True)
+            if (_cfg_bool("ICT_LEGACY_FILTER_COMPATIBILITY_ENABLED", False)
+                    and _cfg_bool("ICT_SELECTIVITY_MODE", True)
                     and not _cfg_bool("ICT_ALLOW_COUNTER_DELIVERY_RAIDS", False)):
                 score = max(0.0, 0.10 + 0.20 * _f(sweep_quality) - 0.25 * opposing_strength)
                 return _ContextDecision(side, False, path,
@@ -498,6 +900,9 @@ class ICTLiquidityEntryEngine:
             + 0.20 * max(0.0, min(1.0, _f(sweep_quality)))
             - 0.18 * min(1.0, opposing_strength)
         )
+        if narrative is not None and narrative.owns(side) and narrative.has_firm_parent_control:
+            path = f"{narrative.phase}_WITH_CONTROL"
+            score += 0.12 * narrative.clarity
         return _ContextDecision(side, True, path, "NONE",
                                 max(0.05, min(0.95, score)), strict,
                                 supporting, opposing, ranging)
@@ -507,6 +912,7 @@ class ICTLiquidityEntryEngine:
                candles_15m: Optional[List[Dict]] = None,
                candles_4h: Optional[List[Dict]] = None,
                candles_1h: Optional[List[Dict]] = None,
+               candles_1d: Optional[List[Dict]] = None,
                micro_state: Optional[MicrostructureState] = None) -> None:
         self._last_scan_skip = {}
         if atr <= _EPS or price <= 0:
@@ -522,6 +928,7 @@ class ICTLiquidityEntryEngine:
         c15 = _closed(candles_15m, 24, "15m", now)
         c1h = _closed(candles_1h, 20, "1h", now) if candles_1h else []
         c4h = _closed(candles_4h, 20, "4h", now)
+        c1d = _closed(candles_1d, 10, "1d", now) if candles_1d else []
         self._last_microstructure = micro_state if micro_state is not None else MicrostructureState.empty(now)
         if not c5 or not c15 or not c4h:
             self._last_analysis = {
@@ -549,11 +956,22 @@ class ICTLiquidityEntryEngine:
         ctx15 = _robust_trend(c15, atr15m, min(56, len(c15)))
         atr1h = _timeframe_atr(c1h) if c1h else 0.0
         ctx1h = _robust_trend(c1h, atr1h, min(44, len(c1h))) if atr1h > _EPS else _TrendContext(0, 0.0, 0.0, 0.0, 0.0)
+        atr1d = _timeframe_atr(c1d) if c1d else 0.0
+        ctx1d = _robust_trend(c1d, atr1d, min(30, len(c1d))) if atr1d > _EPS else _TrendContext(0, 0.0, 0.0, 0.0, 0.0)
+        fresh = self._fresh_5m_sweeps(liq_snapshot, now)
+        parent_htf = self._fresh_parent_htf_sweeps(liq_snapshot, now)
+        self._market_state = build_auction_narrative(
+            {"1d": ctx1d, "4h": ctx4, "1h": ctx1h, "15m": ctx15},
+            parent_htf, fresh, now,
+            aggressive_min_clarity=_cfg_float("MARKET_STATE_AGGRESSIVE_MIN_CLARITY", 0.62),
+            parent_min_quality=_cfg_float("MARKET_STATE_FIRM_PARENT_MIN_QUALITY", 0.60),
+        )
         self._delivery_evidence = build_delivery_evidence(
             liq_snapshot, price, atr,
-            ((ctx4.signed_score, 0.50), (ctx1h.signed_score, 0.20), (ctx15.signed_score, 0.30)),
+            ((ctx1d.signed_score, 0.15), (ctx4.signed_score, 0.35), (ctx1h.signed_score, 0.20), (ctx15.signed_score, 0.30)),
             self._last_microstructure,
         )
+        nifty_regime = self._nifty_intraday_regime(ctx4, ctx1h, ctx15)
         aligned_side = ctx4.side if ctx4.side != 0 and ctx4.side == ctx15.side else 0
         aligned_label = "long" if aligned_side > 0 else ("short" if aligned_side < 0 else "none")
         self._last_analysis = {
@@ -571,6 +989,7 @@ class ICTLiquidityEntryEngine:
             "context_15m_slope_component": ctx15.slope_component, "context_15m_structure_component": ctx15.structure_component,
             "context_15m_atr": atr15m, "context_1h": ctx1h.label,
             "context_1h_score": ctx1h.signed_score, "context_1h_atr": atr1h,
+            "context_1d": ctx1d.label, "context_1d_score": ctx1d.signed_score, "context_1d_atr": atr1d,
             "context_direction_threshold": _CONTEXT_DIRECTION_THRESHOLD,
             "min_structural_rr": self._min_structural_rr,
             "max_structural_rr_reference": self._max_structural_rr_reference,
@@ -591,7 +1010,16 @@ class ICTLiquidityEntryEngine:
             "micro_trade_imbalance": self._last_microstructure.trade_imbalance,
             "microprice_edge_atr": self._last_microstructure.microprice_edge_atr,
             "probability_calibrated": False,
+            "nifty_intraday_phase": nifty_regime.label,
+            "nifty_intraday_direction": nifty_regime.side or "none",
+            "nifty_intraday_score": nifty_regime.signed_score,
+            "nifty_intraday_strength": nifty_regime.strength,
+            "nifty_intraday_aggression": nifty_regime.aggression,
+            "nifty_intraday_reason": nifty_regime.reason,
+            "execution_profile": self._desk_profile,
+            "structural_zone_graph_enabled": self._zone_graph_profile,
         }
+        self._last_analysis.update(self._market_state.payload())
         if self._state in (EngineState.ENTERING, EngineState.IN_POSITION):
             self._record_block("POSITION_LIFECYCLE_ACTIVE", trigger=self._state.value)
             return
@@ -599,6 +1027,20 @@ class ICTLiquidityEntryEngine:
             self._last_analysis.update({"state": EngineState.EXECUTABLE.value, "trigger": "SIGNAL_PENDING_EXECUTION", "block_reason": "NONE"})
             return
 
+        if (self._thesis is not None and self._market_state is not None
+                and self._market_state.has_firm_parent_control
+                and not self._market_state.owns(self._thesis.side)):
+            invalidated_side = self._thesis.side
+            self._thesis = None
+            self._state = EngineState.CONTEXT_READY
+            self._record_block(
+                "AUCTION_CONTROL_TRANSFERRED_AGAINST_THESIS",
+                trigger="MARKET_STATE_OWNER",
+                invalidated_side=invalidated_side,
+                controlling_side=self._market_state.control_side,
+                controlling_parent_tf=self._market_state.parent_timeframe,
+                controlling_parent_quality=self._market_state.parent_quality,
+            )
         if self._thesis is not None:
             if now - self._thesis.formed_at > self._max_thesis_age_sec(self._thesis):
                 self._last_analysis.update({"expired_thesis_age_sec": now - self._thesis.formed_at})
@@ -612,8 +1054,6 @@ class ICTLiquidityEntryEngine:
                 # scanning so a stronger/newer structural opportunity can replace it.
                 self._last_analysis["candidate_ledger_active"] = True
 
-        fresh = self._fresh_5m_sweeps(liq_snapshot, now)
-        parent_htf = self._fresh_parent_htf_sweeps(liq_snapshot, now)
         parent_best = parent_htf[0] if parent_htf else None
         parent_pool = getattr(parent_best, "pool", None) if parent_best is not None else None
         self._last_analysis.update({"fresh_5m_raid_count": len(fresh), "aligned_5m_raid_count": 0,
@@ -628,6 +1068,37 @@ class ICTLiquidityEntryEngine:
                                                                 if parent_best is not None else 0.0)})
         self._state = EngineState.CONTEXT_READY
         self._last_analysis["state"] = self._state.value
+
+        # NIFTY is traded as a fast long-premium intraday profile: entry is the
+        # reclaimed liquidity sweep in the live trend direction. It does not
+        # inherit the slower swing-reversal MSS/FVG waiting chain used for 24x7
+        # token venues.
+        if self._nifty_trend_sweep_profile:
+            nifty_fresh = self._fresh_nifty_entry_sweeps(liq_snapshot, now)
+            self._last_analysis.update({
+                "fresh_nifty_trigger_sweep_count": len(nifty_fresh),
+                "nifty_trigger_timeframes": "1m,5m",
+                "fresh_5m_raid_count": sum(1 for sw in nifty_fresh if str(getattr(getattr(sw, "pool", None), "timeframe", "")).lower() == "5m"),
+            })
+            if not nifty_regime.side:
+                self._record_block("NIFTY_MARKET_PHASE_NOT_DIRECTIONAL", trigger="WAIT_FOR_INTRADAY_TREND_PHASE",
+                                   context_bias_path=nifty_regime.label, context_direction="none",
+                                   context_delivery_score=nifty_regime.strength)
+                return
+            if not nifty_fresh:
+                self._record_block("AWAITING_NIFTY_TREND_DIRECTION_LIQUIDITY_SWEEP", trigger="WAIT_FOR_1M_OR_5M_TREND_PULLBACK_SWEEP",
+                                   context_bias_path="NIFTY_INTRADAY_TREND_SWEEP", context_direction=nifty_regime.side,
+                                   context_delivery_score=nifty_regime.strength, context_permission=True)
+                return
+            same_direction = [sw for sw in nifty_fresh if str(getattr(sw, "direction", "") or "").lower() == nifty_regime.side]
+            for sweep in same_direction:
+                if self._try_nifty_trend_sweep_signal(sweep, nifty_regime, liq_snapshot, price, atr, now):
+                    return
+            if not same_direction:
+                self._record_block("NIFTY_SWEEP_OPPOSES_INTRADAY_TREND", trigger="WAIT_FOR_SAME_DIRECTION_1M_OR_5M_SWEEP",
+                                   context_bias_path="NIFTY_INTRADAY_TREND_SWEEP", context_direction=nifty_regime.side,
+                                   context_delivery_score=nifty_regime.strength, context_permission=True)
+            return
 
         if not fresh:
             # A delivery displacement without a contemporary stop raid is an
@@ -663,7 +1134,7 @@ class ICTLiquidityEntryEngine:
             direction = self._direction_int(side)
             pool = getattr(sweep, "pool", None)
             context_decision = self._context_decision_for_raid(
-                side, ctx4, ctx15, _f(getattr(sweep, "quality", 0.0)))
+                side, ctx4, ctx15, _f(getattr(sweep, "quality", 0.0)), self._market_state)
             candidate = {
                 "candidate_raid_side": side or "unknown",
                 "candidate_raid_pool_side": str(getattr(getattr(pool, "side", None), "value", "") or ""),
@@ -817,9 +1288,35 @@ class ICTLiquidityEntryEngine:
     def pool_plan_info(self) -> Optional[Dict[str, Any]]:
         return dict(self._last_pool_plan) if self._last_pool_plan else None
 
+    @property
+    def entry_zone_plan_info(self) -> Optional[Dict[str, Any]]:
+        return dict(self._last_entry_zone_plan) if self._last_entry_zone_plan else None
+
     # ---------- model internals ----------
     def _expire(self, now: float) -> None:
         self._processed = {k: expiry for k, expiry in self._processed.items() if expiry > now}
+
+    def _fresh_nifty_entry_sweeps(self, snap: LiquidityMapSnapshot, now: float) -> List[SweepResult]:
+        """Return only immediate 1m/5m NIFTY sweep-reclaim triggers.
+
+        The NIFTY option vehicle cannot wait through the generic 5m
+        raid/MSS/FVG cycle. A one-minute stop raid can be the executable entry
+        event once it is reclaimed in an already observed intraday trend.
+        """
+        age_limit = {
+            "1m": max(30.0, _cfg_float("ICICI_NIFTY_TREND_SWEEP_1M_MAX_AGE_SEC", 90.0)),
+            "5m": max(60.0, _cfg_float("ICICI_NIFTY_TREND_SWEEP_5M_MAX_AGE_SEC", 360.0)),
+        }
+        out: List[SweepResult] = []
+        for sw in list(getattr(snap, "recent_sweeps", []) or []):
+            tf = str(getattr(getattr(sw, "pool", None), "timeframe", "") or "").lower()
+            if tf not in age_limit:
+                continue
+            age = max(0.0, now - _f(getattr(sw, "detected_at", 0.0)))
+            if age > age_limit[tf] or _sweep_key(sw) in self._processed:
+                continue
+            out.append(sw)
+        return sorted(out, key=lambda sw: (_f(getattr(sw, "detected_at", 0.0)), _f(getattr(sw, "quality", 0.0))), reverse=True)
 
     def _fresh_5m_sweeps(self, snap: LiquidityMapSnapshot, now: float) -> List[SweepResult]:
         out = []
@@ -908,6 +1405,12 @@ class ICTLiquidityEntryEngine:
             entry_type=EntryType.LIQUIDITY_RAID_REVERSAL,
             invalidation_anchor=wick, evidence_score=evidence_score,
             structural_origin="RAID_WICK",
+            market_phase=(self._market_state.phase if self._market_state else "UNCLASSIFIED"),
+            auction_control_side=(self._market_state.control_side if self._market_state else "none"),
+            auction_control_score=(self._market_state.control_score if self._market_state else 0.0),
+            execution_posture=(self._market_state.posture if self._market_state else "OBSERVE"),
+            auction_risk_scalar=(self._market_state.risk_scalar if self._market_state else 0.35),
+            market_state_thesis=(self._market_state.thesis if self._market_state else ""),
         )
 
     @staticmethod
@@ -1128,7 +1631,16 @@ class ICTLiquidityEntryEngine:
             return None
         fvg, mss, anchor, threshold, source = result
         context_score = max(0.0, evidence.score_for(side))
-        if _cfg_bool("ICT_SELECTIVITY_MODE", True):
+        if (self._market_state is not None and self._market_state.has_firm_parent_control
+                and not self._market_state.owns(side)):
+            self._record_block(
+                "CONTINUATION_NOT_OWNED_BY_AUCTION_CONTROL",
+                trigger="MARKET_STATE_OWNER",
+                candidate_side=side,
+                controlling_side=self._market_state.control_side,
+            )
+            return None
+        if _cfg_bool("ICT_SELECTIVITY_MODE", True) and _cfg_bool("ICT_LEGACY_FILTER_COMPATIBILITY_ENABLED", False):
             min_disp = _cfg_float("ICT_ENTRY_MIN_DISPLACEMENT_ATR_CONTINUATION", 1.25)
             if fvg.displacement_atr < min_disp:
                 self._record_block(
@@ -1159,6 +1671,12 @@ class ICTLiquidityEntryEngine:
             displacement_atr=fvg.displacement_atr, fvg=fvg,
             entry_type=EntryType.DISPLACEMENT_CONTINUATION, invalidation_anchor=anchor,
             evidence_score=context_score, structural_origin="DISPLACEMENT_ORIGIN",
+            market_phase=(self._market_state.phase if self._market_state else "UNCLASSIFIED"),
+            auction_control_side=(self._market_state.control_side if self._market_state else "none"),
+            auction_control_score=(self._market_state.control_score if self._market_state else 0.0),
+            execution_posture=(self._market_state.posture if self._market_state else "OBSERVE"),
+            auction_risk_scalar=(self._market_state.risk_scalar if self._market_state else 0.35),
+            market_state_thesis=(self._market_state.thesis if self._market_state else ""),
         )
 
     def _build_liquidity_expansion_thesis(self, sweep: SweepResult, ctx4: _TrendContext, ctx15: _TrendContext,
@@ -1182,7 +1700,16 @@ class ICTLiquidityEntryEngine:
             return None
         fvg, mss, anchor, threshold, source = result
         context_score = max(0.0, evidence.score_for(side))
-        if _cfg_bool("ICT_SELECTIVITY_MODE", True):
+        if (self._market_state is not None and self._market_state.has_firm_parent_control
+                and not self._market_state.owns(side)):
+            self._record_block(
+                "EXPANSION_NOT_OWNED_BY_AUCTION_CONTROL",
+                trigger="MARKET_STATE_OWNER",
+                candidate_side=side,
+                controlling_side=self._market_state.control_side,
+            )
+            return None
+        if _cfg_bool("ICT_SELECTIVITY_MODE", True) and _cfg_bool("ICT_LEGACY_FILTER_COMPATIBILITY_ENABLED", False):
             min_disp = _cfg_float("ICT_ENTRY_MIN_DISPLACEMENT_ATR_RAID", 1.20)
             min_context = _cfg_float("ICT_ENTRY_MIN_CONTEXT_DELIVERY_SCORE", 0.25)
             if fvg.displacement_atr < min_disp:
@@ -1213,6 +1740,12 @@ class ICTLiquidityEntryEngine:
             displacement_atr=fvg.displacement_atr, fvg=fvg,
             entry_type=EntryType.LIQUIDITY_EXPANSION_RETEST, invalidation_anchor=anchor,
             evidence_score=context_score, structural_origin="EXPANSION_ORIGIN",
+            market_phase=(self._market_state.phase if self._market_state else "UNCLASSIFIED"),
+            auction_control_side=(self._market_state.control_side if self._market_state else "none"),
+            auction_control_score=(self._market_state.control_score if self._market_state else 0.0),
+            execution_posture=(self._market_state.posture if self._market_state else "OBSERVE"),
+            auction_risk_scalar=(self._market_state.risk_scalar if self._market_state else 0.35),
+            market_state_thesis=(self._market_state.thesis if self._market_state else ""),
         )
 
     def _dealing_range(self, candles_15m: List[Dict], candles_4h: List[Dict]) -> Tuple[float, float, float]:
@@ -1254,19 +1787,291 @@ class ICTLiquidityEntryEngine:
             return 0.72, "KILLZONE_ADJACENT"
         return 0.45, "OUTSIDE_KILLZONE"
 
-    def _order_block_zone(self, thesis: _Thesis, candles_5m: List[Dict]) -> Tuple[float, float]:
-        impulse_idx = max(1, min(len(candles_5m) - 1, int(thesis.fvg.index) - 1))
+    @staticmethod
+    def _zone_overlap_ratio(low_a: float, high_a: float, low_b: float, high_b: float) -> float:
+        if high_a <= low_a or high_b <= low_b:
+            return 0.0
+        overlap = max(0.0, min(high_a, high_b) - max(low_a, low_b))
+        return _clamp(overlap / max(min(high_a - low_a, high_b - low_b), _EPS))
+
+    def _order_block_for_fvg(self, side: str, fvg: _FVG, candles: List[Dict]) -> Tuple[float, float]:
+        """Find the last opposing candle that funded a displacement imbalance."""
+        if not candles:
+            return 0.0, 0.0
+        impulse_idx = max(1, min(len(candles) - 1, int(fvg.index) - 1))
         start = max(0, impulse_idx - 8)
-        for row in reversed(candles_5m[start:impulse_idx]):
+        for row in reversed(candles[start:impulse_idx]):
             opened, closed = _f(row.get("o")), _f(row.get("c"))
             if opened <= 0 or closed <= 0:
                 continue
-            if thesis.side == "long" and closed < opened:
+            if side == "long" and closed < opened:
                 return _f(row.get("l")), _f(row.get("h"))
-            if thesis.side == "short" and closed > opened:
+            if side == "short" and closed > opened:
                 return _f(row.get("l")), _f(row.get("h"))
-        origin = candles_5m[max(0, impulse_idx - 1)]
+        origin = candles[max(0, impulse_idx - 1)]
         return _f(origin.get("l")), _f(origin.get("h"))
+
+    def _order_block_zone(self, thesis: _Thesis, candles_5m: List[Dict]) -> Tuple[float, float]:
+        return self._order_block_for_fvg(thesis.side, thesis.fvg, candles_5m)
+
+    def _candidate_fvgs(self, side: str, candles: List[Dict], atr: float,
+                        timeframe: str, recent_bars: int) -> List[_FVG]:
+        """Enumerate visible imbalance zones; do not assume the latest is best."""
+        if atr <= _EPS or len(candles) < 3:
+            return []
+        start = max(2, len(candles) - max(3, int(recent_bars)))
+        zones: List[_FVG] = []
+        for i in range(start, len(candles)):
+            before, impulse, after = candles[i - 2], candles[i - 1], candles[i]
+            if side == "long":
+                low, high = _f(before.get("h")), _f(after.get("l"))
+                body = (_f(impulse.get("c")) - _f(impulse.get("o"))) / max(atr, _EPS)
+            else:
+                low, high = _f(after.get("h")), _f(before.get("l"))
+                body = (_f(impulse.get("o")) - _f(impulse.get("c"))) / max(atr, _EPS)
+            if high > low and body > 0:
+                zones.append(_FVG(side=side, low=low, high=high, index=i, displacement_atr=body))
+        return zones
+
+    def _rank_entry_zones(self, thesis: _Thesis, snap: LiquidityMapSnapshot, price: float,
+                          atr: float, candles_5m: List[Dict], candles_15m: List[Dict]
+                          ) -> Tuple[_FVG, Dict[str, Any]]:
+        """Rank FVG/OB repricing zones in the active market-owned direction.
+
+        The output labels weak imbalances as noise rather than manufacturing a
+        separate veto stack.  Price may execute only through the selected zone;
+        the rest remain observability data or future repricing alternatives.
+        """
+        if not self._zone_graph_profile:
+            return thesis.fvg, {"zone_selection_model": "LEGACY_SINGLE_FVG", "candidates": []}
+        all_fvgs: List[Tuple[_FVG, str, List[Dict], int]] = [(thesis.fvg, "5m", candles_5m, 0)]
+        # Executable entry zones must belong to the already-confirmed delivery
+        # sequence, never an unrelated old gap that predates the raid/MSS.
+        min_trigger_index = max(2, int(thesis.fvg.index) - 1)
+        all_fvgs.extend((f, "5m", candles_5m, len(candles_5m) - f.index)
+                        for f in self._candidate_fvgs(thesis.side, candles_5m, atr, "5m", 52)
+                        if int(f.index) >= min_trigger_index)
+        # 15m imbalances are higher-timeframe location confluence for a 5m
+        # trigger; they do not independently manufacture an execution trigger.
+        overlay_fvgs = self._candidate_fvgs(thesis.side, candles_15m, atr, "15m", 28)
+
+        deduped: List[Tuple[_FVG, str, List[Dict], int]] = []
+        for fvg, tf, rows, age in all_fvgs:
+            duplicate = False
+            for prior, prior_tf, _, _ in deduped:
+                if tf == prior_tf and abs(prior.low - fvg.low) <= 1e-9 and abs(prior.high - fvg.high) <= 1e-9:
+                    duplicate = True
+                    break
+            if not duplicate:
+                deduped.append((fvg, tf, rows, age))
+
+        wick = _f(getattr(getattr(thesis, "sweep", None), "wick_extreme", 0.0), thesis.invalidation_anchor)
+        control_aligned = (
+            self._market_state is None
+            or self._market_state.control_side in ("none", thesis.side)
+        )
+        candidates: List[_EntryZoneCandidate] = []
+        for fvg, tf, rows, age in deduped:
+            width_atr = (fvg.high - fvg.low) / max(atr, _EPS)
+            ob_low, ob_high = self._order_block_for_fvg(thesis.side, fvg, rows)
+            ob_overlap = self._zone_overlap_ratio(fvg.low, fvg.high, ob_low, ob_high)
+            htf_overlap = max((self._zone_overlap_ratio(fvg.low, fvg.high, higher.low, higher.high)
+                               for higher in overlay_fvgs), default=0.0)
+            impulse_score = _clamp(math.tanh(max(0.0, fvg.displacement_atr) / 1.25))
+            # A real entry zone should be close enough to the stop raid or the
+            # displacement invalidation origin to explain why orders transacted.
+            origin = wick if wick > 0 else thesis.invalidation_anchor
+            origin_edge = fvg.low if thesis.side == "long" else fvg.high
+            raid_fuel = math.exp(-abs(origin_edge - origin) / max(2.25 * atr, _EPS)) if origin > 0 else 0.45
+            freshness = math.exp(-max(0, age) / (15.0 if tf == "5m" else 7.0))
+            midpoint = fvg.equilibrium
+            reprice = math.exp(-abs(price - midpoint) / max(1.15 * atr, _EPS))
+            phase_alignment = 1.0 if control_aligned else 0.18
+            tf_weight = 0.80 + 0.20 * htf_overlap
+            score = _clamp(
+                0.24 * impulse_score + 0.18 * ob_overlap + 0.12 * htf_overlap + 0.20 * raid_fuel
+                + 0.13 * freshness + 0.09 * reprice + 0.04 * tf_weight
+            ) * phase_alignment
+            noise_reasons = []
+            if width_atr < 0.025:
+                noise_reasons.append("MICRO_GAP_WITHOUT_MEANINGFUL_REPRICE_CAPACITY")
+            if fvg.displacement_atr < 0.16 and fvg != thesis.fvg:
+                noise_reasons.append("WEAK_DISPLACEMENT")
+            if ob_overlap <= 0.02 and raid_fuel < 0.22 and fvg != thesis.fvg:
+                noise_reasons.append("NO_RAID_OR_ORDER_BLOCK_ORIGIN")
+            classification = "NOISE" if noise_reasons else "VALID"
+            candidates.append(_EntryZoneCandidate(
+                fvg=fvg, timeframe=tf, order_block_low=ob_low, order_block_high=ob_high,
+                displacement_score=impulse_score, order_block_overlap=ob_overlap, higher_tf_overlap=htf_overlap,
+                raid_fuel_score=raid_fuel, freshness_score=freshness,
+                phase_alignment=phase_alignment, reprice_score=reprice,
+                structural_score=score, classification=classification,
+                reason=";".join(noise_reasons) if noise_reasons else "DISPLACEMENT_FUNDED_REPRICE_ZONE",
+            ))
+        valid = [z for z in candidates if z.classification != "NOISE"] or candidates
+        if not valid:
+            return thesis.fvg, {"zone_selection_model": "STRUCTURAL_ZONE_GRAPH", "candidates": []}
+        selected = max(valid, key=lambda z: (z.structural_score, z.timeframe == "15m", z.displacement_score, z.freshness_score))
+        candidate_payload = [z.payload(selected=(z is selected)) for z in sorted(candidates, key=lambda x: x.structural_score, reverse=True)]
+        plan = {
+            "ts": time.time(), "role": "ENTRY", "side": thesis.side,
+            "zone_selection_model": "STRUCTURAL_ZONE_GRAPH_FVG_OB_RAID_ORIGIN",
+            "summary": (
+                f"selected {selected.timeframe} FVG/OB {selected.low:.4f}-{selected.high:.4f} "
+                f"score={selected.structural_score:.2f}; noise={sum(1 for z in candidates if z.classification == 'NOISE')}"
+            ),
+            "selected": selected.payload(selected=True), "candidates": candidate_payload,
+        }
+        self._last_entry_zone_plan = plan
+        self._last_analysis.update({
+            "entry_zone_selection_model": plan["zone_selection_model"],
+            "entry_zone_selected_tf": selected.timeframe,
+            "entry_zone_low": selected.low, "entry_zone_high": selected.high,
+            "entry_zone_equilibrium": selected.equilibrium,
+            "entry_zone_score": selected.structural_score,
+            "entry_zone_order_block_overlap": selected.order_block_overlap,
+            "entry_zone_higher_tf_overlap": selected.higher_tf_overlap,
+            "entry_zone_raid_fuel_score": selected.raid_fuel_score,
+            "entry_zone_candidate_count": len(candidates),
+            "entry_zone_noise_count": sum(1 for z in candidates if z.classification == "NOISE"),
+        })
+        return selected.fvg, plan
+
+    def _liquidity_protected_stop(self, thesis: _Thesis, entry: float, snap: LiquidityMapSnapshot,
+                                  atr: float) -> Optional[_StopPlan]:
+        """Place invalidation beyond the relevant stop-liquidity cluster.
+
+        The old stop sat only beyond a wick.  This method recognises when a
+        nearby live same-side pool would make that stop itself the easy draw on
+        liquidity, then protects beyond the outer structurally-related cluster.
+        Distant/weak pools are kept as noise telemetry instead of widening risk.
+        """
+        raw_stop = self._structural_stop(thesis, atr)
+        if raw_stop is None:
+            return None
+        anchor = _f(getattr(thesis, "invalidation_anchor", 0.0), 0.0)
+        if anchor <= 0 and thesis.sweep is not None:
+            anchor = _f(getattr(thesis.sweep, "wick_extreme", 0.0), raw_stop)
+        if anchor <= 0:
+            anchor = raw_stop
+        selected_zone = ((self._last_entry_zone_plan or {}).get("selected") or {})
+        ob_low = _f(selected_zone.get("order_block_low", 0.0), 0.0)
+        ob_high = _f(selected_zone.get("order_block_high", 0.0), 0.0)
+        # Invalidation must also sit behind the selected institutional origin;
+        # otherwise a normal order-block mitigation can stop the ticket before
+        # the thesis is invalidated.
+        if ob_high > ob_low > 0:
+            anchor = min(anchor, ob_low) if thesis.side == "long" else max(anchor, ob_high)
+        pools = list(snap.ssl_pools if thesis.side == "long" else snap.bsl_pools)
+        # Structural envelope expands when volatility is high and when auction
+        # control is clear; it does not chase remote targets into bad R geometry.
+        clarity = _f(getattr(self._market_state, "clarity", 0.0), 0.0)
+        envelope_atr = 0.45 + 0.80 * self._atr_pctile + 0.35 * clarity
+        selected_rows: List[Dict[str, Any]] = []
+        noise_rows: List[Dict[str, Any]] = []
+        mass = 0.0
+        outer = anchor
+        for target in pools:
+            pool = getattr(target, "pool", None)
+            px = _f(getattr(pool, "price", 0.0), 0.0)
+            if px <= 0:
+                continue
+            on_stop_side = (thesis.side == "long" and px < entry) or (thesis.side == "short" and px > entry)
+            if not on_stop_side:
+                continue
+            dist_anchor_atr = abs(px - anchor) / max(atr, _EPS)
+            sig = max(0.0, _f(getattr(target, "significance", 0.0), 0.0))
+            tf = str(getattr(pool, "timeframe", "") or "")
+            relevance = math.tanh(sig / 4.0) * math.exp(-dist_anchor_atr / max(envelope_atr, _EPS))
+            row = {"pool_price": px, "timeframe": tf, "significance": sig,
+                   "distance_from_anchor_atr": dist_anchor_atr, "relevance": relevance}
+            if dist_anchor_atr <= envelope_atr and relevance >= 0.10:
+                row["classification"] = "PROTECTED_BEYOND_STOP"
+                selected_rows.append(row)
+                mass += sig * max(relevance, 0.05)
+                outer = min(outer, px) if thesis.side == "long" else max(outer, px)
+            else:
+                row["classification"] = "NOISE_OUTSIDE_INVALIDATION_CLUSTER"
+                noise_rows.append(row)
+        base_clearance = atr * (self._stop_clearance_base_atr + self._stop_clearance_pctile_slope_atr * self._atr_pctile)
+        mass_buffer = atr * min(0.22, 0.045 * math.log1p(max(0.0, mass)))
+        clearance = base_clearance + mass_buffer
+        stop = min(raw_stop, anchor - clearance, outer - clearance) if thesis.side == "long" else max(raw_stop, anchor + clearance, outer + clearance)
+        return _StopPlan(
+            price=stop, structural_anchor=anchor, outer_protected_liquidity=outer,
+            clearance=clearance, protected_cluster_mass=mass,
+            selected_pools=tuple(selected_rows), noise_pools=tuple(noise_rows),
+        )
+
+    def _target_cluster_metrics(self, selected: PoolTarget, pools: List[PoolTarget], atr: float) -> Dict[str, Any]:
+        """Estimate relative stop-liquidity concentration around a TP pool."""
+        pool = getattr(selected, "pool", None)
+        px = _f(getattr(pool, "price", 0.0))
+        base_sig = max(0.01, _f(getattr(selected, "significance", 0.0), 0.01))
+        radius_atr = 0.16 + 0.08 * self._atr_pctile + 0.06 * math.tanh(base_sig / 4.0)
+        members: List[Dict[str, Any]] = []
+        mass = 0.0
+        sources = set()
+        for other in list(pools or []):
+            other_pool = getattr(other, "pool", None)
+            opx = _f(getattr(other_pool, "price", 0.0))
+            dist_atr = abs(opx - px) / max(atr, _EPS)
+            if opx <= 0 or dist_atr > radius_atr:
+                continue
+            sig = max(0.01, _f(getattr(other, "significance", 0.0), 0.01))
+            tf_sources = {str(x) for x in list(getattr(other, "tf_sources", []) or []) if str(x)}
+            tf_sources.add(str(getattr(other_pool, "timeframe", "") or ""))
+            htf_count = max(1, int(getattr(other_pool, "htf_count", 1) or 1))
+            confluence_mult = 1.0 + 0.16 * max(0, len(tf_sources) - 1) + 0.07 * max(0, htf_count - 1)
+            weighted = sig * confluence_mult * math.exp(-dist_atr / max(radius_atr, _EPS))
+            mass += weighted
+            tf = str(getattr(other_pool, "timeframe", "") or "")
+            sources.add(tf)
+            members.append({"pool_price": opx, "timeframe": tf, "significance": sig, "distance_atr": dist_atr,
+                            "tf_sources": sorted(tf_sources), "confluence_multiplier": confluence_mult})
+        concentration = _clamp(math.tanh(mass / 6.0) * (0.84 + min(0.16, 0.05 * max(0, len(sources) - 1))))
+        is_noise = len(members) == 1 and base_sig < 1.15 and TF_HIERARCHY.get(str(getattr(pool, "timeframe", "1m")), 1) <= _TF_15M_RANK
+        return {
+            "cluster_mass": mass, "cluster_score": concentration,
+            "cluster_count": len(members), "cluster_timeframes": sorted(sources),
+            "cluster_radius_atr": radius_atr, "cluster_members": members,
+            "noise": bool(is_noise),
+            "noise_reason": "ISOLATED_LOW_MASS_POOL" if is_noise else "NONE",
+        }
+
+    def _path_imbalance_impedance(self, side: str, entry: float, tp: float, atr: float,
+                                  candles_5m: Optional[List[Dict]], candles_15m: Optional[List[Dict]]) -> Dict[str, Any]:
+        """Measure opposing FVG/OB repricing zones encountered before a TP.
+
+        A target behind a substantial opposing imbalance can still be chosen,
+        but it is ranked below an equally liquid objective with a cleaner route.
+        This is delivery geometry, not a new permission gate.
+        """
+        barrier_side = "short" if side == "long" else "long"
+        low_route, high_route = sorted((entry, tp))
+        barriers: List[Dict[str, Any]] = []
+        for tf, rows, lookback, tf_weight in (
+            ("5m", list(candles_5m or []), 52, 0.78),
+            ("15m", list(candles_15m or []), 28, 1.00),
+        ):
+            for fvg in self._candidate_fvgs(barrier_side, rows, atr, tf, lookback):
+                mid = fvg.equilibrium
+                if not (low_route < mid < high_route):
+                    continue
+                ob_low, ob_high = self._order_block_for_fvg(barrier_side, fvg, rows)
+                overlap = self._zone_overlap_ratio(fvg.low, fvg.high, ob_low, ob_high)
+                structural_mass = tf_weight * (
+                    0.55 * math.tanh(max(0.0, fvg.displacement_atr) / 1.25) + 0.45 * overlap
+                )
+                barriers.append({
+                    "timeframe": tf, "low": fvg.low, "high": fvg.high,
+                    "equilibrium": mid, "displacement_atr": fvg.displacement_atr,
+                    "order_block_overlap": overlap, "structural_mass": structural_mass,
+                })
+        total_mass = sum(float(row["structural_mass"]) for row in barriers)
+        penalty = 1.0 / (1.0 + 0.24 * total_mass)
+        return {"path_imbalance_count": len(barriers), "path_imbalance_mass": total_mass,
+                "path_imbalance_penalty": penalty, "path_imbalance_zones": barriers}
 
     def _pd_array_confluence(self, thesis: _Thesis, entry: float, atr: float, now: float,
                              candles_5m: List[Dict], candles_15m: List[Dict],
@@ -1331,6 +2136,27 @@ class ICTLiquidityEntryEngine:
                             candles_5m: Optional[List[Dict]] = None,
                             candles_15m: Optional[List[Dict]] = None,
                             candles_4h: Optional[List[Dict]] = None) -> None:
+        if (self._market_state is not None and self._market_state.has_firm_parent_control
+                and not self._market_state.owns(thesis.side)):
+            thesis.last_reason = "auction control remains with opposing higher-timeframe liquidity transfer"
+            self._record_block(
+                "AUCTION_CONTROL_REMAINS_OPPOSING_SIDE",
+                trigger="MARKET_STATE_OWNER",
+                thesis_side=thesis.side,
+                controlling_side=self._market_state.control_side,
+                controlling_parent_tf=self._market_state.parent_timeframe,
+                controlling_parent_quality=self._market_state.parent_quality,
+            )
+            return
+        # Select one executable repricing zone from all visible FVG / order-
+        # block origins in the market-owned direction.  This makes BTC and
+        # SILVER use the same broader auction intelligence as the new core,
+        # rather than executing whichever latest gap happened to be observed.
+        selected_fvg, _entry_zone_plan = self._rank_entry_zones(
+            thesis, snap, price, atr,
+            list(candles_5m or []), list(candles_15m or []),
+        )
+        thesis.fvg = selected_fvg
         zone_tol = 0.08 * atr
         low_bound, high_bound = thesis.fvg.low - zone_tol, thesis.fvg.high + zone_tol
         in_reprice_zone = low_bound <= price <= high_bound
@@ -1406,18 +2232,18 @@ class ICTLiquidityEntryEngine:
             }
             self._last_analysis.update(pd_payload)
             if pd_confluence.block != "NONE":
-                thesis.last_reason = f"PD array confluence rejected setup: {pd_confluence.block}"
-                self._record_block(pd_confluence.block, trigger="PD_ARRAY_FILTER", **pd_payload)
-                return
-        stop = self._structural_stop(thesis, atr)
-        anchor = _f(getattr(thesis, "invalidation_anchor", 0.0))
-        if anchor <= 0 and thesis.sweep is not None:
-            anchor = _f(getattr(thesis.sweep, "wick_extreme", 0.0))
+                self._last_analysis.update({"pd_array_advisory": pd_confluence.block})
+                if _cfg_bool("ICT_LEGACY_FILTER_COMPATIBILITY_ENABLED", False):
+                    thesis.last_reason = f"legacy PD-array compatibility rejected setup: {pd_confluence.block}"
+                    self._record_block(pd_confluence.block, trigger="LEGACY_PD_ARRAY_FILTER", **pd_payload)
+                    return
+        stop_plan = self._liquidity_protected_stop(thesis, entry, snap, atr)
+        stop = stop_plan.price if stop_plan is not None else None
+        anchor = stop_plan.structural_anchor if stop_plan is not None else _f(getattr(thesis, "invalidation_anchor", 0.0))
         clearance = abs(stop - anchor) if stop is not None else 0.0
-        self._last_analysis.update({
-            "entry": entry, "structural_stop": stop, "stop_clearance": clearance,
-            "stop_clearance_atr": clearance / max(atr, _EPS),
-        })
+        self._last_analysis.update({"entry": entry, "stop_clearance_atr": clearance / max(atr, _EPS)})
+        if stop_plan is not None:
+            self._last_analysis.update(stop_plan.payload())
         if stop is None:
             thesis.last_reason = "invalid structural stop geometry"
             self._record_block("INVALID_STRUCTURAL_STOP")
@@ -1428,7 +2254,10 @@ class ICTLiquidityEntryEngine:
             thesis.last_reason = "structural stop is not on the invalidation side of entry"
             self._record_block("INVALID_STRUCTURAL_STOP_SIDE")
             return
-        target = self._select_liquidity_target(thesis.side, entry, stop, snap, atr)
+        target = self._select_liquidity_target(
+            thesis.side, entry, stop, snap, atr,
+            candles_5m=list(candles_5m or []), candles_15m=list(candles_15m or []),
+        )
         if target is None:
             thesis.last_reason = "no opposing higher-timeframe liquidity destination with positive net R"
             self._record_block("AWAITING_POSITIVE_NET_R_LIQUIDITY_TARGET")
@@ -1437,18 +2266,22 @@ class ICTLiquidityEntryEngine:
         selectivity_block = self._selectivity_block(thesis, rr, rank_score, delivery_score)
         if selectivity_block is not None:
             reason, details = selectivity_block
-            thesis.last_reason = f"institutional selectivity rejected setup: {reason}"
-            self._record_block(reason, trigger="SELECTIVITY_FILTER", **details)
-            return
+            self._last_analysis.update({"legacy_selectivity_advisory": reason, **details})
+            if _cfg_bool("ICT_LEGACY_FILTER_COMPATIBILITY_ENABLED", False):
+                thesis.last_reason = f"legacy selectivity compatibility rejected setup: {reason}"
+                self._record_block(reason, trigger="LEGACY_SELECTIVITY_FILTER", **details)
+                return
         dossier: Optional[_SetupQualityDossier] = None
         if _cfg_bool("ICT_SETUP_DOSSIER_ENABLED", True):
             dossier = self._setup_quality_dossier(thesis, rr, rank_score, delivery_score, pd_confluence)
             dossier_payload = dossier.as_payload()
             self._last_analysis.update(dossier_payload)
             if dossier.block != "NONE":
-                thesis.last_reason = f"institutional setup dossier rejected setup: {dossier.block}"
-                self._record_block(dossier.block, trigger="SETUP_DOSSIER_FILTER", **dossier_payload)
-                return
+                self._last_analysis.update({"setup_dossier_advisory": dossier.block})
+                if _cfg_bool("ICT_LEGACY_FILTER_COMPATIBILITY_ENABLED", False):
+                    thesis.last_reason = f"legacy dossier compatibility rejected setup: {dossier.block}"
+                    self._record_block(dossier.block, trigger="LEGACY_SETUP_DOSSIER_FILTER", **dossier_payload)
+                    return
         quality = {
             "context_4h": thesis.context_4h.confidence,
             "context_15m": thesis.context_15m.confidence,
@@ -1459,6 +2292,11 @@ class ICTLiquidityEntryEngine:
             "target_rank_score": rank_score,
             "probability_calibrated": False,
             "archetype": thesis.entry_type.value,
+            "market_phase": thesis.market_phase,
+            "auction_control_side": thesis.auction_control_side,
+            "auction_control_score": thesis.auction_control_score,
+            "execution_posture": thesis.execution_posture,
+            "auction_risk_scalar": thesis.auction_risk_scalar,
         }
         if pd_confluence is not None:
             quality.update({
@@ -1474,6 +2312,7 @@ class ICTLiquidityEntryEngine:
             f"4H={thesis.context_4h.label}({thesis.context_4h.confidence:.2f}) | "
             f"15m={thesis.context_15m.label}({thesis.context_15m.confidence:.2f}) | "
             f"bias={thesis.context_path}({thesis.context_delivery_score:.2f}) | "
+            f"phase={thesis.market_phase} control={thesis.auction_control_side} posture={thesis.execution_posture} | "
             f"archetype={thesis.entry_type.value} MSS/FVG | displacement={thesis.displacement_atr:.2f}ATR | "
             f"deliveryScore={delivery_score:.2f} rankScore={rank_score:.2f} (uncalibrated)"
         )
@@ -1509,6 +2348,11 @@ class ICTLiquidityEntryEngine:
             "target_timeframe": str(getattr(target_obj.pool, "timeframe", "")),
             "target_pool_price": _f(getattr(target_obj.pool, "price", 0.0)),
             "target_significance": _f(getattr(target_obj, "significance", 0.0)),
+            "market_phase": thesis.market_phase,
+            "auction_control_side": thesis.auction_control_side,
+            "auction_control_score": thesis.auction_control_score,
+            "execution_posture": thesis.execution_posture,
+            "auction_risk_scalar": thesis.auction_risk_scalar,
         })
         if dossier is not None:
             self._last_analysis.update(dossier.as_payload())
@@ -1557,7 +2401,9 @@ class ICTLiquidityEntryEngine:
         return sl if sl > thesis.fvg.high else None
 
     def _select_liquidity_target(self, side: str, entry: float, sl: float,
-                                 snap: LiquidityMapSnapshot, atr: float
+                                 snap: LiquidityMapSnapshot, atr: float,
+                                 candles_5m: Optional[List[Dict]] = None,
+                                 candles_15m: Optional[List[Dict]] = None
                                  ) -> Optional[Tuple[PoolTarget, float, float, float, float]]:
         risk = abs(entry - sl)
         audit = {"pool_total": 0, "wrong_side": 0, "below_timeframe": 0,
@@ -1612,9 +2458,17 @@ class ICTLiquidityEntryEngine:
                     )
             else:
                 context = 0.0
+            cluster = self._target_cluster_metrics(t, list(pools or []), atr)
             sig_term = math.tanh(significance / 5.0)
             dist_reachability = math.exp(-max(0.0, distance_atr - 1.0) / 8.0)
-            delivery_score = max(0.0, min(0.99, 0.46 * context + 0.34 * sig_term + 0.20 * dist_reachability))
+            # Selection follows the highest quality observable liquidity
+            # concentration, not just the closest labelled swing.  An isolated
+            # low-mass print stays visible as noise and naturally loses priority.
+            delivery_score = max(0.0, min(
+                0.99,
+                0.34 * context + 0.20 * sig_term + 0.29 * float(cluster["cluster_score"])
+                + 0.17 * dist_reachability,
+            ))
             cost_r = self._execution_cost_points / max(risk, _EPS)
             net_win_r = rr - cost_r
             lo, hi = sorted((entry, tp))
@@ -1630,9 +2484,16 @@ class ICTLiquidityEntryEngine:
                     gauntlet_n += 1
                     gauntlet_sig += opp_sig
             gauntlet_penalty = 1.0 / (1.0 + 0.22 * gauntlet_n + 0.035 * gauntlet_sig)
+            path_impedance = self._path_imbalance_impedance(
+                side, entry, tp, atr, candles_5m, candles_15m,
+            )
             # A target is selected by structural score and net R; the score is
             # explicitly not converted into an uncalibrated win probability.
-            rank_score = delivery_score * max(0.0, net_win_r) * gauntlet_penalty
+            noise_penalty = 0.58 if bool(cluster["noise"]) else 1.0
+            rank_score = (
+                delivery_score * max(0.0, net_win_r) * gauntlet_penalty
+                * noise_penalty * float(path_impedance["path_imbalance_penalty"])
+            )
             row = {
                 "pool_price": px,
                 "tp_price": tp,
@@ -1649,6 +2510,16 @@ class ICTLiquidityEntryEngine:
                 "gauntlet_n": gauntlet_n,
                 "gauntlet_sig": gauntlet_sig,
                 "gauntlet_penalty": gauntlet_penalty,
+                "structural_liquidity_mass": float(cluster["cluster_mass"]),
+                "liquidity_cluster_score": float(cluster["cluster_score"]),
+                "liquidity_cluster_count": int(cluster["cluster_count"]),
+                "liquidity_cluster_timeframes": list(cluster["cluster_timeframes"]),
+                "liquidity_cluster_radius_atr": float(cluster["cluster_radius_atr"]),
+                "liquidity_cluster_members": list(cluster["cluster_members"]),
+                "classification": "NOISE" if cluster["noise"] else "VALID_TARGET_LIQUIDITY",
+                "noise_reason": str(cluster["noise_reason"]),
+                "noise_penalty": noise_penalty,
+                **path_impedance,
                 "buffer": buffer,
                 "selected": False,
                 "reason": "opposing HTF liquidity candidate",
@@ -1671,6 +2542,13 @@ class ICTLiquidityEntryEngine:
                     "gauntlet_n": gauntlet_n,
                     "gauntlet_sig": gauntlet_sig,
                     "gauntlet_penalty": gauntlet_penalty,
+                    "cluster_mass": float(cluster["cluster_mass"]),
+                    "cluster_score": float(cluster["cluster_score"]),
+                    "cluster_count": int(cluster["cluster_count"]),
+                    "noise_penalty": noise_penalty,
+                    "path_imbalance_penalty": float(path_impedance["path_imbalance_penalty"]),
+                    "path_imbalance_mass": float(path_impedance["path_imbalance_mass"]),
+                    "path_imbalance_count": int(path_impedance["path_imbalance_count"]),
                     "row": row,
                 })
             else:
@@ -1678,6 +2556,7 @@ class ICTLiquidityEntryEngine:
         audit["min_structural_rr"] = self._min_structural_rr
         audit["max_structural_rr_reference"] = max_rr_cap
         audit["target_selection_model"] = "LIQUIDITY_GRAPH_NET_R_RANK"
+        audit["target_selection_authority"] = "LIQUIDITY_CONCENTRATION_GRAPH_NET_R_RANK"
         audit["probability_calibrated"] = False
         audit["round_trip_cost_points"] = self._execution_cost_points
         audit["round_trip_cost_bps"] = self._execution_cost_bps
@@ -1720,7 +2599,7 @@ class ICTLiquidityEntryEngine:
                 row["selected"] = True
         self._last_pool_plan = {
             "ts": time.time(), "role": "TP", "side": side,
-            "summary": f"LIQUIDITY_GRAPH_NET_R_RANK {target.pool.timeframe} {target.pool.side.value}@{target.pool.price:.4f} grossRR={rr:.2f} netWinR={net_win_r:.2f} deliveryScore={delivery_score:.2f} rank={rank_score:+.2f}",
+            "summary": f"LIQUIDITY_CONCENTRATION_GRAPH {target.pool.timeframe} {target.pool.side.value}@{target.pool.price:.4f} mass={float(best.get('cluster_mass', 0.0)):.2f} grossRR={rr:.2f} netWinR={net_win_r:.2f} deliveryScore={delivery_score:.2f} rank={rank_score:+.2f}",
             "selected": selected_row,
             "candidates": all_candidate_rows,
         }
@@ -1733,7 +2612,14 @@ class ICTLiquidityEntryEngine:
             "target_net_win_r": net_win_r,
             "target_gauntlet_n": int(best.get("gauntlet_n", 0) or 0),
             "target_gauntlet_penalty": float(best.get("gauntlet_penalty", 1.0) or 1.0),
+            "target_structural_liquidity_mass": float(best.get("cluster_mass", 0.0) or 0.0),
+            "target_liquidity_cluster_score": float(best.get("cluster_score", 0.0) or 0.0),
+            "target_liquidity_cluster_count": int(best.get("cluster_count", 0) or 0),
+            "target_path_imbalance_penalty": float(best.get("path_imbalance_penalty", 1.0) or 1.0),
+            "target_path_imbalance_mass": float(best.get("path_imbalance_mass", 0.0) or 0.0),
+            "target_path_imbalance_count": int(best.get("path_imbalance_count", 0) or 0),
             "target_selection_model": "LIQUIDITY_GRAPH_NET_R_RANK",
+            "target_selection_authority": "LIQUIDITY_CONCENTRATION_GRAPH_NET_R_RANK",
             "target_policy_max_rr": max_rr_cap,
             "delivery_probability": None, "probability_calibrated": False,
             "delivery_score": delivery_score, "target_rank_score": rank_score,

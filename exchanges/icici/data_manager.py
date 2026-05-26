@@ -82,6 +82,15 @@ class ICICIOptionDataManager:
         self._stream_armed_at = 0.0
         self._first_stream_tick = threading.Event()
         self._last_stream_repair_attempt = 0.0
+        # Stream-route telemetry is execution critical: the underlying quote may
+        # be live while CE/PE packets are missing or cannot be unambiguously
+        # associated with either preselected vehicle.
+        self._stream_tick_observed_count = 0
+        self._stream_unroutable_tick_count = 0
+        self._stream_unroutable_last_keys: tuple[str, ...] = ()
+        self._stream_unroutable_last_ts = 0.0
+        self._stream_last_route_warning_ts = 0.0
+        self._last_identity_reject_log_ts = 0.0
         self._underlying_route_fields = self._route_field_snapshot()
         logger.info("ICICIOptionDataManager initialised [%s]", getattr(instrument, "asset_id", "ICICI"))
 
@@ -346,21 +355,41 @@ class ICICIOptionDataManager:
         return {"stock_code": stock_code, "expiry": expiry, "right": right, "strike": strike}
 
     def _matches_option_identity_tick(self, row: Dict[str, Any], identity: dict[str, Any]) -> bool:
+        """Accept a streamed premium tick only when it proves exact contract identity.
+
+        The shared Breeze hub fans each tick to both CE/PE vehicle callbacks, so
+        merely seeing exchange=NFO is never sufficient. Stock, right and strike
+        must match; expiry is additionally verified whenever the Breeze tick
+        provides it. Accepting an ambiguous tick could stamp both vehicles fresh
+        with the same premium and route an order on stale/wrong execution data.
+        """
         if not identity:
+            return False
+        expected_stock = str(identity.get("stock_code", "") or "").upper().replace(" ", "")
+        expected_expiry = self._ws_expiry(identity.get("expiry", ""))
+        expected_right = str(identity.get("right", "") or "").lower()
+        expected_strike = float(identity.get("strike", 0.0) or 0.0)
+        if not all((expected_stock, expected_expiry, expected_right, expected_strike > 0)):
             return False
         exchange = str(row.get("exchange_code") or row.get("exchange") or "").upper()
         if exchange and "NFO" not in exchange:
             return False
         stock = str(row.get("stock_code") or row.get("stock_name") or "").upper().replace(" ", "")
-        if stock and str(identity.get("stock_code", "")).replace(" ", "") not in stock:
+        if not stock or expected_stock not in stock:
+            return False
+        expiry_val = self._ws_expiry(row.get("expiry_date") or row.get("expiry") or row.get("ExpiryDate") or "")
+        # Breeze quote/depth ticks may omit expiry even when the subscribed
+        # route included it; when present it must match. Stock+right+strike are
+        # always required so a broad NFO tick cannot refresh every vehicle.
+        if expiry_val and expiry_val != expected_expiry:
             return False
         right_val = self.api._normalise_right(row.get("right") or row.get("right_type") or row.get("option_type") or "")
-        if right_val and right_val != identity.get("right"):
+        if not right_val or right_val != expected_right:
             return False
         strike_val = self._float_first(row, ("strike_price", "strike", "StrikePrice"))
-        if strike_val and abs(strike_val - float(identity.get("strike", 0.0) or 0.0)) > 1e-6:
+        if strike_val <= 0 or abs(strike_val - expected_strike) > 1e-6:
             return False
-        return bool("NFO" in exchange or right_val or strike_val or row.get("expiry_date"))
+        return True
 
     def _arm_session_book_streams(self, book) -> bool:
         """Stream both preselected CE/PE contracts before the scan may enter."""
@@ -391,6 +420,8 @@ class ICICIOptionDataManager:
                     "best_bid_qty": float(snapshot.get("best_bid_qty", 0.0) or 0.0),
                     "best_ask_qty": float(snapshot.get("best_ask_qty", 0.0) or 0.0),
                     "stream_pending": True, "candles": candles,
+                    "quote_tick_ts": 0.0, "depth_tick_ts": 0.0, "ohlcv_tick_ts": 0.0,
+                    "last_tick_keys": (),
                 }
                 callback = lambda data, stream_key=key, stream_identity=identity: self._on_session_book_option_tick(stream_key, stream_identity, data)
                 ids = hub.subscribe_option_quotes_and_ohlcv(stock_code=identity["stock_code"], expiry_date=identity["expiry"], strike_price=str(identity["strike"]), right=identity["right"], callback=callback)
@@ -421,7 +452,37 @@ class ICICIOptionDataManager:
 
     def _on_session_book_option_tick(self, key: tuple[str, str, float], identity: dict[str, Any], data: Any) -> None:
         row = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else data
-        if not isinstance(row, dict) or not self._matches_option_identity_tick(row, identity):
+        if not isinstance(row, dict):
+            return
+        self._stream_tick_observed_count += 1
+        if not self._matches_option_identity_tick(row, identity):
+            # Fail closed: a broadcast/multiplexed or malformed NFO tick must
+            # never clear execution freshness for the selected CE/PE vehicle.
+            now = time.time()
+            appears_option_tick = any(k in row for k in ("last", "ltp", "last_price", "close", "price", "bPrice", "sPrice", "best_bid", "best_ask", "interval"))
+            exchange = str(row.get("exchange_code") or row.get("exchange") or "").upper()
+            px_probe = self._float_first(row, ("last", "ltp", "last_price", "close", "price", "Close", "c"))
+            option_like = bool(
+                "NFO" in exchange or row.get("expiry_date") or row.get("strike_price")
+                or row.get("right_type") or row.get("right") or row.get("option_type")
+            )
+            if appears_option_tick:
+                self._stream_unroutable_tick_count += 1
+                self._stream_unroutable_last_keys = tuple(sorted(str(k) for k in row.keys()))
+                self._stream_unroutable_last_ts = now
+            if ((appears_option_tick and (self._stream_unroutable_tick_count == 1 or now - self._stream_last_route_warning_ts >= 60.0))
+                    or (option_like and px_probe > 0 and now - float(self._last_identity_reject_log_ts or 0.0) >= 60.0)):
+                self._stream_last_route_warning_ts = now
+                self._last_identity_reject_log_ts = now
+                logger.warning(
+                    "ICICI option tick rejected by contract identity guard; execution remains blocked. "
+                    "count=%d expected=%s received={exchange=%s stock=%s expiry=%s strike=%s right=%s} keys=%s",
+                    self._stream_unroutable_tick_count, identity, exchange,
+                    str(row.get("stock_code") or row.get("stock_name") or ""), str(row.get("expiry_date") or ""),
+                    str(row.get("strike_price") or row.get("strike") or ""),
+                    str(row.get("right") or row.get("right_type") or row.get("option_type") or ""),
+                    ",".join(self._stream_unroutable_last_keys),
+                )
             return
         px = self._float_first(row, ("last", "ltp", "last_price", "close", "price", "Close", "c"))
         bid, ask, bid_qty, ask_qty = self._extract_top_of_book(row)
@@ -432,6 +493,14 @@ class ICICIOptionDataManager:
         if state is None:
             return
         state["last_stream_tick_ts"] = now
+        state["last_tick_keys"] = tuple(sorted(str(k) for k in row.keys()))
+        interval = str(row.get("interval") or row.get("Interval") or "").lower()
+        if interval in {"1minute", "1min", "1m"}:
+            state["ohlcv_tick_ts"] = now
+        if any(v > 0 for v in (bid, ask, bid_qty, ask_qty)):
+            state["depth_tick_ts"] = now
+        if px > 0 and interval not in {"1minute", "1min", "1m"}:
+            state["quote_tick_ts"] = now
         if px > 0:
             state["last_price"] = px
         if bid > 0:
@@ -443,7 +512,6 @@ class ICICIOptionDataManager:
         if ask_qty > 0:
             state["best_ask_qty"] = ask_qty
         state["stream_pending"] = False
-        interval = str(row.get("interval") or row.get("Interval") or "").lower()
         if px > 0 and interval in {"1minute", "1min", "1m"}:
             o = self._float_first(row, ("open", "Open", "o")) or px
             h = self._float_first(row, ("high", "High", "h")) or px
@@ -794,14 +862,29 @@ class ICICIOptionDataManager:
         return True
 
     def session_contract_book_status(self) -> dict[str, Any]:
+        """Expose the day-start option vehicle book and its actual websocket health.
+
+        Underlying NIFTY ticks are analysis data only. Option execution is ready
+        only after the direction-specific NFO vehicle has produced a fresh routed
+        websocket tick; historical/preselection premiums cannot clear this gate.
+        """
         raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
         book = raw.get("session_contract_book") if isinstance(raw, dict) else None
         if not isinstance(book, dict):
-            return {"status": "MISSING"}
+            return {"status": "MISSING", "execution_freshness_gate": "WEBSOCKET_TICK_REQUIRED"}
+        now = time.time()
+        max_stale = max(0.1, float(_cfg("ICICI_OPTION_STREAM_MAX_STALE_SEC", 15.0)))
 
         def choice_summary(name: str) -> dict[str, Any]:
             choice = book.get(name) if isinstance(book.get(name), dict) else {}
             choice_raw = choice.get("raw") if isinstance(choice.get("raw"), dict) else {}
+            right = str(choice.get("right", name) or name).lower()
+            key = (str(choice.get("expiry", "") or ""), right, round(float(choice.get("strike", 0.0) or 0.0), 6))
+            with self._lock:
+                stream = dict(self._book_stream_state.get(key, {}) or {})
+            stream_ts = float(stream.get("last_stream_tick_ts", 0.0) or 0.0)
+            stream_age = max(0.0, now - stream_ts) if stream_ts > 0 else None
+            ws_fresh = bool(stream_age is not None and stream_age <= max_stale)
             return {
                 "symbol": choice.get("selected_symbol", ""),
                 "right": choice.get("right", ""),
@@ -813,18 +896,83 @@ class ICICIOptionDataManager:
                 "delta": float(choice.get("delta", 0.0) or 0.0),
                 "iv": float(choice_raw.get("bs_volatility", 0.0) or 0.0),
                 "iv_source": str(choice_raw.get("bs_volatility_source") or ""),
+                "ws_fresh": ws_fresh,
+                "ws_age_sec": stream_age,
+                "ws_pending": bool(stream.get("stream_pending", True)),
+                "live_premium": float(stream.get("last_price", 0.0) or 0.0),
+                "live_bid": float(stream.get("best_bid", 0.0) or 0.0),
+                "live_ask": float(stream.get("best_ask", 0.0) or 0.0),
             }
 
+        call = choice_summary("call")
+        put = choice_summary("put")
+        feed_status = self.execution_feed_status()
+        if self._active_stream_key is not None:
+            active_right = str(self._active_stream_key[1]).lower()
+            active = call if active_right == "call" else put if active_right == "put" else {}
+            dynamic_status = "ACTIVE_EXECUTION_VEHICLE_FRESH" if active.get("ws_fresh") and bool(feed_status.get("active_vehicle_ready")) else "ACTIVE_EXECUTION_VEHICLE_STALE"
+        else:
+            dynamic_status = "READY" if bool(feed_status.get("session_vehicle_stream_ready")) else "ARMED_PENDING_WEBSOCKET_TICK"
         return {
-            "status": str(raw.get("session_contract_book_status") or "READY"),
+            "status": dynamic_status,
+            "configured_status": str(raw.get("session_contract_book_status") or "READY"),
+            "execution_feed_status": str(feed_status.get("status") or "UNKNOWN"),
+            "execution_freshness_gate": "WEBSOCKET_TICK_REQUIRED",
+            "max_stream_stale_sec": max_stale,
             "trade_date_ist": str(book.get("trade_date_ist") or ""),
             "built_at": float(book.get("built_at", 0.0) or 0.0),
             "underlying": str(book.get("underlying") or getattr(self.instrument, "asset_id", "")),
             "underlying_spot": float(book.get("underlying_spot", 0.0) or 0.0),
             "available_funds": float(book.get("available_funds", 0.0) or 0.0),
             "source": str(book.get("source") or ""),
-            "call": choice_summary("call"),
-            "put": choice_summary("put"),
+            "call": call,
+            "put": put,
+        }
+
+    def execution_feed_status(self) -> dict[str, Any]:
+        """Execution-only liveness; never substitute underlying NIFTY freshness."""
+        now = time.time()
+        max_age = float(_cfg("ICICI_OPTION_STREAM_MAX_STALE_SEC", 15.0))
+        state_rows = []
+        for key, state in dict(self._book_stream_state).items():
+            ts = float(state.get("last_stream_tick_ts", 0.0) or 0.0)
+            age = (now - ts) if ts > 0 else None
+            px = float(state.get("last_price", 0.0) or 0.0)
+            bid = float(state.get("best_bid", 0.0) or 0.0)
+            ask = float(state.get("best_ask", 0.0) or 0.0)
+            fresh = bool(ts > 0 and age is not None and age <= max_age and px > 0)
+            executable = bool(fresh and bid > 0 and ask > 0 and ask >= bid)
+            state_rows.append({
+                "key": key, "age_sec": age, "price": px, "quote_fresh": fresh,
+                "book_executable": executable, "quote_tick_ts": float(state.get("quote_tick_ts", 0.0) or 0.0),
+                "depth_tick_ts": float(state.get("depth_tick_ts", 0.0) or 0.0),
+                "ohlcv_tick_ts": float(state.get("ohlcv_tick_ts", 0.0) or 0.0),
+            })
+        live = [row for row in state_rows if row["quote_fresh"]]
+        executable = [row for row in state_rows if row["book_executable"]]
+        active_row = next((row for row in state_rows if row["key"] == self._active_stream_key), None)
+        active_ready = bool(active_row and active_row["book_executable"])
+        if active_ready:
+            status = "ACTIVE_OPTION_VEHICLE_LIVE"
+        elif len(executable) == len(state_rows) and state_rows:
+            status = "CE_PE_PRESELECTED_LIVE_PENDING_DIRECTION"
+        elif self._stream_unroutable_tick_count > 0 and not live:
+            status = "MULTIPLEXED_TICKS_SEEN_NO_OPTION_ROUTE"
+        elif self._stream_subscription_ids:
+            status = "ARMED_PENDING_OPTION_WEBSOCKET_TICK"
+        else:
+            status = "OPTION_STREAM_NOT_ARMED"
+        return {
+            "status": status,
+            "session_vehicle_stream_ready": bool(active_ready or (state_rows and len(executable) == len(state_rows))),
+            "active_vehicle_ready": active_ready,
+            "active_vehicle": self._active_stream_key,
+            "preselected_vehicle_count": len(state_rows),
+            "fresh_vehicle_count": len(live),
+            "executable_vehicle_count": len(executable),
+            "unroutable_tick_count": int(self._stream_unroutable_tick_count),
+            "unroutable_last_keys": list(self._stream_unroutable_last_keys),
+            "unroutable_last_age_sec": (now - self._stream_unroutable_last_ts) if self._stream_unroutable_last_ts > 0 else None,
         }
 
     def _activate_session_vehicle(self, choice) -> bool:
@@ -867,7 +1015,10 @@ class ICICIOptionDataManager:
             if not self._start_selected_contract_stream():
                 return False
         if self._last_price <= 0 or not self.is_price_fresh(float(_cfg("ICICI_OPTION_MAX_QUOTE_STALE_SEC", 10.0))):
-            logger.error("ICICI selected session vehicle has no fresh websocket execution price: %s", getattr(choice, "selected_symbol", key))
+            logger.error(
+                "ICICI selected session vehicle has no fresh websocket execution price: %s | execution_feed=%s",
+                getattr(choice, "selected_symbol", key), self.execution_feed_status(),
+            )
             return False
         # The entry price, affordability check and premium-native SL/TP must use
         # the execution-time quote, not the session-start snapshot premium.

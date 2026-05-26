@@ -261,10 +261,25 @@ QUANT_MAX_SPREAD_TICKS_COMMODITY      = 30.0
 QUANT_SPREAD_MIN_SIZE_MULT            = 0.70
 QUANT_SPREAD_SIZE_HAIRCUT_MAX         = 0.30
 
-# Institutional selectivity mode:
-# The engine still waits for actual raid/MSS/FVG/liquidity structure, but weak
-# context, counter-delivery raids, adverse fresh flow and low-rank targets do
-# not receive capital. These are execution gates, not win-rate guarantees.
+# Auction-control market-state authority:
+# A trade is owned by the active multi-timeframe delivery process, not by an
+# isolated five-minute pattern.  1D/4H/1H/15m delivery plus higher-timeframe
+# liquidity transfer establishes phase, controlling side and capital posture.
+# Local raids against firm 1H+ control remain observations until control transfers.
+MARKET_STATE_ENGINE_ENABLED = True
+MARKET_STATE_FIRM_PARENT_MIN_QUALITY = 0.60
+MARKET_STATE_AGGRESSIVE_MIN_CLARITY = 0.62
+
+# Structural zone graph is the common entry/SL/TP authority for BTC, SILVER,
+# commodities and the ICICI profile. It ranks competing FVG/order-block zones,
+# protects SL beyond relevant same-side liquidity clusters and selects TP by
+# observable multi-timeframe liquidity concentration. It does not add a stack
+# of arbitrary trade filters; weak zones remain visible as noise telemetry.
+ICT_STRUCTURAL_ZONE_GRAPH_ENABLED = True
+
+# Legacy scoring surfaces remain logged as diagnostics for audit/replay only.
+# They are not permitted to stack hard filters in the live core by default.
+ICT_LEGACY_FILTER_COMPATIBILITY_ENABLED = False
 ICT_SELECTIVITY_MODE = True
 ICT_ALLOW_COUNTER_DELIVERY_RAIDS = False
 ICT_ENTRY_MIN_CONTEXT_DELIVERY_SCORE = 0.25
@@ -492,6 +507,33 @@ ICICI_OPTION_WEBSOCKET_REQUIRED = os.getenv("ICICI_OPTION_WEBSOCKET_REQUIRED", "
 ICICI_SESSION_BOOK_REQUIRE_FIRST_OPTION_TICK_ON_STARTUP = os.getenv("ICICI_SESSION_BOOK_REQUIRE_FIRST_OPTION_TICK_ON_STARTUP", "false").lower() in ("1", "true", "yes", "on")
 ICICI_OPTION_STREAM_FIRST_TICK_TIMEOUT_SEC = float(os.getenv("ICICI_OPTION_STREAM_FIRST_TICK_TIMEOUT_SEC", "12.0"))
 ICICI_OPTION_STREAM_MAX_STALE_SEC = float(os.getenv("ICICI_OPTION_STREAM_MAX_STALE_SEC", "15.0"))
+
+# NIFTY intraday execution profile: use liquidity sweeps as fast trend-continuation
+# entries under an observed directional auction phase. This is an entry archetype,
+# not an additional filter stack: balance/transition phases simply have no trend
+# impulse to buy options against, while directional phases monetize nearby real
+# liquidity quickly to respect Indian-index chop and premium decay.
+ICICI_NIFTY_TREND_SWEEP_ENABLED = os.getenv("ICICI_NIFTY_TREND_SWEEP_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+ICICI_NIFTY_TREND_SWEEP_MIN_PHASE_SCORE = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_MIN_PHASE_SCORE", "0.30"))
+ICICI_NIFTY_TREND_SWEEP_AGGRESSIVE_PHASE_SCORE = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_AGGRESSIVE_PHASE_SCORE", "0.58"))
+ICICI_NIFTY_TREND_SWEEP_MIN_RR = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_MIN_RR", "1.15"))
+ICICI_NIFTY_TREND_SWEEP_MAX_RR = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_MAX_RR", "2.40"))
+ICICI_NIFTY_TREND_SWEEP_MAX_TARGET_ATR = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_MAX_TARGET_ATR", "2.75"))
+ICICI_NIFTY_TREND_SWEEP_MAX_RECLAIM_EXTENSION_ATR = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_MAX_RECLAIM_EXTENSION_ATR", "0.65"))
+# NIFTY enters off a closed 1m or 5m underlying sweep reclaim; the shorter
+# lifetime prevents an old pullback signal being monetised after the move left.
+ICICI_NIFTY_TREND_SWEEP_1M_MAX_AGE_SEC = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_1M_MAX_AGE_SEC", "90.0"))
+ICICI_NIFTY_TREND_SWEEP_5M_MAX_AGE_SEC = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_5M_MAX_AGE_SEC", "360.0"))
+ICICI_NIFTY_TREND_SWEEP_STOP_BASE_ATR = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_STOP_BASE_ATR", "0.08"))
+ICICI_NIFTY_TREND_SWEEP_STOP_PCTL_SLOPE_ATR = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_STOP_PCTL_SLOPE_ATR", "0.10"))
+ICICI_NIFTY_TREND_SWEEP_MIN_TARGET_REALISM = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_MIN_TARGET_REALISM", "0.42"))
+ICICI_NIFTY_TREND_SWEEP_MAX_HOLD_SEC = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_MAX_HOLD_SEC", "720.0"))
+ICICI_NIFTY_TREND_SWEEP_FAILED_AUCTION_FRACTION = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_FAILED_AUCTION_FRACTION", "0.35"))
+ICICI_NIFTY_TREND_SWEEP_FAILED_AUCTION_R = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_FAILED_AUCTION_R", "-0.15"))
+ICICI_NIFTY_TREND_SWEEP_FAILED_AUCTION_MAX_MFE_R = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_FAILED_AUCTION_MAX_MFE_R", "0.30"))
+ICICI_NIFTY_TREND_SWEEP_MIN_PROGRESS_R = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_MIN_PROGRESS_R", "0.15"))
+ICICI_NIFTY_TREND_SWEEP_HARD_MAX_MULT = float(os.getenv("ICICI_NIFTY_TREND_SWEEP_HARD_MAX_MULT", "1.0"))
+
 ICICI_OPTION_TICK_SIZE = 0.05
 # Safety invariant: never assume a one-unit NFO option lot.  Contract routing
 # is disabled until Breeze/security-master supplies the exact current lot size.
