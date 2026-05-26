@@ -16,6 +16,7 @@ class Exchange(str, Enum):
     DELTA      = "delta"
     COINSWITCH = "coinswitch"
     ICICI      = "icici"
+    GROWW      = "groww"
 
     @classmethod
     def from_str(cls, value: str) -> "Exchange":
@@ -26,8 +27,10 @@ class Exchange(str, Enum):
             return cls.COINSWITCH
         if v in ("icici", "breeze", "icicidirect"):
             return cls.ICICI
+        if v in ("groww", "growwapi", "growwtrade"):
+            return cls.GROWW
         raise ValueError(
-            f"Unknown exchange {value!r}. Valid values: 'delta', 'coinswitch', 'icici'."
+            f"Unknown exchange {value!r}. Valid values: 'delta', 'coinswitch', 'icici', 'groww'."
         )
 
 

@@ -50,11 +50,19 @@ BREEZE_SECRET_KEY = _first_env(
 ICICI_CLIENT_ID           = os.getenv("ICICI_CLIENT_ID", "")
 ICICI_PASSWORD            = os.getenv("ICICI_PASSWORD", "")
 ICICI_ENABLED             = os.getenv("ICICI_ENABLED", "true" if BREEZE_API_KEY else "false").lower() in ("1", "true", "yes", "on")
+GROWW_ACCESS_TOKEN        = _first_env("GROWW_ACCESS_TOKEN", "GROWW_API_AUTH_TOKEN", "GROWW_TOKEN")
+GROWW_API_KEY             = _first_env("GROWW_API_KEY", "GROWW_APP_KEY")
+GROWW_API_SECRET          = _first_env("GROWW_API_SECRET", "GROWW_SECRET_KEY", "GROWW_SECRET")
+GROWW_TOTP_SECRET         = _first_env("GROWW_TOTP_SECRET", "GROWW_TOTP")
+GROWW_ENABLED             = os.getenv(
+    "GROWW_ENABLED",
+    "true" if (GROWW_ACCESS_TOKEN or (GROWW_API_KEY and (GROWW_API_SECRET or GROWW_TOTP_SECRET))) else "false",
+).lower() in ("1", "true", "yes", "on")
 TELEGRAM_BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID          = os.getenv("TELEGRAM_CHAT_ID",   "")
 
-if not DELTA_API_KEY and not COINSWITCH_API_KEY and not BREEZE_API_KEY:
-    raise ValueError("No exchange credentials in .env. Set DELTA_API_KEY, COINSWITCH_API_KEY, or BREEZE_API_KEY.")
+if not DELTA_API_KEY and not COINSWITCH_API_KEY and not BREEZE_API_KEY and not (GROWW_ACCESS_TOKEN or GROWW_API_KEY):
+    raise ValueError("No exchange credentials in .env. Set DELTA_API_KEY, COINSWITCH_API_KEY, BREEZE_API_KEY, or GROWW_ACCESS_TOKEN/GROWW_API_KEY.")
 
 # ── Symbol / Leverage ─────────────────────────────────────────────────────────
 SYMBOL                   = "BTCUSDT"
@@ -101,6 +109,7 @@ TICK_SIZE                        = 0.5 if EXECUTION_EXCHANGE == "delta" else 0.1
 TICK_SIZE_DELTA                  = 0.5
 TICK_SIZE_COINSWITCH             = 0.1
 TICK_SIZE_ICICI                  = 0.05
+TICK_SIZE_GROWW                  = 0.05
 LIMIT_ORDER_OFFSET_TICKS         = 3
 ORDER_TIMEOUT_SECONDS            = 600
 MAX_ORDER_RETRIES                = 2
@@ -190,6 +199,8 @@ def get_tick_size(exchange: str | None = None) -> float:
         return float(TICK_SIZE_COINSWITCH)
     if ex == "icici":
         return float(TICK_SIZE_ICICI)
+    if ex == "groww":
+        return float(TICK_SIZE_GROWW)
     return float(TICK_SIZE)
 
 
@@ -596,10 +607,41 @@ ICICI_OPTION_MIN_PREMIUM_RISK_PCT = 0.14
 ICICI_OPTION_MAX_PREMIUM_RISK_PCT = 0.58
 ICICI_OPTION_MIN_TP_PREMIUM_PCT = 0.18
 ICICI_OPTION_PREMIUM_TP_CONVEXITY_BONUS = 0.08
+
+# Groww / Indian index options desk. Strategy flow is intentionally inherited
+# from the Indian options desk: bullish underlying thesis buys CE, bearish buys
+# PE. Only the broker transport, instrument source and order schema change.
+GROWW_LONG_PREMIUM_ONLY = True
+GROWW_OPTIONS_ONLY = True
+GROWW_REQUIRE_SMART_GTT_PROTECTED_ENTRY = os.getenv("GROWW_REQUIRE_SMART_GTT_PROTECTED_ENTRY", "true").lower() in ("1", "true", "yes", "on")
+GROWW_DISCOVERY_ENABLED = os.getenv("GROWW_DISCOVERY_ENABLED", "true" if GROWW_ENABLED else "false").lower() in ("1", "true", "yes", "on")
+GROWW_OPTIONS_RUNTIME_ENABLED = GROWW_ENABLED
+GROWW_INDEX_OPTIONS_FROM_CONFIG_ONLY = True
+GROWW_INDEX_UNDERLYINGS = os.getenv("GROWW_INDEX_UNDERLYINGS", "NIFTY")
+GROWW_OPTION_PRODUCT_TYPE = os.getenv("GROWW_OPTION_PRODUCT_TYPE", "NRML").upper()
+GROWW_OPTION_TICK_SIZE = 0.05
+GROWW_MIN_CALL_GAP_SEC = float(os.getenv("GROWW_MIN_CALL_GAP_SEC", "0.25"))
+GROWW_INSTRUMENTS_CSV_URL = os.getenv("GROWW_INSTRUMENTS_CSV_URL", "https://growwapi-assets.groww.in/instruments/instrument.csv")
+GROWW_INSTRUMENT_CACHE_TTL_SEC = float(os.getenv("GROWW_INSTRUMENT_CACHE_TTL_SEC", "1800.0"))
+GROWW_USE_OPTION_CHAIN_FOR_SELECTION = os.getenv("GROWW_USE_OPTION_CHAIN_FOR_SELECTION", "false").lower() in ("1", "true", "yes", "on")
+GROWW_MARKET_SESSION_GUARD_ENABLED = ICICI_MARKET_SESSION_GUARD_ENABLED
+GROWW_ANALYZE_ONLY_DURING_MARKET_SESSION = ICICI_ANALYZE_ONLY_DURING_MARKET_SESSION
+GROWW_INDEX_STREAM_ENABLED = os.getenv("GROWW_INDEX_STREAM_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+GROWW_INDEX_WEBSOCKET_REQUIRED = os.getenv("GROWW_INDEX_WEBSOCKET_REQUIRED", "true").lower() in ("1", "true", "yes", "on")
+GROWW_INDEX_STREAM_FIRST_TICK_TIMEOUT_SEC = float(os.getenv("GROWW_INDEX_STREAM_FIRST_TICK_TIMEOUT_SEC", "12.0"))
+GROWW_INDEX_STREAM_MAX_STALE_SEC = float(os.getenv("GROWW_INDEX_STREAM_MAX_STALE_SEC", "15.0"))
+GROWW_OPTION_STREAM_ENABLED = os.getenv("GROWW_OPTION_STREAM_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+GROWW_OPTION_WEBSOCKET_REQUIRED = os.getenv("GROWW_OPTION_WEBSOCKET_REQUIRED", "true").lower() in ("1", "true", "yes", "on")
+GROWW_SESSION_BOOK_REQUIRE_FIRST_OPTION_TICK_ON_STARTUP = os.getenv("GROWW_SESSION_BOOK_REQUIRE_FIRST_OPTION_TICK_ON_STARTUP", "false").lower() in ("1", "true", "yes", "on")
+GROWW_OPTION_STREAM_FIRST_TICK_TIMEOUT_SEC = float(os.getenv("GROWW_OPTION_STREAM_FIRST_TICK_TIMEOUT_SEC", "12.0"))
+GROWW_OPTION_STREAM_MAX_STALE_SEC = float(os.getenv("GROWW_OPTION_STREAM_MAX_STALE_SEC", "15.0"))
+GROWW_WEBSOCKET_RECONNECT_COOLDOWN_SEC = float(os.getenv("GROWW_WEBSOCKET_RECONNECT_COOLDOWN_SEC", "30.0"))
+GROWW_EMERGENCY_EXIT_LIMIT_BUFFER_PCT = float(os.getenv("GROWW_EMERGENCY_EXIT_LIMIT_BUFFER_PCT", "0.10"))
+
 INDIAN_NO_FRESH_ENTRY_AFTER_CLOSE_BUFFER_MIN = 25
 UNIVERSE_INCLUDE_EXCHANGES = os.getenv(
     "UNIVERSE_INCLUDE_EXCHANGES",
-    "delta,coinswitch,icici" if (ICICI_ENABLED or ICICI_DISCOVERY_ENABLED) else "delta,coinswitch",
+    "delta,coinswitch,groww" if (GROWW_ENABLED or GROWW_DISCOVERY_ENABLED) else "delta,coinswitch,icici" if (ICICI_ENABLED or ICICI_DISCOVERY_ENABLED) else "delta,coinswitch",
 )
 
 # Portfolio slots: the bot may hold multiple contracts at once, but each
@@ -760,7 +802,7 @@ TRADING_DESKS = {
         "sl_buffer_atr": 0.75,
     },
     "OPTIONS": {
-        "enabled": ICICI_OPTIONS_RUNTIME_ENABLED,
+        "enabled": ICICI_OPTIONS_RUNTIME_ENABLED or GROWW_OPTIONS_RUNTIME_ENABLED,
         "display_name": "NIFTY Options Desk",
         "strategy": STRATEGY_CORE_NAME,
         "asset_ids": ("NIFTY",),

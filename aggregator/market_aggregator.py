@@ -399,6 +399,10 @@ class MarketAggregator:
                 spot = 0.0
         return bool(preparer(spot, float(available_funds or 0.0), reason="session_start"))
 
+    def prepare_groww_session_contract_book(self, available_funds: float) -> bool:
+        """Preselect Groww CE/PE execution vehicles with the same strategy flow."""
+        return self.prepare_icici_session_contract_book(available_funds)
+
     def release_icici_execution_vehicle(self) -> None:
         releaser = getattr(self._primary, "release_execution_vehicle", None)
         if callable(releaser):

@@ -25,7 +25,7 @@ import config
 from core.types  import Exchange
 from execution.order_manager import (
     OrderManager, CancelResult, GlobalRateLimiter,
-    _CS_LIMITER, _DELTA_LIMITER, _ICICI_LIMITER,
+    _CS_LIMITER, _DELTA_LIMITER, _ICICI_LIMITER, _GROWW_LIMITER,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,6 +42,7 @@ class ExecutionRouter:
         coinswitch_om: Optional[OrderManager],
         delta_om:      Optional[OrderManager],
         icici_om:      Optional[OrderManager] = None,
+        groww_om:      Optional[OrderManager] = None,
         default:       str = "delta",
     ) -> None:
         self._lock        = threading.RLock()
@@ -53,6 +54,8 @@ class ExecutionRouter:
             self._managers[Exchange.DELTA.value] = delta_om
         if icici_om is not None:
             self._managers[Exchange.ICICI.value] = icici_om
+        if groww_om is not None:
+            self._managers[Exchange.GROWW.value] = groww_om
 
         if not self._managers:
             raise RuntimeError("ExecutionRouter requires at least one OrderManager")
@@ -76,6 +79,8 @@ class ExecutionRouter:
             limiter = _DELTA_LIMITER
         elif self._active_key == Exchange.ICICI.value:
             limiter = _ICICI_LIMITER
+        elif self._active_key == Exchange.GROWW.value:
+            limiter = _GROWW_LIMITER
         else:
             limiter = _CS_LIMITER
         GlobalRateLimiter.set_active(limiter)
@@ -137,7 +142,7 @@ class ExecutionRouter:
                 if pos is not None:
                     side  = pos.get("side", "?")
                     entry = pos.get("entry_price", 0)
-                    _cur = str(pos.get("currency_symbol") or ("₹" if self._active_key == Exchange.ICICI.value else "$"))
+                    _cur = str(pos.get("currency_symbol") or ("₹" if self._active_key in {Exchange.ICICI.value, Exchange.GROWW.value} else "$"))
                     return False, (
                         f"❌ Cannot switch exchange while position is open.\n"
                         f"Current: {side} @ {_cur}{entry:,.2f}\n"
@@ -166,8 +171,8 @@ class ExecutionRouter:
             # Update config so downstream reads (strategy, risk manager) see it
             config.EXECUTION_EXCHANGE = target_key
 
-            _cur = "₹" if target_key == Exchange.ICICI.value else "$"
-            _unit = "INR NFO available" if target_key == Exchange.ICICI.value else "USD/USDT available"
+            _cur = "₹" if target_key in {Exchange.ICICI.value, Exchange.GROWW.value} else "$"
+            _unit = "INR FNO available" if target_key == Exchange.GROWW.value else "INR NFO available" if target_key == Exchange.ICICI.value else "USD/USDT available"
             logger.info(f"✅ ExecutionRouter switched: {old_key} → {target_key} "
                         f"(balance on {target_key}: {_cur}{avail:,.2f})")
 

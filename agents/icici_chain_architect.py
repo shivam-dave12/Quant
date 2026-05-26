@@ -533,7 +533,7 @@ def select_contract_for_thesis(
     spot = float(underlying_spot or safe_float(raw.get("underlying_spot_price") or raw.get("spot_price"), 0.0))
     min_dte = float(_cfg("ICICI_OPTION_MIN_DTE", 2.0))
     max_dte = float(_cfg("ICICI_OPTION_MAX_DTE", 21.0))
-    target_delta = float(_cfg("ICICI_INDEX_OPTION_TARGET_ABS_DELTA", 0.45) if raw.get("desk_id") == "ICICI_INDEX_OPTIONS" else _cfg("ICICI_STOCK_OPTION_TARGET_ABS_DELTA", 0.50))
+    target_delta = float(_cfg("ICICI_INDEX_OPTION_TARGET_ABS_DELTA", 0.45) if raw.get("desk_id") in {"ICICI_INDEX_OPTIONS", "GROWW_INDEX_OPTIONS"} else _cfg("ICICI_STOCK_OPTION_TARGET_ABS_DELTA", 0.50))
     delta_band = float(_cfg("ICICI_OPTION_DELTA_BAND", 0.22))
     max_theta = float(_cfg("ICICI_OPTION_MAX_THETA_TO_PREMIUM", 0.08))
     iv_prior = float(_cfg("ICICI_OPTION_IV_STRESS_PRIOR", 0.24))

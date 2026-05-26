@@ -260,6 +260,7 @@ class InstrumentRegistry:
         self.delta: Dict[str, ExchangeInstrument] = {}
         self.coinswitch: Dict[str, ExchangeInstrument] = {}
         self.icici: Dict[str, ExchangeInstrument] = {}
+        self.groww: Dict[str, ExchangeInstrument] = {}
         self.report = DiscoveryReport()
 
     # ──────────────────────────────────────────────────────────────────────
@@ -460,6 +461,72 @@ class InstrumentRegistry:
         logger.info("ICICI configured-index discovery active: underlyings=%s", ",".join(out.keys()) or "none")
         return out
 
+    def load_groww(self, api, *, security_master_url: str | None = None) -> Dict[str, ExchangeInstrument]:
+        """Load configured Groww index-option desk instruments.
+
+        Groww instruments are confirmed from the official SDK/CSV only when the
+        option runtime starts.  Discovery remains auth-light so NIFTY can enter
+        the universe before the first protected SDK call.
+        """
+        _ = (api, security_master_url)
+        out: Dict[str, ExchangeInstrument] = {}
+        discovery_enabled = bool(_cfg("GROWW_DISCOVERY_ENABLED", False))
+        runtime_enabled = bool(_cfg("GROWW_ENABLED", False) or _cfg("GROWW_OPTIONS_RUNTIME_ENABLED", False))
+        if not (discovery_enabled or runtime_enabled):
+            self.groww = out
+            return out
+        underlyings = _csv_symbols(_cfg("GROWW_INDEX_UNDERLYINGS", "NIFTY"))
+        if not underlyings:
+            underlyings = ["NIFTY"]
+        if build_underlying_payload is None:
+            logger.warning("Groww discovery skipped: agents.icici_chain_architect unavailable")
+            self.groww = out
+            return out
+        for priority, underlying in enumerate(underlyings, 1):
+            groww_code = normalise_symbol(underlying)
+            if groww_code in {"NIFTY50", "CNXNIFTY", "NIFTYINDEX"}:
+                groww_code = "NIFTY"
+            raw = build_underlying_payload(groww_code, "GROWW_INDEX_OPTIONS", [])
+            raw.update({
+                "broker": "groww",
+                "groww_underlying_desk": True,
+                "underlying_display": underlying,
+                "configured_underlying": underlying,
+                "groww_stock_code": groww_code,
+                "stock_code": groww_code,
+                "underlying_stock_code": groww_code,
+                "underlying_exchange_code": "NSE",
+                "exchange": "NSE",
+                "segment": "FNO",
+                "exchange_code": "NFO",
+                "chain_source": "configured_groww_index",
+                "chain_candidates_deferred": True,
+            })
+            ei = ExchangeInstrument(
+                exchange=ExchangeName.GROWW,
+                symbol=groww_code,
+                ws_symbol=groww_code,
+                display_symbol=groww_code,
+                asset_id=groww_code,
+                asset_class=AssetClass.OPTION,
+                product_id=None,
+                quote_asset="INR",
+                base_asset=groww_code,
+                contract_type="option_chain",
+                status="active",
+                tick_size=float(_cfg("GROWW_OPTION_TICK_SIZE", 0.05)),
+                lot_step=1.0,
+                min_qty=1.0,
+                max_leverage=1.0,
+                raw={**raw, "configured_priority": priority},
+            )
+            for key in {normalise_symbol(underlying), normalise_symbol(groww_code), "NIFTY50" if groww_code == "NIFTY" else ""}:
+                if key:
+                    out[key] = ei
+        self.groww = out
+        logger.info("Groww configured-index discovery active: underlyings=%s", ",".join(out.keys()) or "none")
+        return out
+
     def _augment_coinswitch_from_requested(self, out: Dict[str, ExchangeInstrument], api, intents: List[AssetIntent]) -> Dict[str, ExchangeInstrument]:
         """Validate configured crypto symbols against CoinSwitch live ticker endpoint.
 
@@ -535,7 +602,9 @@ class InstrumentRegistry:
     def discover(self, delta_api=None, coinswitch_api=None, requested=None,
                  max_active: int = 12, require_primary: bool = True,
                  include_exchanges=None, icici_api=None,
-                 icici_security_master_url: str | None = None) -> DiscoveryReport:
+                 icici_security_master_url: str | None = None,
+                 groww_api=None,
+                 groww_security_master_url: str | None = None) -> DiscoveryReport:
         intents = configured_asset_intents(requested)
         include_exs = _parse_csv_set(include_exchanges)
         delta = self.load_delta(delta_api) if _allow_value("delta", include_exs) else {}
@@ -543,10 +612,12 @@ class InstrumentRegistry:
         if _allow_value("coinswitch", include_exs):
             coins = self._augment_coinswitch_from_requested(coins, coinswitch_api, intents)
         icici = self.load_icici(icici_api, security_master_url=icici_security_master_url) if _allow_value("icici", include_exs) else {}
+        groww = self.load_groww(groww_api, security_master_url=groww_security_master_url) if _allow_value("groww", include_exs) else {}
         self.report = DiscoveryReport(requested=intents, raw_counts={
             "delta": len(delta),
             "coinswitch": len({id(v) for v in coins.values()}),
             "icici": len({id(v) for v in icici.values()}),
+            "groww": len({id(v) for v in groww.values()}),
         })
 
         matched: List[TradableInstrument] = []
@@ -556,14 +627,17 @@ class InstrumentRegistry:
             dmatch = self._match_one(delta, aliases)
             cmatch = self._match_one(coins, aliases)
             imatch = self._match_one(icici, aliases)
+            gmatch = self._match_one(groww, aliases)
             if dmatch is not None:
                 by_ex[ExchangeName.DELTA] = self._retag(dmatch, intent)
             if cmatch is not None:
                 by_ex[ExchangeName.COINSWITCH] = self._retag(cmatch, intent)
             if imatch is not None:
                 by_ex[ExchangeName.ICICI] = self._retag(imatch, intent)
+            if gmatch is not None:
+                by_ex[ExchangeName.GROWW] = self._retag(gmatch, intent)
             if not by_ex:
-                self.report.unavailable[intent.asset_id] = "not present in live Delta/CoinSwitch/ICICI catalog; not traded"
+                self.report.unavailable[intent.asset_id] = "not present in live Delta/CoinSwitch/ICICI/Groww catalog; not traded"
                 continue
             primary = self.execution_preference if self.execution_preference in by_ex else next(iter(by_ex.keys()))
             if require_primary and self.execution_preference not in by_ex:

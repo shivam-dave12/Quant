@@ -43,6 +43,16 @@ except Exception:  # pragma: no cover - ICICI is optional at runtime
     ICICIOptionDataManager = None  # type: ignore
     icici_market_session_state = None  # type: ignore
     ICICIUnderlyingDataManager = None  # type: ignore
+try:
+    from exchanges.groww.api import GrowwRestClient
+    from exchanges.groww.data_manager import GrowwOptionDataManager
+    from exchanges.groww.market_session import groww_market_session_state
+    from exchanges.groww.underlying_data_manager import GrowwUnderlyingDataManager
+except Exception:  # pragma: no cover - Groww is optional until configured
+    GrowwRestClient = None  # type: ignore
+    GrowwOptionDataManager = None  # type: ignore
+    groww_market_session_state = None  # type: ignore
+    GrowwUnderlyingDataManager = None  # type: ignore
 from risk.risk_manager import RiskManager
 from orchestration.portfolio_manager import PortfolioManager, PortfolioRiskManager
 from core.market_policy import active_policy
@@ -120,16 +130,32 @@ class MultiAssetQuantBot:
             BreezeRestClient is not None
             and (wants_icici_discovery or (wants_icici_runtime and has_icici_runtime_keys))
         )
+        wants_groww_discovery = bool(getattr(config, "GROWW_DISCOVERY_ENABLED", False))
+        wants_groww_runtime = bool(getattr(config, "GROWW_OPTIONS_RUNTIME_ENABLED", False))
+        has_groww_runtime_keys = bool(
+            getattr(config, "GROWW_ACCESS_TOKEN", "")
+            or (getattr(config, "GROWW_API_KEY", "") and (getattr(config, "GROWW_API_SECRET", "") or getattr(config, "GROWW_TOTP_SECRET", "")))
+        )
+        has_groww = bool(
+            GrowwRestClient is not None
+            and (wants_groww_discovery or (wants_groww_runtime and has_groww_runtime_keys))
+        )
         delta_api = DeltaAPI(config.DELTA_API_KEY, config.DELTA_SECRET_KEY,
                              testnet=getattr(config, "DELTA_TESTNET", False)) if has_delta else None
         cs_api = CoinSwitchAPI(config.COINSWITCH_API_KEY, config.COINSWITCH_SECRET_KEY) if has_cs else None
         icici_api = BreezeRestClient() if has_icici else None
+        groww_api = GrowwRestClient() if has_groww else None
         if wants_icici_runtime and not has_icici_runtime_keys:
             logger.warning(
                 "ICICI runtime enabled but Breeze API key/secret are missing; "
                 "NIFTY discovery can continue, protected Breeze data/order calls will wait for credentials."
             )
-        return delta_api, cs_api, icici_api
+        if wants_groww_runtime and not has_groww_runtime_keys:
+            logger.warning(
+                "Groww runtime enabled but access token/API key credentials are missing; "
+                "NIFTY discovery can continue, protected Groww data/order calls will wait for credentials."
+            )
+        return delta_api, cs_api, icici_api, groww_api
 
     @staticmethod
     def _is_icici_context(ctx: AssetContext) -> bool:
@@ -138,6 +164,17 @@ class MultiAssetQuantBot:
             return inst.primary_exchange == ExchangeName.ICICI or ExchangeName.ICICI in inst.by_exchange
         except Exception:
             return False
+
+    @staticmethod
+    def _is_groww_context(ctx: AssetContext) -> bool:
+        try:
+            inst = ctx.instrument
+            return inst.primary_exchange == ExchangeName.GROWW or ExchangeName.GROWW in inst.by_exchange
+        except Exception:
+            return False
+
+    def _is_indian_options_context(self, ctx: AssetContext) -> bool:
+        return self._is_icici_context(ctx) or self._is_groww_context(ctx)
 
     @staticmethod
     def _icici_market_open() -> tuple[bool, str]:
@@ -150,6 +187,25 @@ class MultiAssetQuantBot:
             return bool(state.is_open), str(state.reason or "")
         except Exception as exc:
             return False, f"ICICI market session check failed: {exc}"
+
+    @staticmethod
+    def _groww_market_open() -> tuple[bool, str]:
+        if not bool(getattr(config, "GROWW_ANALYZE_ONLY_DURING_MARKET_SESSION", True)):
+            return True, "Groww session guard disabled"
+        if groww_market_session_state is None:
+            return False, "Groww market session guard unavailable"
+        try:
+            state = groww_market_session_state()
+            return bool(state.is_open), str(state.reason or "")
+        except Exception as exc:
+            return False, f"Groww market session check failed: {exc}"
+
+    def _indian_market_open(self, ctx: AssetContext) -> tuple[bool, str, str]:
+        if self._is_groww_context(ctx):
+            ok, reason = self._groww_market_open()
+            return ok, reason, "GROWW"
+        ok, reason = self._icici_market_open()
+        return ok, reason, "ICICI"
 
     @staticmethod
     def _icici_auth_tz() -> timezone:
@@ -366,7 +422,7 @@ class MultiAssetQuantBot:
         for ctx in self.contexts:
             inst = ctx.instrument
             pos = ctx.strategy.get_position()
-            is_icici = self._is_icici_context(ctx)
+            is_indian = self._is_indian_options_context(ctx)
             try:
                 px_raw = ctx.data_manager.get_last_price()
                 px = float(px_raw) if px_raw is not None else None
@@ -376,9 +432,9 @@ class MultiAssetQuantBot:
                 px = None
             cur = self._currency_for_instrument(inst)
             state = ctx.phase_name if pos else ("READY" if ctx.ready else (ctx.start_state or "NOT READY"))
-            if not pos and not ctx.ready and is_icici:
+            if not pos and not ctx.ready and is_indian:
                 try:
-                    is_open, _closed_reason = self._icici_market_open()
+                    is_open, _closed_reason, _broker_label = self._indian_market_open(ctx)
                     if not is_open:
                         state = "DORMANT"
                 except Exception:
@@ -447,8 +503,8 @@ class MultiAssetQuantBot:
             info = eng.analysis_info if eng is not None else {}
             quality = dict(getattr(ctx.strategy, "_last_data_integrity_context", {}) or {})
             lineage = dict(quality.get("lineage", {}) or {})
-            is_icici = self._is_icici_context(ctx)
-            unit = "NIFTYpts" if is_icici or str(lineage.get("analysis_domain", "")).upper() == "UNDERLYING" else self._currency_for_instrument(inst)
+            is_indian = self._is_indian_options_context(ctx)
+            unit = "NIFTYpts" if is_indian or str(lineage.get("analysis_domain", "")).upper() == "UNDERLYING" else self._currency_for_instrument(inst)
             try:
                 analysis_getter = getattr(ctx.data_manager, "get_analysis_price", None)
                 mark_raw = analysis_getter() if callable(analysis_getter) else ctx.data_manager.get_last_price()
@@ -461,13 +517,13 @@ class MultiAssetQuantBot:
                     mark = None
             state = str(info.get("state", "WARMUP" if ctx.ready else "DORMANT"))
             block = str(info.get("block_reason", "DATA_NOT_STARTED" if not ctx.ready else "WAIT"))
-            if not ctx.ready and is_icici:
-                is_open, reason = self._icici_market_open()
+            if not ctx.ready and is_indian:
+                is_open, reason, broker_label = self._indian_market_open(ctx)
                 if not is_open:
                     state, block = "DORMANT", reason
                 else:
                     state = ctx.start_state or "NOT_READY"
-                    block = "ICICI_AUTO_START_PENDING" if state == "STARTING_AFTER_MARKET_OPEN" else state
+                    block = f"{broker_label}_AUTO_START_PENDING" if state == "STARTING_AFTER_MARKET_OPEN" else state
             lines.append(f"\n<b>{self._esc(inst.asset_id)} · {self._esc(inst.primary_exchange.value.upper())}:{self._esc(inst.display_symbol)}</b>  <code>{self._esc(state)}</code>")
             mark_txt = f"{self._esc(unit)}{mark:,.4f}" if mark is not None else "N/A"
             lines.append(f"<code>analysis mark {mark_txt} | block {self._esc(block)}</code>")
@@ -534,7 +590,7 @@ class MultiAssetQuantBot:
         try:
             quote = str(getattr(getattr(inst, "primary", None), "quote_asset", "") or "").upper()
             ex = getattr(getattr(inst, "primary_exchange", None), "value", getattr(inst, "primary_exchange", ""))
-            if quote == "INR" or str(ex).lower() == "icici":
+            if quote == "INR" or str(ex).lower() in {"icici", "groww"}:
                 return "₹"
         except Exception:
             pass
@@ -995,15 +1051,17 @@ class MultiAssetQuantBot:
             logger.info("⚡ MULTI-ASSET INSTITUTIONAL LIQUIDITY SCANNER")
             logger.info("   Live exchange catalogs only — stock desk suspended; no synthetic feeds")
             logger.info("=" * 92)
-            delta_api, cs_api, icici_api = self._build_api_clients()
+            delta_api, cs_api, icici_api, groww_api = self._build_api_clients()
             self.registry = InstrumentRegistry(execution_preference=getattr(config, "EXECUTION_EXCHANGE", "delta"))
             requested = self._filter_suspended_requests(getattr(config, "MULTI_ASSET_REQUESTS", None))
             self.discovery_report = self.registry.discover(
                 delta_api=delta_api,
                 coinswitch_api=cs_api,
                 icici_api=icici_api,
+                groww_api=groww_api,
                 include_exchanges=getattr(config, "UNIVERSE_INCLUDE_EXCHANGES", "delta,coinswitch"),
                 icici_security_master_url=getattr(config, "ICICI_SECURITY_MASTER_URL", None),
+                groww_security_master_url=getattr(config, "GROWW_INSTRUMENTS_CSV_URL", None),
                 requested=requested,
                 max_active=int(getattr(config, "SCANNER_MAX_ACTIVE_INSTRUMENTS", 8)),
                 require_primary=False,
@@ -1015,7 +1073,7 @@ class MultiAssetQuantBot:
                 return False
 
             for inst in self.discovery_report.matched:
-                ctx = self._build_asset_context(inst, delta_api, cs_api, icici_api)
+                ctx = self._build_asset_context(inst, delta_api, cs_api, icici_api, groww_api)
                 if ctx is not None:
                     self.contexts.append(ctx)
             if not self.contexts:
@@ -1027,21 +1085,24 @@ class MultiAssetQuantBot:
             logger.exception("MultiAssetQuantBot initialisation failed")
             return False
 
-    def _build_asset_context(self, inst: TradableInstrument, delta_api, cs_api, icici_api=None) -> Optional[AssetContext]:
+    def _build_asset_context(self, inst: TradableInstrument, delta_api, cs_api, icici_api=None, groww_api=None) -> Optional[AssetContext]:
         primary_ex = inst.primary_exchange
         cs_om = None
         delta_om = None
         icici_om = None
+        groww_om = None
         if ExchangeName.COINSWITCH in inst.by_exchange and cs_api is not None:
             cs_om = OrderManager(cs_api, exchange_name="coinswitch", instrument=inst)
         if ExchangeName.DELTA in inst.by_exchange and delta_api is not None:
             delta_om = OrderManager(delta_api, exchange_name="delta", instrument=inst)
         if ExchangeName.ICICI in inst.by_exchange and icici_api is not None:
             icici_om = OrderManager(icici_api, exchange_name="icici", instrument=inst)
-        if not cs_om and not delta_om and not icici_om:
+        if ExchangeName.GROWW in inst.by_exchange and groww_api is not None:
+            groww_om = OrderManager(groww_api, exchange_name="groww", instrument=inst)
+        if not cs_om and not delta_om and not icici_om and not groww_om:
             logger.warning("%s skipped: no executable order manager", inst.asset_id)
             return None
-        router = ExecutionRouter(coinswitch_om=cs_om, delta_om=delta_om, icici_om=icici_om, default=primary_ex.value)
+        router = ExecutionRouter(coinswitch_om=cs_om, delta_om=delta_om, icici_om=icici_om, groww_om=groww_om, default=primary_ex.value)
 
         if primary_ex == ExchangeName.DELTA:
             primary_dm = DeltaDataManager(instrument=inst)
@@ -1054,6 +1115,13 @@ class MultiAssetQuantBot:
             primary_dm = ICICIOptionDataManager(instrument=inst, api=icici_api)
             secondary_dm = None
             analysis_dm = ICICIUnderlyingDataManager(instrument=inst, api=icici_api)
+        elif primary_ex == ExchangeName.GROWW:
+            if GrowwOptionDataManager is None or GrowwUnderlyingDataManager is None or groww_api is None:
+                logger.warning("%s skipped: Groww data managers unavailable", inst.asset_id)
+                return None
+            primary_dm = GrowwOptionDataManager(instrument=inst, api=groww_api)
+            secondary_dm = None
+            analysis_dm = GrowwUnderlyingDataManager(instrument=inst, api=groww_api)
         else:
             primary_dm = CoinSwitchDataManager(instrument=inst)
             secondary_dm = DeltaDataManager(instrument=inst) if ExchangeName.DELTA in inst.by_exchange and delta_api else None
@@ -1083,14 +1151,15 @@ class MultiAssetQuantBot:
         ctx.start_attempt_count += 1
         try:
             with instrument_scope(inst):
-                if self._is_icici_context(ctx):
-                    session_open, session_reason = self._icici_market_open()
+                if self._is_indian_options_context(ctx):
+                    session_open, session_reason, broker_label = self._indian_market_open(ctx)
                     if not session_open:
                         ctx.ready = False
-                        ctx.start_state = "ICICI_MARKET_CLOSED"
+                        ctx.start_state = f"{broker_label}_MARKET_CLOSED"
                         logger.warning(
-                            "%s ICICI desk dormant: %s. No NIFTY analysis, entries or adoption outside NSE/NFO hours.",
+                            "%s %s desk dormant: %s. No NIFTY analysis, entries or adoption outside NSE/F&O hours.",
                             inst.asset_id,
+                            broker_label,
                             session_reason,
                         )
                         return False
@@ -1098,10 +1167,11 @@ class MultiAssetQuantBot:
                 venue_cap = self._instrument_leverage(inst)
                 max_txt = f" product_cap={inst.max_leverage:g}x" if getattr(inst, "max_leverage", 0.0) else ""
                 logger.info("%s leverage venue_cap=%sx%s leverage_set=DEFERRED_UNTIL_APPROVED_STRUCTURAL_ENTRY", inst.asset_id, venue_cap, max_txt)
-                if self._is_icici_context(ctx) and not self._icici_account_preflight(ctx):
+                if self._is_indian_options_context(ctx) and not self._icici_account_preflight(ctx):
                     ctx.ready = False
-                    ctx.start_state = "ICICI_ACCOUNT_PREFLIGHT_FAILED"
-                    logger.error("%s ICICI desk disabled: F&O account verification did not pass", inst.asset_id)
+                    broker_label = "GROWW" if self._is_groww_context(ctx) else "ICICI"
+                    ctx.start_state = f"{broker_label}_ACCOUNT_PREFLIGHT_FAILED"
+                    logger.error("%s %s desk disabled: F&O account verification did not pass", inst.asset_id, broker_label)
                     return False
                 if not ctx.data_manager.start():
                     ctx.ready = False
@@ -1114,13 +1184,18 @@ class MultiAssetQuantBot:
                     ctx.start_state = "DATA_NOT_READY"
                     logger.error("%s data manager not ready", inst.asset_id)
                     return False
-                if self._is_icici_context(ctx):
+                if self._is_indian_options_context(ctx):
                     balance = ctx.risk_manager.get_available_balance() or {}
-                    preparer = getattr(ctx.data_manager, "prepare_icici_session_contract_book", None)
+                    preparer = (
+                        getattr(ctx.data_manager, "prepare_groww_session_contract_book", None)
+                        if self._is_groww_context(ctx)
+                        else getattr(ctx.data_manager, "prepare_icici_session_contract_book", None)
+                    )
                     if not callable(preparer) or not preparer(float(balance.get("available", 0.0) or 0.0)):
                         ctx.ready = False
-                        ctx.start_state = "ICICI_CONTRACT_BOOK_FAILED"
-                        logger.error("%s ICICI desk disabled: session CE/PE execution contract book could not be verified", inst.asset_id)
+                        broker_label = "GROWW" if self._is_groww_context(ctx) else "ICICI"
+                        ctx.start_state = f"{broker_label}_CONTRACT_BOOK_FAILED"
+                        logger.error("%s %s desk disabled: session CE/PE execution contract book could not be verified", inst.asset_id, broker_label)
                         return False
                 venues = ", ".join(f"{ex.value}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items())
                 ctx.ready = True
@@ -1135,18 +1210,18 @@ class MultiAssetQuantBot:
 
     def _maybe_start_dormant_icici_context(self, ctx: AssetContext) -> bool:
         """Wake a NIFTY desk that was created before NSE/NFO opened."""
-        if ctx.ready or ctx.starting or not self._is_icici_context(ctx):
+        if ctx.ready or ctx.starting or not self._is_indian_options_context(ctx):
             return False
-        session_open, session_reason = self._icici_market_open()
+        session_open, session_reason, broker_label = self._indian_market_open(ctx)
         if not session_open:
-            ctx.start_state = "ICICI_MARKET_CLOSED"
+            ctx.start_state = f"{broker_label}_MARKET_CLOSED"
             self._log_throttled_asset(
                 ctx,
-                f"ICICI market closed: {session_reason}; NIFTY desk dormant, auto-start armed.",
+                f"{broker_label} market closed: {session_reason}; NIFTY desk dormant, auto-start armed.",
             )
             return False
         now = time.time()
-        closed_state = ctx.start_state in ("", "ICICI_MARKET_CLOSED")
+        closed_state = ctx.start_state in ("", "ICICI_MARKET_CLOSED", "GROWW_MARKET_CLOSED")
         retry_default = "ICICI_DORMANT_START_RETRY_SEC" if closed_state else "ICICI_FAILED_START_RETRY_SEC"
         retry_fallback = 30.0 if closed_state else 180.0
         retry_sec = max(5.0, float(getattr(config, retry_default, retry_fallback) or retry_fallback))
@@ -1161,8 +1236,9 @@ class MultiAssetQuantBot:
             ok = False
             try:
                 logger.warning(
-                    "%s ICICI market open; starting NIFTY desk attempt=%d previous_state=%s",
+                    "%s %s market open; starting NIFTY desk attempt=%d previous_state=%s",
                     ctx.instrument.asset_id,
+                    broker_label,
                     ctx.start_attempt_count + 1,
                     previous_state,
                 )
@@ -1174,7 +1250,7 @@ class MultiAssetQuantBot:
 
         threading.Thread(
             target=_runner,
-            name=f"icici-dormant-start-{ctx.instrument.asset_id}",
+            name=f"{broker_label.lower()}-dormant-start-{ctx.instrument.asset_id}",
             daemon=True,
         ).start()
         return True
@@ -1200,7 +1276,7 @@ class MultiAssetQuantBot:
 
         ok_any = any(ok_flags.values())
         dormant_icici = any(
-            self._is_icici_context(ctx) and ctx.start_state == "ICICI_MARKET_CLOSED"
+            self._is_indian_options_context(ctx) and ctx.start_state in {"ICICI_MARKET_CLOSED", "GROWW_MARKET_CLOSED"}
             for ctx in self.contexts
         )
         if not ok_any and not dormant_icici:
@@ -1252,14 +1328,14 @@ class MultiAssetQuantBot:
                     if not ctx.ready:
                         self._maybe_start_dormant_icici_context(ctx)
                         continue
-                    if self._is_icici_context(ctx):
-                        session_open, session_reason = self._icici_market_open()
+                    if self._is_indian_options_context(ctx):
+                        session_open, session_reason, broker_label = self._indian_market_open(ctx)
                         if not session_open:
                             ctx.ready = False
-                            ctx.start_state = "ICICI_MARKET_CLOSED"
+                            ctx.start_state = f"{broker_label}_MARKET_CLOSED"
                             self._log_throttled_asset(
                                 ctx,
-                                f"ICICI market closed: {session_reason}; NIFTY desk dormant, no analysis/entries.",
+                                f"{broker_label} market closed: {session_reason}; NIFTY desk dormant, no analysis/entries.",
                             )
                             continue
                     interval = self.guard.evaluation_interval(ctx)

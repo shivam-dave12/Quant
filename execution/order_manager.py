@@ -104,6 +104,7 @@ class _RateLimiter:
 _CS_LIMITER    = _RateLimiter(min_interval_sec=3.0)
 _DELTA_LIMITER = _RateLimiter(min_interval_sec=0.25)
 _ICICI_LIMITER = _RateLimiter(min_interval_sec=0.75)
+_GROWW_LIMITER = _RateLimiter(min_interval_sec=float(getattr(config, "GROWW_MIN_CALL_GAP_SEC", 0.25)))
 
 # Also keep a module-level alias for compatibility imports (quant_strategy does
 # `from execution.order_manager import GlobalRateLimiter`)
@@ -1645,6 +1646,422 @@ class _ICICIAdapter:
         return {"success": True, "leverage": 1, "message": "ICICI long-premium options are fully funded; leverage is not applicable"}
 
 
+class _GrowwAdapter(_ICICIAdapter):
+    """Long-premium Groww F&O options adapter using official SDK fields."""
+
+    def __init__(self, api, exchange_instrument=None) -> None:
+        super().__init__(api, exchange_instrument=exchange_instrument)
+        self.limiter = _GROWW_LIMITER
+        self._smart_plans: Dict[str, Dict[str, Any]] = {}
+
+    def _instrument_for_symbol(self, trading_symbol: str) -> Dict[str, Any]:
+        symbol = str(trading_symbol or "").strip().upper()
+        if not symbol or not hasattr(self.api, "get_all_instruments"):
+            return {}
+        try:
+            for row in self.api.get_all_instruments():
+                if str(row.get("trading_symbol") or "").strip().upper() == symbol:
+                    return dict(row)
+        except Exception:
+            return {}
+        return {}
+
+    def _enriched_contract_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(row or {})
+        symbol = str(out.get("trading_symbol") or out.get("TradingSymbol") or out.get("symbol") or "").strip()
+        master = self._instrument_for_symbol(symbol)
+        if master:
+            out.setdefault("stock_code", str(master.get("underlying_symbol") or "").upper())
+            out.setdefault("exchange_code", "NFO")
+            out.setdefault("exchange", str(master.get("exchange") or "NSE").upper())
+            out.setdefault("segment", str(master.get("segment") or "FNO").upper())
+            out.setdefault("product_type", "Options")
+            out.setdefault("expiry_date", master.get("expiry_date"))
+            out.setdefault("strike_price", master.get("strike_price"))
+            inst_type = str(master.get("instrument_type") or "").upper()
+            out.setdefault("right", "Call" if inst_type == "CE" else "Put" if inst_type == "PE" else inst_type)
+            out.setdefault("TradingSymbol", symbol)
+            out.setdefault("runtime_lot_size", master.get("lot_size"))
+            out.setdefault("LotSize", master.get("lot_size"))
+        return out
+
+    def _active_raw(self) -> Dict[str, Any]:
+        return self._enriched_contract_row(super()._active_raw())
+
+    def _has_contract_identity(self, raw: Dict[str, Any]) -> bool:
+        return super()._has_contract_identity(self._enriched_contract_row(raw))
+
+    def _contract_key(self, raw: Dict[str, Any]) -> tuple:
+        return super()._contract_key(self._enriched_contract_row(raw))
+
+    def _is_exact_nfo_option_position(self, row: Dict[str, Any]) -> tuple[bool, str]:
+        row = self._enriched_contract_row(row)
+        if not isinstance(row, dict):
+            return False, "non_mapping_row"
+        segment = str(row.get("segment") or "").strip().lower()
+        exchange = str(row.get("exchange") or row.get("exchange_code") or "").strip().upper()
+        product = str(row.get("product_type") or row.get("product") or "").strip().lower()
+        if segment and segment != "fno":
+            return False, "explicit_non_fno_segment"
+        if exchange and exchange not in {"NSE", "NFO"}:
+            return False, "not_groww_fno_exchange"
+        if product and product not in {"option", "options", "nrml", "mis"}:
+            return False, "not_options_product"
+        if not self._has_contract_identity(row):
+            return False, "missing_exact_contract_identity"
+        target = self._target_stock_code()
+        stock = str(row.get("stock_code") or row.get("underlying_symbol") or "").strip().upper()
+        if target and stock and stock != target:
+            return False, "different_underlying"
+        if target and not stock:
+            return False, "missing_underlying"
+        return True, ""
+
+    def _is_exact_nfo_option_order(self, row: Dict[str, Any]) -> tuple[bool, str]:
+        return self._is_exact_nfo_option_position(row)
+
+    def _order_body(self, side: str, order_type: str, quantity: float,
+                    price=None, trigger_price=None, reduce_only: bool = False,
+                    **kwargs) -> Dict:
+        order_type_u = str(order_type or "").upper()
+        stop_order_type = str(kwargs.get("stop_order_type") or "").lower()
+        if "MARKET" in order_type_u and not reduce_only:
+            raise RuntimeError("Groww options guard: market entries are disabled; use limit or protected smart orders")
+        raw = self._active_raw()
+        if not self._has_contract_identity(raw):
+            raise RuntimeError("Groww options guard: exact FNO option identity is required before routing an order")
+        trading_symbol = str(raw.get("trading_symbol") or raw.get("TradingSymbol") or "").strip()
+        if not trading_symbol and hasattr(self.api, "_option_symbol_from_route"):
+            trading_symbol = self.api._option_symbol_from_route(raw)
+        if not trading_symbol:
+            raise RuntimeError("Groww options guard: trading_symbol is required by the official SDK")
+        px = price if price is not None else trigger_price
+        if (px is None or float(px or 0.0) <= 0) and reduce_only:
+            px = raw.get("selected_entry_premium") or raw.get("ltp") or raw.get("last_price") or raw.get("close")
+        is_stop = order_type_u.startswith("STOP") or stop_order_type == "stop_loss_order"
+        is_market_exit = "MARKET" in order_type_u and reduce_only and not is_stop
+        if not is_market_exit and (px is None or float(px or 0.0) <= 0):
+            raise RuntimeError("Groww options guard: executable price is required")
+        lot_raw = float(self._lot_size() or 0.0)
+        if lot_raw <= 0:
+            raise RuntimeError("Groww options guard: verified FNO option lot size is required before routing an order")
+        lot = int(round(lot_raw))
+        if lot <= 0 or abs(lot_raw - lot) > 1e-9:
+            raise RuntimeError(f"Groww options guard: invalid FNO option lot size={lot_raw!r}")
+        requested = float(quantity or 0.0)
+        lots = int(math.floor((requested / lot) + 1e-9))
+        if lots < 1:
+            raise RuntimeError(f"Groww options guard: requested quantity={requested:g} does not fit one lot={lot}")
+        qty = int(lots * lot)
+        if is_stop:
+            sdk_order_type = self.api.const("ORDER_TYPE_STOP_LOSS", "SL") if px else self.api.const("ORDER_TYPE_STOP_LOSS_MARKET", "SL_M")
+        elif is_market_exit:
+            sdk_order_type = self.api.const("ORDER_TYPE_MARKET", "MARKET")
+        else:
+            sdk_order_type = self.api.const("ORDER_TYPE_LIMIT", "LIMIT")
+        body = {
+            "trading_symbol": trading_symbol,
+            "quantity": qty,
+            "validity": self.api.const("VALIDITY_DAY", "DAY"),
+            "exchange": self.api.const("EXCHANGE_NSE", "NSE"),
+            "segment": self.api.const("SEGMENT_FNO", "FNO"),
+            "product": str(getattr(config, "GROWW_OPTION_PRODUCT_TYPE", "NRML") or "NRML").upper(),
+            "order_type": sdk_order_type,
+            "transaction_type": self.api.const("TRANSACTION_TYPE_SELL", "SELL") if reduce_only else self.api.const("TRANSACTION_TYPE_BUY", "BUY"),
+            "price": str(px) if px is not None and float(px or 0.0) > 0 and sdk_order_type != self.api.const("ORDER_TYPE_MARKET", "MARKET") else None,
+            "trigger_price": str(trigger_price) if is_stop and trigger_price is not None and float(trigger_price or 0.0) > 0 else None,
+            "order_reference_id": getattr(self.api, "reference_id", lambda prefix="groww": f"groww{int(time.time())}")("groww"),
+        }
+        return {k: v for k, v in body.items() if v not in (None, "")}
+
+    def extract_order_id(self, resp: Dict) -> Optional[str]:
+        if not isinstance(resp, dict):
+            return None
+        data = resp.get("Success") or resp.get("success") or resp.get("data") or resp.get("result") or resp
+        if isinstance(data, list) and data:
+            data = data[0]
+        if isinstance(data, dict):
+            oid = data.get("groww_order_id") or data.get("order_id") or data.get("id")
+            return str(oid) if oid else None
+        if isinstance(data, str) and data.strip():
+            return data.strip()
+        return None
+
+    def extract_status(self, order_data: Dict) -> str:
+        raw = str(order_data.get("order_status") or order_data.get("status") or order_data.get("smart_order_status") or "").upper()
+        if raw in {"EXECUTED", "FILLED", "COMPLETE", "COMPLETED"}:
+            return "FILLED"
+        if raw in {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED", "FAILED"}:
+            return "CANCELLED"
+        if raw in {"PARTIALLY_FILLED", "PARTIAL"}:
+            return "PARTIAL_FILL"
+        if raw in {"OPEN", "PENDING", "ACTIVE", "TRIGGER_PENDING", "TRIGGERED", "PLACED"}:
+            return "PENDING"
+        return "PENDING" if raw else "UNKNOWN"
+
+    def extract_fill_price(self, order_data: Dict) -> Optional[float]:
+        for f in ("average_fill_price", "average_price", "avg_price", "price", "execution_price", "ltp"):
+            p = self._num(order_data.get(f), 0.0)
+            if p > 0:
+                return p
+        order = order_data.get("order") if isinstance(order_data.get("order"), dict) else {}
+        p = self._num(order.get("price"), 0.0)
+        return p if p > 0 else None
+
+    def extract_filled_qty(self, order_data: Dict) -> float:
+        for f in ("filled_quantity", "executed_quantity", "quantity"):
+            q = self._num(order_data.get(f), 0.0)
+            if q > 0:
+                return q
+        return 0.0
+
+    def place_bracket_limit_entry(self, side: str, quantity: float, limit_price: float, sl_price: float, tp_price: float) -> Optional[Dict]:
+        if not bool(getattr(config, "GROWW_REQUIRE_SMART_GTT_PROTECTED_ENTRY", True)):
+            return {"_error": True, "_raw": {"error": "GROWW_SMART_GTT_DISABLED_FAIL_CLOSED"}}
+        self.limiter.wait()
+        try:
+            raw = self._active_raw()
+            entry_body = self._order_body(side, "LIMIT", quantity, price=limit_price, reduce_only=False)
+            qty = int(entry_body["quantity"])
+            tick = max(float(self.tick_size or getattr(config, "GROWW_OPTION_TICK_SIZE", 0.05) or 0.05), 0.01)
+
+            def _round_nearest(value: float) -> float:
+                return round(round(float(value) / tick) * tick, 2)
+
+            entry = _round_nearest(limit_price)
+            target_trigger = _round_nearest(tp_price)
+            target_limit = target_trigger
+            stop_trigger = _round_nearest(sl_price)
+            stop_limit = _round_nearest(max(tick, stop_trigger - tick))
+            if not (entry > 0 and stop_limit > 0 and stop_trigger < entry < target_trigger):
+                raise RuntimeError(f"Groww smart GTT geometry invalid: stop={stop_trigger} entry={entry} target={target_trigger}")
+            ref = self.api.reference_id("gtt") if hasattr(self.api, "reference_id") else f"gtt{int(time.time())}"
+            last_ref = self._num(raw.get("ltp") or raw.get("last_price") or raw.get("selected_entry_premium"), 0.0)
+            trigger_direction = self.api.const("TRIGGER_DIRECTION_DOWN", "DOWN") if last_ref <= 0 or entry <= last_ref else self.api.const("TRIGGER_DIRECTION_UP", "UP")
+            payload = {
+                "smart_order_type": self.api.const("SMART_ORDER_TYPE_GTT", "GTT"),
+                "reference_id": ref,
+                "segment": self.api.const("SEGMENT_FNO", "FNO"),
+                "trading_symbol": entry_body["trading_symbol"],
+                "quantity": qty,
+                "product_type": str(getattr(config, "GROWW_OPTION_PRODUCT_TYPE", "NRML") or "NRML").upper(),
+                "exchange": self.api.const("EXCHANGE_NSE", "NSE"),
+                "duration": self.api.const("VALIDITY_DAY", "DAY"),
+                "trigger_price": f"{entry:.2f}",
+                "trigger_direction": trigger_direction,
+                "order": {
+                    "order_type": self.api.const("ORDER_TYPE_LIMIT", "LIMIT"),
+                    "price": f"{entry:.2f}",
+                    "transaction_type": self.api.const("TRANSACTION_TYPE_BUY", "BUY"),
+                },
+                "child_legs": {
+                    "target": {
+                        "trigger_price": f"{target_trigger:.2f}",
+                        "order_type": self.api.const("ORDER_TYPE_LIMIT", "LIMIT"),
+                        "price": f"{target_limit:.2f}",
+                    },
+                    "stop_loss": {
+                        "trigger_price": f"{stop_trigger:.2f}",
+                        "order_type": self.api.const("ORDER_TYPE_STOP_LOSS", "SL"),
+                        "price": f"{stop_limit:.2f}",
+                    },
+                },
+            }
+            response = self.api.create_smart_order(**payload)
+            success = response.get("Success") if isinstance(response, dict) else None
+            data = success if isinstance(success, dict) else response if isinstance(response, dict) else {}
+            smart_id = str(data.get("smart_order_id") or data.get("id") or "").strip()
+            if not smart_id:
+                return {"_raw": response, "_sc": 0, "_error": True}
+            oid = f"GROWWGTT:{smart_id}"
+            self._smart_plans[smart_id] = {"quantity": qty, "entry": entry, "sl": stop_trigger, "tp": target_trigger, "payload": payload, "reference_id": ref}
+            logger.info(
+                "Groww protected smart GTT accepted smart_order_id=%s option=%s qty=%s entry=INR %.2f SL=INR %.2f TP=INR %.2f",
+                smart_id, entry_body["trading_symbol"], qty, entry, stop_trigger, target_trigger,
+            )
+            return {
+                "order_id": oid,
+                "smart_order_id": smart_id,
+                "status": "PENDING",
+                "quantity": float(qty),
+                "price": entry,
+                "bracket_order": True,
+                "bracket_child_verified": True,
+                "bracket_sl_order_id": f"{oid}:STOPLOSS",
+                "bracket_tp_order_id": f"{oid}:TARGET",
+                "bracket_sl_price": stop_trigger,
+                "bracket_tp_price": target_trigger,
+                "protection_model": "GROWW_SMART_GTT_BRACKET",
+                "_raw": response,
+            }
+        except Exception as exc:
+            logger.error("Groww protected smart GTT entry rejected before exposure: %s", exc)
+            return {"_raw": {"error": str(exc)}, "_sc": 0, "_error": True}
+
+    def _smart_row(self, order_id: str) -> Optional[Dict[str, Any]]:
+        token = str(order_id or "")
+        if not token.startswith("GROWWGTT:"):
+            return None
+        smart_id = token.split(":")[1] if ":" in token else ""
+        try:
+            resp = self.api.get_smart_order(
+                smart_order_id=smart_id,
+                segment=self.api.const("SEGMENT_FNO", "FNO"),
+                smart_order_type=self.api.const("SMART_ORDER_TYPE_GTT", "GTT"),
+            )
+        except Exception:
+            resp = {}
+        data = resp.get("Success") if isinstance(resp, dict) else None
+        row = data if isinstance(data, dict) else resp if isinstance(resp, dict) else {}
+        status = str(row.get("status") or "").upper()
+        plan = self._smart_plans.get(smart_id, {})
+        mapped_status = "FILLED" if status in {"COMPLETED"} else "PENDING" if status in {"ACTIVE", "TRIGGERED", ""} else status
+        return {
+            "order_id": token,
+            "smart_order_id": smart_id,
+            "status": mapped_status,
+            "average_fill_price": row.get("average_fill_price") or plan.get("entry"),
+            "quantity": row.get("quantity") or plan.get("quantity"),
+            "_raw": row,
+        }
+
+    def cancel_order(self, order_id: str) -> Dict:
+        self.limiter.wait()
+        token = str(order_id or "")
+        if token.startswith("GROWWGTT:"):
+            smart_id = token.split(":")[1]
+            return self.api.cancel_smart_order(
+                smart_order_id=smart_id,
+                segment=self.api.const("SEGMENT_FNO", "FNO"),
+                smart_order_type=self.api.const("SMART_ORDER_TYPE_GTT", "GTT"),
+            ) or {}
+        return self.api.cancel_order(groww_order_id=token, segment=self.api.const("SEGMENT_FNO", "FNO")) or {}
+
+    def get_order(self, order_id: str) -> Optional[Dict]:
+        if str(order_id or "").startswith("GROWWGTT:"):
+            self.limiter.wait()
+            return self._smart_row(str(order_id))
+        try:
+            self.limiter.wait()
+            data = self.api.get_order_detail(groww_order_id=str(order_id), segment=self.api.const("SEGMENT_FNO", "FNO"))
+            return data if isinstance(data, dict) else {"order_id": str(order_id), "status": "PENDING"}
+        except Exception:
+            return {"order_id": str(order_id), "status": "PENDING"}
+
+    def resolve_order_execution(self, order_id: str) -> Optional[Dict]:
+        oid = str(order_id or "").strip()
+        if not oid:
+            return None
+        raw_order = self.get_order(oid)
+        if not isinstance(raw_order, dict):
+            return None
+        status = self.extract_status(raw_order)
+        fill_price = float(self.extract_fill_price(raw_order) or 0.0)
+        filled_qty = float(self.extract_filled_qty(raw_order) or 0.0)
+        if oid.startswith("GROWWGTT:"):
+            return {
+                "status": status,
+                "fill_price": fill_price,
+                "filled_qty": filled_qty,
+                "paid_commission": 0.0,
+                "paid_commission_exact": False,
+                "raw_order": raw_order,
+            }
+        trade_getter = getattr(self.api, "get_trade_detail", None)
+        if callable(trade_getter) and status in {"FILLED", "PARTIAL_FILL"}:
+            try:
+                self.limiter.wait()
+                resp = trade_getter(order_id=oid, segment=self.api.const("SEGMENT_FNO", "FNO"))
+                rows = resp.get("trade_list") or resp.get("trades") or resp.get("data") or [] if isinstance(resp, dict) else []
+                num = den = 0.0
+                for row in rows if isinstance(rows, list) else []:
+                    if not isinstance(row, dict):
+                        continue
+                    px = self._num(row.get("price") or row.get("average_price") or row.get("trade_price"), 0.0)
+                    qty = abs(self._num(row.get("quantity") or row.get("filled_quantity") or row.get("traded_quantity"), 0.0))
+                    if px > 0 and qty > 0:
+                        num += px * qty
+                        den += qty
+                if den > 0:
+                    fill_price = num / den
+                    filled_qty = den
+            except Exception as exc:
+                logger.debug("Groww trade-list execution resolution unavailable for %s: %s", oid, exc)
+        return {
+            "status": status,
+            "fill_price": fill_price,
+            "filled_qty": filled_qty,
+            "paid_commission": 0.0,
+            "paid_commission_exact": False,
+            "raw_order": raw_order,
+        }
+
+    def get_open_orders(self, symbol: str) -> Optional[list]:
+        try:
+            self.limiter.wait()
+            resp = self.api.get_order_list(segment=self.api.const("SEGMENT_FNO", "FNO"), page=0, page_size=25)
+        except Exception as exc:
+            logger.warning("Groww FNO open-order recovery unavailable: %s", exc)
+            return []
+        rows = resp.get("order_list") or resp.get("orders") or resp.get("data") or [] if isinstance(resp, dict) else []
+        rows = rows if isinstance(rows, list) else []
+        active = self._active_raw()
+        active_key = self._contract_key(active) if self._has_contract_identity(active) else None
+        open_orders = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row = self._enriched_contract_row(row)
+            ok, _ = self._is_exact_nfo_option_order(row)
+            if not ok or (active_key and self._contract_key(row) != active_key):
+                continue
+            status = str(row.get("order_status") or row.get("status") or "").strip().upper()
+            if status in {"EXECUTED", "FILLED", "COMPLETE", "COMPLETED", "CANCELLED", "CANCELED", "REJECTED", "EXPIRED", "FAILED"}:
+                continue
+            order_type = str(row.get("order_type") or "").strip().upper()
+            trigger = self._num(row.get("trigger_price"), 0.0)
+            oid = row.get("groww_order_id") or row.get("order_id")
+            if oid:
+                typ = "STOP_LOSS" if order_type in {"SL", "SL_M", "STOP_LOSS", "STOP_LOSS_MARKET"} else "LIMIT"
+                open_orders.append({"order_id": str(oid), "type": typ, "trigger_price": trigger, "raw": row})
+        return open_orders
+
+    def get_positions(self, symbol: str) -> Optional[Dict]:
+        try:
+            return self.api.get_portfolio_positions()
+        except Exception as exc:
+            logger.error("Groww FNO positions fetch failed: %s", exc)
+            return None
+
+    def _normalised_position_row(self, row: Dict[str, Any], *, source: str = "matched") -> Dict[str, Any]:
+        return super()._normalised_position_row(self._enriched_contract_row(row), source=source)
+
+    def get_balance(self) -> Dict:
+        resp = self.api.get_margin(exchange_code="NFO")
+        data = self._success_payload(resp)
+        fno = data.get("fno_margin_details") if isinstance(data.get("fno_margin_details"), dict) else {}
+        available = self._num(fno.get("option_buy_balance_available") or data.get("cash_limit") or data.get("clear_cash"), 0.0)
+        used = max(0.0, self._num(fno.get("net_fno_margin_used") or data.get("block_by_trade"), 0.0))
+        total = max(available + used, self._num(data.get("amount_allocated") or data.get("cash_limit"), 0.0))
+        out = {
+            "available": max(0.0, available),
+            "available_raw": max(0.0, available),
+            "locked": used,
+            "total": total,
+            "currency": "INR",
+            "segment": "FNO",
+            "source": "groww.option_buy_balance_available",
+            "fno_available": max(0.0, available),
+            "fno_blocked": used,
+            "raw": resp,
+        }
+        logger.info("Groww F&O balance source=%s available=%.2f blocked=%.2f", out["source"], out["available"], out["locked"])
+        return out
+
+    def set_leverage(self, leverage: int, product_id: Optional[int] = None) -> Dict:
+        return {"success": True, "leverage": 1, "message": "Groww long-premium options are fully funded; leverage is not applicable"}
+
+
 class OrderManager:
     """
     Exchange-agnostic order manager.
@@ -1670,6 +2087,8 @@ class OrderManager:
             self._adapter = _DeltaAdapter(api, exchange_instrument=exchange_instrument)
         elif exch == "icici":
             self._adapter = _ICICIAdapter(api, exchange_instrument=exchange_instrument)
+        elif exch == "groww":
+            self._adapter = _GrowwAdapter(api, exchange_instrument=exchange_instrument)
         else:
             self._adapter = _CoinSwitchAdapter(api, exchange_instrument=exchange_instrument)
 
@@ -1747,7 +2166,7 @@ class OrderManager:
         raise ValueError(f"Invalid side '{side}'")
 
     def _currency_symbol(self) -> str:
-        return "₹" if str(getattr(self, "_exchange_name", "")).lower() == "icici" else "$"
+        return "₹" if str(getattr(self, "_exchange_name", "")).lower() in {"icici", "groww"} else "$"
 
     def _active_tick_size(self) -> float:
         """Return the executable tick size for the active contract.
@@ -2036,22 +2455,26 @@ class OrderManager:
             if not self._check_window_rate_limit():
                 return None
             api_side = self._normalize_side(side)
-            if self._exchange_name == "icici":
+            if self._exchange_name in {"icici", "groww"}:
                 if not reduce_only:
-                    logger.error("ICICI Breeze guard: market entry rejected; NFO options require a priced LIMIT entry")
+                    logger.error("%s options guard: market entry rejected; F&O options require a priced LIMIT entry", self._exchange_name.upper())
                     return None
                 ex_pos = self.get_open_position()
                 if not ex_pos or bool(ex_pos.get("unadoptable")):
-                    logger.critical("ICICI emergency close refused: no exact adoptable NFO option position is available")
+                    logger.critical("%s emergency close refused: no exact adoptable F&O option position is available", self._exchange_name.upper())
                     return None
                 raw = ex_pos.get("raw") or {}
                 ref = float(raw.get("ltp") or raw.get("LTP") or ex_pos.get("entry_price") or 0.0)
                 if ref <= 0:
-                    logger.critical("ICICI emergency close refused: no reference premium available for priced exit")
+                    logger.critical("%s emergency close refused: no reference premium available for priced exit", self._exchange_name.upper())
                     return None
                 # Breeze prohibits market orders. For an emergency close, send an
                 # aggressively marketable priced limit while retaining exact contract scope.
-                slippage_pct = float(getattr(config, "ICICI_EMERGENCY_EXIT_LIMIT_BUFFER_PCT", 0.10))
+                slippage_pct = (
+                    float(getattr(config, "GROWW_EMERGENCY_EXIT_LIMIT_BUFFER_PCT", getattr(config, "ICICI_EMERGENCY_EXIT_LIMIT_BUFFER_PCT", 0.10)))
+                    if self._exchange_name == "groww"
+                    else float(getattr(config, "ICICI_EMERGENCY_EXIT_LIMIT_BUFFER_PCT", 0.10))
+                )
                 tick = max(float(getattr(self._adapter, "tick_size", 0.05) or 0.05), 0.01)
                 if str(api_side).lower() == "sell":
                     limit_price = math.floor((ref * max(0.01, 1.0 - slippage_pct)) / tick) * tick
@@ -2059,8 +2482,8 @@ class OrderManager:
                     limit_price = math.ceil((ref * (1.0 + slippage_pct)) / tick) * tick
                 limit_price = max(tick, limit_price)
                 logger.critical(
-                    "ICICI Breeze prohibits MARKET exits; routing emergency %s as aggressive LIMIT qty=%s premium_ref=₹%.2f limit=₹%.2f",
-                    api_side.upper(), quantity, ref, limit_price,
+                    "%s options MARKET exits are disabled; routing emergency %s as aggressive LIMIT qty=%s premium_ref=₹%.2f limit=₹%.2f",
+                    self._exchange_name.upper(), api_side.upper(), quantity, ref, limit_price,
                 )
                 return self.place_limit_order(side=side, quantity=quantity, price=limit_price, reduce_only=True)
             logger.info(f"MARKET {side} qty={quantity} reduce_only={reduce_only}")
@@ -2152,7 +2575,7 @@ class OrderManager:
             if not self._check_window_rate_limit():
                 return None
             api_side = self._normalize_side(side)
-            cur = "₹" if self._exchange_name == "icici" else "$"
+            cur = "₹" if self._exchange_name in {"icici", "groww"} else "$"
             logger.info(f"LIMIT {side} qty={quantity} @ {cur}{price:,.2f}")
             data = self._place_with_retry(
                 side=api_side, order_type="LIMIT",
@@ -2181,7 +2604,7 @@ class OrderManager:
           the REST call returns a valid order_id. Used by the strategy
           watchdog to switch from Stage-A to Stage-B timing. Never raises.
         """
-        cur = "₹" if self._exchange_name == "icici" else "$"
+        cur = "₹" if self._exchange_name in {"icici", "groww"} else "$"
         logger.info(f"🎯 Maker entry: {side} {quantity} @ {cur}{limit_price:.2f} "
                     f"(timeout={timeout_sec:.0f}s)")
 
@@ -2314,8 +2737,13 @@ class OrderManager:
             sc = (data or {}).get("_sc", 0)
             raw = (data or {}).get("_raw", {})
             reason = self._compact_error(raw)
+            stage = (
+                "icici_gtt_cover_oco_entry" if self._exchange_name == "icici"
+                else "groww_smart_gtt_bracket_entry" if self._exchange_name == "groww"
+                else "delta_native_bracket_entry"
+            )
             self.last_order_error = {
-                "stage": "icici_gtt_cover_oco_entry" if self._exchange_name == "icici" else "delta_native_bracket_entry",
+                "stage": stage,
                 "status_code": sc,
                 "reason": reason,
                 "raw": raw,
@@ -2360,14 +2788,14 @@ class OrderManager:
                             f" fee={cur}{data['paid_commission']:.4f}"
                             f" exact={data['paid_commission_exact']}")
 
-                if data.get("protection_model") == "ICICI_GTT_COVER_OCO":
+                if data.get("protection_model") in {"ICICI_GTT_COVER_OCO", "GROWW_SMART_GTT_BRACKET"}:
                     # Breeze accepted the entry, target and stoploss as one official
                     # cover-OCO instruction. Child identity is the GTT leg identity;
                     # do not search the normal order book for Delta-style children.
                     data["bracket_child_verified"] = True
                     logger.info(
-                        "✅ ICICI broker-protected GTT cover-OCO active: entry=%s SL-leg=%s TP-leg=%s",
-                        data.get("order_id"), data.get("bracket_sl_order_id"), data.get("bracket_tp_order_id"),
+                        "✅ %s broker-protected smart bracket active: entry=%s SL-leg=%s TP-leg=%s",
+                        self._exchange_name.upper(), data.get("order_id"), data.get("bracket_sl_order_id"), data.get("bracket_tp_order_id"),
                     )
                     return data
 
@@ -2538,7 +2966,7 @@ class OrderManager:
         except Exception as cancel_e:
             cancel_resp = {"cancel_error": str(cancel_e)}
         self.last_order_error = {
-            "stage": "delta_native_bracket_fill_timeout",
+            "stage": "groww_smart_gtt_fill_timeout" if self._exchange_name == "groww" else "delta_native_bracket_fill_timeout",
             "status_code": 0,
             "reason": f"entry_limit_not_filled_within_{timeout_sec:.0f}s",
             "order_id": order_id,

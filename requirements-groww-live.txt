@@ -1,0 +1,3 @@
+# Official Groww Trading API SDK and TOTP helper for access-token generation.
+growwapi
+pyotp>=2.9.0
