@@ -1337,6 +1337,9 @@ class _ICICIAdapter:
         try:
             return self.api.get_portfolio_positions()
         except Exception as exc:
+            if "no positions available" in str(exc).lower():
+                logger.info("ICICI NFO PortfolioPositions verified flat: %s", exc)
+                return {"Success": [], "Status": 200, "Error": None, "_empty_positions": True}
             logger.error("ICICI NFO PortfolioPositions fetch failed: %s", exc)
             return None
 

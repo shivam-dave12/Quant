@@ -257,7 +257,15 @@ class BreezeRestClient:
         return self.request("GET", "/portfolioholdings", body)
 
     def get_portfolio_positions(self) -> Dict[str, Any]:
-        return self.request("GET", "/portfoliopositions", {})
+        try:
+            return self.request("GET", "/portfoliopositions", {})
+        except RuntimeError as exc:
+            # Breeze returns HTTP 200 with Error="No Positions available." for
+            # a verified flat derivatives book. That is not an auth/account
+            # failure and must not disable the ICICI desk.
+            if "no positions available" in str(exc).lower():
+                return {"Success": [], "Status": 200, "Error": None, "_empty_positions": True}
+            raise
 
     def place_order(self, **kwargs) -> Dict[str, Any]:
         order_type = str(kwargs.get("order_type", "")).strip().lower()

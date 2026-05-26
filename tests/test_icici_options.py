@@ -960,6 +960,46 @@ def test_icici_preflight_accepts_verified_fno_flat_and_rejects_unknown_funds():
     assert bot._icici_account_preflight(ctx) is False
 
 
+def test_icici_portfolio_no_positions_response_is_verified_flat():
+    from exchanges.icici.api import BreezeRestClient
+
+    class EmptyPositionsResponse:
+        status_code = 200
+        def json(self):
+            return {"Success": None, "Status": 200, "Error": "No Positions available."}
+
+    class HTTP:
+        def request(self, *args, **kwargs):
+            return EmptyPositionsResponse()
+
+    client = BreezeRestClient(auth=_BreezeFakeAuth())
+    client.http = HTTP()
+
+    assert client.get_portfolio_positions() == {
+        "Success": [], "Status": 200, "Error": None, "_empty_positions": True,
+    }
+
+
+def test_icici_adapter_no_positions_exception_is_verified_flat():
+    from execution.order_manager import _ICICIAdapter
+
+    class API:
+        def get_portfolio_positions(self):
+            raise RuntimeError("Breeze /portfoliopositions failed HTTP 200: No Positions available.")
+
+    raw = build_underlying_payload("NIFTY", "ICICI_INDEX_OPTIONS", [])
+    exchange_inst = SimpleNamespace(
+        symbol="NIFTY", display_symbol="NIFTY", tick_size=0.05,
+        lot_step=1.0, min_qty=1.0, max_qty=0.0, raw=raw,
+    )
+    adapter = _ICICIAdapter(api=API(), exchange_instrument=exchange_inst)
+    position = adapter.normalise_position(adapter.get_positions("NIFTY"))
+
+    assert position["position_scope_verified"] is True
+    assert position["segment"] == "FNO"
+    assert position["size"] == 0.0
+
+
 def test_icici_position_accepts_exact_nfo_option_when_portfolio_segment_is_omitted():
     from execution.order_manager import _ICICIAdapter
     raw = build_underlying_payload("NIFTY", "ICICI_INDEX_OPTIONS", [])
