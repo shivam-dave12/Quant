@@ -1,0 +1,46 @@
+"""Production session wiring example.
+
+Copy to a private module, replace every required value with broker/account-validated data,
+and pass its import path via --configuration-module. Nothing in this file is a trading default.
+"""
+from __future__ import annotations
+import json
+from pathlib import Path
+import numpy as np
+from intelligence.liquidity_intelligence import ZoneObservation
+from intelligence.market_state import TradingRestrictionState
+from orchestration.verified_streams import DeltaDeskRuntimeInputs
+
+ZONE_FILE = Path("/run/secrets/validated_liquidity_zones.json")
+
+
+def _zones(instrument: str) -> list[ZoneObservation]:
+    rows = json.loads(ZONE_FILE.read_text(encoding="utf-8"))[instrument]
+    return [ZoneObservation(**row) for row in rows]
+
+
+def _restriction(_desk: str) -> TradingRestrictionState:
+    # Connect this to your approved market calendar/event/exchange-health provider.
+    raise RuntimeError("APPROVED_RESTRICTION_PROVIDER_MUST_BE_CONFIGURED")
+
+
+def _delta_inputs(_state) -> DeltaDeskRuntimeInputs:
+    # Populate only from validated account/product costs and current account margin.
+    raise RuntimeError("VALIDATED_ACCOUNT_COST_AND_MARGIN_PROVIDER_MUST_BE_CONFIGURED")
+
+
+def _metals_reference_features(_asset: str) -> np.ndarray:
+    # Return approved reference-market momentum/volatility/regime inputs.
+    raise RuntimeError("APPROVED_METALS_REFERENCE_FEATURE_PROVIDER_MUST_BE_CONFIGURED")
+
+
+def configure_streams(factory, coordinator, platform, mode: str) -> None:
+    # Example registration; uncomment only after product symbols and providers are validated.
+    # coordinator.register_stream(factory.btc_stream(
+    #     delta_symbol="<validated Delta BTC product symbol>", inputs_provider=_delta_inputs,
+    #     warmup_zones=_zones("<validated Delta BTC product symbol>"), restriction_provider=_restriction))
+    # coordinator.register_stream(factory.metals_stream(
+    #     asset="SILVER", delta_symbol="<validated Delta silver product symbol>",
+    #     inputs_provider=_delta_inputs, warmup_zones=_zones("<validated Delta silver product symbol>"),
+    #     reference_feature_provider=_metals_reference_features, restriction_provider=_restriction))
+    raise RuntimeError("REGISTER_VERIFIED_DESK_STREAMS_BEFORE_STARTING_RUNTIME")
