@@ -467,6 +467,7 @@ class TelegramBotController:
         def _worker():
             try:
                 from exchanges.icici.breeze_auth import BreezeTokenService
+                from exchanges.icici.daily_token_guard import mark_valid
                 from exchanges.icici.token_generator import assert_playwright_chromium_runtime_ready
                 svc = BreezeTokenService()
                 svc.require_configured(for_login=True)
@@ -476,6 +477,7 @@ class TelegramBotController:
                 )
                 session = svc.get_session(force_refresh=True, otp_getter=self._icici_otp_getter)
                 status = svc.session_status(session)
+                mark_valid(self._icici_auth_now().date().isoformat(), "telegram_token_worker")
                 self._icici_refresh_result = (
                     "✅ <b>ICICI Breeze Session Refreshed</b>\n"
                     "━━━━━━━━━━━━━━━━━━━━\n"
@@ -484,6 +486,11 @@ class TelegramBotController:
                     f"🕘 Created: <code>{_esc(status.get('created_local') or '')}</code>"
                 )
             except Exception as e:
+                try:
+                    from exchanges.icici.daily_token_guard import mark_failed
+                    mark_failed(self._icici_auth_now().date().isoformat(), "telegram_token_worker")
+                except Exception:
+                    pass
                 self._icici_refresh_result = f"❌ <b>ICICI Breeze Refresh Failed</b>\n<code>{_esc(e)}</code>"
             try:
                 self.send_message(self._icici_refresh_result, parse_mode="HTML")
@@ -1361,7 +1368,11 @@ class TelegramBotController:
 
         self._icici_premarket_refresh_day = day_key
         try:
+            from exchanges.icici.daily_token_guard import claim_login_attempt, claim_notice, mark_valid
             if self._icici_same_day_session_ready():
+                if not claim_notice(day_key, "telegram_premarket", "passed_notice"):
+                    return
+                mark_valid(day_key, "telegram_premarket")
                 logger.info("ICICI premarket token check passed for %s; same-day Breeze session is valid.", day_key)
                 self.send_message(
                     "ICICI premarket check passed.\n"
@@ -1369,13 +1380,14 @@ class TelegramBotController:
                 )
                 return
 
+            if not claim_login_attempt(day_key, "telegram_premarket"):
+                logger.info("ICICI premarket token refresh already owned for %s; suppressing duplicate request.", day_key)
+                return
             self.send_message(
                 "ICICI daily premarket login required.\n"
                 "No valid same-day Breeze session was found before NIFTY open. Starting token generation now."
             )
-            response = self._cmd_icici_token()
-            if response:
-                self.send_message(response)
+            self._cmd_icici_token()
         except Exception as exc:
             logger.error("ICICI premarket token refresh failed: %s", exc, exc_info=True)
             self.send_message(
@@ -1440,6 +1452,8 @@ class TelegramBotController:
         if not self._should_auto_icici_token_on_start():
             return
         try:
+            from exchanges.icici.daily_token_guard import current_state, claim_login_attempt, mark_failed, mark_valid
+            day_key = self._icici_auth_now().date().isoformat()
             if self._icici_refresh_thread is not None and self._icici_refresh_thread.is_alive():
                 wait_sec = max(
                     self._icici_otp_timeout_sec() + 60.0,
@@ -1462,12 +1476,16 @@ class TelegramBotController:
             # required for the normal path.
             try:
                 session = svc.get_session(force_refresh=False)
+                mark_valid(day_key, "telegram_start_cached")
                 self.send_message(self._format_icici_session_ok(session))
                 return
             except Exception as first_exc:
                 logger.info("ICICI Breeze session not ready; launching Telegram OTP login before scanner start: %s", first_exc)
 
             svc.require_configured(for_login=True)
+            if not claim_login_attempt(day_key, "telegram_start"):
+                logger.info("ICICI startup login already owned for %s; suppressing duplicate startup token generation.", day_key)
+                return
             self._clear_icici_pending_otp()
             from exchanges.icici.token_generator import assert_playwright_chromium_runtime_ready
             preflight = assert_playwright_chromium_runtime_ready(
@@ -1482,8 +1500,13 @@ class TelegramBotController:
                 "📲 I am launching the token generator now; send only the OTP when requested."
             )
             session = svc.refresh(otp_getter=self._icici_otp_getter)
+            mark_valid(day_key, "telegram_start")
             self.send_message(self._format_icici_session_ok(session))
         except Exception as exc:
+            try:
+                mark_failed(day_key, "telegram_start")
+            except Exception:
+                pass
             msg = f"ICICI Breeze startup token generation failed: {exc}"
             logger.error(msg, exc_info=True)
             if bool(getattr(config, "ICICI_AUTH_REQUIRED_FOR_DETAILS", True)):

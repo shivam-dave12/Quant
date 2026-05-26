@@ -64,6 +64,10 @@ class AssetContext:
     last_heartbeat_sec: float = 0.0
     last_analysis_sec: float = 0.0
     ready: bool = False
+    starting: bool = False
+    last_start_attempt_sec: float = 0.0
+    start_attempt_count: int = 0
+    start_state: str = ""
 
     @property
     def phase_name(self) -> str:
@@ -197,6 +201,7 @@ class MultiAssetQuantBot:
 
         self._icici_premarket_refresh_day = day_key
         try:
+            from exchanges.icici.daily_token_guard import claim_notice, mark_valid
             from exchanges.icici.breeze_auth import BreezeTokenService
             svc = BreezeTokenService()
             status = svc.session_status()
@@ -207,6 +212,9 @@ class MultiAssetQuantBot:
                 except Exception as exc:
                     logger.warning("ICICI premarket direct scanner check could not validate session: %s", exc)
             if bool(status.get("valid") and status.get("same_trading_day")):
+                if not claim_notice(day_key, "multi_asset_premarket", "passed_notice"):
+                    return
+                mark_valid(day_key, "multi_asset_premarket")
                 logger.info("ICICI premarket direct scanner check passed for %s; same-day Breeze session is valid.", day_key)
                 send_telegram_message(
                     "ICICI premarket check passed.\n"
@@ -216,6 +224,12 @@ class MultiAssetQuantBot:
         except Exception as exc:
             logger.warning("ICICI premarket direct scanner status check failed: %s", exc)
 
+        try:
+            from exchanges.icici.daily_token_guard import claim_notice
+            if not claim_notice(day_key, "multi_asset_premarket", "notified_missing"):
+                return
+        except Exception:
+            pass
         send_telegram_message(
             "ICICI daily token is missing before NIFTY open.\n"
             "Generate today's Breeze API_Session now. If the Telegram controller is running, use /icici_token; "
@@ -361,7 +375,7 @@ class MultiAssetQuantBot:
             except Exception:
                 px = None
             cur = self._currency_for_instrument(inst)
-            state = ctx.phase_name if pos else ("READY" if ctx.ready else "NOT READY")
+            state = ctx.phase_name if pos else ("READY" if ctx.ready else (ctx.start_state or "NOT READY"))
             if not pos and not ctx.ready and is_icici:
                 try:
                     is_open, _closed_reason = self._icici_market_open()
@@ -451,6 +465,9 @@ class MultiAssetQuantBot:
                 is_open, reason = self._icici_market_open()
                 if not is_open:
                     state, block = "DORMANT", reason
+                else:
+                    state = ctx.start_state or "NOT_READY"
+                    block = "ICICI_AUTO_START_PENDING" if state == "STARTING_AFTER_MARKET_OPEN" else state
             lines.append(f"\n<b>{self._esc(inst.asset_id)} · {self._esc(inst.primary_exchange.value.upper())}:{self._esc(inst.display_symbol)}</b>  <code>{self._esc(state)}</code>")
             mark_txt = f"{self._esc(unit)}{mark:,.4f}" if mark is not None else "N/A"
             lines.append(f"<code>analysis mark {mark_txt} | block {self._esc(block)}</code>")
@@ -1062,12 +1079,15 @@ class MultiAssetQuantBot:
 
     def _start_one_context(self, ctx: AssetContext) -> bool:
         inst = ctx.instrument
+        ctx.last_start_attempt_sec = time.time()
+        ctx.start_attempt_count += 1
         try:
             with instrument_scope(inst):
                 if self._is_icici_context(ctx):
                     session_open, session_reason = self._icici_market_open()
                     if not session_open:
                         ctx.ready = False
+                        ctx.start_state = "ICICI_MARKET_CLOSED"
                         logger.warning(
                             "%s ICICI desk dormant: %s. No NIFTY analysis, entries or adoption outside NSE/NFO hours.",
                             inst.asset_id,
@@ -1080,14 +1100,18 @@ class MultiAssetQuantBot:
                 logger.info("%s leverage venue_cap=%sx%s leverage_set=DEFERRED_UNTIL_APPROVED_STRUCTURAL_ENTRY", inst.asset_id, venue_cap, max_txt)
                 if self._is_icici_context(ctx) and not self._icici_account_preflight(ctx):
                     ctx.ready = False
+                    ctx.start_state = "ICICI_ACCOUNT_PREFLIGHT_FAILED"
                     logger.error("%s ICICI desk disabled: F&O account verification did not pass", inst.asset_id)
                     return False
                 if not ctx.data_manager.start():
+                    ctx.ready = False
+                    ctx.start_state = "DATA_STREAM_START_FAILED"
                     logger.error("%s data stream start failed", inst.asset_id)
                     return False
                 ready = ctx.data_manager.wait_until_ready(timeout_sec=float(getattr(config, "READY_TIMEOUT_SEC", 180)))
                 ctx.ready = bool(ready)
                 if not ready:
+                    ctx.start_state = "DATA_NOT_READY"
                     logger.error("%s data manager not ready", inst.asset_id)
                     return False
                 if self._is_icici_context(ctx):
@@ -1095,14 +1119,59 @@ class MultiAssetQuantBot:
                     preparer = getattr(ctx.data_manager, "prepare_icici_session_contract_book", None)
                     if not callable(preparer) or not preparer(float(balance.get("available", 0.0) or 0.0)):
                         ctx.ready = False
+                        ctx.start_state = "ICICI_CONTRACT_BOOK_FAILED"
                         logger.error("%s ICICI desk disabled: session CE/PE execution contract book could not be verified", inst.asset_id)
                         return False
                 venues = ", ".join(f"{ex.value}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items())
+                ctx.start_state = "READY"
                 logger.info("✅ %s ready @ %.4f | venues=%s | %s", inst.asset_id, ctx.data_manager.get_last_price(), venues, self.guard.report_line(ctx))
                 return True
         except Exception:
+            ctx.ready = False
+            ctx.start_state = "START_EXCEPTION"
             logger.exception("%s start failed", inst.asset_id)
             return False
+
+    def _maybe_start_dormant_icici_context(self, ctx: AssetContext) -> bool:
+        """Wake a NIFTY desk that was created before NSE/NFO opened."""
+        if ctx.ready or ctx.starting or not self._is_icici_context(ctx):
+            return False
+        session_open, session_reason = self._icici_market_open()
+        if not session_open:
+            ctx.start_state = "ICICI_MARKET_CLOSED"
+            self._log_throttled_asset(
+                ctx,
+                f"ICICI market closed: {session_reason}; NIFTY desk dormant, auto-start armed.",
+            )
+            return False
+        now = time.time()
+        retry_sec = max(5.0, float(getattr(config, "ICICI_DORMANT_START_RETRY_SEC", 30.0) or 30.0))
+        if ctx.last_start_attempt_sec > 0 and now - ctx.last_start_attempt_sec < retry_sec:
+            return False
+
+        ctx.starting = True
+        ctx.start_state = "STARTING_AFTER_MARKET_OPEN"
+
+        def _runner() -> None:
+            ok = False
+            try:
+                logger.warning(
+                    "%s ICICI market open; starting previously dormant NIFTY desk attempt=%d",
+                    ctx.instrument.asset_id,
+                    ctx.start_attempt_count + 1,
+                )
+                ok = self._start_one_context(ctx)
+            finally:
+                ctx.starting = False
+                if ok:
+                    self._market_wakeup.set()
+
+        threading.Thread(
+            target=_runner,
+            name=f"icici-dormant-start-{ctx.instrument.asset_id}",
+            daemon=True,
+        ).start()
+        return True
 
     def start(self) -> bool:
         if not self.contexts:
@@ -1124,7 +1193,11 @@ class MultiAssetQuantBot:
             t.join()
 
         ok_any = any(ok_flags.values())
-        if not ok_any:
+        dormant_icici = any(
+            self._is_icici_context(ctx) and ctx.start_state == "ICICI_MARKET_CLOSED"
+            for ctx in self.contexts
+        )
+        if not ok_any and not dormant_icici:
             return False
         self.running = True
         if self.discovery_report:
@@ -1141,9 +1214,10 @@ class MultiAssetQuantBot:
             lev = self._instrument_leverage(inst)
             pol = active_policy(inst)
             cadence = getattr(pol, "loop_interval_sec", getattr(pol, "tick_eval_sec", 0.0))
+            runtime_state = "READY" if ctx.ready else (ctx.start_state or "NOT_READY")
             lines.append(
                 f"🟢 <b>{inst.asset_id}</b>  <code>{inst.primary_exchange.value.upper()}:{inst.display_symbol}</code>\n"
-                f"   <code>venue-cap {lev}x · risk×{pol.risk_multiplier:.2f} · margin-policy {pol.margin_pct:.0%} · cadence {float(cadence):.2f}s</code>\n"
+                f"   <code>{runtime_state} · venue-cap {lev}x · risk×{pol.risk_multiplier:.2f} · margin-policy {pol.margin_pct:.0%} · cadence {float(cadence):.2f}s</code>\n"
                 f"   <code>{venues}</code>"
             )
         if not bool(getattr(config, "STOCK_DESK_TRADING_ENABLED", True)):
@@ -1170,11 +1244,13 @@ class MultiAssetQuantBot:
                 now_ms = int(time.time() * 1000)
                 for ctx in list(self.contexts):
                     if not ctx.ready:
+                        self._maybe_start_dormant_icici_context(ctx)
                         continue
                     if self._is_icici_context(ctx):
                         session_open, session_reason = self._icici_market_open()
                         if not session_open:
                             ctx.ready = False
+                            ctx.start_state = "ICICI_MARKET_CLOSED"
                             self._log_throttled_asset(
                                 ctx,
                                 f"ICICI market closed: {session_reason}; NIFTY desk dormant, no analysis/entries.",

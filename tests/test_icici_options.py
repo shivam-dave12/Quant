@@ -383,8 +383,10 @@ def test_telegram_start_preflights_icici_token_before_bot_start(monkeypatch, tmp
     import sys
     import types
     from exchanges.icici.breeze_auth import BreezeSession
+    from exchanges.icici.daily_token_guard import reset_for_tests
     import telegram.controller as ctl
 
+    reset_for_tests()
     calls = []
 
     class FakeSvc:
@@ -433,8 +435,10 @@ def test_telegram_premarket_refresh_starts_daily_icici_token(monkeypatch):
     import sys
     import types
     from datetime import datetime, timedelta, timezone
+    from exchanges.icici.daily_token_guard import reset_for_tests
     import telegram.controller as ctl
 
+    reset_for_tests()
     calls = []
 
     class FakeSvc:
@@ -462,15 +466,17 @@ def test_telegram_premarket_refresh_starts_daily_icici_token(monkeypatch):
 
     assert calls == ["status", "token"]
     assert any("daily premarket login required" in m for m in sent)
-    assert any(m == "started" for m in sent)
+    assert not any(m == "started" for m in sent)
 
 
 def test_telegram_premarket_refresh_skips_when_same_day_session_valid(monkeypatch):
     import sys
     import types
     from datetime import datetime, timedelta, timezone
+    from exchanges.icici.daily_token_guard import reset_for_tests
     import telegram.controller as ctl
 
+    reset_for_tests()
     calls = []
 
     class FakeSvc:
@@ -503,8 +509,10 @@ def test_multi_asset_runtime_warns_when_daily_icici_token_missing(monkeypatch):
     import sys
     import types
     from datetime import datetime, timedelta, timezone
+    from exchanges.icici.daily_token_guard import reset_for_tests
     import orchestration.multi_asset_bot as mab
 
+    reset_for_tests()
     calls = []
 
     class FakeSvc:
@@ -533,6 +541,144 @@ def test_multi_asset_runtime_warns_when_daily_icici_token_missing(monkeypatch):
     assert len(sent) == 1
     assert "ICICI daily token is missing" in sent[0]
     assert "NIFTY trading stays blocked" in sent[0]
+
+
+def test_icici_premarket_guard_suppresses_controller_scanner_duplicate(monkeypatch):
+    import sys
+    import types
+    from datetime import datetime, timedelta, timezone
+    from exchanges.icici.daily_token_guard import reset_for_tests
+    import orchestration.multi_asset_bot as mab
+    import telegram.controller as ctl
+
+    reset_for_tests()
+    calls = []
+
+    class FakeSvc:
+        def session_status(self, session=None):
+            calls.append("status")
+            return {"valid": False, "same_trading_day": False, "reason": "missing"}
+        def get_session(self, force_refresh=False):
+            calls.append(("get", force_refresh))
+            raise RuntimeError("missing api session")
+
+    monkeypatch.setitem(sys.modules, "exchanges.icici.breeze_auth", types.SimpleNamespace(BreezeTokenService=FakeSvc))
+    monkeypatch.setattr(ctl.config, "ICICI_OPTIONS_RUNTIME_ENABLED", True, raising=False)
+    monkeypatch.setattr(ctl.config, "ICICI_AUTO_TOKEN_GENERATOR_ON_STARTUP", True, raising=False)
+    monkeypatch.setattr(ctl.config, "ICICI_BREEZE_PREFLIGHT_ON_STARTUP", True, raising=False)
+    monkeypatch.setattr(ctl.config, "ICICI_PREMARKET_TOKEN_REFRESH_ENABLED", True, raising=False)
+    monkeypatch.setattr(ctl.config, "ICICI_PREMARKET_TOKEN_REFRESH_TIME", "08:30", raising=False)
+    monkeypatch.setattr(ctl.config, "ICICI_PREMARKET_TOKEN_REFRESH_WINDOW_MIN", 90.0, raising=False)
+    monkeypatch.setattr(mab.config, "ICICI_DISCOVERY_ENABLED", True, raising=False)
+    monkeypatch.setattr(mab.config, "ICICI_PREMARKET_TOKEN_REFRESH_ENABLED", True, raising=False)
+    monkeypatch.setattr(mab.config, "ICICI_PREMARKET_TOKEN_REFRESH_TIME", "08:30", raising=False)
+    monkeypatch.setattr(mab.config, "ICICI_PREMARKET_TOKEN_REFRESH_WINDOW_MIN", 90.0, raising=False)
+
+    controller = ctl.TelegramBotController.__new__(ctl.TelegramBotController)
+    controller._icici_premarket_refresh_day = ""
+    sent_controller = []
+    controller.send_message = lambda msg, parse_mode="HTML": sent_controller.append(msg) or True
+    controller._cmd_icici_token = lambda: calls.append("token") or "started"
+
+    sent_scanner = []
+    monkeypatch.setattr(mab, "send_telegram_message", lambda msg, *a, **kw: sent_scanner.append(msg) or True)
+    bot = mab.MultiAssetQuantBot.__new__(mab.MultiAssetQuantBot)
+    bot._icici_premarket_refresh_day = ""
+
+    now = datetime(2026, 5, 26, 8, 31, tzinfo=timezone(timedelta(minutes=330)))
+    controller._maybe_run_icici_premarket_refresh(now)
+    bot._maybe_icici_premarket_refresh(now)
+
+    assert calls.count("token") == 1
+    assert sum("ICICI daily" in m for m in sent_controller + sent_scanner) == 1
+
+
+def test_icici_dormant_context_auto_starts_after_market_open(monkeypatch):
+    import threading
+    import time
+    from types import SimpleNamespace
+    import orchestration.multi_asset_bot as mab
+
+    bot = mab.MultiAssetQuantBot.__new__(mab.MultiAssetQuantBot)
+    bot._market_wakeup = threading.Event()
+    bot._is_icici_context = lambda ctx: True
+    bot._icici_market_open = lambda: (True, "open")
+    monkeypatch.setattr(mab.config, "ICICI_DORMANT_START_RETRY_SEC", 5.0, raising=False)
+
+    ctx = SimpleNamespace(
+        ready=False,
+        starting=False,
+        last_start_attempt_sec=0.0,
+        start_attempt_count=0,
+        start_state="ICICI_MARKET_CLOSED",
+        instrument=SimpleNamespace(asset_id="NIFTY"),
+    )
+    calls = []
+
+    def start_one(c):
+        calls.append("start")
+        c.ready = True
+        c.start_state = "READY"
+        c.start_attempt_count += 1
+        return True
+
+    bot._start_one_context = start_one
+
+    assert bot._maybe_start_dormant_icici_context(ctx) is True
+    deadline = time.time() + 2.0
+    while time.time() < deadline and not ctx.ready:
+        time.sleep(0.01)
+
+    assert calls == ["start"]
+    assert ctx.ready is True
+    assert ctx.start_state == "READY"
+    assert bot._market_wakeup.is_set()
+
+
+def test_icici_dormant_context_waits_when_market_still_closed():
+    from types import SimpleNamespace
+    import threading
+    import orchestration.multi_asset_bot as mab
+
+    bot = mab.MultiAssetQuantBot.__new__(mab.MultiAssetQuantBot)
+    bot._market_wakeup = threading.Event()
+    bot._is_icici_context = lambda ctx: True
+    bot._icici_market_open = lambda: (False, "opens 09:15 IST")
+    logs = []
+    bot._log_throttled_asset = lambda ctx, msg: logs.append(msg)
+    bot._start_one_context = lambda ctx: (_ for _ in ()).throw(AssertionError("must not start before open"))
+
+    ctx = SimpleNamespace(
+        ready=False,
+        starting=False,
+        last_start_attempt_sec=0.0,
+        start_attempt_count=0,
+        start_state="",
+        instrument=SimpleNamespace(asset_id="NIFTY"),
+    )
+
+    assert bot._maybe_start_dormant_icici_context(ctx) is False
+    assert ctx.start_state == "ICICI_MARKET_CLOSED"
+    assert "auto-start armed" in logs[0]
+
+
+def test_scanner_start_accepts_only_dormant_icici_context(monkeypatch):
+    from types import SimpleNamespace
+    import orchestration.multi_asset_bot as mab
+
+    bot = mab.MultiAssetQuantBot.__new__(mab.MultiAssetQuantBot)
+    bot.contexts = [SimpleNamespace(start_state="", instrument=SimpleNamespace(asset_id="NIFTY"))]
+    bot.discovery_report = None
+    bot.running = False
+    bot._is_icici_context = lambda ctx: True
+    bot._start_one_context = lambda ctx: setattr(ctx, "start_state", "ICICI_MARKET_CLOSED") or False
+    bot._startup_message = lambda: "startup"
+    sent = []
+    monkeypatch.setattr(mab, "send_telegram_message", lambda msg, *a, **kw: sent.append(msg) or True)
+
+    assert bot.start() is True
+    assert bot.running is True
+    assert sent == ["startup"]
 
 
 def test_breeze_token_service_refreshes_stale_daily_session_cache(tmp_path):
