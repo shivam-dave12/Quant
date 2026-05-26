@@ -11,6 +11,7 @@ from typing import Any
 import requests
 
 from core.config import CONFIG
+from core.environment import environment_diagnostics
 from orchestration.bootstrap import RuntimeBootstrap
 from orchestration.supervisor import ControllerPolicy, TelegramRuntimeSupervisor
 
@@ -27,7 +28,15 @@ class TelegramController:
         session: Any | None = None,
     ) -> None:
         if not token or not chat_id:
-            raise RuntimeError("TELEGRAM_CREDENTIALS_NOT_CONFIGURED")
+            diagnostics = environment_diagnostics(("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"))
+            raise RuntimeError(
+                "TELEGRAM_CREDENTIALS_NOT_CONFIGURED | "
+                f"source={diagnostics['source']} | "
+                f"token_present={diagnostics['present']['TELEGRAM_BOT_TOKEN']} | "
+                f"chat_id_present={diagnostics['present']['TELEGRAM_CHAT_ID']} | "
+                "for Podman use --env-file /absolute/path/.env, or mount a read-only file "
+                "and set BOT_ENV_FILE=/run/secrets/quant.env"
+            )
         self.supervisor = supervisor
         self.token = token
         self.chat_id = str(chat_id)

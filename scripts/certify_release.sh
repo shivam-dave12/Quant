@@ -49,7 +49,10 @@ if unused_imports:
     raise SystemExit(f"Certification failed: unused imports in active executable code: {unused_imports}")
 print("Architecture audit passed: legacy/dead runtime absent, active imports used, one certification test module only.")
 PY
-python -m pytest -q tests/test_institutional_platform.py -W error
+PYTEST_LOG="$(mktemp /tmp/institutional_pytest.XXXXXX.log)"
+trap 'rm -f "${PYTEST_LOG}"' EXIT
+python -m pytest -q tests/test_institutional_platform.py -W error >"${PYTEST_LOG}" 2>&1
+cat "${PYTEST_LOG}"
 python main.py --status >/tmp/institutional_platform_status.json
 python -m telegram.controller --preflight-status >/tmp/telegram_controller_preflight_status.json
 cat /tmp/institutional_platform_status.json

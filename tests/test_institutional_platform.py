@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, UTC
 from pathlib import Path
 import json
 import sys
+import subprocess
 import numpy as np
 import pytest
 
@@ -963,3 +964,81 @@ def test_telegram_supervisor_reports_unexpected_runtime_failure_without_killing_
         assert status["runtime_state"] == "FAILED"
         assert "FEED_RUNTIME_FAILED" in status["last_error"]
     asyncio.run(exercise())
+
+
+# ---------------- Environment / credential loading certification ----------------
+def _run_config_probe(env: dict[str, str]) -> dict[str, object]:
+    probe = (
+        "import json; "
+        "from core.config import CONFIG, ENVIRONMENT_LOAD_STATE; "
+        "print(json.dumps({'token': CONFIG.secrets.telegram_bot_token, "
+        "'chat': CONFIG.secrets.telegram_chat_id, "
+        "'source': ENVIRONMENT_LOAD_STATE.source, "
+        "'loaded': ENVIRONMENT_LOAD_STATE.file_loaded}))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(result.stdout.strip())
+
+
+def test_explicit_bot_env_file_is_loaded_before_immutable_secrets_are_constructed(tmp_path):
+    env_file = tmp_path / "controller.env"
+    env_file.write_text("TELEGRAM_BOT_TOKEN=dotenv-token\nTELEGRAM_CHAT_ID=991122\n", encoding="utf-8")
+    env = os.environ.copy()
+    env.pop("TELEGRAM_BOT_TOKEN", None)
+    env.pop("TELEGRAM_CHAT_ID", None)
+    env["BOT_ENV_FILE"] = str(env_file)
+    result = _run_config_probe(env)
+    assert result["token"] == "dotenv-token"
+    assert result["chat"] == "991122"
+    assert result["loaded"] is True
+    assert result["source"].startswith("dotenv_file:")
+
+
+def test_injected_container_environment_overrides_mounted_dotenv_values(tmp_path):
+    env_file = tmp_path / "controller.env"
+    env_file.write_text("TELEGRAM_BOT_TOKEN=file-token\nTELEGRAM_CHAT_ID=file-chat\n", encoding="utf-8")
+    env = os.environ.copy()
+    env["BOT_ENV_FILE"] = str(env_file)
+    env["TELEGRAM_BOT_TOKEN"] = "podman-injected-token"
+    env["TELEGRAM_CHAT_ID"] = "podman-injected-chat"
+    result = _run_config_probe(env)
+    assert result["token"] == "podman-injected-token"
+    assert result["chat"] == "podman-injected-chat"
+    assert result["loaded"] is True
+
+
+def test_missing_explicit_env_file_reports_non_secret_diagnostics_without_hiding_failure(tmp_path):
+    missing = tmp_path / "missing.env"
+    env = os.environ.copy()
+    env.pop("TELEGRAM_BOT_TOKEN", None)
+    env.pop("TELEGRAM_CHAT_ID", None)
+    env["BOT_ENV_FILE"] = str(missing)
+    probe = (
+        "import json; from core.environment import environment_diagnostics; "
+        "from core.config import CONFIG; "
+        "print(json.dumps(environment_diagnostics(('TELEGRAM_BOT_TOKEN','TELEGRAM_CHAT_ID'))))"
+    )
+    result = subprocess.run([sys.executable, "-c", probe], cwd=ROOT, env=env, check=True, capture_output=True, text=True)
+    diagnostics = json.loads(result.stdout.strip())
+    assert diagnostics["source"].startswith("dotenv_file_missing:")
+    assert diagnostics["present"] == {"TELEGRAM_BOT_TOKEN": False, "TELEGRAM_CHAT_ID": False}
+    assert "token" not in diagnostics and "chat" not in diagnostics
+
+
+def test_container_secret_loading_documentation_and_image_exclusion_are_enforced():
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8")
+    guide = (ROOT / "docs" / "ENV_CREDENTIAL_LOADING.md").read_text(encoding="utf-8")
+    launcher = (ROOT / "scripts" / "run_telegram_controller.sh").read_text(encoding="utf-8")
+    assert ".env" in dockerignore
+    assert '--env-file "$(pwd)/.env"' in dockerfile
+    assert "BOT_ENV_FILE=/run/secrets/quant.env" in dockerfile
+    assert '--env-file "${ENV_FILE}"' in launcher
+    assert "BOT_ENV_FILE" in guide and "credential_environment" in guide

@@ -13,6 +13,7 @@ from adapters.groww.client import GrowwAdapter
 from adapters.hyperliquid.reference import HyperliquidReferenceAdapter
 from adapters.reference_metals.client import ReferenceMetalsAdapter
 from core.config import CONFIG, PlatformConfig
+from core.environment import environment_diagnostics
 from core.observability import Observability
 from orchestration.live_factory import VerifiedLiveFeedFactory
 from orchestration.model_loader import PromotedAuthorityLoader
@@ -60,6 +61,11 @@ class RuntimeBootstrap:
             "promoted_registry_ready": registry_ready,
             "metals_reference_provider_configured": bool(os.getenv("METALS_REFERENCE_PROVIDER_MODULE")),
             "verified_stream_configuration_required": True,
+            "credential_environment": environment_diagnostics((
+                "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
+                "GROWW_ACCESS_TOKEN", "GROWW_API_KEY",
+                "DELTA_API_KEY", "DELTA_SECRET_KEY",
+            )),
         }
 
     @staticmethod

@@ -3,11 +3,15 @@
 #
 # Build:
 #   podman build --no-cache -t localhost/quant:latest .
-# Preflight only:
-#   podman run --rm --env-file .env localhost/quant:latest --preflight-status
+# Preflight only (recommended: Podman injects host .env at runtime):
+#   podman run --rm --env-file "$(pwd)/.env" localhost/quant:latest --preflight-status
 # Controller runtime:
-#   podman run -d --name quant --restart unless-stopped --env-file .env \
+#   podman run -d --name quant --restart unless-stopped --env-file "$(pwd)/.env" \
 #     -p 8088:8088 localhost/quant:latest
+# Alternate application-read file mode (never bake .env into the image):
+#   podman run -d --name quant --restart unless-stopped \
+#     -v "$(pwd)/.env:/run/secrets/quant.env:ro,Z" \
+#     -e BOT_ENV_FILE=/run/secrets/quant.env -p 8088:8088 localhost/quant:latest
 # ─────────────────────────────────────────────────────────────────────────────
 
 FROM docker.io/library/python:3.11-slim AS certification

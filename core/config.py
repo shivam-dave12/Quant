@@ -4,6 +4,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import os
 
+from core.environment import load_runtime_environment
+
+# Load a host-local or explicitly mounted .env before immutable secret fields bind.
+# Process-injected variables retain priority over values in the file.
+ENVIRONMENT_LOAD_STATE = load_runtime_environment()
+
 @dataclass(frozen=True)
 class Secrets:
     delta_api_key: str = field(default_factory=lambda: os.getenv("DELTA_API_KEY", ""))
