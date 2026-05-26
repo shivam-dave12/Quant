@@ -1,2 +1,0 @@
-# Official ICICI Breeze websocket transport used by exchanges/icici/live_feed.py
-breeze-connect==1.0.69
