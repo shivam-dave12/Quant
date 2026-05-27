@@ -24,7 +24,7 @@ LIVE_TRADING_ENABLED = True
 # explicitly listed in LIVE_EXECUTION_VENUES when LIVE_TRADING_ENABLED=True.
 # Safe first-live default: Groww/NIFTY only; add "delta" deliberately later.
 ANALYSIS_DATA_VENUES = ("delta", "coinswitch", "groww")
-LIVE_EXECUTION_VENUES = ("groww",)
+LIVE_EXECUTION_VENUES = ("groww","delta")
 EXECUTION_EXCHANGE = "delta"  # legacy discovery preference; not live-order permission
 
 # Venue activation / environments are runtime policy, not secrets.
@@ -62,6 +62,7 @@ GROWW_AUTH_CONFIGURED     = bool(
     or (GROWW_TOTP_TOKEN and GROWW_TOTP_SECRET)
     or (GROWW_API_KEY and GROWW_API_SECRET)
 )
+GROWW_APPROVED_STATIC_IPS=13.51.193.234
 TELEGRAM_BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID          = os.getenv("TELEGRAM_CHAT_ID",   "")
 
@@ -499,7 +500,7 @@ GROWW_OUTBOUND_IP_OVERRIDE = ""  # testing only; leave empty in production
 # Groww SDK exposes order_reference_id (8-20 chars) for traceability. Broker-side
 # algo registration/whitelisting must be confirmed before live India execution.
 GROWW_REQUIRE_SEBI_ALGO_CONFIRMATION_FOR_LIVE_ORDERS = True
-GROWW_SEBI_ALGO_REGISTRATION_CONFIRMED = False  # set True only after broker confirmation
+GROWW_SEBI_ALGO_REGISTRATION_CONFIRMED = True  # set True only after broker confirmation
 GROWW_SEBI_STRATEGY_PREFIX = "instv2"[:6]
 GROWW_OPTION_MIN_LIVE_IV_COVERAGE = 0.60
 GROWW_OPTION_LONG_MAX_VRP = -0.02
