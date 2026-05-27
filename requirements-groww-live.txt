@@ -1,13 +1,24 @@
-# Core runtime
-requests>=2.31.0
-python-dotenv>=1.0.0
-pydantic>=2.0.0
+# Quant bot v2 — live runtime dependencies
+# This file is suitable for the current Docker runtime and all enabled venues.
+# Do NOT install python-telegram-bot: the repository has a local telegram/ package
+# and uses requests for the Telegram Bot API.
 
-# Exchange transports
-websocket-client>=1.7.0
-python-socketio[client]>=5.11.0
-cryptography>=42.0.0
+# Core runtime / configuration
+requests>=2.31,<3
+python-dotenv>=1.0,<2
+pydantic>=2.7,<3
 
-# Official Groww Trading API SDK and TOTP helper for access-token generation.
+# Streaming / transport / signing
+websocket-client>=1.7,<2
+python-socketio[client]>=5.11,<6
+cryptography>=42,<47
+
+# Groww live execution and TOTP-backed access-token flow
 growwapi
-pyotp>=2.9.0
+pyotp>=2.9,<3
+
+# Hyperliquid official SDK and direct signing dependency used by
+# exchanges/hyperliquid/api.py (Info, Exchange, constants, Account).
+# SDK 0.23.0 includes the perp_dexs/timeout support used in this codebase.
+hyperliquid-python-sdk==0.23.0
+eth-account>=0.10,<0.14
