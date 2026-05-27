@@ -69,6 +69,8 @@ class _OrderAPI:
         return {"data": {"order_id": oid, "status": "RAISED"}}
 
     def get_order(self, order_id, exchange="EXCHANGE_2"):
+        if order_id in {"oid-2", "oid-3"}:
+            return {"data": {"order_id": order_id, "status": "RAISED"}}
         return {"data": {"order_id": order_id, "status": "EXECUTED", "exec_quantity": 0.01, "avg_execution_price": 75000.0}}
 
     def cancel_order(self, order_id, exchange="EXCHANGE_2"):
@@ -79,9 +81,34 @@ def test_coinswitch_entry_arms_position_level_reduce_only_sl_and_tp():
     api = _OrderAPI()
     inst = SimpleNamespace(symbol="BTCUSDT", display_symbol="BTC/USDT", tick_size=0.1, lot_step=0.001, min_qty=0.001, max_qty=1.0)
     adapter = _CoinSwitchAdapter(api, inst)
+    adapter.limiter = SimpleNamespace(wait=lambda: None)
     out = adapter.place_bracket_limit_entry("BUY", 0.01, 75000.0, 74500.0, 76000.0, timeout_sec=1.0)
     assert out["protection_confirmed"] is True
     assert [c["order_type"] for c in api.calls] == ["LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"]
     for call in api.calls[1:]:
         assert call["quantity"] == 0.0
         assert call["reduce_only"] is True
+
+
+class _FailedProtectionAPI(_OrderAPI):
+    def place_order(self, **payload):
+        self.calls.append(payload)
+        if payload["order_type"] == "LIMIT":
+            return {"data": {"order_id": "entry", "status": "EXECUTED", "exec_quantity": payload["quantity"], "avg_execution_price": payload["price"]}}
+        if payload["order_type"] == "STOP_MARKET":
+            return {"error": "protection_failed"}
+        if payload["order_type"] == "TAKE_PROFIT_MARKET":
+            return {"data": {"order_id": "tp", "status": "RAISED"}}
+        return {"data": {"order_id": "flat", "status": "EXECUTED"}}
+
+
+def test_coinswitch_emergency_close_on_protection_failure_is_reduce_only():
+    api = _FailedProtectionAPI()
+    inst = SimpleNamespace(symbol="BTCUSDT", display_symbol="BTC/USDT", tick_size=0.1, lot_step=0.001, min_qty=0.001, max_qty=1.0)
+    adapter = _CoinSwitchAdapter(api, inst)
+    adapter.limiter = SimpleNamespace(wait=lambda: None)
+    out = adapter.place_bracket_limit_entry("BUY", 0.01, 75000.0, 74500.0, 76000.0, timeout_sec=1.0)
+    assert out["_error"] is True
+    emergency = api.calls[-1]
+    assert emergency["order_type"] == "MARKET"
+    assert emergency["reduce_only"] is True

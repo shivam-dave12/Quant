@@ -575,10 +575,25 @@ class InstitutionalStrategy:
                 logger.debug("venue selection unavailable: %s", exc)
                 venue_selection = None
         cost_components = self._execution_cost_components(data_manager, execution_state=execution_state)
-        if venue_selection is not None:
-            cost_components["venue_selection_cost_bps"] = float(venue_selection.selected_cost_bps)
-            if str(venue_selection.selected_venue).lower() != str(venue_selection.current_venue).lower():
-                cost_components["total_cost_bps"] = max(0.0, float(venue_selection.selected_cost_bps))
+        route_governance_block = ""
+        selected_route_estimate = None
+        if venue_selection is not None and venue_selection.selected_venue:
+            selected_route_estimate = venue_selection.estimates.get(str(venue_selection.selected_venue).lower())
+            selected_route_cost_bps = float(venue_selection.selected_cost_bps)
+            cost_components["venue_selection_cost_bps"] = selected_route_cost_bps
+            # The venue-selection cost is authoritative even when the selected
+            # venue is the current venue.  This prevents approval from using a
+            # cheap local spread estimate after the route model finds a loss.
+            cost_components["total_cost_bps"] = max(0.0, selected_route_cost_bps)
+            max_route_cost_bps = float(_cfg("VENUE_SELECTION_MAX_COST_BPS", 100.0))
+            route_expected_edge = getattr(selected_route_estimate, "expected_net_edge_bps", None)
+            route_expected_profit = getattr(selected_route_estimate, "expected_net_profit_usd", None)
+            if selected_route_cost_bps > max_route_cost_bps:
+                route_governance_block = f"selected_route_cost_exceeds_limit:{selected_route_cost_bps:.2f}>{max_route_cost_bps:.2f}"
+            elif route_expected_edge is not None and float(route_expected_edge) <= 0.0:
+                route_governance_block = f"selected_route_nonpositive_expected_net_edge:{float(route_expected_edge):.3f}"
+            elif route_expected_profit is not None and float(route_expected_profit) <= 0.0:
+                route_governance_block = f"selected_route_nonpositive_expected_net_profit:{float(route_expected_profit):.6f}"
         costs_bps = cost_components["total_cost_bps"]
         uncertainty_bps = self._uncertainty_bps(regime, liquidity_score, execution_quality)
         net_edge = directional_edge_bps - costs_bps
@@ -639,6 +654,17 @@ class InstitutionalStrategy:
             "liquidity_zones": [asdict(z) for z in zones],
             "price_window_count": len(self._price_window),
         }
+        if route_governance_block and direction is not Direction.NO_TRADE:
+            model_values["route_governance_block"] = route_governance_block
+            return self._decision(
+                desk=desk, venue=venue, instrument=instrument,
+                decision=DecisionOutput.NO_TRADE_EXECUTION_UNSAFE, direction=direction, regime=regime,
+                expected_net_edge_bps=net_edge, uncertainty_bps=uncertainty_bps,
+                liquidity_score=liquidity_score, execution_quality_score=execution_quality,
+                sizing=None, protection_plan=None, reasons=[route_governance_block],
+                model_values=model_values, research_features=features,
+            )
+
         min_edge = float(_cfg("INSTITUTIONAL_MIN_NET_EDGE_BPS", 3.0))
         if direction is Direction.NO_TRADE or net_edge <= max(min_edge, uncertainty_bps):
             return self._decision(

@@ -216,7 +216,8 @@ def test_shadow_mode_blocks_live_order_even_when_flow_edge_is_positive(tmp_path,
     monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_VENUES", (), raising=False)
     def cfg(name, default):
         values = {"RESEARCH_STORE_PATH": str(tmp_path), "INSTITUTIONAL_ENABLE_LIVE_ENTRIES": False,
-                  "INSTITUTIONAL_MIN_NET_EDGE_BPS": 0.1, "INSTITUTIONAL_MIN_SIGNAL_BPS": 0.01}
+                  "INSTITUTIONAL_MIN_NET_EDGE_BPS": 0.1, "INSTITUTIONAL_MIN_SIGNAL_BPS": 0.01,
+                      "VENUE_SELECTION_ENABLED": False}
         return values.get(name, default)
     monkeypatch.setattr("strategy.institutional_strategy._cfg", cfg)
     strategy = InstitutionalStrategy(instrument=_instrument())
@@ -255,7 +256,7 @@ def test_live_entry_requires_protection_confirmation(tmp_path, monkeypatch):
     def cfg(name, default):
         values = {"RESEARCH_STORE_PATH": str(tmp_path), "INSTITUTIONAL_ENABLE_LIVE_ENTRIES": True,
                   "INSTITUTIONAL_MIN_NET_EDGE_BPS": 0.1, "INSTITUTIONAL_MIN_SIGNAL_BPS": 0.01,
-                  "LEVERAGE": 2.0}
+                  "LEVERAGE": 2.0, "VENUE_SELECTION_ENABLED": False}
         return values.get(name, default)
     monkeypatch.setattr("strategy.institutional_strategy._cfg", cfg)
     strategy = InstitutionalStrategy(instrument=_instrument())
@@ -286,6 +287,7 @@ def test_live_entry_is_blocked_by_risk_manager_trade_gate(tmp_path, monkeypatch)
             "INSTITUTIONAL_MIN_NET_EDGE_BPS": 0.1,
             "INSTITUTIONAL_MIN_SIGNAL_BPS": 0.01,
             "LEVERAGE": 2.0,
+            "VENUE_SELECTION_ENABLED": False,
         }
         return values.get(name, default)
 
@@ -770,3 +772,33 @@ def test_selected_broker_balance_failure_never_falls_back_to_delta_cash(tmp_path
     assert decision.approved is False
     assert decision.available_cash_used == 0.0
     assert decision.reasons == ["cash_unavailable:hyperliquid"]
+
+
+def test_current_venue_cannot_trade_when_route_model_values_it_at_a_loss(tmp_path, monkeypatch):
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_SIGNAL_DECAY_READY", False, raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_FOR_DELTA", False, raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_FOR_DELTA", False, raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_VENUES", (), raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_VENUES", (), raising=False)
+
+    def cfg(name, default):
+        return {
+            "RESEARCH_STORE_PATH": str(tmp_path),
+            "INSTITUTIONAL_ENABLE_LIVE_ENTRIES": True,
+            "INSTITUTIONAL_MIN_NET_EDGE_BPS": 0.1,
+            "INSTITUTIONAL_MIN_SIGNAL_BPS": 0.01,
+            "VENUE_SELECTION_MAX_COST_BPS": 100.0,
+        }.get(name, default)
+
+    selected = SimpleNamespace(
+        selected_venue="delta", selected_symbol="BTCUSD", selected_cost_bps=523.2277,
+        current_venue="delta", current_cost_bps=523.2277, improvement_bps=0.0,
+        reason="selected_cost_above_soft_limit:523.23>100.00",
+        estimates={"delta": SimpleNamespace(expected_net_edge_bps=-402.3366, expected_net_profit_usd=-1.8136)},
+        as_dict=lambda: {"selected_venue": "delta", "selected_cost_bps": 523.2277},
+    )
+    monkeypatch.setattr("strategy.institutional_strategy._cfg", cfg)
+    monkeypatch.setattr("strategy.institutional_strategy.select_execution_venue", lambda **kwargs: selected)
+    decision = InstitutionalStrategy(instrument=_instrument()).evaluate(_Data([100.0] * 5), _Orders(), _Risk(), 1)
+    assert decision.decision is DecisionOutput.NO_TRADE_EXECUTION_UNSAFE
+    assert decision.reasons[0].startswith("selected_route_cost_exceeds_limit:")

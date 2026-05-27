@@ -168,38 +168,18 @@ class FuturesAPI:
         return self._make_request("POST", endpoint, payload=payload)
     
     def get_order(self, order_id: str, exchange: str = "EXCHANGE_2") -> Dict:
-        """
-        Get specific order details by order_id.
-        
-        Args:
-            order_id: Unique order identifier
-            exchange: Exchange identifier
-            
-        Returns:
-            Order details or error dict
-        """
+        """Get order status using the documented required ``order_id`` query only."""
+        _ = exchange  # retained for adapter compatibility; not part of the official query contract
         endpoint = "/trade/api/v2/futures/order"
-        params = {"order_id": order_id, "exchange": exchange}
-        
-        return self._make_request("GET", endpoint, params=params)
-    
+        return self._make_request("GET", endpoint, params={"order_id": order_id})
+
     def get_open_orders(self, exchange: str = "EXCHANGE_2", symbol: str = None) -> Dict:
-        """
-        Get all open orders.
-        
-        Args:
-            exchange: Exchange identifier
-            symbol: Optional filter by symbol
-            
-        Returns:
-            List of open orders or error dict
-        """
-        endpoint = "/trade/api/v2/futures/open_orders"
-        params = {"exchange": exchange}
+        """Get active orders using CoinSwitch's documented POST body contract."""
+        endpoint = "/trade/api/v2/futures/orders/open"
+        payload = {"exchange": exchange}
         if symbol:
-            params["symbol"] = symbol
-        
-        return self._make_request("GET", endpoint, params=params)
+            payload["symbol"] = str(symbol).lower()
+        return self._make_request("POST", endpoint, payload=payload)
     
     def cancel_order(self, order_id: str, exchange: str = "EXCHANGE_2") -> Dict:
         """
@@ -402,11 +382,24 @@ class FuturesAPI:
                     available = float(total_avail_str)
                     locked = float(total_blocked_str)
                     
-                    return {
+                    total = float(balances.get("total_balance", available + locked) or 0.0)
+                    position_margin = float(balances.get("total_position_margin", 0.0) or 0.0)
+                    open_order_margin = float(balances.get("total_open_order_margin", 0.0) or 0.0)
+                    out = {
                         "available": available,
                         "locked": locked,
+                        "total": total,
+                        "position_margin": position_margin,
+                        "open_order_margin": open_order_margin,
                         "currency": currency,
+                        "source": "coinswitch_futures_wallet_balance.total_available_balance",
+                        "wallet_type": "USDT_FUTURES",
                     }
+                    logger.info(
+                        "CoinSwitch futures wallet balance source=%s available=$%.4f locked=$%.4f total=$%.4f position_margin=$%.4f open_order_margin=$%.4f",
+                        out["source"], available, locked, total, position_margin, open_order_margin,
+                    )
+                    return out
             
             # If we reach here, USDT was not found
             return {

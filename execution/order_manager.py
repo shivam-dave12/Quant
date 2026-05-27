@@ -256,7 +256,11 @@ class _CoinSwitchAdapter:
         resp = self.api.get_open_orders(exchange=self.exchange_id, symbol=symbol)
         if not isinstance(resp, dict) or resp.get("error"):
             return None
-        raw = resp.get("data", [])
+        data = resp.get("data", {})
+        if isinstance(data, dict):
+            raw = data.get("orders", [])
+        else:
+            raw = data
         return raw if isinstance(raw, list) else []
 
     def get_positions(self, symbol: str) -> Optional[Dict]:
@@ -331,7 +335,22 @@ class _CoinSwitchAdapter:
         tp = self.place_order(exit_side, "TAKE_PROFIT_MARKET", 0.0, trigger_price=float(tp_price), reduce_only=True)
         sl_oid = str((sl or {}).get("order_id") or "") if isinstance(sl, dict) else ""
         tp_oid = str((tp or {}).get("order_id") or "") if isinstance(tp, dict) else ""
-        if not sl_oid or not tp_oid:
+        protection_statuses: dict[str, str] = {}
+        protection_confirmed = bool(sl_oid and tp_oid)
+        if protection_confirmed:
+            # CoinSwitch order placement returning an ID only acknowledges the
+            # request. Confirm both position-level trigger orders via the
+            # documented Get Order Status contract before accepting protection.
+            sl_state = self.get_order(sl_oid) or {}
+            tp_state = self.get_order(tp_oid) or {}
+            protection_statuses = {
+                "stop": self.extract_status(sl_state),
+                "target": self.extract_status(tp_state),
+            }
+            protection_confirmed = all(
+                status in {"PENDING", "FILLED"} for status in protection_statuses.values()
+            )
+        if not protection_confirmed:
             for child in (sl_oid, tp_oid):
                 if child:
                     try:
@@ -340,11 +359,14 @@ class _CoinSwitchAdapter:
                         pass
             emergency = None
             if bool(_cfg("COINSWITCH_EMERGENCY_CLOSE_ON_PROTECTION_FAILURE", True)):
-                emergency = self.place_order(exit_side, "MARKET", filled_qty, reduce_only=False)
+                # Official position lifecycle requires reduce_only for safe
+                # counter-side closure so an emergency action cannot flip exposure.
+                emergency = self.place_order(exit_side, "MARKET", filled_qty, reduce_only=True)
             return {
                 "_error": True, "_sc": 200,
-                "_raw": {"entry_order_id": oid, "stop_response": sl, "target_response": tp, "emergency_close": emergency},
-                "_err_msg": "coinswitch_protection_arm_failed_after_fill",
+                "_raw": {"entry_order_id": oid, "stop_response": sl, "target_response": tp,
+                         "protection_statuses": protection_statuses, "emergency_close": emergency},
+                "_err_msg": "coinswitch_protection_not_confirmed_after_fill",
             }
         return {
             "order_id": oid, "status": "FILLED", "quantity": filled_qty,
@@ -353,7 +375,7 @@ class _CoinSwitchAdapter:
             "bracket_sl_order_id": sl_oid, "bracket_tp_order_id": tp_oid,
             "bracket_sl_price": float(sl_price), "bracket_tp_price": float(tp_price),
             "protection_model": "COINSWITCH_POSITION_TPSL_AFTER_FILL",
-            "protection_confirmed": True,
+            "protection_confirmed": True, "protection_statuses": protection_statuses,
             "paid_commission": 0.0, "paid_commission_exact": False,
         }
 
@@ -2199,29 +2221,20 @@ class _HyperliquidAdapter:
 
     def get_open_orders(self, symbol: str) -> Optional[list]:
         self.limiter.wait()
-        rows = self.api.open_orders()
+        rows = self.api.open_orders(coin=self.symbol)
         sym = str(symbol or self.symbol)
         return [r for r in rows if str(r.get("coin", "")).upper() == sym.upper()]
 
     def get_positions(self, symbol: str) -> Optional[Dict]:
         self.limiter.wait()
-        return self.api.user_state()
+        return self.api.user_state(coin=self.symbol)
 
     def get_balance(self) -> Dict:
         self.limiter.wait()
-        state = self.api.user_state()
-        summary = state.get("marginSummary") or state.get("crossMarginSummary") or {}
-        account_value = self._num(summary.get("accountValue"), 0.0)
-        withdrawable = self._num(state.get("withdrawable"), account_value)
-        return {
-            "available": withdrawable,
-            "available_raw": withdrawable,
-            "total": account_value,
-            "total_raw": account_value,
-            "currency": "USDC",
-            "source": "hyperliquid_user_state",
-            "raw": state,
-        }
+        # Resolve native versus HIP-3 collateral from the selected instrument
+        # and official account-abstraction state; never read the default DEX
+        # for xyz:/km: instruments.
+        return self.api.get_balance(self.symbol)
 
     def set_leverage(self, leverage: int, product_id: Optional[int] = None) -> Dict:
         _ = product_id
