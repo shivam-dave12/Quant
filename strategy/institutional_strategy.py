@@ -248,6 +248,7 @@ class InstitutionalStrategy:
         # It must never block fresh market evaluation on the strategy thread.
         self._entry_lock = threading.RLock()
         self._entry_thread: threading.Thread | None = None
+        self._runtime_stop_requested = threading.Event()
 
     def bind_market_wakeup(self, callback: Callable[[], Any]) -> None:
         self._market_wakeup = callback
@@ -264,6 +265,7 @@ class InstitutionalStrategy:
         context so CoinSwitch/Hyperliquid account endpoints are not flooded.
         """
         self._runtime_order_manager = order_manager
+        self._runtime_stop_requested.clear()
         if self._collateral_service is not None:
             self._collateral_service.register_router(order_manager)
             self._collateral_service.start()
@@ -278,6 +280,7 @@ class InstitutionalStrategy:
         self._venue_cash_refresh_thread.start()
 
     def stop_runtime_services(self) -> None:
+        self._runtime_stop_requested.set()
         # Shared portfolio service is owned and stopped by the orchestrator.
         if self._collateral_service is None:
             self._venue_cash_refresh_stop.set()
@@ -1400,6 +1403,9 @@ class InstitutionalStrategy:
             pass
 
     def _submit_approved_async(self, decision: OpportunityDecision, order_manager, risk_manager) -> None:
+        if self._runtime_stop_requested.is_set():
+            logger.info("Protected entry skipped during runtime stop asset=%s venue=%s instrument=%s", self._asset_id, decision.venue, decision.instrument)
+            return
         sizing = decision.sizing
         protection = decision.protection_plan
         if sizing is None or protection is None:
@@ -1440,6 +1446,9 @@ class InstitutionalStrategy:
                     pass
 
     def _execute_approved(self, decision: OpportunityDecision, order_manager, risk_manager) -> None:
+        if self._runtime_stop_requested.is_set():
+            logger.info("Protected entry aborted before submission during runtime stop asset=%s venue=%s instrument=%s", self._asset_id, decision.venue, decision.instrument)
+            return
         sizing = decision.sizing
         protection = decision.protection_plan
         if sizing is None or protection is None:
@@ -1480,6 +1489,9 @@ class InstitutionalStrategy:
                 self._notify_order_error(decision, execution_manager)
                 logger.error("%s leverage set exception before protected entry: %s", decision.venue.upper(), exc, exc_info=True)
                 return
+        if self._runtime_stop_requested.is_set():
+            logger.info("Protected entry aborted after preflight during runtime stop asset=%s venue=%s instrument=%s", self._asset_id, decision.venue, decision.instrument)
+            return
         result = execution_manager.place_bracket_limit_entry(
             side,
             sizing.quantity,

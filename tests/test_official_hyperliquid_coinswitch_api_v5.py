@@ -156,3 +156,35 @@ def test_hyperliquid_adapter_passes_selected_hip3_symbol_to_balance_orders_and_p
     adapter.get_open_orders("xyz:SILVER")
     adapter.get_positions("xyz:SILVER")
     assert (api.balance_symbol, api.order_symbol, api.state_symbol) == ("xyz:SILVER", "xyz:SILVER", "xyz:SILVER")
+
+
+class _CaptureHyperExchange:
+    def __init__(self):
+        self.bulk_orders_calls = []
+
+    def bulk_orders(self, orders, grouping="na"):
+        self.bulk_orders_calls.append((orders, grouping))
+        return {"status": "ok", "response": {"type": "order", "data": {"statuses": [
+            {"resting": {"oid": 201}},
+            {"resting": {"oid": 202}},
+        ]}}}
+
+
+def test_hyperliquid_post_fill_protection_uses_position_tpsl_grouping():
+    api = object.__new__(HyperliquidAPI)
+    api.exchange = _CaptureHyperExchange()
+    api.size_decimals = lambda coin: 5
+
+    out = api.place_reduce_only_tpsl(
+        coin="BTC",
+        is_buy=True,
+        size=0.00067,
+        stop_px=75061.0,
+        target_px=74203.0,
+    )
+
+    orders, grouping = api.exchange.bulk_orders_calls[0]
+    assert grouping == "positionTpsl"
+    assert HyperliquidAPI.child_order_ids(out) == [201, 202]
+    assert [row["order_type"]["trigger"]["tpsl"] for row in orders] == ["sl", "tp"]
+    assert all(row["reduce_only"] is True for row in orders)

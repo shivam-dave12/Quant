@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import threading
 import sys
 import types
 from types import SimpleNamespace
@@ -180,6 +181,48 @@ def test_protected_entry_supervisor_returns_immediately_and_prevents_tick_blocki
     thread = strategy._entry_thread
     assert thread is not None
     thread.join(timeout=1.0)
+    assert strategy._pos.phase is PositionPhase.FLAT
+
+
+def test_runtime_stop_blocks_async_entry_after_preflight(monkeypatch, tmp_path):
+    monkeypatch.setattr("strategy.institutional_strategy._cfg", lambda name, default: str(tmp_path) if name == "RESEARCH_STORE_PATH" else default)
+    strategy = InstitutionalStrategy(instrument=None)
+
+    class _BlockingOrders:
+        active_exchange = "hyperliquid"
+        symbol = "BTC"
+        display_symbol = "BTC"
+
+        def __init__(self):
+            self.leverage_entered = threading.Event()
+            self.release_leverage = threading.Event()
+            self.placed = []
+
+        def set_leverage(self, leverage):
+            self.leverage_entered.set()
+            self.release_leverage.wait(timeout=1.0)
+            return {"success": True, "leverage": leverage}
+
+        def place_bracket_limit_entry(self, *args, **kwargs):
+            self.placed.append((args, kwargs))
+            return {"order_id": "late-entry"}
+
+    orders = _BlockingOrders()
+    decision = SimpleNamespace(
+        sizing=SimpleNamespace(quantity=1.0, leverage_selected=10.0),
+        protection_plan=SimpleNamespace(entry_price=100.0, stop_price=99.0, target_price=102.0, protection_type="VENUE_NATIVE_BRACKET"),
+        direction=Direction.LONG, venue="hyperliquid", instrument="BTC", model_values={},
+    )
+
+    strategy._submit_approved_async(decision, orders, SimpleNamespace())
+    assert orders.leverage_entered.wait(timeout=1.0)
+    thread = strategy._entry_thread
+    assert thread is not None
+    strategy.stop_runtime_services()
+    orders.release_leverage.set()
+    thread.join(timeout=1.0)
+
+    assert orders.placed == []
     assert strategy._pos.phase is PositionPhase.FLAT
 
 

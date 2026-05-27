@@ -477,7 +477,7 @@ class HyperliquidAPI:
                 "reduce_only": True,
             },
         ]
-        return ex.bulk_orders(orders, grouping="normalTpsl")
+        return ex.bulk_orders(orders, grouping="positionTpsl")
 
     def query_order(self, oid: str | int) -> Any:
         return self.info.query_order_by_oid(self.account_address, int(oid))
@@ -495,4 +495,3 @@ class HyperliquidAPI:
 
     def update_leverage(self, coin: str, leverage: int, is_cross: bool = True) -> Any:
         return self._require_exchange().update_leverage(int(leverage), str(coin), is_cross=bool(is_cross))
-
