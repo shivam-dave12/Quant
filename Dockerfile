@@ -25,13 +25,16 @@ PY
 
 RUN useradd --home-dir /app/.runtime-home --create-home --shell /usr/sbin/nologin botuser
 
-# GrowwFeed(groww) in the official SDK writes package-local cache/state files at
-# runtime:
-#   - growwapi/instruments.csv
-#   - growwapi/common/a.creds
-# Grant the non-root process write access only to those SDK-owned runtime files;
-# do not make the Python package/code directory writable.
-RUN python - <<'PY'
+# GrowwFeed(groww) in the official SDK writes package-local runtime state at
+# startup. Live logs proved this is not a single fixed filename: after
+# instruments.csv it created growwapi/common/a.creds, then growwapi/common/b.creds.
+# Institutional boundary:
+#   - keep the full site-packages tree read-only;
+#   - keep Groww package code read-only;
+#   - allow botuser write access only to the SDK-owned runtime-state directory
+#     that the official feed client itself uses, plus the SDK instruments cache.
+# This avoids filename whack-a-mole without granting broad package write access.
+RUN python - <<'EOF'
 from pathlib import Path
 from pwd import getpwnam
 import os
@@ -39,17 +42,20 @@ import growwapi
 
 user = getpwnam("botuser")
 sdk_root = Path(growwapi.__file__).resolve().parent
-runtime_files = [
-    sdk_root / "instruments.csv",
-    sdk_root / "common" / "a.creds",
-]
-for cache in runtime_files:
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    cache.touch(exist_ok=True)
-    os.chown(cache, user.pw_uid, user.pw_gid)
-    os.chmod(cache, 0o600)
-    print(f"Groww SDK runtime cache prepared for non-root runtime: {cache}")
-PY
+common_state_dir = sdk_root / "common"
+instruments_cache = sdk_root / "instruments.csv"
+
+common_state_dir.mkdir(parents=True, exist_ok=True)
+instruments_cache.touch(exist_ok=True)
+
+os.chown(common_state_dir, user.pw_uid, user.pw_gid)
+os.chmod(common_state_dir, 0o700)
+os.chown(instruments_cache, user.pw_uid, user.pw_gid)
+os.chmod(instruments_cache, 0o600)
+
+print(f"Groww SDK runtime state dir prepared for non-root runtime: {common_state_dir}")
+print(f"Groww SDK instruments cache prepared for non-root runtime: {instruments_cache}")
+EOF
 
 COPY . .
 

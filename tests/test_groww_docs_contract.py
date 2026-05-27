@@ -178,11 +178,14 @@ def test_oco_submission_response_is_not_accepted_as_protection_confirmation():
     assert result.emergency_order_id == "emergency"
 
 
-def test_runtime_image_prepares_only_groww_sdk_feed_cache_file_for_botuser():
+def test_runtime_image_scopes_groww_sdk_state_boundary_for_botuser():
     from pathlib import Path
 
     dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text(encoding="utf-8")
-    assert 'sdk_root / "instruments.csv"' in dockerfile
-    assert 'sdk_root / "common" / "a.creds"' in dockerfile
-    assert "os.chown(cache, user.pw_uid, user.pw_gid)" in dockerfile
+    assert 'common_state_dir = sdk_root / "common"' in dockerfile
+    assert 'instruments_cache = sdk_root / "instruments.csv"' in dockerfile
+    assert "os.chown(common_state_dir, user.pw_uid, user.pw_gid)" in dockerfile
+    assert "os.chmod(common_state_dir, 0o700)" in dockerfile
+    assert "os.chown(instruments_cache, user.pw_uid, user.pw_gid)" in dockerfile
     assert "chown -R botuser:botuser /usr/local/lib/python3.11/site-packages" not in dockerfile
+    assert "chmod -R" not in dockerfile
