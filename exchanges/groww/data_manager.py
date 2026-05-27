@@ -1045,10 +1045,10 @@ class GrowwOptionDataManager:
         logger.info(
             "GROWW SESSION CONTRACT BOOK %s [%s] reason=%s spot=%.2f funds=₹%.2f | "
             "CE=%s strike=%.2f expiry=%s lot=%.0f prem=₹%.2f score=%.3f delta=%+.3f theta/day=%.4f theta/hold=%.2fbps | "
-            "PE=%s strike=%.2f expiry=%s lot=%.0f prem=₹%.2f score=%.3f delta=%+.3f theta/day=%.4f theta/hold=%.2fbps | audit=%s",
+            "PE=%s strike=%.2f expiry=%s lot=%.0f prem=₹%.2f score=%.3f delta=%+.3f theta/day=%.4f theta/hold=%.2fbps",
             raw["session_contract_book_status"], book.trade_date_ist, reason, underlying_spot, available_funds,
             book.call.selected_symbol, book.call.strike, book.call.expiry, float(book.call.raw.get("runtime_lot_size", 0.0) or 0.0), float(book.call.raw.get("selected_entry_premium", 0.0) or 0.0), book.call.score, book.call.delta, book.call.theta_to_premium, float(book.call.raw.get("theta_carry_bps_expected_hold", 0.0) or 0.0),
-            book.put.selected_symbol, book.put.strike, book.put.expiry, float(book.put.raw.get("runtime_lot_size", 0.0) or 0.0), float(book.put.raw.get("selected_entry_premium", 0.0) or 0.0), book.put.score, book.put.delta, book.put.theta_to_premium, float(book.put.raw.get("theta_carry_bps_expected_hold", 0.0) or 0.0), self._compact_model_audit(diagnostics),
+            book.put.selected_symbol, book.put.strike, book.put.expiry, float(book.put.raw.get("runtime_lot_size", 0.0) or 0.0), float(book.put.raw.get("selected_entry_premium", 0.0) or 0.0), book.put.score, book.put.delta, book.put.theta_to_premium, float(book.put.raw.get("theta_carry_bps_expected_hold", 0.0) or 0.0),
         )
         if bool(_cfg("GROWW_SESSION_MODEL_AUDIT_FULL_INFO", False)):
             logger.info("GROWW SESSION MODEL_AUDIT_DETAIL %s", diagnostics)

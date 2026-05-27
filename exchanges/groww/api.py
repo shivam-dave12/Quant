@@ -68,11 +68,11 @@ class GrowwRestClient:
         # Groww documents three distinct credential modes.  Keep the TOTP token
         # separate from an API-key/secret credential and from a generated access
         # token so a long-lived TOTP token can never be sent as a bearer token.
-        self.access_token = (access_token or _cfg("GROWW_ACCESS_TOKEN", "") or os.getenv("GROWW_ACCESS_TOKEN", "")).strip()
-        self.totp_token = (totp_token or _cfg("GROWW_TOTP_TOKEN", "") or os.getenv("GROWW_TOTP_TOKEN", "")).strip()
-        self.totp_secret = (totp_secret or _cfg("GROWW_TOTP_SECRET", "") or os.getenv("GROWW_TOTP_SECRET", "")).strip()
-        self.api_key = (api_key or _cfg("GROWW_API_KEY", "") or os.getenv("GROWW_API_KEY", "")).strip()
-        self.api_secret = (api_secret or _cfg("GROWW_API_SECRET", "") or os.getenv("GROWW_API_SECRET", "")).strip()
+        self.access_token = (access_token or _cfg("GROWW_ACCESS_TOKEN", "")).strip()
+        self.totp_token = (totp_token or _cfg("GROWW_TOTP_TOKEN", "")).strip()
+        self.totp_secret = (totp_secret or _cfg("GROWW_TOTP_SECRET", "")).strip()
+        self.api_key = (api_key or _cfg("GROWW_API_KEY", "")).strip()
+        self.api_secret = (api_secret or _cfg("GROWW_API_SECRET", "")).strip()
         self._client = None
         self._instrument_rows: list[dict[str, Any]] = []
         self._instrument_loaded_ts = 0.0
@@ -148,13 +148,11 @@ class GrowwRestClient:
         """Validate outbound IP for live Groww order routing.
 
         Groww live order placement must originate from an approved static IP.
-        The approved IP list is operator supplied via GROWW_APPROVED_STATIC_IPS.
-        GROWW_OUTBOUND_IP_OVERRIDE is supported for controlled deployment tests.
+        The approved IP list is controlled in config.py via GROWW_APPROVED_STATIC_IPS.
+        GROWW_OUTBOUND_IP_OVERRIDE is config-only and supported for controlled deployment tests.
         """
         required = bool(_cfg("GROWW_REQUIRE_STATIC_IP_FOR_LIVE_ORDERS", True))
-        approved_ips = tuple(_cfg("GROWW_APPROVED_STATIC_IPS", ())) or tuple(
-            x.strip() for x in os.getenv("GROWW_APPROVED_STATIC_IPS", "").split(",") if x.strip()
-        )
+        approved_ips = tuple(_cfg("GROWW_APPROVED_STATIC_IPS", ()))
         if not required:
             return {"required": False, "approved": True, "reason": "not_required"}
         if not approved_ips:
@@ -165,7 +163,7 @@ class GrowwRestClient:
                 "observed_ip": "",
                 "reason": "GROWW_APPROVED_STATIC_IPS missing",
             }
-        observed = str(_cfg("GROWW_OUTBOUND_IP_OVERRIDE", "") or os.getenv("GROWW_OUTBOUND_IP_OVERRIDE", "")).strip()
+        observed = str(_cfg("GROWW_OUTBOUND_IP_OVERRIDE", "")).strip()
         if not observed:
             try:
                 import requests

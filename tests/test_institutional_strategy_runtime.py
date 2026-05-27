@@ -131,7 +131,7 @@ def test_shadow_mode_blocks_live_order_even_when_flow_edge_is_positive(tmp_path,
     for i in range(80):
         strategy.on_tick(data, orders, _Risk(), i)
     assert strategy._last_decision is not None
-    assert strategy._last_decision.decision is DecisionOutput.NO_TRADE_INSUFFICIENT_EDGE
+    assert strategy._last_decision.decision is DecisionOutput.SHADOW_SIGNAL_VALIDATED
     assert "shadow_mode_live_entries_disabled" in strategy._last_decision.reasons
     assert orders.placed == []
 
@@ -378,7 +378,8 @@ def test_decision_telemetry_emits_compact_transition_not_every_tick(tmp_path, mo
         strategy._log_decision_calculation(decision)
     assert caplog.text.count("DECISION_TRANSITION") == 1
     assert "DECISION_DETAIL" not in caplog.text
-    assert "NO_DIRECTION_ACTIVATED_OPTION_YET" in caplog.text
+    assert "NOT_EVALUATED_UNTIL_DIRECTION_ACTIVATES_CE_OR_PE" in caplog.text
+    assert '"liquidity_score":null' in caplog.text
 
 
 def test_decision_telemetry_can_emit_full_detail_on_transition(tmp_path, monkeypatch, caplog):
@@ -434,3 +435,72 @@ def test_telemetry_does_not_log_unqualified_microstructure_flips_as_transitions(
         strategy._log_decision_calculation(decision(Direction.LONG, "ofi_tfi_microprice_long"))
         strategy._log_decision_calculation(decision(Direction.SHORT, "ofi_tfi_microprice_short"))
     assert caplog.text.count("DECISION_TRANSITION") == 1
+
+
+def test_nonactionable_blocker_does_not_emit_transition_only_for_regime_flip(tmp_path, monkeypatch, caplog):
+    def cfg(name, default):
+        values = {
+            "RESEARCH_STORE_PATH": str(tmp_path),
+            "INSTITUTIONAL_DECISION_TELEMETRY_ENABLED": True,
+            "INSTITUTIONAL_DECISION_TELEMETRY_HEARTBEAT_SEC": 30.0,
+        }
+        return values.get(name, default)
+    monkeypatch.setattr("strategy.institutional_strategy._cfg", cfg)
+    strategy = InstitutionalStrategy(instrument=_groww_instrument_for_strategy())
+    from strategy.domain import DecisionOutput, Direction, Regime
+    def blocked(regime):
+        return strategy._decision(
+            desk="DESK_A_METALS", venue="delta", instrument="SLVONUSD",
+            decision=DecisionOutput.NO_TRADE_INSUFFICIENT_EDGE, direction=Direction.NO_TRADE,
+            regime=regime, expected_net_edge_bps=-20.0, uncertainty_bps=7.0,
+            liquidity_score=0.2, execution_quality_score=1.0, sizing=None, protection_plan=None,
+            reasons=["near_touch_depth_unavailable", "net_edge_does_not_clear_uncertainty_and_minimum"],
+            model_values={"signal_source": "near_touch_depth_unavailable", "costs_bps": 22.0},
+            research_features={},
+        )
+    import logging
+    with caplog.at_level(logging.INFO):
+        strategy._log_decision_calculation(blocked(Regime.BALANCE))
+        strategy._log_decision_calculation(blocked(Regime.TREND))
+    assert caplog.text.count("DECISION_TRANSITION") == 1
+
+
+def test_shadow_validated_telemetry_is_not_labelled_insufficient_edge(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr("strategy.institutional_strategy._cfg", lambda name, default: {
+        "RESEARCH_STORE_PATH": str(tmp_path),
+        "INSTITUTIONAL_DECISION_TELEMETRY_ENABLED": True,
+    }.get(name, default))
+    strategy = InstitutionalStrategy(instrument=_groww_instrument_for_strategy())
+    from strategy.domain import DecisionOutput, Direction, Regime
+    decision = strategy._decision(
+        desk="DESK_A_METALS", venue="delta", instrument="PAXGUSD",
+        decision=DecisionOutput.SHADOW_SIGNAL_VALIDATED, direction=Direction.LONG,
+        regime=Regime.BALANCE, expected_net_edge_bps=4.8, uncertainty_bps=3.0,
+        liquidity_score=0.9, execution_quality_score=1.0, sizing=None, protection_plan=None,
+        reasons=["shadow_mode_live_entries_disabled"], model_values={"costs_bps": 2.7}, research_features={},
+    )
+    import logging
+    with caplog.at_level(logging.INFO):
+        strategy._log_decision_calculation(decision)
+    assert "DECISION_SHADOW_VALIDATED" in caplog.text
+    assert "SHADOW_SIGNAL_VALIDATED" in caplog.text
+
+
+def test_microstructure_telemetry_includes_weighted_edge_components(tmp_path, monkeypatch):
+    monkeypatch.setattr("strategy.institutional_strategy._cfg", lambda name, default: {
+        "RESEARCH_STORE_PATH": str(tmp_path),
+        "INSTITUTIONAL_REQUIRE_BTC_CROSS_VENUE": False,
+        "INSTITUTIONAL_MIN_SIGNAL_BPS": 0.01,
+    }.get(name, default))
+    strategy = InstitutionalStrategy(instrument=_instrument())
+    data = _Data([100.0] * 40, feed_ok=True, flow=2400.0)
+    decision = strategy.evaluate(data, _Orders(), _Risk(), 1)
+    values = decision.model_values
+    assert values["near_touch_depth_usd"] > 0
+    assert "weighted_signal_bps" in values
+    assert "ofi_component_bps" in values
+    assert "tfi_component_bps" in values
+    assert abs(values["weighted_signal_bps"] - (
+        values["ofi_component_bps"] + values["tfi_component_bps"]
+        + values["microprice_component_bps"] + values["dislocation_component_bps"]
+    )) < 1e-9

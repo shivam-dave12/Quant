@@ -1271,10 +1271,20 @@ class MultiAssetInstitutionalBot:
             inst = ctx.instrument
             price = ctx.data_manager.get_last_price()
             pos = ctx.strategy.get_position()
-            engine = getattr(ctx.strategy, "_entry_engine", None)
-            info = engine.analysis_info if engine is not None else {}
-            state = ctx.phase_name if pos else str(info.get("state", "WARMUP"))
-            block = str(info.get("block_reason", "WAITING_FOR_FIRST_DECISION"))
+            decision = getattr(ctx.strategy, "_last_decision", None)
+            if pos:
+                state = ctx.phase_name
+                block = "POSITION_ACTIVE"
+            elif decision is None:
+                state = "WARMUP"
+                block = "WAITING_FOR_FIRST_DECISION"
+            elif getattr(getattr(decision, "decision", None), "value", "") == "SHADOW_SIGNAL_VALIDATED":
+                state = "SHADOW_VALIDATED"
+                block = "LIVE_ENTRIES_DISABLED"
+            else:
+                state = "SCANNING"
+                reasons = list(getattr(decision, "reasons", []) or [])
+                block = str(reasons[0] if reasons else getattr(getattr(decision, "decision", None), "value", "DECISION_AVAILABLE"))
             with instrument_scope(inst):
                 logger.info(
                     "🩺 DESK_HEALTH asset=%s venue=%s symbol=%s state=%s block=%s mark=%.4f eval_ms=%.1f slots=%d/%d %s",

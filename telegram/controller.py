@@ -929,158 +929,30 @@ class TelegramBotController:
     # ================================================================
 
     def _cmd_setexchange(self, args: str) -> str:
-        global bot_instance, bot_running
-
-        if not args:
-            active = getattr(config, "EXECUTION_EXCHANGE", "?")
-            return (
-                f"Current execution exchange: <b>{active.upper()}</b>\n\n"
-                f"Usage: /setexchange &lt;exchange&gt;\n"
-                f"Valid values: <code>delta</code>, <code>coinswitch</code>\n\n"
-                f"<i>Data is aggregated from both exchanges regardless of this setting.</i>"
-            )
-
-        target = args.strip().lower()
-
-        if not bot_running or bot_instance is None:
-            try:
-                from core.types import Exchange
-                Exchange.from_str(target)
-                config.EXECUTION_EXCHANGE = Exchange.from_str(target).value
-                return (f"✅ Execution exchange set to <b>{target.upper()}</b> "
-                        f"(bot not running — takes effect on next start)")
-            except ValueError:
-                return f"❌ Unknown exchange: <code>{target}</code>"
-
-        router = getattr(bot_instance, "execution_router", None)
-        if router is None:
-            return "❌ Execution router not available."
-
-        strategy = getattr(bot_instance, "strategy", None)
-        success, message = router.switch(target, strategy=strategy)
-
-        if success:
-            message += "\nLeverage remains unset while flat; it will be computed and applied only for an approved structural entry."
-        return message
+        _ = args
+        allowed = ", ".join(str(v).upper() for v in getattr(config, "LIVE_EXECUTION_VENUES", ())) or "NONE"
+        return (
+            "🔒 <b>CONFIG-OWNED EXECUTION POLICY</b>\n"
+            f"Discovery preference: <code>{getattr(config, 'EXECUTION_EXCHANGE', '?').upper()}</code>\n"
+            f"Live-order venues: <code>{allowed}</code>\n\n"
+            "Runtime exchange switching is disabled. Edit <code>config.py</code> "
+            "(<code>LIVE_EXECUTION_VENUES</code> / <code>LIVE_TRADING_ENABLED</code>) "
+            "and restart the service."
+        )
 
     # ================================================================
     # /set
     # ================================================================
 
     def _cmd_set(self, args: str) -> str:
-        import config as cfg
-
-        if not args or len(args.split()) < 2:
-            return (
-                "Usage: /set &lt;key&gt; &lt;value&gt;\n\n"
-                "<b>Adjustable:</b>\n"
-                "  leverage          int   (e.g. 20)\n"
-                "  risk              float (0.001-0.050, e.g. 0.025 = 2.5%)\n"
-                "  cooldown          int   seconds\n"
-                "  loss_lockout      int   seconds after any loss\n"
-                "  consec_lockout    int   seconds after max consecutive losses\n"
-                "  max_daily_trades  int\n"
-                "  max_daily_loss    float %\n"
-                "  max_consec_loss   int\n"
-                "  min_rr            float\n"
-
-                "  max_hold          int   seconds\n"
-            )
-
-        parts   = args.split(None, 1)
-        key     = parts[0].lower().strip()
-        val_str = parts[1].strip()
-
-        allowed = {
-            "leverage":         ("LEVERAGE",             int),
-            # Stop-risk ceiling; margin policy remains desk-specific and visible
-            # in institutional liquidity decision and funding logs.
-            "risk":             ("RISK_PER_TRADE",       float),
-            "cooldown":         ("MIN_TIME_BETWEEN_TRADES_SEC", int),
-            "loss_lockout":     ("INSTITUTIONAL_LOCKOUT_AFTER_LOSS_SEC", int),
-            "consec_lockout":   ("INSTITUTIONAL_LOSS_LOCKOUT_SEC", int),
-            "max_daily_trades": ("MAX_DAILY_TRADES",     int),
-            "max_daily_loss":   ("MAX_DAILY_LOSS_PCT",   float),
-            "max_consec_loss":  ("MAX_CONSECUTIVE_LOSSES", int),
-            "min_rr":           ("MIN_RISK_REWARD_RATIO", float),
-            "max_hold":         ("INSTITUTIONAL_MAX_HOLD_SEC",   int),
-        }
-
-        if key not in allowed:
-            return (f"Unknown key: <code>{key}</code>\n"
-                    f"Allowed: {', '.join(sorted(allowed.keys()))}")
-
-        attr_name, val_type = allowed[key]
-        try:
-            new_val = (val_str.lower() in ("true", "1", "yes", "on")
-                       if val_type == bool else val_type(val_str))
-        except ValueError:
-            return f"Invalid value: <code>{val_str}</code> (expected {val_type.__name__})"
-
-        old_val = getattr(cfg, attr_name, "?")
-
-        if key == "leverage":
-            global bot_instance, bot_running
-            if bot_running and bot_instance and bot_instance.strategy:
-                pos = bot_instance.strategy.get_position()
-                if pos:
-                    return (
-                        f"❌ Cannot change leverage while position is open.\n"
-                        f"Close position first, then /set leverage {new_val}."
-                    )
-            setattr(cfg, attr_name, new_val)
-            return (f"✅ <b>VENUE LEVERAGE CAP</b>: {old_val}x → <b>{new_val}x</b>\n"
-                    "No exchange leverage is changed while flat. The next approved structural entry "
-                    "computes and sets only the leverage required by its risk/margin geometry.")
-
-        # ── Risk per trade validation ─────────────────────────────────────
-        if key == "risk":
-            if not (0.001 <= new_val <= 0.050):
-                return (
-                    f"Risk/trade must be 0.001-0.050 (0.1%-5.0%).\n"
-                    f"You entered: {new_val} ({new_val*100:.2f}%)\n"
-                    f"Example: /set risk 0.025  (= 2.5% of balance risked per trade at SL)"
-                )
-            if bot_running and bot_instance and bot_instance.strategy:
-                pos = bot_instance.strategy.get_position()
-                if pos:
-                    return (
-                        f"❌ Cannot change risk/trade while position is open.\n"
-                        f"Close position first, then /set risk {new_val}."
-                    )
-            setattr(cfg, attr_name, new_val)
-            logger.info(f"CONFIG via Telegram: {attr_name} {old_val} → {new_val}")
-            return (
-                f"✅ <b>RISK/TRADE</b>: {old_val*100:.2f}% → <b>{new_val*100:.2f}%</b>\n"
-                f"Next trade will risk {new_val*100:.2f}% of available balance at SL."
-            )
-
-        if key == "cooldown":
-            setattr(cfg, "TRADE_COOLDOWN_SECONDS", int(new_val))
-
-        setattr(cfg, attr_name, new_val)
-        logger.info(f"CONFIG via Telegram: {attr_name} {old_val} → {new_val}")
-
-        # Bug #41 fix: several module-level constants in other modules are read
-        # at import time and never re-read from config afterward.  When the
-        # operator changes them via /set, the config module is updated but the
-        # cached constant in the consuming module is stale.  Propagate the change
-        # explicitly here.
-        if key == "min_rr":
-            try:
-                import strategy.entry_engine as _ee
-                if hasattr(_ee, '_MIN_RR_RATIO'):
-                    _ee._MIN_RR_RATIO = float(new_val)
-                    logger.info(f"CONFIG propagated to entry_engine._MIN_RR_RATIO = {new_val}")
-            except ImportError:
-                try:
-                    import entry_engine as _ee
-                    if hasattr(_ee, '_MIN_RR_RATIO'):
-                        _ee._MIN_RR_RATIO = float(new_val)
-                except ImportError:
-                    pass
-
-        return f"✅ <b>{attr_name}</b>: {old_val} → <b>{new_val}</b>"
+        _ = args
+        return (
+            "🔒 <b>CONFIG-OWNED RUNTIME POLICY</b>\n"
+            "Telegram parameter mutation is disabled.\n\n"
+            "Edit <code>config.py</code> and restart <code>quant.service</code>. "
+            "Secrets remain in <code>.env</code>; all risk, model, live-mode and "
+            "telemetry policy remains version-controlled in code."
+        )
 
     # ================================================================
     # /pnl — Quick PnL snapshot (most used command)
@@ -1368,8 +1240,10 @@ class TelegramBotController:
         self.send_message(
             "⚡ <b>Institutional Controller Ready</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "🏦 Execution: <code>" + getattr(config, "EXECUTION_EXCHANGE", "?").upper() + "</code>\n"
-            "?? Groww credentials: <code>" + ("ready" if (getattr(config, "GROWW_ACCESS_TOKEN", "") or (getattr(config, "GROWW_TOTP_TOKEN", "") and getattr(config, "GROWW_TOTP_SECRET", "")) or (getattr(config, "GROWW_API_KEY", "") and getattr(config, "GROWW_API_SECRET", ""))) else "missing") + "</code>\n\n"
+            "🏦 Discovery preference: <code>" + getattr(config, "EXECUTION_EXCHANGE", "?").upper() + "</code>\n"
+            "🚦 Live trading: <code>" + ("ENABLED" if bool(getattr(config, "LIVE_TRADING_ENABLED", False)) else "SHADOW") + "</code>\n"
+            "🎯 Live venues: <code>" + ",".join(str(v).upper() for v in getattr(config, "LIVE_EXECUTION_VENUES", ())) + "</code>\n"
+            "🔐 Groww credentials: <code>" + ("ready" if (getattr(config, "GROWW_ACCESS_TOKEN", "") or (getattr(config, "GROWW_TOTP_TOKEN", "") and getattr(config, "GROWW_TOTP_SECRET", "")) or (getattr(config, "GROWW_API_KEY", "") and getattr(config, "GROWW_API_SECRET", ""))) else "missing") + "</code>\n\n"
             + self._cmd_help())
         logger.info("Telegram controller started")
         self._maybe_run_groww_premarket_refresh()

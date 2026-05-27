@@ -68,6 +68,24 @@ def _num(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _live_routing_permission(venue: str) -> tuple[bool, str]:
+    """Return live-order permission from the code-owned control plane.
+
+    Analysis and shadow validation continue on every configured data venue.
+    An order can route only when the master switch is enabled and this exact
+    execution venue is explicitly allow-listed in config.py.
+    """
+    master = bool(_cfg("LIVE_TRADING_ENABLED", _cfg("INSTITUTIONAL_ENABLE_LIVE_ENTRIES", False)))
+    if not master:
+        return False, "shadow_mode_live_entries_disabled"
+    raw = _cfg("LIVE_EXECUTION_VENUES", ("delta", "coinswitch", "groww"))
+    allowed = {str(v).strip().lower() for v in (raw if isinstance(raw, (tuple, list, set)) else str(raw).split(",")) if str(v).strip()}
+    venue_key = str(venue or "").strip().lower()
+    if venue_key not in allowed:
+        return False, f"live_execution_venue_not_authorised:{venue_key or 'unknown'}"
+    return True, "live_execution_authorised"
+
+
 class PositionPhase(str, Enum):
     FLAT = "FLAT"
     ENTERING = "ENTERING"
@@ -266,8 +284,23 @@ class InstitutionalStrategy:
             reasons = ["unqualified_signal_below_required_edge", "net_edge_does_not_clear_uncertainty_and_minimum"]
             signal_source = "unqualified_signal"
             direction_key = "UNQUALIFIED_SIGNAL"
+        regime_key = decision.regime.value
+        stable_non_actionable_reasons = {
+            "btc_reference_microstate_unavailable",
+            "near_touch_depth_unavailable",
+            "nifty_no_valid_structural_displacement",
+            "unqualified_signal_below_required_edge",
+            "flow_signal_flat",
+        }
+        if (
+            decision.decision is DecisionOutput.NO_TRADE_INSUFFICIENT_EDGE
+            and reasons and reasons[0] in stable_non_actionable_reasons
+        ):
+            # Regime stays in the heartbeat payload but cannot cause operational
+            # transition spam while the same execution/edge blocker is unchanged.
+            regime_key = "HEARTBEAT_ONLY_WHILE_NON_ACTIONABLE"
         return (
-            decision.decision.value, direction_key, decision.regime.value, tuple(reasons),
+            decision.decision.value, direction_key, regime_key, tuple(reasons),
             signal_source, str(model.get("thesis_reason", "")),
             bool(option_context.get("ready_for_long_premium_decision", False)),
             str(execution_feed.get("status", "")), str(session_book.get("status", "")),
@@ -333,7 +366,13 @@ class InstitutionalStrategy:
                     "cost_bps": self._round_or_none(model.get("costs_bps")),
                 }
             if decision.liquidity_score == 0.0 and decision.direction is Direction.NO_TRADE:
-                payload["liquidity_score_scope"] = "NO_DIRECTION_ACTIVATED_OPTION_YET; SEE_SESSION_BOOK_FOR_LIVE_CE_PE_BOOKS"
+                # No direction means a CE or PE has not been activated for order
+                # measurement. Do not report this internal sentinel as zero liquidity.
+                payload["liquidity_score"] = None
+                payload["liquidity_score_scope"] = "NOT_EVALUATED_UNTIL_DIRECTION_ACTIVATES_CE_OR_PE"
+                payload["preselected_ce_pe_book_live"] = bool(
+                    isinstance(session_book, dict) and session_book.get("status") == "READY"
+                )
         else:
             costs = model.get("execution_cost_components", {}) if isinstance(model.get("execution_cost_components"), dict) else {}
             payload["microstructure"] = {
@@ -345,6 +384,14 @@ class InstitutionalStrategy:
                 "ofi_10s_usd": self._round_or_none(model.get("ofi_usd_10s"), 2),
                 "tfi_1s_usd": self._round_or_none(model.get("tfi_usd_1s"), 2),
                 "tfi_10s_usd": self._round_or_none(model.get("tfi_usd_10s"), 2),
+                "near_touch_depth_usd": self._round_or_none(model.get("near_touch_depth_usd"), 2),
+                "weighted_signal_bps": self._round_or_none(model.get("weighted_signal_bps")),
+                "signal_components_bps": {
+                    "ofi": self._round_or_none(model.get("ofi_component_bps")),
+                    "tfi": self._round_or_none(model.get("tfi_component_bps")),
+                    "microprice": self._round_or_none(model.get("microprice_component_bps")),
+                    "dislocation": self._round_or_none(model.get("dislocation_component_bps")),
+                },
             }
         if decision.sizing is not None:
             payload["sizing"] = asdict(decision.sizing)
@@ -370,11 +417,15 @@ class InstitutionalStrategy:
         debug_every_tick = bool(_cfg("INSTITUTIONAL_DECISION_TELEMETRY_DEBUG_EVERY_TICK", False))
         if not transition and not decision.approved and not debug_every_tick and now - self._telemetry_last_emit_ts < heartbeat_sec:
             return
-        event = "APPROVED" if decision.approved else ("TRANSITION" if transition else "HEARTBEAT")
+        shadow_validated = decision.decision is DecisionOutput.SHADOW_SIGNAL_VALIDATED
+        event = "APPROVED" if decision.approved else ("SHADOW_VALIDATED" if shadow_validated and transition else ("TRANSITION" if transition else "HEARTBEAT"))
         try:
             compact = self._compact_decision_payload(decision, event)
             logger.info("🧮 DECISION_%s %s", event, json.dumps(compact, sort_keys=True, separators=(",", ":"), default=str))
-            full_detail = bool(decision.approved or debug_every_tick or (transition and _cfg("INSTITUTIONAL_DECISION_TELEMETRY_FULL_ON_TRANSITION", False)))
+            full_detail = bool(
+                decision.approved or (shadow_validated and transition) or debug_every_tick
+                or (transition and _cfg("INSTITUTIONAL_DECISION_TELEMETRY_FULL_ON_TRANSITION", False))
+            )
             if full_detail:
                 sizing = asdict(decision.sizing) if decision.sizing is not None else None
                 protection = asdict(decision.protection_plan) if decision.protection_plan is not None else None
@@ -433,7 +484,7 @@ class InstitutionalStrategy:
         liquidity_score, zones = self._liquidity_score(data_manager, instrument, price, execution_state=execution_state)
         if btc_composite is not None:
             execution_quality = btc_composite.delta_execution_quality_score
-        direction, directional_edge_bps, direction_reason = self._direction_and_edge(
+        direction, directional_edge_bps, direction_reason, signal_breakdown = self._direction_and_edge(
             desk, price, liquidity_score, execution_state=execution_state, btc_composite=btc_composite
         )
         cost_components = self._execution_cost_components(data_manager)
@@ -451,6 +502,7 @@ class InstitutionalStrategy:
             "regime": regime.value,
             "signal_source": direction_reason,
         }
+        model_values.update(signal_breakdown)
         if execution_state is not None:
             model_values.update({
                 "ofi_usd_1s": execution_state.ofi_usd_1s,
@@ -534,12 +586,13 @@ class InstitutionalStrategy:
                 research_features=features,
             )
 
-        if not bool(_cfg("INSTITUTIONAL_ENABLE_LIVE_ENTRIES", False)):
+        live_allowed, live_reason = _live_routing_permission(venue)
+        if not live_allowed:
             return self._decision(
                 desk=desk,
                 venue=venue,
                 instrument=instrument,
-                decision=DecisionOutput.NO_TRADE_INSUFFICIENT_EDGE,
+                decision=DecisionOutput.SHADOW_SIGNAL_VALIDATED,
                 direction=direction,
                 regime=regime,
                 expected_net_edge_bps=net_edge,
@@ -548,7 +601,7 @@ class InstitutionalStrategy:
                 execution_quality_score=execution_quality,
                 sizing=sizing,
                 protection_plan=protection,
-                reasons=["shadow_mode_live_entries_disabled"],
+                reasons=[live_reason],
                 model_values=model_values,
                 research_features=features,
             )
@@ -729,13 +782,14 @@ class InstitutionalStrategy:
                 sizing=sizing, protection_plan=protection, reasons=sizing.reasons,
                 model_values=model_values, research_features=features,
             )
-        if not bool(_cfg("INSTITUTIONAL_ENABLE_LIVE_ENTRIES", False)):
+        live_allowed, live_reason = _live_routing_permission(venue)
+        if not live_allowed:
             return self._decision(
                 desk=DeskId.INDIA_OPTIONS.value, venue=venue, instrument=instrument,
-                decision=DecisionOutput.NO_TRADE_INSUFFICIENT_EDGE, direction=thesis,
+                decision=DecisionOutput.SHADOW_SIGNAL_VALIDATED, direction=thesis,
                 regime=regime, expected_net_edge_bps=net_edge, uncertainty_bps=uncertainty_bps,
                 liquidity_score=liquidity_score, execution_quality_score=feed_health.quality_score,
-                sizing=sizing, protection_plan=protection, reasons=["shadow_mode_live_entries_disabled"],
+                sizing=sizing, protection_plan=protection, reasons=[live_reason],
                 model_values=model_values, research_features=features,
             )
         return self._decision(
@@ -845,8 +899,8 @@ class InstitutionalStrategy:
                     model_values=decision.model_values,
                     reasons=decision.reasons,
                     features=decision.research_features,
-                    model_version="observable-groww-carry-aware-v2.9",
-                    policy_version="official-feed-protected-execution-v2.9",
+                    model_version="observable-groww-carry-aware-v2.11",
+                    policy_version="config-owned-protected-execution-v2.11",
                 )
             )
         except Exception:
@@ -1073,41 +1127,56 @@ class InstitutionalStrategy:
 
     def _direction_and_edge(
         self, desk: str, price: float, liquidity_score: float, *, execution_state: VenueMicrostate | None, btc_composite: BTCCompositeState | None
-    ) -> tuple[Direction, float, str]:
+    ) -> tuple[Direction, float, str, dict[str, Any]]:
         if price <= 0 or execution_state is None:
-            return Direction.NO_TRADE, 0.0, "microstructure_state_unavailable"
+            return Direction.NO_TRADE, 0.0, "microstructure_state_unavailable", {}
         if not execution_state.usable_for_decision:
-            return Direction.NO_TRADE, 0.0, "execution_microstate_unhealthy"
+            return Direction.NO_TRADE, 0.0, "execution_microstate_unhealthy", {}
         execution_quality = btc_composite.delta_execution_quality_score if btc_composite else execution_state.feed_quality_score
+        breakdown: dict[str, Any] = {
+            "edge_calculation_formula": "abs(weighted_signal_bps) * execution_quality * liquidity_score",
+            "execution_quality_multiplier": execution_quality,
+            "liquidity_score_multiplier": liquidity_score,
+        }
         if execution_quality < float(_cfg("INSTITUTIONAL_MIN_EXECUTION_QUALITY", 0.40)):
-            return Direction.NO_TRADE, 0.0, f"execution_quality_low:{execution_quality:.3f}"
+            return Direction.NO_TRADE, 0.0, f"execution_quality_low:{execution_quality:.3f}", breakdown
         if desk == DeskId.BTC.value and bool(_cfg("INSTITUTIONAL_REQUIRE_BTC_CROSS_VENUE", True)):
             if btc_composite is None or not btc_composite.reference_states:
-                return Direction.NO_TRADE, 0.0, "btc_reference_microstate_unavailable"
+                return Direction.NO_TRADE, 0.0, "btc_reference_microstate_unavailable", breakdown
             if btc_composite.flow_agreement_score < float(_cfg("INSTITUTIONAL_MIN_FLOW_AGREEMENT", 0.55)):
-                return Direction.NO_TRADE, 0.0, f"venue_flow_disagreement:{btc_composite.flow_agreement_score:.3f}"
+                breakdown["flow_agreement_score"] = btc_composite.flow_agreement_score
+                return Direction.NO_TRADE, 0.0, f"venue_flow_disagreement:{btc_composite.flow_agreement_score:.3f}", breakdown
             if btc_composite.cross_venue_dispersion_bps > float(_cfg("INSTITUTIONAL_MAX_CROSS_VENUE_DISPERSION_BPS", 15.0)):
-                return Direction.NO_TRADE, 0.0, f"cross_venue_dispersion_high:{btc_composite.cross_venue_dispersion_bps:.3f}"
+                breakdown["cross_venue_dispersion_bps"] = btc_composite.cross_venue_dispersion_bps
+                return Direction.NO_TRADE, 0.0, f"cross_venue_dispersion_high:{btc_composite.cross_venue_dispersion_bps:.3f}", breakdown
         near_depth = sum(float(execution_state.bid_depth_usd_by_band.get(k, 0.0) + execution_state.ask_depth_usd_by_band.get(k, 0.0)) for k in ("0-1", "1-3"))
+        breakdown["near_touch_depth_usd"] = near_depth
         if near_depth <= 0:
-            return Direction.NO_TRADE, 0.0, "near_touch_depth_unavailable"
+            return Direction.NO_TRADE, 0.0, "near_touch_depth_unavailable", breakdown
         ofi_norm = (execution_state.ofi_usd_1s + 0.50 * execution_state.ofi_usd_10s) / near_depth
         tfi_norm = (execution_state.tfi_usd_1s + 0.50 * execution_state.tfi_usd_10s) / near_depth
         micro_deviation_bps = (execution_state.microprice / max(execution_state.mid, 1e-9) - 1.0) * 10_000.0
         dislocation_bps = float(btc_composite.delta_dislocation_bps or 0.0) if btc_composite else 0.0
-        signal_bps = (
-            float(_cfg("INSTITUTIONAL_FLOW_OFI_WEIGHT", 1.0)) * ofi_norm * 100.0
-            + float(_cfg("INSTITUTIONAL_FLOW_TFI_WEIGHT", 0.30)) * tfi_norm * 100.0
-            + float(_cfg("INSTITUTIONAL_FLOW_MICROPRICE_WEIGHT", 0.35)) * micro_deviation_bps
-            - float(_cfg("INSTITUTIONAL_FLOW_DISLOCATION_WEIGHT", 0.50)) * dislocation_bps
-        )
+        ofi_component_bps = float(_cfg("INSTITUTIONAL_FLOW_OFI_WEIGHT", 1.0)) * ofi_norm * 100.0
+        tfi_component_bps = float(_cfg("INSTITUTIONAL_FLOW_TFI_WEIGHT", 0.30)) * tfi_norm * 100.0
+        microprice_component_bps = float(_cfg("INSTITUTIONAL_FLOW_MICROPRICE_WEIGHT", 0.35)) * micro_deviation_bps
+        dislocation_component_bps = -float(_cfg("INSTITUTIONAL_FLOW_DISLOCATION_WEIGHT", 0.50)) * dislocation_bps
+        signal_bps = ofi_component_bps + tfi_component_bps + microprice_component_bps + dislocation_component_bps
         edge = abs(signal_bps) * max(0.0, min(1.0, execution_quality)) * max(0.0, min(1.0, liquidity_score))
+        breakdown.update({
+            "ofi_component_bps": ofi_component_bps,
+            "tfi_component_bps": tfi_component_bps,
+            "microprice_component_bps": microprice_component_bps,
+            "dislocation_component_bps": dislocation_component_bps,
+            "weighted_signal_bps": signal_bps,
+            "directional_edge_after_quality_liquidity_bps": edge,
+        })
         threshold = float(_cfg("INSTITUTIONAL_MIN_SIGNAL_BPS", 0.50))
         if signal_bps > threshold:
-            return Direction.LONG, edge, "ofi_tfi_microprice_long"
+            return Direction.LONG, edge, "ofi_tfi_microprice_long", breakdown
         if signal_bps < -threshold:
-            return Direction.SHORT, edge, "ofi_tfi_microprice_short"
-        return Direction.NO_TRADE, 0.0, "flow_signal_flat"
+            return Direction.SHORT, edge, "ofi_tfi_microprice_short", breakdown
+        return Direction.NO_TRADE, 0.0, "flow_signal_flat", breakdown
 
     def _regime(self) -> Regime:
         if len(self._price_window) < 20:

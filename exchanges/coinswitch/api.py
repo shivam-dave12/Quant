@@ -31,8 +31,8 @@ class FuturesAPI:
             api_key: CoinSwitch API key
             secret_key: CoinSwitch secret key
         """
-        self.api_key = api_key or os.getenv('COINSWITCH_API_KEY')
-        self.secret_key = secret_key or os.getenv('COINSWITCH_SECRET_KEY')
+        self.api_key = api_key or getattr(config, 'COINSWITCH_API_KEY', '')
+        self.secret_key = secret_key or getattr(config, 'COINSWITCH_SECRET_KEY', '')
         self.base_url = "https://coinswitch.co"
         
         if not self.api_key or not self.secret_key:

@@ -102,80 +102,16 @@ class ExecutionRouter:
 
     def switch(
         self,
-        target_exchange:  str,
-        strategy=None,    # InstitutionalStrategy instance — used for open-position check
+        target_exchange: str,
+        strategy=None,
         force: bool = False,
     ) -> Tuple[bool, str]:
-        """
-        Switch execution to target_exchange.
-
-        Returns: (success: bool, message: str)
-
-        Safety guards:
-          1. Must be a configured exchange.
-          2. No open position (unless force=True — emergency use only).
-          3. Target exchange balance must be readable.
-        """
-        try:
-            target_key = Exchange.from_str(target_exchange).value
-        except ValueError as e:
-            return False, str(e)
-
-        with self._lock:
-            if target_key == self._active_key:
-                return True, f"Already executing on {target_key} — no change."
-
-            if target_key not in self._managers:
-                return False, (
-                    f"Exchange '{target_key}' is not configured. "
-                    f"Available: {list(self._managers.keys())}"
-                )
-
-            # Guard 1: no open position
-            if not force and strategy is not None:
-                pos = strategy.get_position()
-                if pos is not None:
-                    side  = pos.get("side", "?")
-                    entry = pos.get("entry_price", 0)
-                    _cur = str(pos.get("currency_symbol") or ("₹" if self._active_key == Exchange.GROWW.value else "$"))
-                    return False, (
-                        f"❌ Cannot switch exchange while position is open.\n"
-                        f"Current: {side} @ {_cur}{entry:,.2f}\n"
-                        f"Close position first, then /setexchange {target_key}."
-                    )
-
-            # Guard 2: verify target balance is readable
-            target_om = self._managers[target_key]
-            try:
-                bal = target_om.get_balance()
-                if bal is None or bal.get("error"):
-                    return False, (
-                        f"❌ Cannot verify balance on {target_key}: "
-                        f"{bal.get('error', 'null response') if bal else 'null response'}\n"
-                        f"Check API credentials for {target_key}."
-                    )
-                avail = float(bal.get("available", 0))
-            except Exception as e:
-                return False, f"❌ Balance check on {target_key} failed: {e}"
-
-            # All guards passed — switch
-            old_key = self._active_key
-            self._active_key = target_key
-            self._sync_global_limiter()
-
-            # Update config so downstream reads (strategy, risk manager) see it
-            config.EXECUTION_EXCHANGE = target_key
-
-            _cur = "₹" if target_key == Exchange.GROWW.value else "$"
-            _unit = "INR FNO available" if target_key == Exchange.GROWW.value else "USD/USDT available"
-            logger.info(f"✅ ExecutionRouter switched: {old_key} → {target_key} "
-                        f"(balance on {target_key}: {_cur}{avail:,.2f})")
-
-            return True, (
-                f"✅ <b>Execution switched to {target_key.upper()}</b>\n"
-                f"Balance: {_cur}{avail:,.2f} {_unit}\n"
-                f"Previous: {old_key}"
-            )
+        """Reject runtime venue mutation; live order permission is config-owned."""
+        _ = (target_exchange, strategy, force)
+        return False, (
+            "Runtime execution switching is disabled. Edit LIVE_EXECUTION_VENUES "
+            "and LIVE_TRADING_ENABLED in config.py, then restart the service."
+        )
 
     # ── Delegate all OrderManager calls to the active instance ───────────────
     # These are the methods the strategy and risk manager call directly.

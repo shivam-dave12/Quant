@@ -1,8 +1,9 @@
 """
-config.py — Unified Configuration v10.0
+config.py — Unified Configuration v11.0
 =========================================
-Single source of truth. All institutional parameters inline.
-No config_overrides.py — everything lives here.
+Single source of truth. All non-secret runtime and trading policy is inline.
+The .env file contains credentials only; it cannot change live/shadow mode,
+trading venues, risk, feed requirements, models, or log cadence.
 
 Risk-controlled configuration for structural institutional liquidity execution.
 """
@@ -14,13 +15,28 @@ except ImportError:  # production image may not ship python-dotenv
         return False
 load_dotenv()
 
-# ── Exchange routing ──────────────────────────────────────────────────────────
-EXECUTION_EXCHANGE = os.getenv("EXECUTION_EXCHANGE", "delta").lower()
+# ── OPERATOR CONTROL PANEL — change policy only here, never in .env ───────────
+# LIVE TRADING MASTER SWITCH. Keep False for shadow validation. Change only this
+# line to True once the live venues below are explicitly approved.
+LIVE_TRADING_ENABLED = True
 
-# ── Credentials ───────────────────────────────────────────────────────────────
+# Analysis may run across all configured feeds. Orders may route ONLY to venues
+# explicitly listed in LIVE_EXECUTION_VENUES when LIVE_TRADING_ENABLED=True.
+# Safe first-live default: Groww/NIFTY only; add "delta" deliberately later.
+ANALYSIS_DATA_VENUES = ("delta", "coinswitch", "groww")
+LIVE_EXECUTION_VENUES = ("groww",)
+EXECUTION_EXCHANGE = "delta"  # legacy discovery preference; not live-order permission
+
+# Venue activation / environments are runtime policy, not secrets.
+DELTA_TESTNET = False
+GROWW_ENABLED = True
+HYPERLIQUID_REFERENCE_ENABLED = False  # read-only BTC reference feed; never routes orders
+HYPERLIQUID_TESTNET = False
+HYPERLIQUID_RECONNECT_SEC = 3.0
+
+# ── Credentials — .env may contain ONLY values in this section ────────────────
 DELTA_API_KEY             = os.getenv("DELTA_API_KEY",    "")
 DELTA_SECRET_KEY          = os.getenv("DELTA_SECRET_KEY", "")
-DELTA_TESTNET             = os.getenv("DELTA_TESTNET", "false").lower() == "true"
 COINSWITCH_API_KEY        = os.getenv("COINSWITCH_API_KEY",    "")
 COINSWITCH_SECRET_KEY     = os.getenv("COINSWITCH_SECRET_KEY", "")
 
@@ -46,9 +62,6 @@ GROWW_AUTH_CONFIGURED     = bool(
     or (GROWW_TOTP_TOKEN and GROWW_TOTP_SECRET)
     or (GROWW_API_KEY and GROWW_API_SECRET)
 )
-GROWW_ENABLED             = os.getenv(
-    "GROWW_ENABLED", "true" if GROWW_AUTH_CONFIGURED else "false"
-).lower() in ("1", "true", "yes", "on")
 TELEGRAM_BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID          = os.getenv("TELEGRAM_CHAT_ID",   "")
 
@@ -63,10 +76,6 @@ DELTA_CONTRACT_VALUE_BTC = 0.001
 DELTA_BALANCE_CURRENCY   = "USD"
 COINSWITCH_SYMBOL        = "BTCUSDT"
 COINSWITCH_EXCHANGE      = "EXCHANGE_2"
-# Read-only reference feed for BTC leader/follower research; it never routes orders.
-HYPERLIQUID_REFERENCE_ENABLED = os.getenv("HYPERLIQUID_REFERENCE_ENABLED", "false").lower() in ("1", "true", "yes", "on")
-HYPERLIQUID_TESTNET          = os.getenv("HYPERLIQUID_TESTNET", "false").lower() in ("1", "true", "yes", "on")
-HYPERLIQUID_RECONNECT_SEC    = float(os.getenv("HYPERLIQUID_RECONNECT_SEC", "3.0"))
 
 # ── Position sizing ───────────────────────────────────────────────────────────
 MIN_MARGIN_PER_TRADE     = 0       # 0 = no arbitrary dollar floor; exchange min_qty/step controls executability
@@ -224,8 +233,8 @@ AGG_OB_DEPTH_LEVELS  = 10
 AGG_TRADE_WINDOW_SEC = 30.0
 
 # ── Microstructure alpha baseline (kept in shadow mode until forward labels validate it) ──
-INSTITUTIONAL_ENABLE_LIVE_ENTRIES = os.getenv("INSTITUTIONAL_ENABLE_LIVE_ENTRIES", "false").lower() in ("1", "true", "yes", "on")
-INSTITUTIONAL_REQUIRE_BTC_CROSS_VENUE = os.getenv("INSTITUTIONAL_REQUIRE_BTC_CROSS_VENUE", "true").lower() in ("1", "true", "yes", "on")
+INSTITUTIONAL_ENABLE_LIVE_ENTRIES = LIVE_TRADING_ENABLED  # backwards-compatible internal alias
+INSTITUTIONAL_REQUIRE_BTC_CROSS_VENUE = True
 INSTITUTIONAL_MIN_EXECUTION_QUALITY = 0.40
 INSTITUTIONAL_MIN_FLOW_AGREEMENT = 0.55
 INSTITUTIONAL_MAX_CROSS_VENUE_DISPERSION_BPS = 15.0
@@ -238,8 +247,8 @@ INSTITUTIONAL_FLOW_DISLOCATION_WEIGHT = 0.50
 INSTITUTIONAL_RISK_FRACTION_PER_TRADE = 0.0025
 INSTITUTIONAL_QUARTER_KELLY = 0.25
 INSTITUTIONAL_TARGET_OBSERVATION_VOL_BPS = 10.0
-INSTITUTIONAL_CORRELATED_EXPOSURE_CAP_FRACTION = float(os.getenv("INSTITUTIONAL_CORRELATED_EXPOSURE_CAP_FRACTION", "0.35"))
-RESEARCH_STORE_PATH = os.getenv("RESEARCH_STORE_PATH", "research_output")
+INSTITUTIONAL_CORRELATED_EXPOSURE_CAP_FRACTION = 0.35
+RESEARCH_STORE_PATH = "research_output"
 
 # ── Institutional Strategy ────────────────────────────────────────────────────────────
 INSTITUTIONAL_MARGIN_PCT               = 0.50
@@ -450,69 +459,69 @@ SUSPENDED_ASSET_CLASSES = ("equity", "index")
 # follows Groww's official SDK: generated access token, TOTP token+secret, or API key+secret.
 GROWW_LONG_PREMIUM_ONLY = True
 GROWW_OPTIONS_ONLY = True
-GROWW_DISCOVERY_ENABLED = os.getenv("GROWW_DISCOVERY_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+GROWW_DISCOVERY_ENABLED = True
 GROWW_OPTIONS_RUNTIME_ENABLED = GROWW_ENABLED
 GROWW_INDEX_OPTIONS_FROM_CONFIG_ONLY = True
-GROWW_INDEX_UNDERLYINGS = os.getenv("GROWW_INDEX_UNDERLYINGS", "NIFTY")
+GROWW_INDEX_UNDERLYINGS = "NIFTY"
 GROWW_INDEX_STOCK_CODE_BY_UNDERLYING = {"NIFTY": "NIFTY", "NIFTY50": "NIFTY", "CNXNIFTY": "NIFTY"}
-GROWW_OPTION_PRODUCT_TYPE = os.getenv("GROWW_OPTION_PRODUCT_TYPE", "NRML").upper()
+GROWW_OPTION_PRODUCT_TYPE = "NRML"
 GROWW_OPTION_TICK_SIZE = 0.05
-GROWW_MIN_CALL_GAP_SEC = float(os.getenv("GROWW_MIN_CALL_GAP_SEC", "0.25"))
-GROWW_INSTRUMENTS_CSV_URL = os.getenv("GROWW_INSTRUMENTS_CSV_URL", "https://growwapi-assets.groww.in/instruments/instrument.csv")
-GROWW_INSTRUMENT_CACHE_TTL_SEC = float(os.getenv("GROWW_INSTRUMENT_CACHE_TTL_SEC", "1800.0"))
-GROWW_SECURITY_MASTER_CACHE_PATH = os.getenv("GROWW_SECURITY_MASTER_CACHE_PATH", "data/groww_instruments.csv")
+GROWW_MIN_CALL_GAP_SEC = 0.25
+GROWW_INSTRUMENTS_CSV_URL = "https://growwapi-assets.groww.in/instruments/instrument.csv"
+GROWW_INSTRUMENT_CACHE_TTL_SEC = 1800.0
+GROWW_SECURITY_MASTER_CACHE_PATH = "data/groww_instruments.csv"
 GROWW_SECURITY_MASTER_REQUIRE_TODAY = True
 GROWW_MARKET_SESSION_GUARD_ENABLED = True
 GROWW_MARKET_OPEN_TIME = "09:15"
 GROWW_MARKET_CLOSE_TIME = "15:30"
-GROWW_MARKET_HOLIDAYS = tuple(x.strip() for x in os.getenv("GROWW_MARKET_HOLIDAYS", "").split(",") if x.strip())
-GROWW_ANALYZE_ONLY_DURING_MARKET_SESSION = os.getenv("GROWW_ANALYZE_ONLY_DURING_MARKET_SESSION", "true").lower() in ("1", "true", "yes", "on")
+GROWW_MARKET_HOLIDAYS: tuple[str, ...] = ()  # populate verified NSE holidays here when needed
+GROWW_ANALYZE_ONLY_DURING_MARKET_SESSION = True
 GROWW_ALLOW_CLOSED_MARKET_HISTORICAL_WARMUP = True
 GROWW_ALLOW_CLOSED_MARKET_WARMUP = False
-GROWW_INDEX_STREAM_ENABLED = os.getenv("GROWW_INDEX_STREAM_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-GROWW_INDEX_WEBSOCKET_REQUIRED = os.getenv("GROWW_INDEX_WEBSOCKET_REQUIRED", "true").lower() in ("1", "true", "yes", "on")
-GROWW_INDEX_STREAM_FIRST_TICK_TIMEOUT_SEC = float(os.getenv("GROWW_INDEX_STREAM_FIRST_TICK_TIMEOUT_SEC", "12.0"))
-GROWW_INDEX_STREAM_MAX_STALE_SEC = float(os.getenv("GROWW_INDEX_STREAM_MAX_STALE_SEC", "15.0"))
-GROWW_WEBSOCKET_RECONNECT_COOLDOWN_SEC = float(os.getenv("GROWW_WEBSOCKET_RECONNECT_COOLDOWN_SEC", "30.0"))
-GROWW_SHARED_TRANSPORT_MAX_STALE_SEC = float(os.getenv("GROWW_SHARED_TRANSPORT_MAX_STALE_SEC", "20.0"))
+GROWW_INDEX_STREAM_ENABLED = True
+GROWW_INDEX_WEBSOCKET_REQUIRED = True
+GROWW_INDEX_STREAM_FIRST_TICK_TIMEOUT_SEC = 12.0
+GROWW_INDEX_STREAM_MAX_STALE_SEC = 15.0
+GROWW_WEBSOCKET_RECONNECT_COOLDOWN_SEC = 30.0
+GROWW_SHARED_TRANSPORT_MAX_STALE_SEC = 20.0
 GROWW_REQUIRE_UNDERLYING_ANALYSIS_FEED = True
 GROWW_INDEX_STREAM_CHANNELS = "LIVE_QUOTE"
 GROWW_INDEX_STREAM_SCRIPT_CODES = {}
-GROWW_OPTION_STREAM_ENABLED = os.getenv("GROWW_OPTION_STREAM_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-GROWW_OPTION_WEBSOCKET_REQUIRED = os.getenv("GROWW_OPTION_WEBSOCKET_REQUIRED", "true").lower() in ("1", "true", "yes", "on")
-GROWW_SESSION_BOOK_REQUIRE_FIRST_OPTION_TICK_ON_STARTUP = os.getenv("GROWW_SESSION_BOOK_REQUIRE_FIRST_OPTION_TICK_ON_STARTUP", "false").lower() in ("1", "true", "yes", "on")
-GROWW_OPTION_STREAM_FIRST_TICK_TIMEOUT_SEC = float(os.getenv("GROWW_OPTION_STREAM_FIRST_TICK_TIMEOUT_SEC", "12.0"))
-GROWW_OPTION_STREAM_MAX_STALE_SEC = float(os.getenv("GROWW_OPTION_STREAM_MAX_STALE_SEC", "15.0"))
-GROWW_REQUIRE_STATIC_IP_FOR_LIVE_ORDERS = os.getenv("GROWW_REQUIRE_STATIC_IP_FOR_LIVE_ORDERS", "true").lower() in ("1", "true", "yes", "on")
-GROWW_APPROVED_STATIC_IPS = tuple(x.strip() for x in os.getenv("GROWW_APPROVED_STATIC_IPS", "").split(",") if x.strip())
-GROWW_OUTBOUND_IP_CHECK_URL = os.getenv("GROWW_OUTBOUND_IP_CHECK_URL", "https://api.ipify.org?format=json")
-GROWW_OUTBOUND_IP_OVERRIDE = os.getenv("GROWW_OUTBOUND_IP_OVERRIDE", "").strip()
+GROWW_OPTION_STREAM_ENABLED = True
+GROWW_OPTION_WEBSOCKET_REQUIRED = True
+GROWW_SESSION_BOOK_REQUIRE_FIRST_OPTION_TICK_ON_STARTUP = False
+GROWW_OPTION_STREAM_FIRST_TICK_TIMEOUT_SEC = 12.0
+GROWW_OPTION_STREAM_MAX_STALE_SEC = 15.0
+GROWW_REQUIRE_STATIC_IP_FOR_LIVE_ORDERS = True
+GROWW_APPROVED_STATIC_IPS: tuple[str, ...] = ()  # SET TO ("<YOUR_EC2_ELASTIC_IP>",) BEFORE GROWW LIVE
+GROWW_OUTBOUND_IP_CHECK_URL = "https://api.ipify.org?format=json"
+GROWW_OUTBOUND_IP_OVERRIDE = ""  # testing only; leave empty in production
 # Groww SDK exposes order_reference_id (8-20 chars) for traceability. Broker-side
 # algo registration/whitelisting must be confirmed before live India execution.
-GROWW_REQUIRE_SEBI_ALGO_CONFIRMATION_FOR_LIVE_ORDERS = os.getenv("GROWW_REQUIRE_SEBI_ALGO_CONFIRMATION_FOR_LIVE_ORDERS", "true").lower() in ("1", "true", "yes", "on")
-GROWW_SEBI_ALGO_REGISTRATION_CONFIRMED = os.getenv("GROWW_SEBI_ALGO_REGISTRATION_CONFIRMED", "false").lower() in ("1", "true", "yes", "on")
-GROWW_SEBI_STRATEGY_PREFIX = os.getenv("GROWW_SEBI_STRATEGY_PREFIX", "instv2")[:6]
-GROWW_OPTION_MIN_LIVE_IV_COVERAGE = float(os.getenv("GROWW_OPTION_MIN_LIVE_IV_COVERAGE", "0.60"))
-GROWW_OPTION_LONG_MAX_VRP = float(os.getenv("GROWW_OPTION_LONG_MAX_VRP", "-0.02"))
+GROWW_REQUIRE_SEBI_ALGO_CONFIRMATION_FOR_LIVE_ORDERS = True
+GROWW_SEBI_ALGO_REGISTRATION_CONFIRMED = False  # set True only after broker confirmation
+GROWW_SEBI_STRATEGY_PREFIX = "instv2"[:6]
+GROWW_OPTION_MIN_LIVE_IV_COVERAGE = 0.60
+GROWW_OPTION_LONG_MAX_VRP = -0.02
 
-GROWW_NIFTY_TREND_liquidity_event_ENABLED = os.getenv("GROWW_NIFTY_TREND_liquidity_event_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-GROWW_NIFTY_TREND_liquidity_event_MIN_PHASE_SCORE = float(os.getenv("GROWW_NIFTY_TREND_liquidity_event_MIN_PHASE_SCORE", "0.30"))
-GROWW_NIFTY_TREND_liquidity_event_AGGRESSIVE_PHASE_SCORE = float(os.getenv("GROWW_NIFTY_TREND_liquidity_event_AGGRESSIVE_PHASE_SCORE", "0.58"))
-GROWW_NIFTY_TREND_liquidity_event_MIN_RR = float(os.getenv("GROWW_NIFTY_TREND_liquidity_event_MIN_RR", "1.15"))
-GROWW_NIFTY_TREND_liquidity_event_MAX_RR = float(os.getenv("GROWW_NIFTY_TREND_liquidity_event_MAX_RR", "2.40"))
-GROWW_NIFTY_TREND_liquidity_event_MAX_TARGET_ATR = float(os.getenv("GROWW_NIFTY_TREND_liquidity_event_MAX_TARGET_ATR", "2.75"))
-GROWW_NIFTY_TREND_liquidity_event_MAX_RECLAIM_EXTENSION_ATR = float(os.getenv("GROWW_NIFTY_TREND_liquidity_event_MAX_RECLAIM_EXTENSION_ATR", "0.65"))
-GROWW_NIFTY_TREND_liquidity_event_1M_MAX_AGE_SEC = float(os.getenv("GROWW_NIFTY_TREND_liquidity_event_1M_MAX_AGE_SEC", "90.0"))
-GROWW_NIFTY_TREND_liquidity_event_5M_MAX_AGE_SEC = float(os.getenv("GROWW_NIFTY_TREND_liquidity_event_5M_MAX_AGE_SEC", "360.0"))
-GROWW_NIFTY_TREND_liquidity_event_STOP_BASE_ATR = float(os.getenv("GROWW_NIFTY_TREND_liquidity_event_STOP_BASE_ATR", "0.08"))
-GROWW_NIFTY_TREND_liquidity_event_STOP_PCTL_SLOPE_ATR = float(os.getenv("GROWW_NIFTY_TREND_liquidity_event_STOP_PCTL_SLOPE_ATR", "0.10"))
-GROWW_NIFTY_TREND_liquidity_event_MIN_TARGET_REALISM = float(os.getenv("GROWW_NIFTY_TREND_liquidity_event_MIN_TARGET_REALISM", "0.42"))
-GROWW_NIFTY_TREND_liquidity_event_MAX_HOLD_SEC = float(os.getenv("GROWW_NIFTY_TREND_liquidity_event_MAX_HOLD_SEC", "720.0"))
-GROWW_NIFTY_TREND_liquidity_event_FAILED_market_state_FRACTION = float(os.getenv("GROWW_NIFTY_TREND_liquidity_event_FAILED_market_state_FRACTION", "0.35"))
-GROWW_NIFTY_TREND_liquidity_event_FAILED_market_state_R = float(os.getenv("GROWW_NIFTY_TREND_liquidity_event_FAILED_market_state_R", "-0.15"))
-GROWW_NIFTY_TREND_liquidity_event_FAILED_market_state_MAX_MFE_R = float(os.getenv("GROWW_NIFTY_TREND_liquidity_event_FAILED_market_state_MAX_MFE_R", "0.30"))
-GROWW_NIFTY_TREND_liquidity_event_MIN_PROGRESS_R = float(os.getenv("GROWW_NIFTY_TREND_liquidity_event_MIN_PROGRESS_R", "0.15"))
-GROWW_NIFTY_TREND_liquidity_event_HARD_MAX_MULT = float(os.getenv("GROWW_NIFTY_TREND_liquidity_event_HARD_MAX_MULT", "1.0"))
+GROWW_NIFTY_TREND_liquidity_event_ENABLED = True
+GROWW_NIFTY_TREND_liquidity_event_MIN_PHASE_SCORE = 0.30
+GROWW_NIFTY_TREND_liquidity_event_AGGRESSIVE_PHASE_SCORE = 0.58
+GROWW_NIFTY_TREND_liquidity_event_MIN_RR = 1.15
+GROWW_NIFTY_TREND_liquidity_event_MAX_RR = 2.40
+GROWW_NIFTY_TREND_liquidity_event_MAX_TARGET_ATR = 2.75
+GROWW_NIFTY_TREND_liquidity_event_MAX_RECLAIM_EXTENSION_ATR = 0.65
+GROWW_NIFTY_TREND_liquidity_event_1M_MAX_AGE_SEC = 90.0
+GROWW_NIFTY_TREND_liquidity_event_5M_MAX_AGE_SEC = 360.0
+GROWW_NIFTY_TREND_liquidity_event_STOP_BASE_ATR = 0.08
+GROWW_NIFTY_TREND_liquidity_event_STOP_PCTL_SLOPE_ATR = 0.10
+GROWW_NIFTY_TREND_liquidity_event_MIN_TARGET_REALISM = 0.42
+GROWW_NIFTY_TREND_liquidity_event_MAX_HOLD_SEC = 720.0
+GROWW_NIFTY_TREND_liquidity_event_FAILED_market_state_FRACTION = 0.35
+GROWW_NIFTY_TREND_liquidity_event_FAILED_market_state_R = -0.15
+GROWW_NIFTY_TREND_liquidity_event_FAILED_market_state_MAX_MFE_R = 0.30
+GROWW_NIFTY_TREND_liquidity_event_MIN_PROGRESS_R = 0.15
+GROWW_NIFTY_TREND_liquidity_event_HARD_MAX_MULT = 1.0
 
 GROWW_OPTION_DEFAULT_LOT_SIZE = 0.0
 GROWW_OPTION_MIN_DTE = 1.0
@@ -521,15 +530,15 @@ GROWW_INDEX_OPTION_TARGET_ABS_DELTA = 0.45
 GROWW_STOCK_OPTION_TARGET_ABS_DELTA = 0.50
 GROWW_OPTION_DELTA_BAND = 0.22
 # Observability/selection policy: theta is measured as hold-horizon carry, not a static session veto.
-GROWW_OPTION_SELECTION_CARRY_REFERENCE_BPS = float(os.getenv("GROWW_OPTION_SELECTION_CARRY_REFERENCE_BPS", "100.0"))
-GROWW_SESSION_BOOK_RESCAN_SEC = float(os.getenv("GROWW_SESSION_BOOK_RESCAN_SEC", "30.0"))
+GROWW_OPTION_SELECTION_CARRY_REFERENCE_BPS = 100.0
+GROWW_SESSION_BOOK_RESCAN_SEC = 30.0
 # Live operator telemetry: transition-first and periodic, never a full JSON dump per scan tick.
-INSTITUTIONAL_DECISION_TELEMETRY_ENABLED = os.getenv("INSTITUTIONAL_DECISION_TELEMETRY_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-INSTITUTIONAL_DECISION_TELEMETRY_HEARTBEAT_SEC = float(os.getenv("INSTITUTIONAL_DECISION_TELEMETRY_HEARTBEAT_SEC", "30.0"))
-INSTITUTIONAL_DECISION_TELEMETRY_FULL_ON_TRANSITION = os.getenv("INSTITUTIONAL_DECISION_TELEMETRY_FULL_ON_TRANSITION", "false").lower() in ("1", "true", "yes", "on")
-INSTITUTIONAL_DECISION_TELEMETRY_LOG_UNQUALIFIED_SIGNAL_FLIPS = os.getenv("INSTITUTIONAL_DECISION_TELEMETRY_LOG_UNQUALIFIED_SIGNAL_FLIPS", "false").lower() in ("1", "true", "yes", "on")
-INSTITUTIONAL_DECISION_TELEMETRY_DEBUG_EVERY_TICK = os.getenv("INSTITUTIONAL_DECISION_TELEMETRY_DEBUG_EVERY_TICK", "false").lower() in ("1", "true", "yes", "on")
-GROWW_SESSION_MODEL_AUDIT_FULL_INFO = os.getenv("GROWW_SESSION_MODEL_AUDIT_FULL_INFO", "false").lower() in ("1", "true", "yes", "on")
+INSTITUTIONAL_DECISION_TELEMETRY_ENABLED = True
+INSTITUTIONAL_DECISION_TELEMETRY_HEARTBEAT_SEC = 30.0
+INSTITUTIONAL_DECISION_TELEMETRY_FULL_ON_TRANSITION = False
+INSTITUTIONAL_DECISION_TELEMETRY_LOG_UNQUALIFIED_SIGNAL_FLIPS = False
+INSTITUTIONAL_DECISION_TELEMETRY_DEBUG_EVERY_TICK = False
+GROWW_SESSION_MODEL_AUDIT_FULL_INFO = False
 GROWW_OPTION_IV_STRESS_PRIOR = 0.24
 GROWW_OPTION_MIN_IMPLIED_VOL = 0.03
 GROWW_OPTION_MAX_IMPLIED_VOL = 1.50
@@ -554,7 +563,7 @@ GROWW_OPTION_MIN_BOOK_LOTS = 1.0
 GROWW_OPTION_EXECUTION_ATR_PERIOD = 14
 GROWW_OPTION_MAX_SPREAD_TO_1M_ATR = 0.35
 GROWW_OPTION_MAX_QUOTE_STALE_SEC = 10.0
-GROWW_EXECUTION_SIGNAL_DEFER_COOLDOWN_SEC = float(os.getenv("GROWW_EXECUTION_SIGNAL_DEFER_COOLDOWN_SEC", "5.0"))
+GROWW_EXECUTION_SIGNAL_DEFER_COOLDOWN_SEC = 5.0
 GROWW_UNDERLYING_REST_REFRESH_SEC = 30.0
 GROWW_UNDERLYING_REST_RECONCILE_SEC = 900.0
 GROWW_OPTION_SLTP_DELTA_MULT = 1.00
@@ -563,16 +572,13 @@ GROWW_OPTION_MAX_PREMIUM_RISK_PCT = 0.58
 GROWW_OPTION_MIN_TP_PREMIUM_PCT = 0.18
 GROWW_OPTION_PREMIUM_TP_CONVEXITY_BONUS = 0.08
 # NIFTY signal stays in underlying/index units; execution risk stays in option-premium units.
-GROWW_STRUCTURAL_BREAK_BUFFER_ATR = float(os.getenv("GROWW_STRUCTURAL_BREAK_BUFFER_ATR", "0.15"))
-GROWW_STRUCTURAL_MIN_ALIGNMENT_BPS = float(os.getenv("GROWW_STRUCTURAL_MIN_ALIGNMENT_BPS", "2.0"))
-GROWW_OPTION_PROTECTION_MIN_ATR_BARS = int(os.getenv("GROWW_OPTION_PROTECTION_MIN_ATR_BARS", "10"))
-GROWW_OPTION_TARGET_RR = float(os.getenv("GROWW_OPTION_TARGET_RR", "1.60"))
+GROWW_STRUCTURAL_BREAK_BUFFER_ATR = 0.15
+GROWW_STRUCTURAL_MIN_ALIGNMENT_BPS = 2.0
+GROWW_OPTION_PROTECTION_MIN_ATR_BARS = 10
+GROWW_OPTION_TARGET_RR = 1.60
 
 INDIAN_NO_FRESH_ENTRY_AFTER_CLOSE_BUFFER_MIN = 25
-UNIVERSE_INCLUDE_EXCHANGES = os.getenv(
-    "UNIVERSE_INCLUDE_EXCHANGES",
-    "delta,coinswitch,groww" if (GROWW_ENABLED or GROWW_DISCOVERY_ENABLED) else "delta,coinswitch",
-)
+UNIVERSE_INCLUDE_EXCHANGES = ",".join(ANALYSIS_DATA_VENUES)
 
 # Portfolio slots: the bot may hold multiple contracts at once, but each
 # contract gets only one ENTERING/ACTIVE/EXITING slot.  Sizing is not divided
@@ -760,14 +766,30 @@ DELTA_BRACKET_CHILD_PRICE_TOL_PCT = 0.0025
 DELTA_EMERGENCY_FLATTEN_ON_BRACKET_MISMATCH = True
 TELEGRAM_ALERT_PROTECTION_FAILURE = True
 
-# Telegram command-channel network resilience
-def _float_env(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)))
-    except Exception:
-        return float(default)
+# Telegram command-channel network resilience (policy lives in code, not .env)
+TELEGRAM_GETUPDATES_BACKOFF_BASE_SEC = 2.0
+TELEGRAM_GETUPDATES_BACKOFF_MAX_SEC = 30.0
+TELEGRAM_LONG_POLL_TIMEOUT_SEC = 2.0  # fast graceful container stop
 
-TELEGRAM_GETUPDATES_BACKOFF_BASE_SEC = _float_env("TELEGRAM_GETUPDATES_BACKOFF_BASE_SEC", 2.0)
-TELEGRAM_GETUPDATES_BACKOFF_MAX_SEC = _float_env("TELEGRAM_GETUPDATES_BACKOFF_MAX_SEC", 30.0)
-TELEGRAM_LONG_POLL_TIMEOUT_SEC = _float_env("TELEGRAM_LONG_POLL_TIMEOUT_SEC", 2.0)  # fast graceful container stop
+
+def validate_live_control_plane() -> None:
+    """Fail closed on live-order policy before any desk can route an order."""
+    errors: list[str] = []
+    allowed = {"delta", "coinswitch", "groww"}
+    live_venues = {str(v).strip().lower() for v in LIVE_EXECUTION_VENUES}
+    unknown = live_venues - allowed
+    if unknown:
+        errors.append(f"unknown LIVE_EXECUTION_VENUES={sorted(unknown)}")
+    if LIVE_TRADING_ENABLED and not live_venues:
+        errors.append("LIVE_TRADING_ENABLED=True requires at least one LIVE_EXECUTION_VENUE")
+    if LIVE_TRADING_ENABLED and "groww" in live_venues:
+        if GROWW_REQUIRE_STATIC_IP_FOR_LIVE_ORDERS and not GROWW_APPROVED_STATIC_IPS:
+            errors.append("Groww live requires GROWW_APPROVED_STATIC_IPS configured in config.py")
+        if GROWW_REQUIRE_SEBI_ALGO_CONFIRMATION_FOR_LIVE_ORDERS and not GROWW_SEBI_ALGO_REGISTRATION_CONFIRMED:
+            errors.append("Groww live requires GROWW_SEBI_ALGO_REGISTRATION_CONFIRMED=True after broker confirmation")
+    if errors:
+        raise ValueError("Invalid live control plane: " + "; ".join(errors))
+
+
+validate_live_control_plane()
 
