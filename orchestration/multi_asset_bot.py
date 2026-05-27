@@ -54,6 +54,7 @@ from risk.risk_manager import RiskManager
 from orchestration.portfolio_manager import PortfolioManager, PortfolioRiskManager
 from core.market_policy import active_policy
 from strategy.institutional_strategy import InstitutionalStrategy
+from intelligence.composite_asset_state import CompositeIntelligenceBus
 from telegram.notifier import TelegramLogHandler, install_global_telegram_log_handler, send_telegram_message
 
 logger = logging.getLogger(__name__)
@@ -110,6 +111,9 @@ class MultiAssetInstitutionalBot:
         self._external_shutdown_requested = threading.Event()
         self._stopped = False
         self._groww_premarket_refresh_day: str = ""
+        # One bus for the portfolio: all verified normalised feeds contribute to
+        # factor intelligence while execution alpha remains product-aware.
+        self._composite_intelligence_bus = CompositeIntelligenceBus()
 
     def _build_api_clients(self):
         has_delta = bool(config.DELTA_API_KEY and config.DELTA_SECRET_KEY)
@@ -949,7 +953,7 @@ class MultiAssetInstitutionalBot:
             logger.info("   Live exchange catalogs only — stock desk suspended; no synthetic feeds")
             logger.info("=" * 92)
             delta_api, cs_api, hl_api, groww_api = self._build_api_clients()
-            self.registry = InstrumentRegistry(execution_preference=getattr(config, "EXECUTION_EXCHANGE", "delta"))
+            self.registry = InstrumentRegistry(execution_preference=getattr(config, "DISCOVERY_PRIMARY_EXCHANGE", ""))
             requested = self._filter_suspended_requests(getattr(config, "MULTI_ASSET_REQUESTS", None))
             self.discovery_report = self.registry.discover(
                 delta_api=delta_api,
@@ -975,7 +979,8 @@ class MultiAssetInstitutionalBot:
             if not self.contexts:
                 logger.error("No asset contexts could be built.")
                 return False
-            logger.info("✅ Built %d isolated strategy contexts", len(self.contexts))
+            logger.info("✅ Built %d execution-equivalence contexts with shared normalised composite intelligence", len(self.contexts))
+            logger.info("🧠 INTELLIGENCE ARCHITECTURE | all verified feeds -> bps/USD-normalised factor state -> product-equivalent execution routing; raw cross-product price routing disabled")
             return True
         except Exception:
             logger.exception("MultiAssetInstitutionalBot initialisation failed")
@@ -1070,7 +1075,7 @@ class MultiAssetInstitutionalBot:
             contexts_getter=lambda: list(self.contexts) if self.contexts else list(ctx_holder.values()),
             manager=self.guard,
         )
-        strategy = InstitutionalStrategy(router, instrument=inst)
+        strategy = InstitutionalStrategy(router, instrument=inst, intelligence_bus=self._composite_intelligence_bus)
         strategy.bind_market_wakeup(self._market_wakeup.set)
         data.register_strategy(strategy)
         ctx = AssetContext(inst, data, router, risk, strategy)

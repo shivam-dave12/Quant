@@ -808,7 +808,7 @@ class TelegramBotController:
             "Trigger: fresh external-liquidity liquidity_event → state_change/displacement → liquidity_gap rebalance\n"
             "Protection: venue-native SL/TP required before activation\n"
             "Accounting: exact broker fills; instrument-scoped currency/payoff model\n"
-            f"Default exchange: {_esc(str(getattr(cfg, 'EXECUTION_EXCHANGE', '-')).upper())}"
+            f"Live execution venues: {_esc(','.join(str(v).upper() for v in getattr(cfg, 'LIVE_EXECUTION_VENUES', ())) or 'NONE')} | Origination: DYNAMIC"
         )
 
     # ================================================================
@@ -933,7 +933,7 @@ class TelegramBotController:
         allowed = ", ".join(str(v).upper() for v in getattr(config, "LIVE_EXECUTION_VENUES", ())) or "NONE"
         return (
             "🔒 <b>CONFIG-OWNED EXECUTION POLICY</b>\n"
-            f"Discovery preference: <code>{getattr(config, 'EXECUTION_EXCHANGE', '?').upper()}</code>\n"
+            f"Discovery preference: <code>{(getattr(config, 'DISCOVERY_PRIMARY_EXCHANGE', '') or 'NONE — DYNAMIC').upper()}</code>\n"
             f"Live-order venues: <code>{allowed}</code>\n\n"
             "Runtime exchange switching is disabled. Edit <code>config.py</code> "
             "(<code>LIVE_EXECUTION_VENUES</code> / <code>LIVE_TRADING_ENABLED</code>) "
@@ -1240,7 +1240,7 @@ class TelegramBotController:
         self.send_message(
             "⚡ <b>Institutional Controller Ready</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "🏦 Discovery preference: <code>" + getattr(config, "EXECUTION_EXCHANGE", "?").upper() + "</code>\n"
+            "🏦 Discovery preference: <code>" + (getattr(config, "DISCOVERY_PRIMARY_EXCHANGE", "") or "NONE — DYNAMIC").upper() + "</code>\n"
             "🚦 Live trading: <code>" + ("ENABLED" if bool(getattr(config, "LIVE_TRADING_ENABLED", False)) else "SHADOW") + "</code>\n"
             "🎯 Live venues: <code>" + ",".join(str(v).upper() for v in getattr(config, "LIVE_EXECUTION_VENUES", ())) + "</code>\n"
             "🔐 Groww credentials: <code>" + ("ready" if (getattr(config, "GROWW_ACCESS_TOKEN", "") or (getattr(config, "GROWW_TOTP_TOKEN", "") and getattr(config, "GROWW_TOTP_SECRET", "")) or (getattr(config, "GROWW_API_KEY", "") and getattr(config, "GROWW_API_SECRET", ""))) else "missing") + "</code>\n\n"

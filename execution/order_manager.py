@@ -2390,10 +2390,13 @@ class OrderManager:
         try:
             inst = getattr(self, "instrument", None)
             by_ex = getattr(inst, "by_exchange", {}) or {}
+            selected = str(getattr(self, "_exchange_name", "") or "").lower()
             # Keys may be ExchangeName enums or strings depending on construction.
+            # Never consume another broker's tick when the selected adapter lacks metadata.
             for key, ei in by_ex.items():
                 try:
-                    if str(key).lower().endswith("delta") or str(key).lower() == "delta":
+                    key_value = str(getattr(key, "value", key) or "").lower()
+                    if key_value == selected or key_value.endswith(f".{selected}"):
                         tick = float(getattr(ei, "tick_size", 0.0) or 0.0)
                         if tick > 0:
                             return tick
@@ -2403,8 +2406,10 @@ class OrderManager:
             pass
         getter = getattr(config, "get_tick_size", None)
         if callable(getter):
-            return float(getter())
-        return float(getattr(config, "TICK_SIZE", 0.1))
+            tick = float(getter(str(getattr(self, "_exchange_name", "") or "")) or 0.0)
+            if tick > 0:
+                return tick
+        raise RuntimeError(f"tick_size_unresolved_for_selected_venue:{getattr(self, '_exchange_name', 'unknown')}")
 
     def _round_price_to_tick(self, price: float) -> float:
         tick = max(self._active_tick_size(), 1e-9)

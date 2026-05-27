@@ -231,7 +231,7 @@ def test_shadow_mode_blocks_live_order_even_when_flow_edge_is_positive(tmp_path,
     assert orders.placed == []
 
 
-def test_momentum_without_flow_is_not_a_trade_signal(tmp_path, monkeypatch):
+def test_price_walk_without_venue_local_structural_state_is_not_a_trade_signal(tmp_path, monkeypatch):
     def cfg(name, default):
         values = {"RESEARCH_STORE_PATH": str(tmp_path), "INSTITUTIONAL_ENABLE_LIVE_ENTRIES": True,
                   "INSTITUTIONAL_MIN_NET_EDGE_BPS": 0.0, "INSTITUTIONAL_MIN_SIGNAL_BPS": 0.50}
@@ -244,7 +244,7 @@ def test_momentum_without_flow_is_not_a_trade_signal(tmp_path, monkeypatch):
         decision = strategy.evaluate(data, _Orders(), _Risk(), i)
     assert decision is not None
     assert decision.direction.value == "NO_TRADE"
-    assert any(reason.startswith(("flow_signal_flat", "venue_flow_disagreement")) for reason in decision.reasons)
+    assert any(reason.startswith(("market_state_and_flow_flat", "venue_flow_disagreement")) for reason in decision.reasons)
 
 
 def test_live_entry_requires_protection_confirmation(tmp_path, monkeypatch):
@@ -305,7 +305,7 @@ def test_live_entry_is_blocked_by_risk_manager_trade_gate(tmp_path, monkeypatch)
     assert orders.placed == []
 
 
-def test_selected_venue_signal_disagreement_blocks_silver_route(tmp_path, monkeypatch):
+def test_unvalidated_opposite_venue_cannot_receive_silver_execution_route(tmp_path, monkeypatch):
     monkeypatch.setattr("strategy.institutional_strategy._cfg", lambda name, default: {
         "RESEARCH_STORE_PATH": str(tmp_path),
         "INSTITUTIONAL_ENABLE_LIVE_ENTRIES": False,
@@ -321,10 +321,11 @@ def test_selected_venue_signal_disagreement_blocks_silver_route(tmp_path, monkey
     }.get(name, default))
     strategy = InstitutionalStrategy(instrument=_silver_instrument())
     decision = strategy.evaluate(_SilverRouteData(), _MultiVenueOrders(), _Risk(), 1)
-    assert decision.decision is DecisionOutput.NO_TRADE_INSUFFICIENT_EDGE
-    assert decision.direction.value == "NO_TRADE"
-    assert decision.venue == "hyperliquid"
-    assert decision.reasons[0].startswith("selected_venue_signal_disagreement:")
+    assert decision.decision in {DecisionOutput.NO_TRADE_INSUFFICIENT_EDGE, DecisionOutput.NO_TRADE_EXECUTION_UNSAFE}
+    estimates = decision.model_values.get("venue_selection", {}).get("estimates", {})
+    assert "hyperliquid" in estimates
+    assert estimates["hyperliquid"]["routeable"] is False
+    assert decision.model_values.get("selected_execution_venue") != "hyperliquid"
 
 
 def test_groww_direction_is_no_trade_until_options_volatility_context_is_available(tmp_path, monkeypatch):
@@ -720,10 +721,14 @@ def test_microstructure_telemetry_includes_weighted_edge_components(tmp_path, mo
     assert "weighted_signal_bps" in values
     assert "ofi_component_bps" in values
     assert "tfi_component_bps" in values
-    assert abs(values["weighted_signal_bps"] - (
+    assert abs(values["raw_microstructure_signal_bps"] - (
         values["ofi_component_bps"] + values["tfi_component_bps"]
-        + values["microprice_component_bps"] + values["dislocation_component_bps"]
+        + values["microprice_component_bps"]
     )) < 1e-9
+    assert abs(values["weighted_signal_bps"] - (
+        values["robust_microstructure_alpha_bps"] + values["venue_local_market_state_alpha_bps"]
+    )) < 1e-9
+    assert values["dislocation_component_bps"] == 0.0
 
 
 def test_selected_broker_balance_controls_final_position_size_not_delta_balance(tmp_path, monkeypatch):

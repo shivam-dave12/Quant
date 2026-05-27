@@ -107,6 +107,7 @@ class VenueCostEstimate:
     preference_adjustment_bps: float
     near_depth_usd: float
     mid: float
+    relative_touch_bps_diagnostic: float = 0.0
     proposed_notional_usd: float = 0.0
     gross_edge_bps: float | None = None
     expected_net_edge_bps: float | None = None
@@ -162,10 +163,15 @@ def estimate_venue_cost(
     side = "buy" if _direction_key(direction) in {"LONG", "BULLISH", "BUY"} else "sell"
     depth = _near_depth(state, side)
     ref = max(float(reference_mid or 0.0), 1e-9)
+    # Cross-venue price dislocation is not an execution-cost credit. A cheaper
+    # quoted instrument may be a different economic exposure (as SLVON vs XAG
+    # demonstrated live). Route cost is therefore local and non-negative; any
+    # relative touch difference is kept as diagnostic/research state only.
     if side == "buy":
-        effective_touch_bps = (float(state.best_ask) / ref - 1.0) * 10_000.0
+        relative_touch_bps = (float(state.best_ask) / ref - 1.0) * 10_000.0
     else:
-        effective_touch_bps = (1.0 - float(state.best_bid) / ref) * 10_000.0
+        relative_touch_bps = (1.0 - float(state.best_bid) / ref) * 10_000.0
+    effective_touch_bps = max(0.0, float(state.spread_bps or 0.0))
     fee = _round_trip_fee_bps(venue, state)
     impact_mult = float(_cfg("VENUE_SLIPPAGE_IMPACT_MULTIPLIER", 35.0))
     impact = impact_mult * max(0.0, float(notional_usd or 0.0)) / max(depth, 1.0)
@@ -182,7 +188,7 @@ def estimate_venue_cost(
     # No venue gets a permanent score advantage.  Asset-specific overrides are
     # retained only as explicit risk penalties (default zero in live config).
     preference = 0.0
-    if str(asset_id or "").upper() == "SILVER" and venue == "delta" and depth < float(_cfg("SILVER_DELTA_MIN_NEAR_DEPTH_USD", 50000.0)):
+    if str(asset_id or "").upper() in {"SILVER", "SILVER_SLVON"} and venue == "delta" and depth < float(_cfg("SILVER_DELTA_MIN_NEAR_DEPTH_USD", 50000.0)):
         preference += float(_cfg("SILVER_DELTA_ILLIQUIDITY_PENALTY_BPS", 0.0))
     cash_checked = available_cash_usd is not None
     capital_feasible = (not cash_checked) or float(available_cash_usd or 0.0) >= max(0.0, float(required_margin_usd or 0.0))
@@ -198,7 +204,7 @@ def estimate_venue_cost(
     if not capital_feasible:
         reasons.append("insufficient_venue_collateral")
     eligible = bool(routeable and state.execution_enabled and state.usable_for_decision and protection_capable and capital_feasible)
-    total = effective_touch_bps + fee + impact + funding + latency + quality_penalty + liquidity_penalty + protection_activation_penalty + preference
+    total = max(0.0, effective_touch_bps + fee + impact + funding + latency + quality_penalty + liquidity_penalty + protection_activation_penalty + preference)
     expected_net_edge = None if gross_edge_bps is None else float(gross_edge_bps) - float(total)
     expected_net_profit = None if expected_net_edge is None else float(notional_usd or 0.0) * expected_net_edge / 10_000.0
     return VenueCostEstimate(
@@ -217,6 +223,7 @@ def estimate_venue_cost(
         preference_adjustment_bps=float(preference),
         near_depth_usd=float(depth),
         mid=float(state.mid),
+        relative_touch_bps_diagnostic=float(relative_touch_bps),
         proposed_notional_usd=float(notional_usd or 0.0),
         gross_edge_bps=None if gross_edge_bps is None else float(gross_edge_bps),
         expected_net_edge_bps=expected_net_edge,
@@ -241,6 +248,7 @@ def select_execution_venue(
     required_margin_usd: float = 0.0,
     protection_capable_venues: set[str] | None = None,
     gross_edge_bps: float | None = None,
+    gross_edge_by_venue: Mapping[str, float] | None = None,
     notional_by_venue: Mapping[str, float] | None = None,
     required_margin_by_venue: Mapping[str, float] | None = None,
 ) -> VenueSelection:
@@ -261,6 +269,10 @@ def select_execution_venue(
         # smaller but executable Hyperliquid/CoinSwitch route.
         venue_notional = float((notional_by_venue or {}).get(venue, notional_usd) or 0.0)
         venue_margin = float((required_margin_by_venue or {}).get(venue, required_margin_usd) or 0.0)
+        venue_gross_edge = (
+            gross_edge_by_venue.get(venue, gross_edge_bps)
+            if isinstance(gross_edge_by_venue, Mapping) else gross_edge_bps
+        )
         estimates[venue] = estimate_venue_cost(
             state=state,
             direction=direction,
@@ -271,7 +283,7 @@ def select_execution_venue(
             available_cash_usd=cash,
             required_margin_usd=venue_margin,
             protection_capable=protected,
-            gross_edge_bps=gross_edge_bps,
+            gross_edge_bps=venue_gross_edge,
         )
     candidates = [e for e in estimates.values() if e.routeable]
     if not candidates:
@@ -281,7 +293,7 @@ def select_execution_venue(
     # lowest cost bps would systematically favour tiny balances. Select the
     # venue with highest expected dollar alpha after execution/protection cost.
     # Cost-only mode remains available for callers that do not supply edge.
-    if gross_edge_bps is not None:
+    if gross_edge_bps is not None or isinstance(gross_edge_by_venue, Mapping):
         best = max(candidates, key=lambda e: (float(e.expected_net_profit_usd) if e.expected_net_profit_usd is not None else -math.inf, -e.total_cost_bps))
         reason = "highest_broker_local_expected_net_profit_route"
     else:

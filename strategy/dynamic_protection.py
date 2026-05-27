@@ -308,6 +308,25 @@ class DynamicProtectionPlanBuilder:
         if require_decay and not decay.ready:
             diagnostics = {"signal_decay": asdict(decay), "kyle_impact": asdict(impact), "vpin": asdict(toxicity)}
             return ProtectionPlan(price, price, price, protection_type, False, [decay.reason], diagnostics=diagnostics)
+        min_hold_map = _cfg("DYNAMIC_PROTECTION_MIN_EXECUTABLE_HOLD_SEC_BY_ASSET", {})
+        min_hold_sec = 0.0
+        if isinstance(min_hold_map, Mapping):
+            try:
+                min_hold_sec = float(min_hold_map.get(asset_key, min_hold_map.get("DEFAULT", 0.0)) or 0.0)
+            except (TypeError, ValueError):
+                min_hold_sec = 0.0
+        if decay.ready and decay.optimal_hold_sec is not None and min_hold_sec > 0.0 and float(decay.optimal_hold_sec) < min_hold_sec:
+            diagnostics = {
+                "model": "dynamic_exit_state_v1",
+                "asset_id": asset_key,
+                "venue": venue_key,
+                "required_min_executable_hold_sec": min_hold_sec,
+                "signal_decay": asdict(decay),
+                "kyle_impact": asdict(impact),
+                "vpin": asdict(toxicity),
+            }
+            reason = f"signal_horizon_below_protected_execution_min:{float(decay.optimal_hold_sec):.3f}<{min_hold_sec:.3f}"
+            return ProtectionPlan(price, price, price, protection_type, False, [reason], diagnostics=diagnostics)
         # Kyle and VPIN readiness are venue-specific. The previous implementation
         # named these policies *_FOR_DELTA but accidentally blocked Hyperliquid and
         # CoinSwitch forever when their selected feed had no Delta-style event tape.
@@ -401,6 +420,8 @@ class DynamicProtectionPlanBuilder:
                 "policy_min_rr": policy_min_rr,
                 "policy_max_rr": policy_max_rr,
                 "asset_min_target_bps": min_target_bps,
+                "volatility_source": str(market.get("volatility_source") or "unknown"),
+                "venue_local_robust_vol_bps": market.get("venue_local_robust_vol_bps"),
             },
             "signal_decay": asdict(decay),
             "kyle_impact": asdict(impact),

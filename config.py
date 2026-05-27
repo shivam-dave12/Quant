@@ -26,7 +26,15 @@ LIVE_TRADING_ENABLED = True
 # this three-crypto-venue release until its separate compliance prerequisites are enabled.
 ANALYSIS_DATA_VENUES = ("delta", "coinswitch", "hyperliquid", "groww")
 LIVE_EXECUTION_VENUES = ("delta", "coinswitch", "hyperliquid")
-EXECUTION_EXCHANGE = "delta"  # legacy discovery preference; not live-order permission
+# Legacy execution default is retained only for old one-venue callers. It must not
+# make Delta the signal origin or route preference in the multi-venue scanner.
+EXECUTION_EXCHANGE = "delta"
+DISCOVERY_PRIMARY_EXCHANGE = ""  # no configured broker gets signal/routing priority
+INDEPENDENT_VENUE_SIGNAL_ORIGINATION_ENABLED = True
+EXECUTION_ASYNC_ENTRY_LIFECYCLE_ENABLED = True
+CROSS_VENUE_RAW_PRICE_ROUTING_ENABLED = False
+VENUE_ROUTE_PRICE_ADVANTAGE_CREDIT_ENABLED = False
+COINSWITCH_REQUIRE_LIVE_ORDERBOOK_FOR_EXECUTION = True
 
 # Venue activation / environments are runtime policy, not secrets.
 DELTA_TESTNET = False
@@ -39,8 +47,9 @@ HYPERLIQUID_RECONNECT_SEC = 3.0
 HYPERLIQUID_PERP_DEXS = ("", "xyz", "km")
 HYPERLIQUID_REFERENCE_COIN_BY_ASSET = {
     "BTC": "BTC",
-    "GOLD": "PAXG",
-    "SILVER": "xyz:SILVER",
+    # These are distinct exposure groups; no raw-price substitution is permitted.
+    "GOLD_HL": "xyz:GOLD",
+    "SILVER_HL": "xyz:SILVER",
 }
 # No permanent venue preference: route from live executable economics,
 # collateral and protection feasibility on each approved candidate.
@@ -261,16 +270,67 @@ AGG_TRADE_WINDOW_SEC = 30.0
 
 # ── Microstructure alpha baseline (kept in shadow mode until forward labels validate it) ──
 INSTITUTIONAL_ENABLE_LIVE_ENTRIES = LIVE_TRADING_ENABLED  # backwards-compatible internal alias
-INSTITUTIONAL_REQUIRE_BTC_CROSS_VENUE = True
+INSTITUTIONAL_REQUIRE_BTC_CROSS_VENUE = False  # legacy hard veto retired; cross-venue evidence is continuous risk input
 INSTITUTIONAL_MIN_EXECUTION_QUALITY = 0.40
-INSTITUTIONAL_MIN_FLOW_AGREEMENT = 0.55
+INSTITUTIONAL_MIN_FLOW_AGREEMENT = 0.55  # retained for telemetry only; never a binary entry veto
 INSTITUTIONAL_MAX_CROSS_VENUE_DISPERSION_BPS = 15.0
 INSTITUTIONAL_MIN_SIGNAL_BPS = 0.50
 INSTITUTIONAL_MIN_NET_EDGE_BPS = 3.0
 INSTITUTIONAL_FLOW_OFI_WEIGHT = 1.0
 INSTITUTIONAL_FLOW_TFI_WEIGHT = 0.30
 INSTITUTIONAL_FLOW_MICROPRICE_WEIGHT = 0.35
-INSTITUTIONAL_FLOW_DISLOCATION_WEIGHT = 0.50
+INSTITUTIONAL_FLOW_DISLOCATION_WEIGHT = 0.00  # raw venue dislocation is diagnostic unless an independently validated RV model exists
+# Venue-local market-state alpha: robust shrinkage of confirmed displacement,
+# range acceptance and live impulse; it is additive alpha, not a loose filter.
+INSTITUTIONAL_ENABLE_MARKET_STATE_ALPHA = True
+INSTITUTIONAL_MARKET_STATE_ASSETS = ("BTC", "GOLD_PAXG", "GOLD_HL", "SILVER_SLVON", "SILVER_XAG", "SILVER_HL", "OIL")
+INSTITUTIONAL_MARKET_STATE_PARAMETERS = {
+    "DEFAULT": {"capture_rate": 0.18, "max_alpha_bps": 18.0, "acceptance_weight": 0.25, "live_impulse_weight": 0.15, "min_confidence": 0.25},
+    "BTC": {"capture_rate": 0.24, "max_alpha_bps": 32.0, "acceptance_weight": 0.30, "live_impulse_weight": 0.22, "min_confidence": 0.25},
+    "GOLD_PAXG": {"capture_rate": 0.28, "max_alpha_bps": 34.0, "acceptance_weight": 0.35, "live_impulse_weight": 0.15, "min_confidence": 0.30},
+    "GOLD_HL": {"capture_rate": 0.28, "max_alpha_bps": 34.0, "acceptance_weight": 0.35, "live_impulse_weight": 0.15, "min_confidence": 0.30},
+    "SILVER_SLVON": {"capture_rate": 0.20, "max_alpha_bps": 28.0, "acceptance_weight": 0.30, "live_impulse_weight": 0.12, "min_confidence": 0.32},
+    "SILVER_XAG": {"capture_rate": 0.24, "max_alpha_bps": 32.0, "acceptance_weight": 0.32, "live_impulse_weight": 0.14, "min_confidence": 0.30},
+    "SILVER_HL": {"capture_rate": 0.24, "max_alpha_bps": 32.0, "acceptance_weight": 0.32, "live_impulse_weight": 0.14, "min_confidence": 0.30},
+    "OIL": {"capture_rate": 0.22, "max_alpha_bps": 32.0, "acceptance_weight": 0.30, "live_impulse_weight": 0.15, "min_confidence": 0.30},
+}
+INSTITUTIONAL_MICROSTRUCTURE_ALPHA_CAP_BPS = {"BTC": 22.0, "GOLD_PAXG": 18.0, "GOLD_HL": 18.0, "SILVER_SLVON": 15.0, "SILVER_XAG": 18.0, "SILVER_HL": 18.0, "OIL": 18.0}
+# Venue disagreement raises uncertainty and scales confidence continuously. A
+# leader venue may still trade a genuine impulse before followers converge.
+INSTITUTIONAL_CROSS_VENUE_MODE = "continuous_confidence"
+INSTITUTIONAL_CROSS_VENUE_UNCERTAINTY_MAX_BPS = 6.0
+INSTITUTIONAL_RELATIVE_VALUE_ALPHA_ENABLED = False
+# Product-aware composite intelligence policy. Data from all verified venues may
+# contribute normalised factor evidence, but execution alpha transfers only
+# inside a validated fungible/execution-equivalence group. Related products such
+# as PAXG vs HIP-3 GOLD and SLVON vs XAG/SILVER are context-only until a fitted,
+# formally approved basis/hedge-ratio model is installed below.
+INSTITUTIONAL_FACTOR_BY_ASSET = {
+    "BTC": "BTC", "OIL": "OIL",
+    "GOLD_PAXG": "GOLD", "GOLD_HL": "GOLD",
+    "SILVER_SLVON": "SILVER", "SILVER_XAG": "SILVER", "SILVER_HL": "SILVER",
+}
+INSTITUTIONAL_EXECUTION_EQUIVALENCE_GROUP_BY_ASSET = {
+    "BTC": "BTC_LINEAR_PERP",
+    "OIL": "OIL_HL_ONLY",
+    "GOLD_PAXG": "PAXG_TOKEN_PERP",
+    "GOLD_HL": "GOLD_HIP3_ONLY",
+    "SILVER_SLVON": "SLVON_TOKEN_PERP_ONLY",
+    "SILVER_XAG": "XAG_PERP_ONLY",
+    "SILVER_HL": "SILVER_HIP3_ONLY",
+}
+INSTITUTIONAL_FACTOR_TRANSFER_MODE_BY_ASSET = {
+    "BTC": "TRANSFERABLE_EXECUTION_ALPHA",
+    "OIL": "TRANSFERABLE_EXECUTION_ALPHA",
+    "GOLD_PAXG": "CONFIDENCE_ONLY",
+    "GOLD_HL": "CONFIDENCE_ONLY",
+    "SILVER_SLVON": "CONFIDENCE_ONLY",
+    "SILVER_XAG": "CONFIDENCE_ONLY",
+    "SILVER_HL": "CONFIDENCE_ONLY",
+}
+INSTITUTIONAL_FACTOR_EVIDENCE_MAX_STALENESS_SEC = 8.0
+INSTITUTIONAL_VALIDATED_FACTOR_TRANSLATION_MODELS = {}  # disabled until fitted/approved research exists
+INSTITUTIONAL_COMPOSITE_INTELLIGENCE_ENABLED = True
 INSTITUTIONAL_RISK_FRACTION_PER_TRADE = 0.0025
 INSTITUTIONAL_QUARTER_KELLY = 0.25
 INSTITUTIONAL_TARGET_OBSERVATION_VOL_BPS = 10.0
@@ -352,17 +412,34 @@ DYNAMIC_PROTECTION_DEPTH_STRESS_MIN_COVERAGE = 4.0
 DYNAMIC_PROTECTION_DEPTH_STRESS_STOP_BPS = 18.0
 DYNAMIC_PROTECTION_ASSET_MIN_STOP_BPS = {
     "BTC": 10.0,
-    "GOLD": 22.0,
-    "SILVER": 45.0,
+    "GOLD_PAXG": 22.0,
+    "GOLD_HL": 22.0,
+    "SILVER_SLVON": 65.0,
+    "SILVER_XAG": 55.0,
+    "SILVER_HL": 55.0,
 }
 DYNAMIC_PROTECTION_VENUE_ASSET_MIN_STOP_BPS = {
-    "hyperliquid:SILVER": 55.0,
-    "delta:SILVER": 65.0,
+    "hyperliquid:SILVER_HL": 55.0,
+    "delta:SILVER_SLVON": 65.0,
 }
 DYNAMIC_PROTECTION_ASSET_MIN_TARGET_BPS = {
     "BTC": 20.0,
-    "GOLD": 45.0,
-    "SILVER": 100.0,
+    "GOLD_PAXG": 45.0,
+    "GOLD_HL": 45.0,
+    "SILVER_SLVON": 100.0,
+    "SILVER_XAG": 100.0,
+    "SILVER_HL": 100.0,
+}
+# A short-lived OFI/TFI burst cannot justify a wide structural bracket. Entries
+# fail closed when the estimated alpha life is shorter than protected execution.
+DYNAMIC_PROTECTION_MIN_EXECUTABLE_HOLD_SEC_BY_ASSET = {
+    "BTC": 5.0,
+    "OIL": 20.0,
+    "GOLD_PAXG": 30.0,
+    "GOLD_HL": 20.0,
+    "SILVER_SLVON": 60.0,
+    "SILVER_XAG": 30.0,
+    "SILVER_HL": 30.0,
 }
 DYNAMIC_PROTECTION_RR_FLOOR = 1.15
 DYNAMIC_PROTECTION_OPTION_RR_FLOOR = 1.10
@@ -728,8 +805,13 @@ MULTI_ASSET_REQUESTS = [
 
     # Commodity exposure available on Delta is tokenised/RWA futures, not physical spot futures.
     {"asset_id": "OIL", "display_name": "Crude Oil / WTI", "asset_class": "commodity", "aliases": ["OIL", "WTI", "CL", "USOIL", "CRUDE", "CRUDEOIL", "OILUSD", "OILUSDT", "WTIUSDT"], "priority": 10},
-    {"asset_id": "GOLD", "display_name": "Gold token derivatives", "asset_class": "commodity", "aliases": ["PAXGUSD", "XAUTUSD", "PAXG", "PAXGUSDT", "XAUT", "XAUTUSDT", "GOLD", "XAU", "XAUUSD"], "priority": 11},
-    {"asset_id": "SILVER", "display_name": "Silver token derivatives", "asset_class": "commodity", "aliases": ["SLVONUSD", "SLVON", "SILVER", "XAG", "XAGUSD", "SLV", "SILVERUSDT"], "priority": 12},
+    # Exposure-equivalence groups.  Do not route raw prices between tokenised
+    # ETF derivatives and commodity/HIP-3 products without a validated basis model.
+    {"asset_id": "GOLD_PAXG", "display_name": "PAXG token derivatives", "asset_class": "commodity", "aliases": ["PAXGUSD", "PAXGUSDT", "PAXG"], "priority": 11},
+    {"asset_id": "GOLD_HL", "display_name": "Hyperliquid GOLD HIP-3", "asset_class": "commodity", "aliases": ["xyz:GOLD"], "priority": 12},
+    {"asset_id": "SILVER_SLVON", "display_name": "SLV Ondo token derivative", "asset_class": "commodity", "aliases": ["SLVONUSD", "SLVON"], "priority": 13},
+    {"asset_id": "SILVER_XAG", "display_name": "CoinSwitch XAG perpetual", "asset_class": "commodity", "aliases": ["XAGUSDT", "XAG/USDT", "XAG"], "priority": 14},
+    {"asset_id": "SILVER_HL", "display_name": "Hyperliquid SILVER HIP-3", "asset_class": "commodity", "aliases": ["xyz:SILVER"], "priority": 15},
 
     # Important: Delta SPXUSD is SPX6900 crypto, NOT S&P 500. Do not alias it here.
     {"asset_id": "SPX_INDEX", "display_name": "S&P 500 index", "asset_class": "index", "aliases": ["SPX500USD", "US500", "SP500", "S&P500"], "priority": 20},
@@ -809,7 +891,7 @@ POLICY_OPTION_VWAP_WINDOW = 35
 # Desk model: every desk uses the unified structural market_state authority.
 # Archetypes compete under one execution/risk authority; evidence is not probability.
 # Desks differ only in venue execution, risk, cost and lot-size policy.
-STRATEGY_CORE_NAME = "INSTITUTIONAL_market_state_V514"
+STRATEGY_CORE_NAME = "INSTITUTIONAL_COMPOSITE_FACTOR_EXECUTION_V8"
 TELEGRAM_RECENT_TRADES_LIMIT = 30
 
 TRADING_DESKS = {

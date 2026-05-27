@@ -40,6 +40,8 @@ def run_coinswitch(symbols: list[str]) -> dict[str, Any]:
     for symbol in symbols:
         sym = symbol.replace("/", "").upper()
         out["symbols"][sym] = {
+            "ticker": compact(api.get_futures_ticker(symbol=sym, exchange=config.COINSWITCH_EXCHANGE)),
+            "orderbook": compact(api.get_orderbook(symbol=sym, exchange=config.COINSWITCH_EXCHANGE)),
             "positions": compact(api.get_positions(exchange=config.COINSWITCH_EXCHANGE, symbol=sym)),
             "open_orders": compact(api.get_open_orders(exchange=config.COINSWITCH_EXCHANGE, symbol=sym)),
         }
@@ -52,6 +54,7 @@ def run_hyperliquid(symbols: list[str]) -> dict[str, Any]:
     for symbol in symbols:
         out["symbols"][symbol] = {
             "balance": compact(api.get_balance(symbol)),
+            "asset_context": compact(api.current_asset_context(symbol)),
             "position_state": compact(api.user_state(coin=symbol)),
             "open_orders": compact(api.open_orders(coin=symbol)),
         }
@@ -63,7 +66,23 @@ def main() -> int:
     parser.add_argument("--coinswitch", nargs="*", default=["BTCUSDT", "PAXGUSDT", "XAGUSDT"])
     parser.add_argument("--hyperliquid", nargs="*", default=["BTC", "xyz:GOLD", "xyz:SILVER"])
     args = parser.parse_args()
-    report: dict[str, Any] = {}
+    report: dict[str, Any] = {
+        "execution_policy": {
+            "live_execution_venues": list(getattr(config, "LIVE_EXECUTION_VENUES", ())),
+            "discovery_primary_exchange": getattr(config, "DISCOVERY_PRIMARY_EXCHANGE", ""),
+            "cross_venue_raw_price_routing_enabled": getattr(config, "CROSS_VENUE_RAW_PRICE_ROUTING_ENABLED", False),
+            "composite_intelligence_enabled": getattr(config, "INSTITUTIONAL_COMPOSITE_INTELLIGENCE_ENABLED", False),
+            "factor_by_asset": getattr(config, "INSTITUTIONAL_FACTOR_BY_ASSET", {}),
+            "execution_equivalence_group_by_asset": getattr(config, "INSTITUTIONAL_EXECUTION_EQUIVALENCE_GROUP_BY_ASSET", {}),
+            "factor_transfer_mode_by_asset": getattr(config, "INSTITUTIONAL_FACTOR_TRANSFER_MODE_BY_ASSET", {}),
+            "validated_factor_translation_models": getattr(config, "INSTITUTIONAL_VALIDATED_FACTOR_TRANSLATION_MODELS", {}),
+            "exposure_groups": [
+                {"asset_id": row.get("asset_id"), "aliases": row.get("aliases", [])}
+                for row in getattr(config, "MULTI_ASSET_REQUESTS", [])
+                if str(row.get("asset_id", "")).startswith(("SILVER", "GOLD"))
+            ],
+        }
+    }
     try:
         report["coinswitch"] = run_coinswitch(args.coinswitch)
     except Exception as exc:

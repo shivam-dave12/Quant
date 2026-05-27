@@ -197,7 +197,9 @@ class CoinSwitchDataManager:
     def start(self) -> bool:
         try:
             self.is_ready = self.is_streaming = False
-            symbol = self.ws_symbol
+            # Official Futures WebSocket pair format is BASEUSDT (for example
+            # XAGUSDT), never the UI display label XAG/USDT.
+            symbol = str(self.symbol).upper().replace("/", "").replace("-", "")
 
             logger.info(f"CoinSwitch DM[{symbol}]: starting WebSocket...")
             self.ws = CoinSwitchWebSocket()
@@ -517,6 +519,9 @@ class CoinSwitchDataManager:
                    for tf in mins if counts[tf] < mins[tf]]
         if missing:
             logger.debug(f"CoinSwitch DM not ready: {', '.join(missing)}")
+            return False
+        if bool(getattr(config, "COINSWITCH_REQUIRE_LIVE_ORDERBOOK_FOR_EXECUTION", True)) and not self._snapshot_ready:
+            logger.warning("CoinSwitch DM[%s] fail-closed: candles warm but no official live orderbook snapshot received", self.symbol)
             return False
         return True
 

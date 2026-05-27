@@ -29,7 +29,7 @@ class PortfolioExposureTracker:
     @staticmethod
     def bucket_for(asset_id: str) -> str:
         asset = str(asset_id or "").upper()
-        if asset in {"BTC", "GOLD", "SILVER", "XAUT", "XAG"}:
+        if asset == "BTC" or asset.startswith("GOLD") or asset.startswith("SILVER") or asset in {"XAUT", "XAG"}:
             return "ANTI_DOLLAR_MACRO"
         if asset in {"NIFTY", "BANKNIFTY", "SENSEX"}:
             return "INDIA_EQUITY_INDEX"

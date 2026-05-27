@@ -156,6 +156,34 @@ class MarketAggregator:
             exchange = getattr(self.instrument, "primary_exchange", "")
         return str(exchange or "").lower() == "groww" and bool(getattr(config, "GROWW_REQUIRE_UNDERLYING_ANALYSIS_FEED", True))
 
+    def _market_managers(self):
+        return [dm for dm in [self._primary, self._secondary, *self._references] if dm is not None]
+
+    def _promote_ready_market_manager(self, manager) -> None:
+        """Promote a live executable feed for wrapper compatibility only.
+
+        Signal origination remains venue-local and independent; promotion only
+        prevents a failed first-listed catalogue venue from making the whole
+        asset context appear disconnected.
+        """
+        if manager is self._primary:
+            return
+        old_primary = self._primary
+        if manager is self._secondary:
+            self._primary, self._secondary = self._secondary, self._primary
+            self._secondary_alive = bool(getattr(self._secondary, "is_ready", False))
+        else:
+            self._references = [dm for dm in self._references if dm is not manager]
+            self._primary = manager
+            if old_primary is not None and old_primary not in self._references and old_primary is not self._secondary:
+                self._references.append(old_primary)
+        if self._strategy_ref is not None:
+            try:
+                self._primary.register_strategy(self._strategy_ref)
+            except Exception:
+                pass
+        logger.warning("⚖ Context compatibility feed promoted to %s after bootstrap feed unavailability; venue-local alpha/routing remains independent", type(self._primary).__name__)
+
     # ── Internal: secondary trade tap ────────────────────────────────────────
 
     def _install_secondary_trade_tap(self) -> None:
@@ -215,66 +243,58 @@ class MarketAggregator:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self) -> bool:
-        """Start both data managers concurrently for faster boot."""
+        """Start every configured venue concurrently; no catalogue-first venue is mandatory.
+
+        For non-option assets, any live venue can keep the context alive because
+        strategy and routing are venue-local. Groww remains fail-closed on its
+        mandatory underlying/option feed relationship.
+        """
         import threading
 
-        primary_ok = [False]
-        secondary_ok = [False]
-
-        def start_primary():
-            primary_ok[0] = self._primary.start()
-
-        def start_secondary():
-            if self._secondary is None:
-                return
-            try:
-                secondary_ok[0] = self._secondary.start()
-            except Exception as e:
-                logger.warning(f"Secondary DM start failed (non-fatal): {e}")
-                secondary_ok[0] = False
-
+        managers = self._market_managers()
+        start_ok: dict[int, bool] = {id(dm): False for dm in managers}
         analysis_ok = [True]
 
-        def start_analysis():
-            if self._analysis is None:
-                return
+        def start_dm(dm):
             try:
-                analysis_ok[0] = self._analysis.start()
-            except Exception as e:
-                logger.warning(f"Analysis DM start failed (non-fatal): {e}")
-                analysis_ok[0] = False
-
-        t1 = threading.Thread(target=start_primary,   daemon=True)
-        t2 = threading.Thread(target=start_secondary, daemon=True)
-        t3 = threading.Thread(target=start_analysis,  daemon=True)
-        t1.start(); t2.start(); t3.start()
-        t1.join(); t2.join(); t3.join()
-
-        if not primary_ok[0]:
-            logger.error("❌ Primary DM failed to start — cannot trade")
-            return False
-
-        if self._secondary and not secondary_ok[0]:
-            logger.warning(
-                "⚠️  Secondary DM failed to start — running on primary only. "
-                "raw trade/quote telemetry will be single-exchange."
-            )
-            self._secondary_alive = False
-        elif self._secondary:
-            self._secondary_alive = True
-            logger.info("✅ Both exchanges live — dual-feed aggregation active")
-
-        if self._analysis and not analysis_ok[0]:
-            if self._requires_analysis_feed():
-                logger.error("GROWW analysis websocket unavailable; desk is fail-closed because underlying structural feed is mandatory")
-                return False
-            logger.warning("Analysis DM unavailable; primary candles will be used for structure")
-
-        for ref in self._references:
-            try:
-                ref.start()
+                start_ok[id(dm)] = bool(dm.start())
             except Exception as exc:
-                logger.warning("Read-only reference feed %s failed to start: %s", type(ref).__name__, exc)
+                logger.warning("Market data manager %s start failed: %s", type(dm).__name__, exc)
+                start_ok[id(dm)] = False
+
+        threads = [threading.Thread(target=start_dm, args=(dm,), daemon=True) for dm in managers]
+        for thread in threads:
+            thread.start()
+        if self._analysis is not None:
+            def start_analysis():
+                try:
+                    analysis_ok[0] = bool(self._analysis.start())
+                except Exception as exc:
+                    logger.warning("Analysis DM start failed: %s", exc)
+                    analysis_ok[0] = False
+            analysis_thread = threading.Thread(target=start_analysis, daemon=True)
+            analysis_thread.start()
+            threads.append(analysis_thread)
+        for thread in threads:
+            thread.join()
+
+        if self._requires_analysis_feed():
+            if not start_ok.get(id(self._primary), False):
+                logger.error("GROWW execution feed failed to start — desk remains fail-closed")
+                return False
+            if not analysis_ok[0]:
+                logger.error("GROWW analysis websocket unavailable; underlying structural feed is mandatory")
+                return False
+            return True
+
+        if not any(start_ok.values()):
+            logger.error("❌ No venue data manager started — asset context cannot trade safely")
+            return False
+        if not start_ok.get(id(self._primary), False):
+            logger.warning("Bootstrap catalogue feed failed to start; awaiting any live executable venue")
+        if self._secondary is not None:
+            self._secondary_alive = bool(start_ok.get(id(self._secondary), False))
+        logger.info("✅ Venue-isolated data feeds started: %s", ", ".join(type(dm).__name__ for dm in managers if start_ok.get(id(dm), False)))
         return True
 
     def stop(self) -> None:
@@ -315,88 +335,24 @@ class MarketAggregator:
         return ok
 
     def wait_until_ready(self, timeout_sec: float = 120.0) -> bool:
+        """Become ready when any eligible venue has a verified live state.
+
+        A first-listed discovery venue is never a gate for crypto/commodity
+        contexts. Groww options retain their mandatory dual-domain readiness.
         """
-        Wait for the primary DM to be ready.
-        If primary fails within timeout AND secondary is available and ready,
-        transparently swap them so the bot can still trade.
-        """
-        import time as _time
-
-        # Fast path — primary is already ready
-        if self._primary.is_ready:
-            if self._analysis is not None:
-                try:
-                    analysis_ready = bool(self._analysis.wait_until_ready(min(timeout_sec, 30.0)))
-                    if self._requires_analysis_feed() and not analysis_ready:
-                        logger.error("GROWW mandatory underlying analysis feed did not become ready")
-                        return False
-                except Exception as exc:
-                    if self._requires_analysis_feed():
-                        logger.error("GROWW mandatory underlying analysis readiness failed: %s", exc)
-                        return False
-            return True
-
-        # Wait for primary
-        ready = self._primary.wait_until_ready(timeout_sec)
-        if ready:
-            if self._analysis is not None:
-                try:
-                    analysis_ready = bool(self._analysis.wait_until_ready(min(timeout_sec, 30.0)))
-                    if self._requires_analysis_feed() and not analysis_ready:
-                        logger.error("GROWW mandatory underlying analysis feed did not become ready")
-                        return False
-                except Exception as exc:
-                    if self._requires_analysis_feed():
-                        logger.error("GROWW mandatory underlying analysis readiness failed: %s", exc)
-                        return False
-            return True
-
-        # Primary timed out — check if secondary can take over
-        if self._secondary is not None and getattr(self._secondary, 'is_ready', False):
-            logger.warning(
-                "⚠️  Primary DM not ready within timeout — "
-                "promoting secondary to primary for candle data."
-            )
-            # Swap: secondary becomes primary for candle reads
-            self._primary, self._secondary = self._secondary, self._primary
-            self._secondary_alive = True
-            # BUG-AGG-2 FIX: after promoting secondary to primary, re-register
-            # the strategy on the new primary so its _on_trade fires callbacks.
-            # Without this, the new primary's _strategy_ref is None and all
-            # real-time trade callbacks (trade and quote callbacks) are permanently severed.
-            if self._strategy_ref is not None:
-                try:
-                    self._primary.register_strategy(self._strategy_ref)
-                    logger.info(
-                        "✅ Strategy re-registered on new primary after failover"
-                    )
-                except Exception as _reg_e:
-                    logger.error(
-                        f"Failed to re-register strategy on new primary: {_reg_e}"
-                    )
-
-            # BUG-AGG-3 FIX: the OLD primary is now the NEW secondary, but its
-            # _on_trade is the untapped original. After the swap, secondary
-            # trades no longer flow into _merged_trades. Re-install the tap
-            # on the new secondary so dual-feed trade monitoring resumes.
-            if self._secondary is not None:
-                try:
-                    self._install_secondary_trade_tap()
-                    logger.info(
-                        "✅ Trade tap re-installed on new secondary after failover"
-                    )
-                except Exception as _tap_e:
-                    logger.error(
-                        f"Failed to re-install trade tap on new secondary: {_tap_e}"
-                    )
-
-            logger.info(
-                f"✅ Swapped: new primary={type(self._primary).__name__} "
-                f"new secondary={type(self._secondary).__name__}"
-            )
-            return True
-
-        logger.error("❌ Both data managers not ready — bot cannot trade safely")
+        deadline = time.time() + float(timeout_sec)
+        if self._requires_analysis_feed():
+            primary_ready = bool(self._primary.wait_until_ready(timeout_sec))
+            analysis_ready = bool(self._analysis is not None and self._analysis.wait_until_ready(min(timeout_sec, 30.0)))
+            return bool(primary_ready and analysis_ready)
+        while time.time() < deadline:
+            ready = [dm for dm in self._market_managers() if bool(getattr(dm, "is_ready", False))]
+            if ready:
+                if self._primary not in ready:
+                    self._promote_ready_market_manager(ready[0])
+                return True
+            time.sleep(0.05)
+        logger.error("❌ No independently configured venue became ready — asset context cannot trade safely")
         return False
 
     def prepare_groww_session_contract_book(self, available_funds: float) -> bool:
@@ -634,6 +590,50 @@ class MarketAggregator:
             "mode": "analysis_underlying" if self._analysis is not None else ("cross_venue" if secondary_ready or reference_ready else "single"),
         })
         return out
+
+    def _manager_for_venue(self, venue: str):
+        """Resolve an independent venue manager without merging price domains."""
+        key = str(venue or "").strip().lower()
+        for dm in [self._primary, self._secondary, *self._references]:
+            if dm is None:
+                continue
+            declared = str(getattr(dm, "venue", "") or "").lower()
+            cls = type(dm).__name__.lower()
+            inferred = (
+                "delta" if "delta" in cls else
+                "coinswitch" if "coinswitch" in cls else
+                "hyperliquid" if "hyperliquid" in cls else
+                "groww" if "groww" in cls else declared
+            )
+            if key in {declared, inferred}:
+                return dm
+        return None
+
+    def get_venue_candles(self, venue: str, timeframe: str = "5m", limit: int = 100) -> List[Dict]:
+        """Return candles from the exact candidate venue only.
+
+        Venue-local structural alpha must never be generated from the primary
+        venue's candles when an alternate broker is being scored.
+        """
+        dm = self._manager_for_venue(venue)
+        getter = getattr(dm, "get_candles", None) if dm is not None else None
+        if not callable(getter):
+            return []
+        try:
+            return list(getter(timeframe, limit) or [])
+        except Exception:
+            return []
+
+    def get_venue_microstructure_research_state(self, venue: str) -> Dict:
+        """Protection-calibration event stream for the selected execution venue."""
+        dm = self._manager_for_venue(venue)
+        getter = getattr(dm, "get_microstructure_research_state", None) if dm is not None else None
+        if callable(getter):
+            try:
+                return dict(getter() or {})
+            except Exception:
+                return {}
+        return {}
 
     def get_venue_microstates(self) -> Dict[str, object]:
         """Return separate venue states; no cross-venue depth summation is permitted."""

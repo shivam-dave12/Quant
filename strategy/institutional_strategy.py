@@ -17,6 +17,7 @@ import json
 import logging
 import math
 import time
+import threading
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -27,6 +28,11 @@ from core.market_policy import active_policy
 from core.pnl import gross_pnl_usd
 from execution.venue_selection import select_execution_venue
 from intelligence.cross_venue_btc import BTCCompositeState, build_btc_composite_state
+from intelligence.composite_asset_state import CompositeAssetDecision, CompositeIntelligenceBus
+from intelligence.venue_market_state import (
+    CrossVenueEvidence, VenueMarketState, VenueMarketStateEngine,
+    build_continuous_cross_venue_evidence,
+)
 from market_data.feed_health import FeedHealth, score_feed_health
 from market_data.normalizer import (
     InstrumentMapping,
@@ -183,7 +189,7 @@ class DailyRiskGate:
 class InstitutionalStrategy:
     """Runtime adapter exposing the bot-facing strategy API."""
 
-    def __init__(self, order_manager=None, *, instrument: TradableInstrument | None = None) -> None:
+    def __init__(self, order_manager=None, *, instrument: TradableInstrument | None = None, intelligence_bus: CompositeIntelligenceBus | None = None) -> None:
         self._om = order_manager
         self._instrument = instrument
         self._asset_id = getattr(instrument, "asset_id", str(_cfg("SYMBOL", "BTC")))
@@ -200,6 +206,10 @@ class InstitutionalStrategy:
         self._forward_labels = ForwardLabelWriter(self._research_store)
         self._last_candidate_id = ""
         self._protection_engine = DynamicProtectionPlanBuilder(asset_id=self._asset_id)
+        self._market_state_engine = VenueMarketStateEngine(asset_id=self._asset_id)
+        # Shared normalised factor bus: executable alpha transfers only inside
+        # validated equivalence groups; related products remain context-only.
+        self._composite_bus = intelligence_bus or CompositeIntelligenceBus()
         # Operator telemetry is state/change driven. The model can evaluate on
         # every market event without emitting an INFO-scale JSON payload per tick.
         self._telemetry_last_signature: tuple[Any, ...] | None = None
@@ -207,6 +217,10 @@ class InstitutionalStrategy:
         # Per-venue collateral snapshots prevent the route model selecting a
         # cheaper-looking exchange that cannot actually fund the approved trade.
         self._venue_cash_cache: dict[str, tuple[float, float]] = {}
+        # Protected entry confirmation may wait for fill/bracket acknowledgements.
+        # It must never block fresh market evaluation on the strategy thread.
+        self._entry_lock = threading.RLock()
+        self._entry_thread: threading.Thread | None = None
 
     def bind_market_wakeup(self, callback: Callable[[], Any]) -> None:
         self._market_wakeup = callback
@@ -251,6 +265,10 @@ class InstitutionalStrategy:
         self._last_tick_time = time.time()
         if order_manager is not None:
             self._om = order_manager
+        if self._pos.phase is PositionPhase.ENTERING:
+            # The execution supervisor owns fill/protection reconciliation while
+            # this candidate is pending; no duplicate entry is allowed.
+            return
         if not self._pos.is_flat():
             self._monitor_position(data_manager, order_manager, risk_manager)
             return
@@ -260,7 +278,10 @@ class InstitutionalStrategy:
         self._log_decision_calculation(decision)
         self._persist_decision(decision, now_ms)
         if decision.approved:
-            self._execute_approved(decision, order_manager, risk_manager)
+            if bool(_cfg("EXECUTION_ASYNC_ENTRY_LIFECYCLE_ENABLED", False)) and decision.venue != "groww":
+                self._submit_approved_async(decision, order_manager, risk_manager)
+            else:
+                self._execute_approved(decision, order_manager, risk_manager)
 
     @staticmethod
     def _round_or_none(value: Any, digits: int = 3) -> float | None:
@@ -490,16 +511,47 @@ class InstitutionalStrategy:
 
         states = self._venue_states(data_manager)
         execution_state, btc_composite = self._microstructure_context(data_manager, venue, instrument, feed_health, states=states)
-        liquidity_score, zones = self._liquidity_score(data_manager, instrument, price, execution_state=execution_state)
-        if btc_composite is not None:
-            execution_quality = btc_composite.delta_execution_quality_score
-        direction, directional_edge_bps, direction_reason, signal_breakdown = self._direction_and_edge(
-            desk, price, liquidity_score, execution_state=execution_state, btc_composite=btc_composite
+        market_states: dict[str, VenueMarketState] = {}
+        if bool(_cfg("INSTITUTIONAL_ENABLE_MARKET_STATE_ALPHA", True)) and states:
+            market_states = self._market_state_engine.build(data_manager, states)
+        cross_venue_evidence = (
+            build_continuous_cross_venue_evidence(self._asset_id, market_states, states)
+            if self._asset_id.upper() == "BTC" and market_states else None
         )
+        composite_decision = (
+            self._composite_bus.build_decision(asset_id=self._asset_id, market_states=market_states, microstates=states)
+            if bool(_cfg("INSTITUTIONAL_COMPOSITE_INTELLIGENCE_ENABLED", True)) and market_states else None
+        )
+        liquidity_score, zones = self._liquidity_score(data_manager, instrument, price, execution_state=execution_state)
+        direction, directional_edge_bps, direction_reason, signal_breakdown = self._direction_and_edge(
+            desk, price, liquidity_score, execution_state=execution_state, btc_composite=btc_composite,
+            market_state=market_states.get(str(venue).lower()), cross_venue_evidence=cross_venue_evidence,
+            composite_decision=composite_decision,
+        )
+        signal_origin_candidates: list[dict[str, Any]] = []
+        if bool(_cfg("INDEPENDENT_VENUE_SIGNAL_ORIGINATION_ENABLED", False)) and states:
+            best_origin, signal_origin_candidates = self._best_originating_venue_signal(
+                data_manager, states, btc_composite, instrument, market_states, cross_venue_evidence, composite_decision
+            )
+            if best_origin is not None:
+                venue = str(best_origin["venue"])
+                instrument = str(best_origin["instrument"])
+                desk = str(best_origin["desk"])
+                price = float(best_origin["price"])
+                execution_state = best_origin["state"]
+                liquidity_score = float(best_origin["liquidity_score"])
+                zones = best_origin["zones"]
+                execution_quality = float(best_origin["execution_quality"])
+                direction = best_origin["direction"]
+                directional_edge_bps = float(best_origin["edge_bps"])
+                direction_reason = f"independent_venue_origin:{venue}:{best_origin['reason']}"
+                signal_breakdown = dict(best_origin["breakdown"])
+                regime = self._market_state_regime(market_states.get(venue), regime)
         venue_selection = None
         venue_available_cash: dict[str, float] = {}
         venue_candidate_notional: dict[str, float] = {}
         venue_required_margin: dict[str, float] = {}
+        validated_edge_by_venue: dict[str, float] = {}
         if (
             bool(_cfg("VENUE_SELECTION_ENABLED", True))
             and direction is not Direction.NO_TRADE
@@ -507,6 +559,19 @@ class InstitutionalStrategy:
         ):
             try:
                 routeable = self._routeable_venues(order_manager)
+                if signal_origin_candidates:
+                    for row in signal_origin_candidates:
+                        row_venue = str(row.get("venue", "")).lower()
+                        if str(row.get("direction", "")) == direction.value and _num(row.get("edge_bps"), 0.0) > 0.0:
+                            validated_edge_by_venue[row_venue] = _num(row.get("edge_bps"), 0.0)
+                    # Execution may route only to a venue that independently
+                    # validated the same directional thesis. No broker inherits
+                    # another venue's alpha absent a fitted lead/lag transfer model.
+                    if validated_edge_by_venue:
+                        routeable = routeable.intersection(validated_edge_by_venue)
+                if not validated_edge_by_venue:
+                    validated_edge_by_venue[str(venue).lower()] = float(directional_edge_bps)
+                    routeable = routeable.intersection({str(venue).lower()})
                 venue_available_cash = self._venue_available_cash(order_manager, routeable)
                 venue_candidate_notional, venue_required_margin = self._venue_selection_budgets(venue_available_cash)
                 venue_selection = select_execution_venue(
@@ -520,6 +585,7 @@ class InstitutionalStrategy:
                     required_margin_usd=0.0,
                     protection_capable_venues=self._protection_capable_venues(order_manager, routeable),
                     gross_edge_bps=directional_edge_bps,
+                    gross_edge_by_venue=validated_edge_by_venue,
                     notional_by_venue=venue_candidate_notional,
                     required_margin_by_venue=venue_required_margin,
                 )
@@ -545,8 +611,11 @@ class InstitutionalStrategy:
                         refs = {k: v for k, v in states.items() if k != "delta"}
                         selected_composite = build_btc_composite_state(delta_state=states["delta"], reference_states=refs) if refs else None
                     venue_direction, venue_edge_bps, venue_reason, venue_breakdown = self._direction_and_edge(
-                        desk, price, liquidity_score, execution_state=execution_state, btc_composite=selected_composite
+                        desk, price, liquidity_score, execution_state=execution_state, btc_composite=selected_composite,
+                        market_state=market_states.get(venue), cross_venue_evidence=cross_venue_evidence,
+                        composite_decision=composite_decision,
                     )
+                    regime = self._market_state_regime(market_states.get(venue), regime)
                     if venue_direction is Direction.NO_TRADE:
                         direction = Direction.NO_TRADE
                         directional_edge_bps = 0.0
@@ -588,7 +657,9 @@ class InstitutionalStrategy:
             max_route_cost_bps = float(_cfg("VENUE_SELECTION_MAX_COST_BPS", 100.0))
             route_expected_edge = getattr(selected_route_estimate, "expected_net_edge_bps", None)
             route_expected_profit = getattr(selected_route_estimate, "expected_net_profit_usd", None)
-            if selected_route_cost_bps > max_route_cost_bps:
+            if selected_route_cost_bps < 0.0:
+                route_governance_block = f"selected_route_invalid_negative_cost:{selected_route_cost_bps:.3f}"
+            elif selected_route_cost_bps > max_route_cost_bps:
                 route_governance_block = f"selected_route_cost_exceeds_limit:{selected_route_cost_bps:.2f}>{max_route_cost_bps:.2f}"
             elif route_expected_edge is not None and float(route_expected_edge) <= 0.0:
                 route_governance_block = f"selected_route_nonpositive_expected_net_edge:{float(route_expected_edge):.3f}"
@@ -596,9 +667,15 @@ class InstitutionalStrategy:
                 route_governance_block = f"selected_route_nonpositive_expected_net_profit:{float(route_expected_profit):.6f}"
         costs_bps = cost_components["total_cost_bps"]
         uncertainty_bps = self._uncertainty_bps(regime, liquidity_score, execution_quality)
+        uncertainty_bps += max(0.0, _num(signal_breakdown.get("market_state_uncertainty_bps"), 0.0))
+        uncertainty_bps += max(0.0, _num(signal_breakdown.get("cross_venue_uncertainty_bps"), 0.0))
         net_edge = directional_edge_bps - costs_bps
-        research_state_getter = getattr(data_manager, "get_microstructure_research_state", None)
-        research_state = research_state_getter() if callable(research_state_getter) else {}
+        venue_research_getter = getattr(data_manager, "get_venue_microstructure_research_state", None)
+        if callable(venue_research_getter):
+            research_state = venue_research_getter(venue) or {}
+        else:
+            research_state_getter = getattr(data_manager, "get_microstructure_research_state", None)
+            research_state = research_state_getter() if callable(research_state_getter) else {}
         self._protection_engine.observe(
             signal_bps=_num(signal_breakdown.get("weighted_signal_bps"), 0.0),
             timestamp_s=time.time(), research_state=research_state,
@@ -618,6 +695,12 @@ class InstitutionalStrategy:
             "signal_source": direction_reason,
             "selected_execution_venue": venue,
             "selected_execution_symbol": instrument,
+            "signal_origin_candidates": signal_origin_candidates,
+            "exposure_equivalence_group": self._asset_id,
+            "venue_market_state": {k: v.as_dict() for k, v in market_states.items()},
+            "composite_asset_intelligence": composite_decision.as_dict() if composite_decision is not None else {},
+            "cross_venue_evidence": cross_venue_evidence.as_dict() if cross_venue_evidence is not None else {},
+            "protection_research_venue": venue,
             "exit_model_state": {
                 "signal_decay": asdict(decay_state),
                 "kyle_impact": asdict(impact_state),
@@ -631,6 +714,7 @@ class InstitutionalStrategy:
             model_values["venue_candidate_notional_usd"] = dict(venue_candidate_notional)
             model_values["venue_required_margin_usd"] = dict(venue_required_margin)
             model_values["selected_venue_available_cash_usd"] = float(venue_available_cash.get(str(venue).lower(), 0.0))
+            model_values["venue_validated_directional_edge_bps"] = dict(validated_edge_by_venue)
         if execution_state is not None:
             model_values.update({
                 "ofi_usd_1s": execution_state.ofi_usd_1s,
@@ -689,6 +773,7 @@ class InstitutionalStrategy:
             desk, direction, price, liquidity_score, data_manager=data_manager,
             gross_edge_bps=directional_edge_bps, costs_bps=costs_bps,
             venue=venue, instrument=instrument, execution_state=execution_state, regime=regime,
+            venue_market_state=market_states.get(str(venue).lower()),
         )
         model_values["dynamic_protection_plan"] = protection.diagnostics if protection is not None else {}
         if protection is None or not protection.protection_feasible:
@@ -713,6 +798,7 @@ class InstitutionalStrategy:
         sizing = self._size_position(
             desk, instrument, direction, price, net_edge, liquidity_score, protection, risk_manager,
             venue=venue, balance_source=self._execution_manager_for(order_manager, venue),
+            venue_market_state=market_states.get(str(venue).lower()),
         )
         if not sizing.approved:
             return self._decision(
@@ -738,6 +824,7 @@ class InstitutionalStrategy:
             gross_edge_bps=directional_edge_bps, costs_bps=costs_bps,
             position_notional=sizing.notional, quantity=sizing.quantity,
             venue=venue, instrument=instrument, execution_state=execution_state, regime=regime,
+            venue_market_state=market_states.get(str(venue).lower()),
         )
         model_values["dynamic_protection_plan"] = protection.diagnostics if protection is not None else {}
         if protection is None or not protection.protection_feasible:
@@ -1131,6 +1218,46 @@ class InstitutionalStrategy:
             )
         except Exception:
             pass
+
+    def _submit_approved_async(self, decision: OpportunityDecision, order_manager, risk_manager) -> None:
+        sizing = decision.sizing
+        protection = decision.protection_plan
+        if sizing is None or protection is None:
+            return
+        with self._entry_lock:
+            if self._pos.phase is not PositionPhase.FLAT:
+                return
+            self._pos = PositionState(
+                phase=PositionPhase.ENTERING,
+                side="long" if decision.direction in {Direction.LONG, Direction.BULLISH} else "short",
+                quantity=float(sizing.quantity), entry_price=float(protection.entry_price),
+                sl_price=float(protection.stop_price), tp_price=float(protection.target_price),
+                exchange=decision.venue, execution_symbol=decision.instrument, asset_id=self._asset_id,
+                protection_model=protection.protection_type, protection_confirmed=False,
+                quant_components=decision.model_values,
+            )
+            self._entry_thread = threading.Thread(
+                target=self._execute_approved_worker, args=(decision, order_manager, risk_manager),
+                daemon=True, name=f"protected-entry-{self._asset_id}-{decision.venue}",
+            )
+            self._entry_thread.start()
+            logger.info("🧵 PROTECTED_ENTRY_SUPERVISOR launched asset=%s venue=%s instrument=%s; signal loop remains live", self._asset_id, decision.venue, decision.instrument)
+
+    def _execute_approved_worker(self, decision: OpportunityDecision, order_manager, risk_manager) -> None:
+        try:
+            self._execute_approved(decision, order_manager, risk_manager)
+        except Exception as exc:
+            logger.exception("Protected entry supervisor failed for %s/%s: %s", decision.venue, decision.instrument, exc)
+        finally:
+            with self._entry_lock:
+                if self._pos.phase is PositionPhase.ENTERING:
+                    self._pos = PositionState(asset_id=self._asset_id)
+                self._entry_thread = None
+            if callable(self._market_wakeup):
+                try:
+                    self._market_wakeup()
+                except Exception:
+                    pass
 
     def _execute_approved(self, decision: OpportunityDecision, order_manager, risk_manager) -> None:
         sizing = decision.sizing
@@ -1699,30 +1826,78 @@ class InstitutionalStrategy:
                 states = {}
         return states
 
+    def _best_originating_venue_signal(
+        self, data_manager, states: dict[str, VenueMicrostate], btc_composite: BTCCompositeState | None,
+        fallback_instrument: str, market_states: dict[str, VenueMarketState] | None = None,
+        cross_venue_evidence: CrossVenueEvidence | None = None,
+        composite_decision: CompositeAssetDecision | None = None,
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        """Choose alpha origin from separately-priced, venue-local candidates.
+
+        The selected origin is never dictated by configured primary order.  A
+        broker with a live structural move can lead; peer disagreement enters
+        confidence and uncertainty rather than acting as a retail-style veto.
+        """
+        candidates: list[dict[str, Any]] = []
+        best: dict[str, Any] | None = None
+        market_states = market_states or {}
+        for candidate_venue, state in states.items():
+            if not isinstance(state, VenueMicrostate) or not state.usable_for_decision or float(state.mid or 0.0) <= 0.0:
+                continue
+            candidate_instrument = self._symbol_for_venue(candidate_venue, fallback_instrument)
+            candidate_desk = self._desk_id(candidate_venue, candidate_instrument)
+            candidate_price = float(state.mid)
+            liq, zones = self._liquidity_score(data_manager, candidate_instrument, candidate_price, execution_state=state)
+            market_state = market_states.get(str(candidate_venue).lower())
+            direction, edge, reason, breakdown = self._direction_and_edge(
+                candidate_desk, candidate_price, liq, execution_state=state, btc_composite=btc_composite,
+                market_state=market_state, cross_venue_evidence=cross_venue_evidence,
+                composite_decision=composite_decision,
+            )
+            local_cost = float(self._execution_cost_components(data_manager, execution_state=state).get("total_cost_bps", 0.0))
+            screened_net = float(edge) - local_cost - max(0.0, _num(breakdown.get("market_state_uncertainty_bps"), 0.0)) - max(0.0, _num(breakdown.get("cross_venue_uncertainty_bps"), 0.0))
+            public = {
+                "venue": candidate_venue, "instrument": candidate_instrument,
+                "direction": direction.value, "edge_bps": float(edge),
+                "local_cost_bps": local_cost, "screened_net_edge_bps": screened_net,
+                "reason": reason, "usable": True,
+                "market_state": market_state.as_dict() if market_state is not None else {},
+            }
+            candidates.append(public)
+            if direction is Direction.NO_TRADE:
+                continue
+            candidate = {
+                **public, "desk": candidate_desk, "price": candidate_price, "state": state,
+                "liquidity_score": liq, "zones": zones,
+                "execution_quality": float(state.feed_quality_score or 0.0),
+                "direction": direction, "breakdown": breakdown,
+            }
+            if best is None or screened_net > float(best["screened_net_edge_bps"]):
+                best = candidate
+        return best, candidates
+
     def _direction_and_edge(
-        self, desk: str, price: float, liquidity_score: float, *, execution_state: VenueMicrostate | None, btc_composite: BTCCompositeState | None
+        self, desk: str, price: float, liquidity_score: float, *, execution_state: VenueMicrostate | None,
+        btc_composite: BTCCompositeState | None, market_state: VenueMarketState | None = None,
+        cross_venue_evidence: CrossVenueEvidence | None = None,
+        composite_decision: CompositeAssetDecision | None = None,
     ) -> tuple[Direction, float, str, dict[str, Any]]:
         if price <= 0 or execution_state is None:
             return Direction.NO_TRADE, 0.0, "microstructure_state_unavailable", {}
         if not execution_state.usable_for_decision:
             return Direction.NO_TRADE, 0.0, "execution_microstate_unhealthy", {}
-        execution_quality = btc_composite.delta_execution_quality_score if btc_composite else execution_state.feed_quality_score
+        # Execution quality is strictly venue-local. Delta may contribute BTC
+        # contextual evidence, but never scale a Hyperliquid/CoinSwitch order.
+        execution_quality = float(execution_state.feed_quality_score or 0.0)
+        venue_key = str(execution_state.venue or "").lower()
         breakdown: dict[str, Any] = {
-            "edge_calculation_formula": "abs(weighted_signal_bps) * execution_quality * liquidity_score",
-            "execution_quality_multiplier": execution_quality,
+            "edge_calculation_formula": "abs(venue_timing_alpha + normalised_execution_equivalence_composite_alpha) * venue_feed_quality * liquidity * contextual_factor_confidence",
+            "venue_local_execution_quality_multiplier": execution_quality,
             "liquidity_score_multiplier": liquidity_score,
+            "signal_venue": venue_key,
         }
         if execution_quality < float(_cfg("INSTITUTIONAL_MIN_EXECUTION_QUALITY", 0.40)):
             return Direction.NO_TRADE, 0.0, f"execution_quality_low:{execution_quality:.3f}", breakdown
-        if desk == DeskId.BTC.value and bool(_cfg("INSTITUTIONAL_REQUIRE_BTC_CROSS_VENUE", True)):
-            if btc_composite is None or not btc_composite.reference_states:
-                return Direction.NO_TRADE, 0.0, "btc_reference_microstate_unavailable", breakdown
-            if btc_composite.flow_agreement_score < float(_cfg("INSTITUTIONAL_MIN_FLOW_AGREEMENT", 0.55)):
-                breakdown["flow_agreement_score"] = btc_composite.flow_agreement_score
-                return Direction.NO_TRADE, 0.0, f"venue_flow_disagreement:{btc_composite.flow_agreement_score:.3f}", breakdown
-            if btc_composite.cross_venue_dispersion_bps > float(_cfg("INSTITUTIONAL_MAX_CROSS_VENUE_DISPERSION_BPS", 15.0)):
-                breakdown["cross_venue_dispersion_bps"] = btc_composite.cross_venue_dispersion_bps
-                return Direction.NO_TRADE, 0.0, f"cross_venue_dispersion_high:{btc_composite.cross_venue_dispersion_bps:.3f}", breakdown
         near_depth = sum(float(execution_state.bid_depth_usd_by_band.get(k, 0.0) + execution_state.ask_depth_usd_by_band.get(k, 0.0)) for k in ("0-1", "1-3"))
         breakdown["near_touch_depth_usd"] = near_depth
         if near_depth <= 0:
@@ -1730,27 +1905,98 @@ class InstitutionalStrategy:
         ofi_norm = (execution_state.ofi_usd_1s + 0.50 * execution_state.ofi_usd_10s) / near_depth
         tfi_norm = (execution_state.tfi_usd_1s + 0.50 * execution_state.tfi_usd_10s) / near_depth
         micro_deviation_bps = (execution_state.microprice / max(execution_state.mid, 1e-9) - 1.0) * 10_000.0
-        dislocation_bps = float(btc_composite.delta_dislocation_bps or 0.0) if btc_composite else 0.0
         ofi_component_bps = float(_cfg("INSTITUTIONAL_FLOW_OFI_WEIGHT", 1.0)) * ofi_norm * 100.0
         tfi_component_bps = float(_cfg("INSTITUTIONAL_FLOW_TFI_WEIGHT", 0.30)) * tfi_norm * 100.0
         microprice_component_bps = float(_cfg("INSTITUTIONAL_FLOW_MICROPRICE_WEIGHT", 0.35)) * micro_deviation_bps
-        dislocation_component_bps = -float(_cfg("INSTITUTIONAL_FLOW_DISLOCATION_WEIGHT", 0.50)) * dislocation_bps
-        signal_bps = ofi_component_bps + tfi_component_bps + microprice_component_bps + dislocation_component_bps
-        edge = abs(signal_bps) * max(0.0, min(1.0, execution_quality)) * max(0.0, min(1.0, liquidity_score))
+        # Relative-value/dislocation alpha remains disabled without a separately
+        # validated fungibility/basis model; it is telemetry only.
+        dislocation_diagnostic_bps = float(btc_composite.delta_dislocation_bps or 0.0) if btc_composite and venue_key == "delta" else 0.0
+        raw_micro_signal_bps = ofi_component_bps + tfi_component_bps + microprice_component_bps
+        caps = _cfg("INSTITUTIONAL_MICROSTRUCTURE_ALPHA_CAP_BPS", {})
+        cap = float(caps.get(self._asset_id.upper(), 24.0) if isinstance(caps, Mapping) else 24.0)
+        robust_micro_signal_bps = cap * math.tanh(raw_micro_signal_bps / max(cap, 1e-9))
+        structural_alpha_bps = 0.0
+        market_uncertainty_bps = 0.0
+        if composite_decision is not None and composite_decision.ready:
+            # The collective thesis aggregates both confirmed structural motion
+            # and USD-normalised flow from execution-equivalent venues. The local
+            # book below controls executability/timing; it is not added twice as alpha.
+            structural_alpha_bps = float(composite_decision.transferable_structural_alpha_bps)
+            market_uncertainty_bps = float(composite_decision.diagnostics.get("execution_uncertainty_bps", 0.0) or 0.0)
+            breakdown["composite_asset_intelligence"] = composite_decision.as_dict()
+            breakdown["structural_alpha_authority"] = "normalised_execution_equivalence_composite"
+        elif market_state is not None and market_state.ready and self._asset_id.upper() in set(_cfg("INSTITUTIONAL_MARKET_STATE_ASSETS", ("BTC", "GOLD_PAXG", "GOLD_HL"))):
+            structural_alpha_bps = float(market_state.signed_alpha_bps)
+            market_uncertainty_bps = float(market_state.uncertainty_bps)
+            breakdown["venue_market_state"] = market_state.as_dict()
+            breakdown["structural_alpha_authority"] = "venue_local_fallback"
+        local_timing_confidence = 1.0
+        local_timing_uncertainty_bps = 0.0
+        if composite_decision is not None and composite_decision.ready:
+            combined_signal_bps = float(composite_decision.transferable_total_alpha_bps)
+            collective_sign = 1 if combined_signal_bps > 0 else -1 if combined_signal_bps < 0 else 0
+            local_sign = 1 if robust_micro_signal_bps > 0 else -1 if robust_micro_signal_bps < 0 else 0
+            if collective_sign and local_sign == collective_sign:
+                local_timing_confidence = 1.04
+            elif collective_sign and local_sign == -collective_sign:
+                # A venue may execute a collective thesis only with an explicit
+                # uncertainty charge when its immediate book/tape opposes it.
+                local_timing_confidence = 0.84
+                local_timing_uncertainty_bps = min(abs(robust_micro_signal_bps) * 0.50, 6.0)
+            breakdown["local_execution_timing_alpha_bps"] = robust_micro_signal_bps
+            breakdown["local_execution_timing_confidence_multiplier"] = local_timing_confidence
+            breakdown["local_execution_timing_uncertainty_bps"] = local_timing_uncertainty_bps
+        else:
+            combined_signal_bps = robust_micro_signal_bps + structural_alpha_bps
+        signal_sign = 1 if combined_signal_bps > 0 else -1 if combined_signal_bps < 0 else 0
+        cross_confidence = 1.0
+        cross_uncertainty_bps = 0.0
+        if composite_decision is not None and composite_decision.ready and signal_sign != 0:
+            cross_confidence = composite_decision.directional_confidence_multiplier(signal_sign) * local_timing_confidence
+            cross_uncertainty_bps = composite_decision.contextual_uncertainty_for(signal_sign) + local_timing_uncertainty_bps
+            breakdown["collective_factor_policy"] = {
+                "factor_id": composite_decision.factor_id,
+                "execution_equivalence_group": composite_decision.equivalence_group,
+                "factor_translation_enabled": composite_decision.basis_translation_enabled,
+                "related_products_are_context_only": not composite_decision.basis_translation_enabled,
+            }
+        elif desk == DeskId.BTC.value and cross_venue_evidence is not None and signal_sign != 0:
+            cross_confidence = cross_venue_evidence.confidence_for(venue_key, signal_sign)
+            cross_uncertainty_bps = cross_venue_evidence.uncertainty_for(venue_key)
+            breakdown["cross_venue_evidence"] = cross_venue_evidence.as_dict()
+        elif desk == DeskId.BTC.value:
+            cross_confidence = 0.72
+            cross_uncertainty_bps = float(_cfg("INSTITUTIONAL_CROSS_VENUE_UNCERTAINTY_MAX_BPS", 6.0)) * 0.5
+        edge = abs(combined_signal_bps) * max(0.0, min(1.0, execution_quality)) * max(0.0, min(1.0, liquidity_score)) * cross_confidence
         breakdown.update({
-            "ofi_component_bps": ofi_component_bps,
-            "tfi_component_bps": tfi_component_bps,
+            "ofi_component_bps": ofi_component_bps, "tfi_component_bps": tfi_component_bps,
             "microprice_component_bps": microprice_component_bps,
-            "dislocation_component_bps": dislocation_component_bps,
-            "weighted_signal_bps": signal_bps,
+            "raw_microstructure_signal_bps": raw_micro_signal_bps,
+            "robust_microstructure_alpha_bps": robust_micro_signal_bps,
+            "venue_local_market_state_alpha_bps": structural_alpha_bps,
+            "collective_transferable_microstructure_alpha_bps": float(composite_decision.transferable_microstructure_alpha_bps) if composite_decision is not None and composite_decision.ready else 0.0,
+            "collective_transferable_total_alpha_bps": float(composite_decision.transferable_total_alpha_bps) if composite_decision is not None and composite_decision.ready else combined_signal_bps,
+            "dislocation_diagnostic_bps": dislocation_diagnostic_bps,
+            "dislocation_component_bps": 0.0,
+            "cross_venue_confidence_multiplier": cross_confidence,
+            "cross_venue_uncertainty_bps": cross_uncertainty_bps,
+            "market_state_uncertainty_bps": market_uncertainty_bps,
+            "weighted_signal_bps": combined_signal_bps,
             "directional_edge_after_quality_liquidity_bps": edge,
         })
         threshold = float(_cfg("INSTITUTIONAL_MIN_SIGNAL_BPS", 0.50))
-        if signal_bps > threshold:
-            return Direction.LONG, edge, "ofi_tfi_microprice_long", breakdown
-        if signal_bps < -threshold:
-            return Direction.SHORT, edge, "ofi_tfi_microprice_short", breakdown
-        return Direction.NO_TRADE, 0.0, "flow_signal_flat", breakdown
+        if combined_signal_bps > threshold:
+            return Direction.LONG, edge, "market_state_flow_long", breakdown
+        if combined_signal_bps < -threshold:
+            return Direction.SHORT, edge, "market_state_flow_short", breakdown
+        return Direction.NO_TRADE, 0.0, "market_state_and_flow_flat", breakdown
+
+    @staticmethod
+    def _market_state_regime(market_state: VenueMarketState | None, fallback: Regime) -> Regime:
+        if market_state is None or not market_state.ready:
+            return fallback
+        mapping = {"EXPANSION": Regime.EXPANSION, "TREND": Regime.TREND, "BALANCE": Regime.BALANCE, "SHOCK": Regime.SHOCK}
+        return mapping.get(str(market_state.regime_label).upper(), fallback)
 
     def _regime(self) -> Regime:
         if len(self._price_window) < 20:
@@ -1811,7 +2057,7 @@ class InstitutionalStrategy:
         self, desk: str, direction: Direction, price: float, liquidity_score: float, *, data_manager,
         gross_edge_bps: float, costs_bps: float, position_notional: float = 0.0, quantity: float = 0.0,
         venue: str | None = None, instrument: str = "", execution_state: VenueMicrostate | None = None,
-        regime: Regime | None = None,
+        regime: Regime | None = None, venue_market_state: VenueMarketState | None = None,
     ) -> ProtectionPlan | None:
         if price <= 0 or liquidity_score <= 0:
             return None
@@ -1840,9 +2086,17 @@ class InstitutionalStrategy:
             "regime": getattr(regime, "value", regime) if regime is not None else "",
             "policy_min_rr": float(getattr(policy, "min_rr", 0.0) or 0.0),
             "policy_max_rr": float(getattr(policy, "max_rr", 0.0) or 0.0),
+            "venue_market_state_ready": bool(venue_market_state is not None and venue_market_state.ready),
+            "venue_local_robust_vol_bps": float(venue_market_state.robust_one_minute_vol_bps) if venue_market_state is not None and venue_market_state.ready else None,
         }
+        if venue_market_state is not None and venue_market_state.ready:
+            volatility_price = max(price * float(venue_market_state.robust_one_minute_vol_bps) / 10_000.0, float(mapping.price_tick or 0.0))
+            market_state["volatility_source"] = f"venue_local_confirmed_candles:{str(venue or '').lower()}"
+        else:
+            volatility_price = self._realized_vol_price()
+            market_state["volatility_source"] = "context_fallback_price_window"
         return self._protection_engine.build_plan(
-            direction=direction, entry_price=price, volatility_price=self._realized_vol_price(),
+            direction=direction, entry_price=price, volatility_price=volatility_price,
             gross_edge_bps=gross_edge_bps, execution_cost_bps=costs_bps,
             protection_type="VENUE_NATIVE_BRACKET", asset_class=asset_class,
             position_notional=position_notional, quantity=quantity,
@@ -1850,7 +2104,7 @@ class InstitutionalStrategy:
         )
 
     def _size_position(
-        self, desk: str, instrument: str, direction: Direction, price: float, net_edge: float, liquidity_score: float, protection: ProtectionPlan, risk_manager, venue: str | None = None, balance_source=None,
+        self, desk: str, instrument: str, direction: Direction, price: float, net_edge: float, liquidity_score: float, protection: ProtectionPlan, risk_manager, venue: str | None = None, balance_source=None, venue_market_state: VenueMarketState | None = None,
     ) -> PositionSizingDecision:
         _ = direction
         capital_venue = str(venue or "").strip().lower()
@@ -1902,7 +2156,11 @@ class InstitutionalStrategy:
         liquidity_cap = max(0.0, cash * min(1.0, liquidity_score) * 0.20)
         edge_pct = max(0.0, net_edge) / 10_000.0
         kelly_notional = cash * (edge_pct / max(stop_distance_pct, 1e-9)) * float(_cfg("INSTITUTIONAL_QUARTER_KELLY", 0.25))
-        observation_vol_bps = self._realized_vol_log() * 10_000.0
+        observation_vol_bps = (
+            float(venue_market_state.robust_one_minute_vol_bps)
+            if venue_market_state is not None and venue_market_state.ready
+            else self._realized_vol_log() * 10_000.0
+        )
         vol_scalar = min(1.0, float(_cfg("INSTITUTIONAL_TARGET_OBSERVATION_VOL_BPS", 10.0)) / max(observation_vol_bps, 1e-6))
         risk_limited_notional = risk_budget / max(stop_distance_pct, 1e-9)
         target_notional = min(liquidity_cap, risk_limited_notional, kelly_notional * vol_scalar)
@@ -2027,7 +2285,7 @@ class InstitutionalStrategy:
         if venue == "groww":
             return DeskId.INDIA_OPTIONS.value
         asset = self._asset_id.upper()
-        if asset in {"GOLD", "SILVER"} or any(x in instrument.upper() for x in ("PAXG", "XAUT", "SLV", "XAG")):
+        if asset.startswith("GOLD") or asset.startswith("SILVER") or any(x in instrument.upper() for x in ("PAXG", "XAUT", "SLV", "XAG", "SILVER", "GOLD")):
             return DeskId.METALS.value
         return DeskId.BTC.value
 
@@ -2041,7 +2299,9 @@ class InstitutionalStrategy:
                 return self._instrument.primary_exchange.value
         except Exception:
             pass
-        return str(_cfg("EXECUTION_EXCHANGE", "delta")).lower()
+        # In live multi-venue routing, missing venue identity is unsafe: an
+        # implicit Delta fallback can mis-size or mis-route another broker.
+        return "unresolved"
 
     def _routeable_venues(self, order_manager) -> set[str]:
         getter = getattr(order_manager, "available_exchanges", None)

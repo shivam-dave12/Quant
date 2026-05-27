@@ -273,11 +273,12 @@ class DiscoveryReport:
 
 
 class InstrumentRegistry:
-    def __init__(self, execution_preference: str = "delta") -> None:
+    def __init__(self, execution_preference: str = "") -> None:
+        raw = str(execution_preference or "").strip().lower()
         try:
-            self.execution_preference = ExchangeName(str(execution_preference).lower())
+            self.execution_preference = ExchangeName(raw) if raw else None
         except Exception:
-            self.execution_preference = ExchangeName.DELTA
+            self.execution_preference = None
         self.delta: Dict[str, ExchangeInstrument] = {}
         self.coinswitch: Dict[str, ExchangeInstrument] = {}
         self.groww: Dict[str, ExchangeInstrument] = {}
@@ -648,10 +649,10 @@ class InstrumentRegistry:
                 preferred = None
             primary = (
                 preferred if preferred in by_ex
-                else self.execution_preference if self.execution_preference in by_ex
+                else self.execution_preference if self.execution_preference is not None and self.execution_preference in by_ex
                 else next(iter(by_ex.keys()))
             )
-            if require_primary and self.execution_preference not in by_ex:
+            if require_primary and self.execution_preference is not None and self.execution_preference not in by_ex:
                 self.report.unavailable[intent.asset_id] = (
                     f"required primary exchange {self.execution_preference.value} unavailable; not traded"
                 )
