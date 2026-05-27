@@ -424,6 +424,48 @@ class MarketAggregator:
         if callable(releaser):
             releaser()
 
+    def get_groww_option_volatility_context(self) -> Dict:
+        """Build live long-premium valuation context from official Groww inputs.
+
+        The primary contributes official chain IV/OI data; the analysis manager
+        contributes NIFTY underlying candles.  The method deliberately returns
+        not-ready when either side is incomplete.
+        """
+        getter = getattr(self._primary, "get_verified_option_chain_snapshot", None)
+        if not callable(getter):
+            return {"ready_for_long_premium_decision": False, "reasons": ["official_option_chain_unavailable"]}
+        try:
+            chain = list(getter() or [])
+        except Exception as exc:
+            return {"ready_for_long_premium_decision": False, "reasons": [f"official_option_chain_error:{exc}"]}
+        try:
+            from agents.indian_options_desk import build_option_volatility_context
+            candles = self.get_candles("1d", 60)
+            spot = self.get_analysis_price()
+            lot_getter = getattr(self._primary, "get_session_book_lot_size", None)
+            lot = int(lot_getter() or 0) if callable(lot_getter) else 0
+            if lot <= 0:
+                return {"ready_for_long_premium_decision": False, "reasons": ["verified_option_lot_unavailable"]}
+            return build_option_volatility_context(
+                chain=chain, underlying_candles=candles, spot=spot, lot_size=lot
+            ).as_dict()
+        except Exception as exc:
+            return {"ready_for_long_premium_decision": False, "reasons": [f"option_volatility_context_error:{exc}"]}
+
+    def activate_groww_execution_vehicle(self, thesis_side: str, available_funds: float):
+        """Activate the already-preselected CE or PE only after a valid thesis.
+
+        Selection is delegated to the official Groww option manager and remains
+        gated by fresh LTP plus market-depth state for that exact contract.
+        """
+        selector = getattr(self._primary, "select_contract_for_thesis", None)
+        if not callable(selector):
+            return None
+        return selector(
+            str(thesis_side), underlying_spot=float(self.get_analysis_price() or 0.0),
+            available_funds=float(available_funds or 0.0),
+        )
+
     def get_session_contract_book_status(self) -> Dict:
         status_fn = getattr(self._primary, "session_contract_book_status", None)
         if callable(status_fn):

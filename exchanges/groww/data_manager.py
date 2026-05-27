@@ -270,7 +270,11 @@ class GrowwOptionDataManager:
             return False
         expected_stock = str(identity.get("stock_code", "") or "").upper().replace(" ", "")
         expected_expiry = self._ws_expiry(identity.get("expiry", ""))
-        expected_right = str(identity.get("right", "") or "").lower()
+        # Canonicalise both sides through the same Groww right normaliser.
+        # The SDK emits title-case values ("Call"/"Put"); comparing a
+        # lower-cased expected value against an un-normalised received value
+        # rejects a valid tick even when all contract fields match.
+        expected_right = str(self.api._normalise_right(identity.get("right", "")) or "").casefold()
         expected_strike = float(identity.get("strike", 0.0) or 0.0)
         if not all((expected_stock, expected_expiry, expected_right, expected_strike > 0)):
             return False
@@ -291,7 +295,7 @@ class GrowwOptionDataManager:
         # always required so a broad NFO tick cannot refresh every vehicle.
         if expiry_val and expiry_val != expected_expiry:
             return False
-        right_val = self.api._normalise_right(row.get("right") or row.get("right_type") or row.get("option_type") or "")
+        right_val = str(self.api._normalise_right(row.get("right") or row.get("right_type") or row.get("option_type") or "") or "").casefold()
         if not right_val or right_val != expected_right:
             return False
         strike_val = self._float_first(row, ("strike_price", "strike", "StrikePrice"))
@@ -979,6 +983,30 @@ class GrowwOptionDataManager:
         )
         return True
 
+    def get_verified_option_chain_snapshot(self) -> list[dict[str, Any]]:
+        """Return the official hydrated NFO chain retained for valuation context.
+
+        The chain is sourced from the official instrument master joined to
+        ``get_option_chain``; no synthetic IV/OI rows are generated here.
+        """
+        raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
+        rows = raw.get("chain_candidates") if isinstance(raw, dict) else []
+        return [dict(row) for row in (rows or []) if isinstance(row, dict)]
+
+    def get_session_book_lot_size(self) -> int:
+        raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
+        book = raw.get("session_contract_book") if isinstance(raw, dict) else {}
+        for side in ("call", "put"):
+            choice = book.get(side) if isinstance(book, dict) else None
+            choice_raw = choice.get("raw") if isinstance(choice, dict) and isinstance(choice.get("raw"), dict) else {}
+            try:
+                lot = int(round(float(choice_raw.get("runtime_lot_size", 0.0) or 0.0)))
+            except Exception:
+                lot = 0
+            if lot > 0:
+                return lot
+        return 0
+
     def session_contract_book_status(self) -> dict[str, Any]:
         """Expose the day-start option vehicle book and its actual websocket health.
 
@@ -1106,7 +1134,8 @@ class GrowwOptionDataManager:
 
     def _activate_session_vehicle(self, choice) -> bool:
         apply_contract_choice(self.instrument, choice)
-        snapshot = self._contract_snapshots.get(self._snapshot_key(choice))
+        key = self._snapshot_key(choice)
+        snapshot = self._contract_snapshots.get(key) or {}
         if snapshot:
             with self._lock:
                 self._last_price = float(snapshot.get("last_price", 0.0) or 0.0)
@@ -1115,20 +1144,51 @@ class GrowwOptionDataManager:
                 self._best_ask = float(snapshot.get("best_ask", 0.0) or 0.0)
                 self._best_bid_qty = float(snapshot.get("best_bid_qty", 0.0) or 0.0)
                 self._best_ask_qty = float(snapshot.get("best_ask_qty", 0.0) or 0.0)
-                self._candles = {tf: deque(rows, maxlen=600) for tf, rows in (snapshot.get("candles") or {}).items()}
-        else:
+                if snapshot.get("candles"):
+                    self._candles = {tf: deque(rows, maxlen=600) for tf, rows in (snapshot.get("candles") or {}).items()}
+        # Stream discovery verifies an executable book but does not provide a
+        # premium OHLC history.  SL/TP for long options must be built in the
+        # option-premium domain, so fetch the exact selected contract's official
+        # historical candles once and cache them for subsequent activations.
+        min_atr_bars = max(2, int(_cfg("GROWW_OPTION_PROTECTION_MIN_ATR_BARS", 10)))
+        cached_1m = list((snapshot.get("candles") or {}).get("1m", [])) if isinstance(snapshot, dict) else []
+        if len(cached_1m) < min_atr_bars:
             self._warmup(historical_only=True)
+            with self._lock:
+                target = self._contract_snapshots.setdefault(key, {})
+                target["candles"] = {tf: list(rows) for tf, rows in self._candles.items()}
+        # Refresh the selected snapshot after historical warmup and carry that
+        # official premium history into the already-armed stream buffer. Without
+        # this merge, a sparse newly opened stream can overwrite the ATR history
+        # just before protection construction and permanently block safe entries.
+        snapshot = self._contract_snapshots.get(key) or snapshot
+        historical_candles = (snapshot.get("candles") or {}) if isinstance(snapshot, dict) else {}
         # Both session vehicles are websocket-armed before signal execution.
         # Activation routes the direction-specific vehicle without subscribing on
         # the latency-sensitive entry path. A fresh Groww LTP plus market-depth
         # stream for the exact selected option is mandatory; there is no REST substitute.
-        key = self._snapshot_key(choice)
         stream_state = self._book_stream_state.get(key)
         self._active_stream_key = key
         if stream_state:
             self._repair_option_stream_if_stale("activate_session_vehicle", wait_key=key)
             stream_state = self._book_stream_state.get(key) or stream_state
             with self._lock:
+                if historical_candles:
+                    stream_candles = stream_state.setdefault("candles", {})
+                    for timeframe in ("1m", "5m", "15m", "1h", "4h", "1d"):
+                        merged: dict[int, dict[str, Any]] = {}
+                        for row in list(historical_candles.get(timeframe, []) or []):
+                            if isinstance(row, dict):
+                                merged[int(row.get("t", row.get("timestamp", 0)) or 0)] = row
+                        for row in list(stream_candles.get(timeframe, []) or []):
+                            if isinstance(row, dict):
+                                merged[int(row.get("t", row.get("timestamp", 0)) or 0)] = row
+                        stream_candles[timeframe] = deque(
+                            [merged[ts] for ts in sorted(merged) if ts > 0][-600:], maxlen=600
+                        )
+                self._contract_snapshots.setdefault(key, {})["candles"] = {
+                    tf: list(rows) for tf, rows in (stream_state.get("candles") or {}).items()
+                }
                 self._active_stream_contract = dict(stream_state.get("identity") or {})
                 self._last_price = float(stream_state.get("last_price", 0.0) or 0.0)
                 stream_ts = float(stream_state.get("last_stream_tick_ts", 0.0) or 0.0)

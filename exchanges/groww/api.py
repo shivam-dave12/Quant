@@ -256,15 +256,21 @@ class GrowwRestClient:
             "30minute": 30,
             "30m": 30,
             "1h": 60,
+            "1hour": 60,
+            "hour": 60,
             "60minute": 60,
             "4h": 240,
+            "4hour": 240,
+            "240minute": 240,
             "day": 1440,
             "1day": 1440,
             "1d": 1440,
             "week": 10080,
             "1week": 10080,
         }
-        return mapping.get(raw, 1)
+        if raw not in mapping:
+            raise RuntimeError(f"Unsupported Groww candle interval: {interval!r}; refusing implicit 1-minute fallback.")
+        return mapping[raw]
 
     @staticmethod
     def _to_groww_time(value: Any) -> Any:

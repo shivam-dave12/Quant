@@ -1088,8 +1088,20 @@ class MultiAssetInstitutionalBot:
                         return False
                 venues = ", ".join(f"{ex.value}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items())
                 ctx.ready = True
-                ctx.start_state = "READY"
-                logger.info("✅ %s ready @ %.4f | venues=%s | %s", inst.asset_id, ctx.data_manager.get_last_price(), venues, self.guard.report_line(ctx))
+                if self._is_indian_options_context(ctx):
+                    feed_status_fn = getattr(ctx.data_manager, "get_execution_feed_status", None)
+                    execution_feed = feed_status_fn() if callable(feed_status_fn) else {}
+                    active_ready = bool(execution_feed.get("active_vehicle_ready", False))
+                    execution_status = str(execution_feed.get("status") or "UNKNOWN")
+                    ctx.start_state = "READY" if active_ready else "ANALYSIS_READY_EXECUTION_ARMED"
+                    logger.info(
+                        "✅ %s analysis live @ %.4f | execution=%s active_vehicle_ready=%s | venues=%s | %s",
+                        inst.asset_id, ctx.data_manager.get_last_price(), execution_status, active_ready,
+                        venues, self.guard.report_line(ctx),
+                    )
+                else:
+                    ctx.start_state = "READY"
+                    logger.info("✅ %s ready @ %.4f | venues=%s | %s", inst.asset_id, ctx.data_manager.get_last_price(), venues, self.guard.report_line(ctx))
                 return True
         except Exception:
             ctx.ready = False

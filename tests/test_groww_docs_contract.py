@@ -1,5 +1,7 @@
 
 import sys
+
+import pytest
 from types import ModuleType, SimpleNamespace
 
 from exchanges.groww.api import GrowwRestClient
@@ -256,6 +258,8 @@ def test_session_book_screens_chain_then_accepts_documented_stream_depth(monkeyp
     monkeypatch.setattr(chain.config, "GROWW_SESSION_BOOK_REQUIRE_TWO_SIDED_QUOTE", True, raising=False)
     monkeypatch.setattr(chain.config, "GROWW_OPTION_MIN_DTE", 1.0, raising=False)
     monkeypatch.setattr(chain.config, "GROWW_OPTION_MAX_DTE", 21.0, raising=False)
+    # This test validates transport/executable-book wiring rather than theta policy.
+    monkeypatch.setattr(chain.config, "GROWW_OPTION_MAX_THETA_TO_PREMIUM", 1.0, raising=False)
 
     ce_shortlist = chain.shortlist_contracts_for_stream_validation(
         instrument, "long", underlying_spot=25000.0, available_funds=25852.96, limit=4
@@ -405,3 +409,99 @@ def test_session_discovery_selects_from_documented_live_fno_depth_not_rest_quote
     assert set(books) == {"NIFTY26J0225000CE", "NIFTY26J0225000PE"}
     assert books["NIFTY26J0225000CE"]["selection_liquidity_source"] == "groww.subscribe_market_depth"
     assert len(hub.unsubscribed) == 2
+
+
+
+def test_selected_option_identity_accepts_official_title_case_right_payload():
+    from exchanges.groww.data_manager import GrowwOptionDataManager
+
+    class Api:
+        @staticmethod
+        def _normalise_right(value):
+            value = str(value or "").strip().lower()
+            return "Call" if value in {"call", "ce", "c"} else "Put" if value in {"put", "pe", "p"} else ""
+
+    manager = GrowwOptionDataManager(
+        instrument=SimpleNamespace(asset_id="NIFTY", primary=SimpleNamespace(raw={})), api=Api()
+    )
+    identity = {"stock_code": "NIFTY", "expiry": "02-Jun-2026", "right": "Call", "strike": 24100.0}
+    official_tick = {
+        "exchange": "NFO", "stock_code": "NIFTY", "expiry_date": "02-Jun-2026",
+        "right": "Call", "strike_price": 24100.0, "ltp": 89.47,
+    }
+
+    assert manager._matches_option_identity_tick(official_tick, identity) is True
+
+
+def test_native_hour_interval_aliases_do_not_collapse_to_one_minute():
+    assert GrowwRestClient._interval_minutes("1hour") == 60
+    assert GrowwRestClient._interval_minutes("4hour") == 240
+    with pytest.raises(RuntimeError, match="Unsupported Groww candle interval"):
+        GrowwRestClient._interval_minutes("unknown")
+
+
+
+def test_session_book_hard_rejects_contract_above_theta_premium_ceiling(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+    from agents import groww_chain_architect as chain
+    expiry = (datetime.now(timezone.utc) + timedelta(days=7)).strftime("%Y-%m-%d")
+    instrument = SimpleNamespace(asset_id="NIFTY", primary=SimpleNamespace(raw={
+        "desk_id": "GROWW_INDEX_OPTIONS", "stock_code": "NIFTY", "underlying": "NIFTY",
+        "chain_source": "official_instrument_csv_plus_get_option_chain", "chain_candidates": [
+            {"right": "Call", "TradingSymbol": "NIFTYCE", "trading_symbol": "NIFTYCE", "strike_price": 25000, "expiry_date": expiry, "runtime_lot_size": 25, "ltp": 100.0, "iv": 15.0},
+            {"right": "Put", "TradingSymbol": "NIFTYPE", "trading_symbol": "NIFTYPE", "strike_price": 25000, "expiry_date": expiry, "runtime_lot_size": 25, "ltp": 100.0, "iv": 15.0},
+        ]
+    }))
+    monkeypatch.setattr(chain.config, "GROWW_SESSION_BOOK_REQUIRE_TWO_SIDED_QUOTE", True, raising=False)
+    monkeypatch.setattr(chain.config, "GROWW_OPTION_MIN_DTE", 1.0, raising=False)
+    monkeypatch.setattr(chain.config, "GROWW_OPTION_MAX_DTE", 21.0, raising=False)
+    monkeypatch.setattr(chain.config, "GROWW_OPTION_MAX_THETA_TO_PREMIUM", 0.0000001, raising=False)
+    live = {
+        "NIFTYCE": {"bid_price": 99.5, "offer_price": 100.0, "bid_quantity": 100, "offer_quantity": 100},
+        "NIFTYPE": {"bid_price": 99.5, "offer_price": 100.0, "bid_quantity": 100, "offer_quantity": 100},
+    }
+    assert chain.build_session_contract_book(instrument, underlying_spot=25000.0, available_funds=25852.96, option_quote_by_symbol=live, commit=False) is None
+
+
+def test_selected_vehicle_activation_keeps_official_premium_history_when_live_stream_is_sparse(monkeypatch):
+    import time
+    from collections import deque
+    from types import SimpleNamespace
+    from exchanges.groww import data_manager as dm
+    from exchanges.groww.data_manager import GrowwOptionDataManager
+
+    instrument = SimpleNamespace(asset_id="NIFTY", primary=SimpleNamespace(raw={}))
+    manager = GrowwOptionDataManager(instrument=instrument, api=SimpleNamespace())
+    choice = SimpleNamespace(expiry="2026-06-02", right="call", strike=24100.0, selected_symbol="NIFTYCE")
+    key = ("2026-06-02", "call", 24100.0)
+    now = time.time()
+    live_bar = {"t": 16, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5}
+    history = [
+        {"t": i, "open": 95.0 + i, "high": 96.0 + i, "low": 94.0 + i, "close": 95.5 + i}
+        for i in range(1, 16)
+    ]
+
+    monkeypatch.setattr(dm, "apply_contract_choice", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(dm.config, "GROWW_OPTION_PROTECTION_MIN_ATR_BARS", 10, raising=False)
+    monkeypatch.setattr(manager, "_repair_option_stream_if_stale", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(manager, "_execution_price_fresh", lambda *_args, **_kwargs: True)
+
+    def warmup(*, historical_only=False):
+        assert historical_only is True
+        manager._candles["1m"].clear()
+        manager._candles["1m"].extend(history)
+
+    monkeypatch.setattr(manager, "_warmup", warmup)
+    manager._book_stream_state[key] = {
+        "identity": {}, "last_price": 100.5, "last_stream_tick_ts": now,
+        "last_quote_ts": now, "quote_tick_ts": now, "depth_tick_ts": now,
+        "best_bid": 100.0, "best_ask": 100.5, "best_bid_qty": 65, "best_ask_qty": 65,
+        "candles": {"1m": deque([live_bar], maxlen=600)},
+    }
+
+    assert manager._activate_session_vehicle(choice) is True
+    rows = list(manager._candles["1m"])
+    assert len(rows) == 16
+    assert rows[0]["t"] == 1
+    assert rows[-1]["t"] == 16

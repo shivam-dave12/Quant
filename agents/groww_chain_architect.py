@@ -657,6 +657,12 @@ def select_contract_for_thesis(
             iv_source = "stress_prior"
         bs = BlackScholesModel.greeks(desired, local_spot, strike, dte, rate, iv, premium=prem)
         if bs:
+            # Long-premium vehicles with daily theta drain above the configured
+            # policy ceiling are not execution candidates.  Previously this
+            # value only reduced the score, allowing contracts above a declared
+            # maximum (as observed live) to be armed for trading.
+            if bs.theta_to_premium > max_theta:
+                continue
             # A session execution vehicle must already lie within the intended
             # delta band; do not publish a CE/PE book that immediately fails its
             # own intraday revalidation at the same underlying spot.

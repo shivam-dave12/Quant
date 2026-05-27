@@ -258,6 +258,12 @@ class InstitutionalStrategy:
                 research_features={"price": price, "feed_health": asdict(feed_health)},
             )
 
+        if desk == DeskId.INDIA_OPTIONS.value:
+            return self._evaluate_india_options(
+                data_manager=data_manager, order_manager=order_manager, risk_manager=risk_manager,
+                instrument=instrument, underlying_price=price, regime=regime, feed_health=feed_health,
+            )
+
         execution_state, btc_composite = self._microstructure_context(data_manager, venue, instrument, feed_health)
         liquidity_score, zones = self._liquidity_score(data_manager, instrument, price, execution_state=execution_state)
         if btc_composite is not None:
@@ -396,6 +402,247 @@ class InstitutionalStrategy:
             reasons=["edge_risk_execution_and_protection_validated"],
             model_values=model_values,
             research_features=features,
+        )
+
+    def _evaluate_india_options(
+        self, *, data_manager, order_manager, risk_manager, instrument: str,
+        underlying_price: float, regime: Regime, feed_health: FeedHealth,
+    ) -> OpportunityDecision:
+        """Evaluate NIFTY long-premium execution without mixing price domains.
+
+        Direction is derived only in NIFTY-underlying units; the selected CE/PE
+        vehicle is activated afterwards and all execution, cost, SL/TP and sizing
+        calculations use the option premium and its own documented live book.
+        """
+        venue = "groww"
+        context_getter = getattr(data_manager, "get_groww_option_volatility_context", None)
+        volatility_context = dict(context_getter() or {}) if callable(context_getter) else {
+            "ready_for_long_premium_decision": False, "reasons": ["option_volatility_context_interface_missing"]
+        }
+        model_values: dict[str, Any] = {
+            "underlying_price": underlying_price,
+            "feed_quality": feed_health.quality_score,
+            "option_volatility_context": volatility_context,
+            "pricing_domains": {"signal": "NIFTY_UNDERLYING", "execution": "OPTION_PREMIUM"},
+        }
+        features: dict[str, Any] = {"underlying_price": underlying_price, "feed_health": asdict(feed_health), "option_volatility_context": volatility_context}
+        if not bool(volatility_context.get("ready_for_long_premium_decision", False)):
+            reasons = list(volatility_context.get("reasons") or ["options_volatility_context_not_ready"])
+            return self._decision(
+                desk=DeskId.INDIA_OPTIONS.value, venue=venue, instrument=instrument,
+                decision=DecisionOutput.NO_TRADE_INSUFFICIENT_EDGE, direction=Direction.NO_TRADE,
+                regime=regime, expected_net_edge_bps=0.0, uncertainty_bps=999.0,
+                liquidity_score=0.0, execution_quality_score=feed_health.quality_score,
+                sizing=None, protection_plan=None, reasons=reasons,
+                model_values=model_values, research_features=features,
+            )
+        thesis, underlying_edge_bps, thesis_reason, thesis_features = self._india_underlying_structural_thesis(data_manager, underlying_price)
+        model_values.update(thesis_features)
+        if thesis is Direction.NO_TRADE:
+            return self._decision(
+                desk=DeskId.INDIA_OPTIONS.value, venue=venue, instrument=instrument,
+                decision=DecisionOutput.NO_TRADE_INSUFFICIENT_EDGE, direction=Direction.NO_TRADE,
+                regime=regime, expected_net_edge_bps=0.0, uncertainty_bps=8.0,
+                liquidity_score=0.0, execution_quality_score=feed_health.quality_score,
+                sizing=None, protection_plan=None, reasons=[thesis_reason],
+                model_values=model_values, research_features=features,
+            )
+        try:
+            balance = risk_manager.get_available_balance() or {}
+            available_funds = _num(balance.get("available"), 0.0)
+        except Exception:
+            available_funds = 0.0
+        activator = getattr(data_manager, "activate_groww_execution_vehicle", None)
+        thesis_side = "long" if thesis is Direction.BULLISH else "short"
+        choice = activator(thesis_side, available_funds) if callable(activator) else None
+        if choice is None:
+            return self._decision(
+                desk=DeskId.INDIA_OPTIONS.value, venue=venue, instrument=instrument,
+                decision=DecisionOutput.NO_TRADE_EXECUTION_UNSAFE, direction=thesis,
+                regime=regime, expected_net_edge_bps=0.0, uncertainty_bps=999.0,
+                liquidity_score=0.0, execution_quality_score=0.0,
+                sizing=None, protection_plan=None,
+                reasons=["direction_specific_groww_vehicle_not_fresh_or_not_executable"],
+                model_values=model_values, research_features=features,
+            )
+        execution_feed_getter = getattr(data_manager, "get_execution_feed_status", None)
+        execution_feed = dict(execution_feed_getter() or {}) if callable(execution_feed_getter) else {}
+        if not bool(execution_feed.get("active_vehicle_ready", False)):
+            return self._decision(
+                desk=DeskId.INDIA_OPTIONS.value, venue=venue, instrument=instrument,
+                decision=DecisionOutput.NO_TRADE_EXECUTION_UNSAFE, direction=thesis,
+                regime=regime, expected_net_edge_bps=0.0, uncertainty_bps=999.0,
+                liquidity_score=0.0, execution_quality_score=0.0,
+                sizing=None, protection_plan=None, reasons=["active_option_ltp_depth_stream_not_fresh"],
+                model_values={**model_values, "execution_feed": execution_feed}, research_features=features,
+            )
+        try:
+            option_price = _num(data_manager.get_last_price(), 0.0)
+        except Exception:
+            option_price = 0.0
+        if option_price <= 0:
+            return self._decision(
+                desk=DeskId.INDIA_OPTIONS.value, venue=venue, instrument=instrument,
+                decision=DecisionOutput.NO_TRADE_EXECUTION_UNSAFE, direction=thesis,
+                regime=regime, expected_net_edge_bps=0.0, uncertainty_bps=999.0,
+                liquidity_score=0.0, execution_quality_score=0.0,
+                sizing=None, protection_plan=None, reasons=["active_option_premium_unavailable"],
+                model_values=model_values, research_features=features,
+            )
+        liquidity_score, zones = self._liquidity_score(data_manager, instrument, option_price)
+        delta = abs(_num(getattr(choice, "delta", 0.0), 0.0))
+        if delta <= 0:
+            return self._decision(
+                desk=DeskId.INDIA_OPTIONS.value, venue=venue, instrument=instrument,
+                decision=DecisionOutput.NO_TRADE_EXECUTION_UNSAFE, direction=thesis,
+                regime=regime, expected_net_edge_bps=0.0, uncertainty_bps=999.0,
+                liquidity_score=liquidity_score, execution_quality_score=feed_health.quality_score,
+                sizing=None, protection_plan=None, reasons=["selected_option_live_delta_unavailable"],
+                model_values=model_values, research_features=features,
+            )
+        # First-order premium edge: Delta * expected underlying move, converted
+        # into option-premium bps. Gamma is not credited before it materialises.
+        premium_edge_bps = underlying_edge_bps * delta * underlying_price / max(option_price, 1e-9)
+        costs_bps = self._execution_cost_bps(data_manager)
+        net_edge = premium_edge_bps - costs_bps
+        uncertainty_bps = self._uncertainty_bps(regime, liquidity_score, feed_health.quality_score)
+        model_values.update({
+            "thesis": thesis.value, "thesis_reason": thesis_reason,
+            "underlying_edge_bps": underlying_edge_bps, "selected_option_symbol": getattr(choice, "selected_symbol", ""),
+            "selected_option_delta": delta, "selected_option_premium": option_price,
+            "premium_delta_edge_bps": premium_edge_bps, "costs_bps": costs_bps,
+            "net_edge_bps": net_edge, "uncertainty_bps": uncertainty_bps,
+            "execution_feed": execution_feed, "liquidity_score": liquidity_score,
+        })
+        features["liquidity_zones"] = [asdict(z) for z in zones]
+        min_edge = float(_cfg("INSTITUTIONAL_MIN_NET_EDGE_BPS", 3.0))
+        if net_edge <= max(min_edge, uncertainty_bps):
+            return self._decision(
+                desk=DeskId.INDIA_OPTIONS.value, venue=venue, instrument=instrument,
+                decision=DecisionOutput.NO_TRADE_INSUFFICIENT_EDGE, direction=thesis,
+                regime=regime, expected_net_edge_bps=net_edge, uncertainty_bps=uncertainty_bps,
+                liquidity_score=liquidity_score, execution_quality_score=feed_health.quality_score,
+                sizing=None, protection_plan=None,
+                reasons=[thesis_reason, "option_premium_edge_does_not_clear_cost_and_uncertainty"],
+                model_values=model_values, research_features=features,
+            )
+        protection = self._option_premium_protection_plan(data_manager, option_price)
+        if protection is None or not protection.protection_feasible:
+            return self._decision(
+                desk=DeskId.INDIA_OPTIONS.value, venue=venue, instrument=instrument,
+                decision=DecisionOutput.NO_TRADE_EXECUTION_UNSAFE, direction=thesis,
+                regime=regime, expected_net_edge_bps=net_edge, uncertainty_bps=uncertainty_bps,
+                liquidity_score=liquidity_score, execution_quality_score=feed_health.quality_score,
+                sizing=None, protection_plan=protection,
+                reasons=(protection.reasons if protection else ["option_premium_protection_unavailable"]),
+                model_values=model_values, research_features=features,
+            )
+        sizing = self._size_position(DeskId.INDIA_OPTIONS.value, instrument, thesis, option_price, net_edge, liquidity_score, protection, risk_manager)
+        if not sizing.approved:
+            return self._decision(
+                desk=DeskId.INDIA_OPTIONS.value, venue=venue, instrument=instrument,
+                decision=DecisionOutput.NO_TRADE_RISK_BUDGET, direction=thesis,
+                regime=regime, expected_net_edge_bps=net_edge, uncertainty_bps=uncertainty_bps,
+                liquidity_score=liquidity_score, execution_quality_score=feed_health.quality_score,
+                sizing=sizing, protection_plan=protection, reasons=sizing.reasons,
+                model_values=model_values, research_features=features,
+            )
+        if not bool(_cfg("INSTITUTIONAL_ENABLE_LIVE_ENTRIES", False)):
+            return self._decision(
+                desk=DeskId.INDIA_OPTIONS.value, venue=venue, instrument=instrument,
+                decision=DecisionOutput.NO_TRADE_INSUFFICIENT_EDGE, direction=thesis,
+                regime=regime, expected_net_edge_bps=net_edge, uncertainty_bps=uncertainty_bps,
+                liquidity_score=liquidity_score, execution_quality_score=feed_health.quality_score,
+                sizing=sizing, protection_plan=protection, reasons=["shadow_mode_live_entries_disabled"],
+                model_values=model_values, research_features=features,
+            )
+        return self._decision(
+            desk=DeskId.INDIA_OPTIONS.value, venue=venue, instrument=instrument,
+            decision=DecisionOutput.TRADE_APPROVED_WITH_PROTECTION_PLAN, direction=thesis,
+            regime=regime, expected_net_edge_bps=net_edge, uncertainty_bps=uncertainty_bps,
+            liquidity_score=liquidity_score, execution_quality_score=feed_health.quality_score,
+            sizing=sizing, protection_plan=protection, reasons=["groww_long_premium_thesis_execution_protection_validated"],
+            model_values=model_values, research_features=features,
+        )
+
+    def _india_underlying_structural_thesis(self, data_manager, spot: float) -> tuple[Direction, float, str, dict[str, Any]]:
+        """Generate an underlying-domain thesis from multi-timeframe displacement.
+
+        An index has no order book of its own; this routine therefore uses only
+        official index candles and rejects entries unless 5m displacement breaks
+        established liquidity range with 15m directional alignment.
+        """
+        try:
+            bars_5m = list(data_manager.get_candles("5m", 40) or [])
+            bars_15m = list(data_manager.get_candles("15m", 30) or [])
+        except Exception:
+            return Direction.NO_TRADE, 0.0, "nifty_underlying_candles_unavailable", {}
+        def close(row):
+            return _num(row.get("close") if isinstance(row, Mapping) else None, _num(row.get("c") if isinstance(row, Mapping) else None, 0.0))
+        def high(row):
+            return _num(row.get("high") if isinstance(row, Mapping) else None, _num(row.get("h") if isinstance(row, Mapping) else None, 0.0))
+        def low(row):
+            return _num(row.get("low") if isinstance(row, Mapping) else None, _num(row.get("l") if isinstance(row, Mapping) else None, 0.0))
+        if spot <= 0 or len(bars_5m) < 22 or len(bars_15m) < 4:
+            return Direction.NO_TRADE, 0.0, "nifty_underlying_structure_warmup", {"bars_5m": len(bars_5m), "bars_15m": len(bars_15m)}
+        history = bars_5m[-21:-1]
+        swing_high = max(high(x) for x in history)
+        swing_low = min(low(x) for x in history)
+        tr = []
+        prev = close(history[0])
+        for bar in history[1:]:
+            h, l, c = high(bar), low(bar), close(bar)
+            if min(h, l, c, prev) > 0:
+                tr.append(max(h - l, abs(h - prev), abs(l - prev)))
+            prev = c
+        atr = sum(tr) / len(tr) if tr else 0.0
+        prior_15 = close(bars_15m[-4])
+        current_15 = close(bars_15m[-1]) or spot
+        align_bps = math.log(current_15 / prior_15) * 10_000.0 if min(current_15, prior_15) > 0 else 0.0
+        buffer = max(atr * float(_cfg("GROWW_STRUCTURAL_BREAK_BUFFER_ATR", 0.15)), spot * 0.00005)
+        break_up_bps = (spot - (swing_high + buffer)) / spot * 10_000.0
+        break_down_bps = ((swing_low - buffer) - spot) / spot * 10_000.0
+        min_alignment = float(_cfg("GROWW_STRUCTURAL_MIN_ALIGNMENT_BPS", 2.0))
+        metrics = {"swing_high": swing_high, "swing_low": swing_low, "atr_5m": atr, "alignment_15m_bps": align_bps, "break_up_bps": break_up_bps, "break_down_bps": break_down_bps}
+        if break_up_bps > 0 and align_bps >= min_alignment:
+            return Direction.BULLISH, break_up_bps + 0.25 * align_bps, "nifty_liquidity_break_displacement_bullish", metrics
+        if break_down_bps > 0 and align_bps <= -min_alignment:
+            return Direction.BEARISH, break_down_bps + 0.25 * abs(align_bps), "nifty_liquidity_break_displacement_bearish", metrics
+        return Direction.NO_TRADE, 0.0, "nifty_no_valid_structural_displacement", metrics
+
+    def _option_premium_protection_plan(self, data_manager, premium: float) -> ProtectionPlan | None:
+        try:
+            candles = list(data_manager.get_execution_candles("1m", 40) or [])
+        except Exception:
+            candles = []
+        if premium <= 0 or len(candles) < int(_cfg("GROWW_OPTION_PROTECTION_MIN_ATR_BARS", 10)):
+            return ProtectionPlan(premium, premium, premium, "GROWW_OCO_AFTER_FILL", False, ["option_premium_atr_warmup_unavailable"])
+        ranges: list[float] = []
+        previous = None
+        for row in candles[-20:]:
+            if not isinstance(row, Mapping):
+                continue
+            h = _num(row.get("high") or row.get("h"), 0.0)
+            l = _num(row.get("low") or row.get("l"), 0.0)
+            c = _num(row.get("close") or row.get("c"), 0.0)
+            if min(h, l, c) <= 0:
+                continue
+            ranges.append(max(h - l, abs(h - previous), abs(l - previous)) if previous else h - l)
+            previous = c
+        if len(ranges) < 5:
+            return ProtectionPlan(premium, premium, premium, "GROWW_OCO_AFTER_FILL", False, ["option_premium_atr_invalid"])
+        atr = sum(ranges[-14:]) / min(len(ranges), 14)
+        min_risk = premium * float(_cfg("GROWW_OPTION_MIN_PREMIUM_RISK_PCT", 0.14))
+        max_risk = premium * float(_cfg("GROWW_OPTION_MAX_PREMIUM_RISK_PCT", 0.58))
+        stop_distance = min(max(max(atr * float(_cfg("GROWW_OPTION_SLTP_DELTA_MULT", 1.0)), min_risk), 0.05), max_risk)
+        if stop_distance <= 0 or stop_distance >= premium:
+            return ProtectionPlan(premium, premium, premium, "GROWW_OCO_AFTER_FILL", False, ["option_premium_stop_not_executable"])
+        rr = float(_cfg("GROWW_OPTION_TARGET_RR", 1.60))
+        target_distance = max(stop_distance * rr, premium * float(_cfg("GROWW_OPTION_MIN_TP_PREMIUM_PCT", 0.18)))
+        return ProtectionPlan(
+            entry_price=premium, stop_price=max(0.05, premium - stop_distance), target_price=premium + target_distance,
+            protection_type="GROWW_OCO_AFTER_FILL", protection_feasible=True,
+            reasons=["premium_domain_atr_protection", "groww_long_option_oco_required"],
         )
 
     def _decision(self, **kwargs: Any) -> OpportunityDecision:
@@ -645,8 +892,6 @@ class InstitutionalStrategy:
     def _direction_and_edge(
         self, desk: str, price: float, liquidity_score: float, *, execution_state: VenueMicrostate | None, btc_composite: BTCCompositeState | None
     ) -> tuple[Direction, float, str]:
-        if desk == DeskId.INDIA_OPTIONS.value:
-            return Direction.NO_TRADE, 0.0, "options_volatility_context_required"
         if price <= 0 or execution_state is None:
             return Direction.NO_TRADE, 0.0, "microstructure_state_unavailable"
         if not execution_state.usable_for_decision:
@@ -782,7 +1027,15 @@ class InstitutionalStrategy:
         risk_limited_notional = risk_budget / max(stop_distance_pct, 1e-9)
         target_notional = min(liquidity_cap, risk_limited_notional, kelly_notional * vol_scalar)
         if desk == DeskId.INDIA_OPTIONS.value:
-            lot = int(_cfg("GROWW_OPTION_DEFAULT_LOT_SIZE", 0) or 0) or 1
+            # Never size NFO options from a configured/default lot.  The lot
+            # must be the exact value joined from Groww's official instrument
+            # master for the direction-specific session vehicle.
+            raw = getattr(getattr(self._instrument, "primary", None), "raw", {}) if self._instrument is not None else {}
+            selected = raw.get("selected_option_contract") if isinstance(raw, dict) else None
+            selected_raw = selected.get("raw") if isinstance(selected, dict) and isinstance(selected.get("raw"), dict) else {}
+            lot = int(round(_num(selected_raw.get("runtime_lot_size"), 0.0)))
+            if lot <= 0:
+                return PositionSizingDecision(desk, instrument, False, 0.0, 0.0, 0.0, None, 0.0, net_edge, liquidity_cap, 0.0, 0.0, ["verified_nfo_lot_size_unavailable"])
             qty = float(max(0, math.floor(target_notional / max(unit_notional * lot, 1e-9)) * lot))
             leverage = None
         else:
