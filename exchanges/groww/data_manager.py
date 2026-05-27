@@ -33,7 +33,7 @@ from agents.groww_chain_architect import (
     chain_quality, is_chain_instrument, apply_contract_choice,
     build_session_contract_book, select_contract_from_session_book,
     eligible_nfo_master_option_rows, merge_verified_chain_quotes, contract_key,
-    shortlist_contracts_for_quote_validation,
+    shortlist_contracts_for_stream_validation,
 )
 from core.instruments import normalise_symbol
 
@@ -578,7 +578,7 @@ class GrowwOptionDataManager:
         bid = self._float_first(row, ("best_bid_price", "best_bid", "bid", "bPrice", "bid_price"))
         ask = self._float_first(row, ("best_offer_price", "best_ask_price", "best_ask", "ask", "sPrice", "ask_price", "offer_price"))
         bid_qty = self._float_first(row, ("best_bid_quantity", "bid_quantity", "bid_qty", "bQty"))
-        ask_qty = self._float_first(row, ("best_offer_quantity", "best_ask_quantity", "ask_quantity", "ask_qty", "sQty"))
+        ask_qty = self._float_first(row, ("best_offer_quantity", "offer_quantity", "best_ask_quantity", "ask_quantity", "ask_qty", "sQty"))
         if bid > 0 and ask > 0 and bid_qty > 0 and ask_qty > 0:
             return bid, ask, bid_qty, ask_qty
         depth = row.get("depth") or row.get("Depth") or row.get("market_depth") or row.get("MarketDepth")
@@ -737,63 +737,173 @@ class GrowwOptionDataManager:
             return False, {"spread_bps": spread_bps, "visible_depth": visible_depth, "premium_atr": premium_atr, "spread_to_atr": spread_to_atr}
         return True, {"spread_bps": spread_bps, "visible_depth": visible_depth, "premium_atr": premium_atr, "spread_to_atr": spread_to_atr}
 
-    def _fetch_executable_quote_shortlist(self, underlying_spot: float, available_funds: float) -> dict[str, dict[str, Any]]:
-        """Validate a bounded CE/PE shortlist with Groww's documented Quote API.
+    def _stream_executable_shortlist(self, underlying_spot: float, available_funds: float) -> dict[str, dict[str, Any]]:
+        """Select CE/PE vehicles from Groww's documented live market-depth stream.
 
-        The official Option Chain endpoint deliberately does not publish bid/offer
-        depth.  It is therefore used for chain-wide screening only.  The official
-        Quote endpoint supplies bid/offer and quantities for a small ranked set;
-        these snapshots are used only to finalise the session vehicle book.  Live
-        execution later remains blocked until the documented LTP and market-depth
-        websocket streams are fresh for the activated option.
+        ``get_option_chain`` determines the liquid/Greek-aware candidate universe.
+        Executability is not inferred from REST snapshots: a bounded shortlist is
+        subscribed to the official FNO LTP and market-depth feeds, and only a
+        contract with a live two-sided book can be promoted into the session book.
+        After discovery subscriptions are removed, the chosen CE/PE vehicles are
+        armed again as the dedicated execution streams.
         """
-        per_side = max(1, int(_cfg("GROWW_SESSION_BOOK_QUOTE_SHORTLIST_PER_SIDE", 4)))
+        per_side = max(1, int(_cfg("GROWW_SESSION_BOOK_STREAM_CANDIDATES_PER_SIDE", 12)))
         routes: list[dict[str, Any]] = []
+        route_side: dict[str, str] = {}
         for thesis in ("long", "short"):
-            ranked = shortlist_contracts_for_quote_validation(
+            ranked = shortlist_contracts_for_stream_validation(
                 self.instrument, thesis, underlying_spot=underlying_spot,
                 available_funds=available_funds, limit=per_side,
             )
             if not ranked:
-                logger.error("GROWW session contract book failed: option-chain shortlist empty for thesis=%s", thesis)
+                logger.error("GROWW stream discovery failed: option-chain shortlist empty for thesis=%s", thesis)
                 return {}
-            routes.extend(ranked)
-        quotes: dict[str, dict[str, Any]] = {}
-        requested = 0
-        two_sided = 0
-        seen: set[str] = set()
-        for route in routes:
-            symbol = normalise_symbol(route.get("TradingSymbol") or route.get("trading_symbol") or "")
-            if not symbol or symbol in seen:
-                continue
-            seen.add(symbol)
-            requested += 1
-            try:
-                groww_throttle(f"selection_quote:{symbol}")
-                response = self.api.get_quote_for_instrument(route)
-                row = self._first_response_row(response)
-                if not row:
-                    continue
-                row["selection_quote_source"] = "groww.get_quote"
-                quotes[symbol] = row
-                bid, ask, bid_qty, ask_qty = self._extract_top_of_book(row)
+            for route in ranked:
+                symbol = normalise_symbol(route.get("TradingSymbol") or route.get("trading_symbol") or "")
+                if symbol and symbol not in route_side:
+                    routes.append(route)
+                    route_side[symbol] = thesis
+
+        timeout = max(1.0, float(_cfg("GROWW_SESSION_BOOK_STREAM_DISCOVERY_TIMEOUT_SEC", 15.0)))
+        hub = hub_for_api(self.api)
+        self._live_hub = hub
+        discovery_ids: list[str] = []
+        states: dict[str, dict[str, Any]] = {}
+        tick_event = threading.Event()
+        lock = threading.RLock()
+
+        def on_candidate_tick(symbol: str, data: Any) -> None:
+            row = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else data
+            if not isinstance(row, dict):
+                return
+            px = self._float_first(row, ("last", "ltp", "last_price", "close", "price", "Close", "c"))
+            bid, ask, bid_qty, ask_qty = self._extract_top_of_book(row)
+            now = time.time()
+            with lock:
+                state = states.get(symbol)
+                if state is None:
+                    return
+                if px > 0:
+                    state["ltp"] = px
+                    state["last_price"] = px
+                    state["ltp_ts"] = now
+                if bid > 0:
+                    state["bid_price"] = bid
+                    state["best_bid_price"] = bid
+                if ask > 0:
+                    state["offer_price"] = ask
+                    state["best_offer_price"] = ask
+                if bid_qty > 0:
+                    state["bid_quantity"] = bid_qty
+                    state["best_bid_quantity"] = bid_qty
+                if ask_qty > 0:
+                    state["offer_quantity"] = ask_qty
+                    state["best_offer_quantity"] = ask_qty
                 if bid > 0 and ask >= bid and bid_qty > 0 and ask_qty > 0:
-                    two_sided += 1
-            except Exception as exc:
-                logger.warning("GROWW documented executable quote snapshot failed symbol=%s: %s", symbol, exc)
-        logger.info(
-            "GROWW two-stage option selection quotes loaded: requested=%d returned=%d two_sided=%d "
-            "basis=option_chain_greeks_oi_volume_then_get_quote_depth",
-            requested, len(quotes), two_sided,
-        )
-        return quotes
+                    state["depth_ts"] = now
+                    state["selection_liquidity_source"] = "groww.subscribe_market_depth"
+                    state["quote_source"] = "groww_live_fno_ltp_and_market_depth"
+            tick_event.set()
+
+        try:
+            feed_routes: list[dict[str, Any]] = []
+            for route in routes:
+                symbol = normalise_symbol(route.get("TradingSymbol") or route.get("trading_symbol") or "")
+                stock_code = str(route.get("stock_code") or getattr(self.instrument, "asset_id", "")).upper()
+                expiry = self._ws_expiry(route.get("expiry_date") or route.get("expiry") or "")
+                right = self.api._normalise_right(route.get("right") or route.get("option_type") or "")
+                strike = float(route.get("strike_price") or route.get("strike") or 0.0)
+                if not all((symbol, stock_code, expiry, right, strike > 0)):
+                    logger.warning("GROWW stream discovery skipped incomplete option route symbol=%s", symbol or "<missing>")
+                    continue
+                states[symbol] = {
+                    "trading_symbol": symbol, "TradingSymbol": symbol,
+                    "stock_code": stock_code, "exchange": "NSE", "segment": "FNO", "exchange_code": "NFO",
+                    "expiry_date": expiry, "right": right, "strike_price": strike,
+                    "thesis": route_side.get(symbol, ""),
+                }
+                feed_routes.append({
+                    "stock_code": stock_code, "expiry_date": expiry,
+                    "strike_price": str(strike), "right": right,
+                })
+            if not feed_routes:
+                return {}
+            discovery_ids.extend(hub.subscribe_option_universe_market_data(
+                routes=feed_routes,
+                callback=lambda data: on_candidate_tick(normalise_symbol(data.get("TradingSymbol") or data.get("trading_symbol") or ""), data),
+            ))
+
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                with lock:
+                    live = {
+                        symbol: dict(state) for symbol, state in states.items()
+                        if float(state.get("ltp_ts", 0.0) or 0.0) > 0
+                        and float(state.get("depth_ts", 0.0) or 0.0) > 0
+                        and float(state.get("bid_price", 0.0) or 0.0) > 0
+                        and float(state.get("offer_price", 0.0) or 0.0) >= float(state.get("bid_price", 0.0) or 0.0)
+                        and float(state.get("bid_quantity", 0.0) or 0.0) > 0
+                        and float(state.get("offer_quantity", 0.0) or 0.0) > 0
+                    }
+                have_call = any(row.get("thesis") == "long" for row in live.values())
+                have_put = any(row.get("thesis") == "short" for row in live.values())
+                if have_call and have_put:
+                    # Do not stop on the first two-sided CE/PE packets.  Confirm that
+                    # the live books can actually produce the session execution pair;
+                    # otherwise continue observing the remaining ranked candidates.
+                    trial_book = build_session_contract_book(
+                        self.instrument, underlying_spot=underlying_spot,
+                        available_funds=available_funds, option_quote_by_symbol=live, commit=False,
+                    )
+                    if trial_book is not None:
+                        logger.info(
+                            "GROWW live stream discovery selectable books ready: requested=%d live_two_sided=%d "
+                            "basis=option_chain_rank_then_official_fno_ltp_market_depth",
+                            len(states), len(live),
+                        )
+                        return live
+                tick_event.wait(min(0.5, max(0.0, deadline - time.time())))
+                tick_event.clear()
+
+            with lock:
+                ltp_count = sum(1 for row in states.values() if float(row.get("ltp_ts", 0.0) or 0.0) > 0)
+                depth_rows = [dict(row) for row in states.values() if float(row.get("depth_ts", 0.0) or 0.0) > 0]
+            sample = []
+            for row in depth_rows[:8]:
+                bid = float(row.get("bid_price", 0.0) or 0.0); ask = float(row.get("offer_price", 0.0) or 0.0)
+                mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0
+                spread_bps = ((ask - bid) / mid * 10000.0) if mid > 0 else None
+                sample.append({
+                    "symbol": row.get("trading_symbol"), "side": row.get("thesis"),
+                    "ltp": round(float(row.get("ltp", 0.0) or 0.0), 4),
+                    "bid": round(bid, 4), "ask": round(ask, 4),
+                    "bid_qty": float(row.get("bid_quantity", 0.0) or 0.0),
+                    "ask_qty": float(row.get("offer_quantity", 0.0) or 0.0),
+                    "spread_bps": round(spread_bps, 2) if spread_bps is not None else None,
+                })
+            logger.error(
+                "GROWW live stream discovery produced no selectable CE/PE pair within %.1fs: subscribed=%d ltp_live=%d two_sided_depth=%d sample_books=%s; "
+                "desk remains fail-closed on official FNO market-depth evidence",
+                timeout, len(states), ltp_count, len(depth_rows), sample,
+            )
+            return {}
+        except Exception as exc:
+            logger.error("GROWW live option stream discovery failed: %s", exc)
+            return {}
+        finally:
+            if discovery_ids:
+                try:
+                    hub.unsubscribe(discovery_ids)
+                except Exception as exc:
+                    logger.warning("GROWW discovery stream unsubscribe failed after selection: %s", exc)
+
 
     def _prewarm_session_vehicle(self, choice) -> bool:
-        """Load option-premium history after documented Quote validation.
+        """Load option-premium history after live-depth vehicle validation.
 
-        Two-sided selection liquidity was already verified through get_quote.
-        Do not test websocket state before subscriptions exist; fresh LTP+depth
-        websocket state remains the non-negotiable entry activation gate.
+        Two-sided selection liquidity has been verified through the official Groww
+        market-depth stream.  Fresh dedicated LTP+depth websocket state remains the
+        non-negotiable entry activation gate after the selected feeds are armed.
         """
         route = self._route_field_snapshot()
         try:
@@ -807,7 +917,7 @@ class GrowwOptionDataManager:
                     "last_price": self._last_price, "last_quote_ts": 0.0,
                     "best_bid": 0.0, "best_ask": 0.0,
                     "best_bid_qty": 0.0, "best_ask_qty": 0.0,
-                    "selection_liquidity_source": "groww.get_quote",
+                    "selection_liquidity_source": "groww.subscribe_market_depth",
                     "execution_liquidity_source": "DOCUMENTED_OPTION_LTP_AND_DEPTH_STREAM_REQUIRED",
                     "candles": {tf: list(rows) for tf, rows in self._candles.items()},
                 }
@@ -825,19 +935,18 @@ class GrowwOptionDataManager:
             return False
         if not self._hydrate_chain_candidates(force_refresh=force_refresh, underlying_spot=underlying_spot):
             return False
-        # Groww's option-chain payload contains LTP/Greeks/OI/volume but no
-        # two-sided book.  First rank a small official-chain shortlist, then use
-        # documented get_quote snapshots to finalise executable CE/PE vehicles.
-        quote_by_symbol = self._fetch_executable_quote_shortlist(underlying_spot, available_funds)
-        if not quote_by_symbol:
-            logger.error("GROWW session contract book rejected: no documented executable quote snapshots for shortlisted CE/PE vehicles")
+        # The official option chain supplies screening fields; actual CE/PE
+        # executability must be proven by the official FNO LTP + market-depth feed.
+        live_book_by_symbol = self._stream_executable_shortlist(underlying_spot, available_funds)
+        if not live_book_by_symbol:
+            logger.error("GROWW session contract book rejected: official FNO market-depth stream did not verify executable CE and PE vehicles")
             return False
         book = build_session_contract_book(
             self.instrument, underlying_spot=underlying_spot,
-            available_funds=available_funds, option_quote_by_symbol=quote_by_symbol, commit=False,
+            available_funds=available_funds, option_quote_by_symbol=live_book_by_symbol, commit=False,
         )
         if book is None:
-            logger.error("GROWW session contract book rejected: no CE/PE pair passed documented get_quote spread/depth and sizing checks")
+            logger.error("GROWW session contract book rejected: no live-stream CE/PE pair passed sizing and liquidity-cost checks")
             return False
         if bool(_cfg("GROWW_SESSION_BOOK_PREWARM_EXECUTION_DATA", True)):
             if not self._prewarm_session_vehicle(book.call) or not self._prewarm_session_vehicle(book.put):

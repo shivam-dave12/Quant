@@ -370,7 +370,7 @@ def merge_verified_chain_quotes(master_rows: Iterable[Mapping[str, Any]], quote_
 
 
 
-def shortlist_contracts_for_quote_validation(
+def shortlist_contracts_for_stream_validation(
     instrument: Any,
     thesis_side: str,
     *,
@@ -378,14 +378,12 @@ def shortlist_contracts_for_quote_validation(
     available_funds: float,
     limit: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Rank chain-defined vehicles before querying executable quote snapshots.
+    """Rank chain-defined vehicles for official live-stream validation.
 
     Groww's documented ``get_option_chain`` response contains LTP, Greeks, open
-    interest and volume, but it does not contain the two-sided order book needed
-    for execution validation.  This stage uses only those documented chain fields
-    plus the verified instrument master/lot size to construct a small shortlist.
-    The next stage calls documented ``get_quote`` for that shortlist and the final
-    stage requires live LTP + market-depth websocket state before any order.
+    interest and volume.  It is used to rank a bounded candidate universe only.
+    The next stage subscribes that universe to the official FNO LTP and market-
+    depth feeds; only two-sided streamed books may enter the session contract book.
     """
     raw = getattr(getattr(instrument, "primary", None), "raw", {}) or {}
     chain = [dict(x) for x in (raw.get("chain_candidates") or []) if isinstance(x, Mapping)]
@@ -400,7 +398,7 @@ def shortlist_contracts_for_quote_validation(
     max_fraction = clamp(safe_float(_cfg("GROWW_OPTION_MAX_FUNDS_FRACTION_PER_TRADE", 0.42), 0.42), 0.01, 1.0)
     cash_buffer = max(0.0, safe_float(_cfg("GROWW_OPTION_MIN_CASH_BUFFER_INR", 0.0), 0.0))
     max_cost = max(0.0, (safe_float(available_funds, 0.0) - cash_buffer) * max_fraction)
-    max_rows = max(1, int(limit if limit is not None else _cfg("GROWW_SESSION_BOOK_QUOTE_SHORTLIST_PER_SIDE", 4)))
+    max_rows = max(1, int(limit if limit is not None else _cfg("GROWW_SESSION_BOOK_STREAM_CANDIDATES_PER_SIDE", 12)))
     ranked: list[tuple[float, dict[str, Any]]] = []
     for candidate in chain:
         if _right(candidate) != desired:
@@ -433,7 +431,7 @@ def shortlist_contracts_for_quote_validation(
         score = 0.40 * delta_score + 0.18 * activity + 0.17 * affordability + 0.15 * dte_score + 0.10 * proximity
         enriched = dict(candidate)
         enriched["shortlist_score"] = score
-        enriched["shortlist_basis"] = "groww_option_chain_greeks_oi_volume_then_get_quote"
+        enriched["shortlist_basis"] = "groww_option_chain_rank_then_live_fno_depth"
         enriched["shortlist_contract_cost"] = cost
         enriched["runtime_lot_size"] = lot
         ranked.append((score, enriched))
@@ -649,9 +647,9 @@ def select_contract_for_thesis(
             continue
         local_spot = safe_float(q.get("underlying_spot_price") or q.get("underlying_ltp"), 0.0) or spot
         if local_spot <= 0:
-            # before live quote/underlying warmup, use strike-ladder proximity
+            # Before streamed underlying/book validation, use strike-ladder proximity
             # instead of fabricating a price.  This keeps the candidate eligible
-            # for later quote validation but discounts the score.
+            # for later official live-depth validation but discounts the score.
             local_spot = strike
         iv, iv_source = _market_volatility(desired, local_spot, strike, dte, rate, prem, c, q)
         if iv <= 0:

@@ -116,14 +116,24 @@ class GrowwLiveFeedHub:
         return rows
 
     @staticmethod
-    def _top_depth(levels: Any) -> tuple[float, float]:
+    def _top_depth(levels: Any, *, side: str) -> tuple[float, float]:
+        """Return Groww level-1 price/quantity without relying on dict order.
+
+        Groww documents ``buyBook`` / ``sellBook`` as level-keyed mappings and its
+        example is not insertion-ordered with level ``"1"`` first.  We therefore
+        consume the official level-1 row when present; only if it is absent do we
+        select the economically best positive level (highest bid / lowest offer).
+        """
+        candidates: list[tuple[float, float]] = []
         if isinstance(levels, dict):
-            values = list(levels.values())
+            level_one = levels.get("1") or levels.get(1)
+            ordered = [level_one] if isinstance(level_one, dict) else []
+            ordered.extend(value for key, value in levels.items() if str(key) != "1")
         elif isinstance(levels, list):
-            values = levels
+            ordered = list(levels)
         else:
-            values = []
-        for level in values:
+            ordered = []
+        for level in ordered:
             if not isinstance(level, dict):
                 continue
             try:
@@ -132,8 +142,13 @@ class GrowwLiveFeedHub:
             except Exception:
                 continue
             if price > 0 and qty > 0:
-                return price, qty
-        return 0.0, 0.0
+                if level is level_one if isinstance(levels, dict) else False:
+                    return price, qty
+                candidates.append((price, qty))
+        if not candidates:
+            return 0.0, 0.0
+        return (max(candidates, key=lambda item: item[0]) if side == "buy"
+                else min(candidates, key=lambda item: item[0]))
 
     @classmethod
     def _flatten_market_depth(cls, payload: Any) -> Iterable[dict[str, Any]]:
@@ -150,8 +165,8 @@ class GrowwLiveFeedHub:
                 for token, data in tokens.items():
                     if not isinstance(data, dict):
                         continue
-                    bid, bid_qty = cls._top_depth(data.get("buyBook"))
-                    ask, ask_qty = cls._top_depth(data.get("sellBook"))
+                    bid, bid_qty = cls._top_depth(data.get("buyBook"), side="buy")
+                    ask, ask_qty = cls._top_depth(data.get("sellBook"), side="sell")
                     row = dict(data)
                     row.update({
                         "exchange": exchange,
@@ -208,6 +223,68 @@ class GrowwLiveFeedHub:
         instrument = {"exchange": exchange, "segment": "CASH", "exchange_token": symbol}
         return self._subscribe("index_value", [instrument], callback)
 
+    def _resolve_option_feed_route(self, route: dict[str, Any]) -> tuple[dict[str, str], dict[str, Any]]:
+        stock_code = str(route.get("stock_code") or "").upper()
+        expiry_date = str(route.get("expiry_date") or "")
+        strike_price = str(route.get("strike_price") or "")
+        right = str(route.get("right") or "")
+        broker_route = {
+            "stock_code": stock_code, "exchange_code": "NFO", "segment": "FNO",
+            "expiry_date": expiry_date, "strike_price": strike_price, "right": right,
+        }
+        symbol = self.api._option_symbol_from_route(broker_route)
+        if not symbol:
+            raise RuntimeError(f"Groww feed route missing option trading_symbol for {broker_route}")
+        token = self.api.resolve_exchange_token(exchange="NSE", segment="FNO", trading_symbol=symbol)
+        if not token:
+            raise RuntimeError(f"Groww exchange token not found in official instrument CSV for {symbol}")
+        instrument = {"exchange": "NSE", "segment": "FNO", "exchange_token": str(token)}
+        identity = {
+            "stock_code": stock_code, "exchange_code": "NFO", "exchange": "NSE", "segment": "FNO",
+            "trading_symbol": symbol, "TradingSymbol": symbol, "exchange_token": str(token),
+            "expiry_date": expiry_date, "strike_price": strike_price, "right": right,
+        }
+        return instrument, identity
+
+    def subscribe_option_universe_market_data(
+        self, *, routes: list[dict[str, Any]], callback: Callable[[Any], None]
+    ) -> list[str]:
+        """Subscribe a bounded F&O universe in one LTP and one depth request.
+
+        Groww documents multi-instrument feed subscriptions and identifies packets by
+        exchange token.  A token-to-route map preserves exact contract identity and
+        prevents one CE/PE packet from refreshing another candidate's state.
+        """
+        instruments: list[dict[str, str]] = []
+        by_token: dict[str, dict[str, Any]] = {}
+        for route in routes:
+            instrument, identity = self._resolve_option_feed_route(dict(route))
+            token = str(instrument["exchange_token"])
+            if token in by_token:
+                continue
+            instruments.append(instrument)
+            by_token[token] = identity
+        if not instruments:
+            raise RuntimeError("Groww option universe subscription received no resolvable FNO instruments")
+
+        def _callback(row: Any) -> None:
+            if not isinstance(row, dict):
+                return
+            token = str(row.get("exchange_token") or "").strip()
+            identity = by_token.get(token)
+            if identity is None:
+                return
+            out = dict(row)
+            out.update(identity)
+            if out.get("ltp") is not None:
+                out.setdefault("last_price", out.get("ltp"))
+            callback(out)
+
+        return [
+            self._subscribe("ltp", instruments, _callback),
+            self._subscribe("market_depth", instruments, _callback),
+        ]
+
     def subscribe_option_market_data(
         self,
         *,
@@ -217,51 +294,14 @@ class GrowwLiveFeedHub:
         right: str,
         callback: Callable[[Any], None],
     ) -> list[str]:
-        """Subscribe an F&O execution vehicle to official LTP and depth feeds.
-
-        Groww's documented feed supplies LTP and market depth; interval candles remain
-        sourced from documented historical-candles calls, not fabricated here.
-        """
-        route = {
-            "stock_code": stock_code,
-            "exchange_code": "NFO",
-            "segment": "FNO",
-            "expiry_date": expiry_date,
-            "strike_price": strike_price,
-            "right": right,
-        }
-        symbol = self.api._option_symbol_from_route(route)
-        if not symbol:
-            raise RuntimeError(f"Groww feed route missing option trading_symbol for {route}")
-        token = self.api.resolve_exchange_token(exchange="NSE", segment="FNO", trading_symbol=symbol)
-        if not token:
-            raise RuntimeError(f"Groww exchange token not found in official instrument CSV for {symbol}")
-
-        def _callback(row: Any) -> None:
-            if not isinstance(row, dict):
-                callback(row)
-                return
-            out = dict(row)
-            out.update({
-                "stock_code": stock_code,
-                "exchange_code": "NFO",
-                "exchange": "NSE",
-                "segment": "FNO",
-                "trading_symbol": symbol,
-                "TradingSymbol": symbol,
-                "expiry_date": expiry_date,
-                "strike_price": strike_price,
-                "right": right,
-            })
-            if out.get("ltp") is not None:
-                out.setdefault("last_price", out.get("ltp"))
-            callback(out)
-
-        instrument = {"exchange": "NSE", "segment": "FNO", "exchange_token": token}
-        return [
-            self._subscribe("ltp", [instrument], _callback),
-            self._subscribe("market_depth", [instrument], _callback),
-        ]
+        """Subscribe one final F&O execution vehicle through official live feeds."""
+        return self.subscribe_option_universe_market_data(
+            routes=[{
+                "stock_code": stock_code, "expiry_date": expiry_date,
+                "strike_price": strike_price, "right": right,
+            }],
+            callback=callback,
+        )
 
     def unsubscribe(self, subscription_ids: list[str]) -> None:
         feed = self._feed()

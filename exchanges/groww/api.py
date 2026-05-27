@@ -440,7 +440,7 @@ class GrowwRestClient:
                 # Groww's documented Option Chain returns Greeks nested under
                 # ``greeks`` and provides LTP/OI/volume, but not bid/offer depth.
                 # Preserve and flatten these official values for session screening;
-                # executable depth is obtained separately from get_quote/feed.
+                # executable validation is obtained from the official FNO market-depth stream.
                 greeks = row.get("greeks") if isinstance(row.get("greeks"), Mapping) else {}
                 row.update({
                     "stock_code": underlying,

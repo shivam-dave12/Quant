@@ -220,7 +220,7 @@ def test_option_chain_normalisation_preserves_official_nested_greeks_without_inv
     assert "best_offer_price" not in row
 
 
-def test_two_stage_session_book_screens_chain_then_requires_documented_quote_depth(monkeypatch):
+def test_session_book_screens_chain_then_accepts_documented_stream_depth(monkeypatch):
     from datetime import datetime, timedelta, timezone
     from types import SimpleNamespace
     from agents import groww_chain_architect as chain
@@ -257,26 +257,26 @@ def test_two_stage_session_book_screens_chain_then_requires_documented_quote_dep
     monkeypatch.setattr(chain.config, "GROWW_OPTION_MIN_DTE", 1.0, raising=False)
     monkeypatch.setattr(chain.config, "GROWW_OPTION_MAX_DTE", 21.0, raising=False)
 
-    ce_shortlist = chain.shortlist_contracts_for_quote_validation(
+    ce_shortlist = chain.shortlist_contracts_for_stream_validation(
         instrument, "long", underlying_spot=25000.0, available_funds=25852.96, limit=4
     )
-    pe_shortlist = chain.shortlist_contracts_for_quote_validation(
+    pe_shortlist = chain.shortlist_contracts_for_stream_validation(
         instrument, "short", underlying_spot=25000.0, available_funds=25852.96, limit=4
     )
     assert ce_shortlist[0]["TradingSymbol"] == ce_symbol
     assert pe_shortlist[0]["TradingSymbol"] == pe_symbol
-    # An option-chain row alone is not executable because Groww documents no bid/offer depth there.
+    # An option-chain row alone is not executable; the map below represents documented live market-depth packets.
     assert chain.build_session_contract_book(
         instrument, underlying_spot=25000.0, available_funds=25852.96, commit=False
     ) is None
 
-    quote_by_symbol = {
+    live_book_by_symbol = {
         ce_symbol: {"bid_price": 99.5, "offer_price": 100.0, "bid_quantity": 100, "offer_quantity": 100},
         pe_symbol: {"bid_price": 104.0, "offer_price": 104.5, "bid_quantity": 100, "offer_quantity": 100},
     }
     book = chain.build_session_contract_book(
         instrument, underlying_spot=25000.0, available_funds=25852.96,
-        option_quote_by_symbol=quote_by_symbol, commit=False,
+        option_quote_by_symbol=live_book_by_symbol, commit=False,
     )
     assert book is not None
     assert book.call.selected_symbol == ce_symbol
@@ -305,3 +305,103 @@ def test_execution_freshness_requires_independently_fresh_ltp_and_market_depth()
     assert manager._execution_price_fresh(10.0) is True
     manager._last_ltp_stream_ts = now - 60.0
     assert manager._execution_price_fresh(10.0) is False
+
+
+def test_market_depth_uses_documented_level_one_not_mapping_insertion_order():
+    row = next(iter(GrowwLiveFeedHub._flatten_market_depth({
+        "NSE": {"FNO": {"1001": {
+            "buyBook": {
+                "2": {"price": 99.0, "qty": 5},
+                "1": {"price": 100.0, "qty": 25},
+            },
+            "sellBook": {
+                "2": {"price": 102.0, "qty": 5},
+                "1": {"price": 101.0, "qty": 30},
+            },
+        }}}
+    })))
+    assert row["best_bid_price"] == 100.0
+    assert row["best_bid_quantity"] == 25.0
+    assert row["best_offer_price"] == 101.0
+    assert row["best_offer_quantity"] == 30.0
+
+
+def test_option_subscription_does_not_misattribute_shared_feed_tokens():
+    callbacks = {}
+
+    class FakeFeed:
+        def consume(self):
+            return None
+        def subscribe_ltp(self, instruments, on_data_received=None):
+            callbacks["ltp"] = on_data_received
+        def subscribe_market_depth(self, instruments, on_data_received=None):
+            callbacks["depth"] = on_data_received
+        def get_ltp(self):
+            return {"ltp": {"NSE": {"FNO": {
+                "1001": {"ltp": 100.0},
+                "2002": {"ltp": 999.0},
+            }}}}
+        def get_market_depth(self):
+            return {"NSE": {"FNO": {
+                "1001": {"buyBook": {"1": {"price": 99.5, "qty": 50}}, "sellBook": {"1": {"price": 100.0, "qty": 50}}},
+                "2002": {"buyBook": {"1": {"price": 998.0, "qty": 50}}, "sellBook": {"1": {"price": 999.0, "qty": 50}}},
+            }}}
+
+    api = SimpleNamespace(
+        _option_symbol_from_route=lambda route: "NIFTY26J0225000CE",
+        resolve_exchange_token=lambda **kwargs: "1001",
+    )
+    received = []
+    hub = GrowwLiveFeedHub(api)
+    hub.feed = FakeFeed()
+    hub.subscribe_option_market_data(
+        stock_code="NIFTY", expiry_date="2026-06-02", strike_price="25000", right="Call", callback=received.append
+    )
+    callbacks["ltp"]()
+    callbacks["depth"]()
+    assert len(received) == 2
+    assert all(row["exchange_token"] == "1001" for row in received)
+    assert received[0]["last_price"] == 100.0
+    assert received[1]["best_bid_price"] == 99.5
+    assert received[1]["best_offer_price"] == 100.0
+
+
+def test_session_discovery_selects_from_documented_live_fno_depth_not_rest_quote(monkeypatch):
+    from exchanges.groww import data_manager as dm
+    from exchanges.groww.data_manager import GrowwOptionDataManager
+
+    ce = {"TradingSymbol": "NIFTY26J0225000CE", "trading_symbol": "NIFTY26J0225000CE", "stock_code": "NIFTY", "expiry_date": "2026-06-02", "right": "Call", "strike_price": 25000}
+    pe = {"TradingSymbol": "NIFTY26J0225000PE", "trading_symbol": "NIFTY26J0225000PE", "stock_code": "NIFTY", "expiry_date": "2026-06-02", "right": "Put", "strike_price": 25000}
+    monkeypatch.setattr(dm, "shortlist_contracts_for_stream_validation", lambda _instrument, thesis, **_kw: [ce] if thesis == "long" else [pe])
+    monkeypatch.setattr(dm, "build_session_contract_book", lambda *_args, **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(dm.config, "GROWW_SESSION_BOOK_STREAM_CANDIDATES_PER_SIDE", 1, raising=False)
+    monkeypatch.setattr(dm.config, "GROWW_SESSION_BOOK_STREAM_DISCOVERY_TIMEOUT_SEC", 1.0, raising=False)
+
+    class Api:
+        @staticmethod
+        def _normalise_right(value):
+            return "call" if str(value).lower() in {"call", "ce"} else "put"
+
+    class Hub:
+        def __init__(self):
+            self.unsubscribed = []
+        def subscribe_option_universe_market_data(self, *, routes, callback):
+            for route in routes:
+                right = route["right"]
+                symbol = "NIFTY26J0225000CE" if right == "call" else "NIFTY26J0225000PE"
+                px = 100.0 if right == "call" else 105.0
+                callback({"TradingSymbol": symbol, "ltp": px})
+                callback({"TradingSymbol": symbol, "bid_price": px - 0.5, "offer_price": px, "bid_quantity": 100, "offer_quantity": 100})
+            return ["ltp:universe", "depth:universe"]
+        def unsubscribe(self, ids):
+            self.unsubscribed.extend(ids)
+
+    hub = Hub()
+    monkeypatch.setattr(dm, "hub_for_api", lambda _api: hub)
+    manager = GrowwOptionDataManager(
+        instrument=SimpleNamespace(asset_id="NIFTY", primary=SimpleNamespace(raw={})), api=Api()
+    )
+    books = manager._stream_executable_shortlist(25000.0, 25852.96)
+    assert set(books) == {"NIFTY26J0225000CE", "NIFTY26J0225000PE"}
+    assert books["NIFTY26J0225000CE"]["selection_liquidity_source"] == "groww.subscribe_market_depth"
+    assert len(hub.unsubscribed) == 2
