@@ -10,6 +10,8 @@ from __future__ import annotations
 import logging
 import math
 import json
+import threading
+import time
 from typing import Any, Dict, Iterable, List, Optional
 
 try:
@@ -76,6 +78,15 @@ class HyperliquidAPI:
         self.exchange = None
         self.account_address = str(account_address or "").strip()
         self.api_wallet_address = str(api_wallet_address or "").strip()
+        # Account-state reads are shared across all symbol adapters.  Cache the
+        # authority/margin-mode and verified spot balance to avoid rate-limit
+        # storms from several concurrent HIP-3 strategy contexts.
+        self._state_cache_lock = threading.RLock()
+        self._abstraction_cache: dict[str, Any] | None = None
+        self._abstraction_cache_at = 0.0
+        self._spot_state_cache: dict[str, Any] | None = None
+        self._spot_state_cache_at = 0.0
+        self._state_warning_at = 0.0
 
         key = str(private_key or "").strip()
         if key:
@@ -138,8 +149,30 @@ class HyperliquidAPI:
         except Exception:
             return float(default)
 
-    def account_abstraction_state(self) -> dict[str, Any]:
-        """Read official account abstraction state used to choose balance authority."""
+    def _ensure_state_cache(self) -> None:
+        """Initialise cache lazily as tests may construct the adapter with __new__."""
+        if not hasattr(self, "_state_cache_lock"):
+            self._state_cache_lock = threading.RLock()
+            self._abstraction_cache = None
+            self._abstraction_cache_at = 0.0
+            self._spot_state_cache = None
+            self._spot_state_cache_at = 0.0
+            self._state_warning_at = 0.0
+
+    def account_abstraction_state(self, *, force: bool = False) -> dict[str, Any]:
+        """Read/cache official account abstraction state used to choose balance authority.
+
+        The account mode changes rarely, so polling it for each instrument is both
+        wasteful and unsafe under venue rate limits.  A last verified state is retained
+        through transient API failures.
+        """
+        self._ensure_state_cache()
+        now = time.monotonic()
+        ttl = max(30.0, float(_cfg("HYPERLIQUID_ACCOUNT_MODE_CACHE_SEC", 900.0)))
+        with self._state_cache_lock:
+            if not force and self._abstraction_cache is not None and now - self._abstraction_cache_at <= ttl:
+                return dict(self._abstraction_cache)
+            prior = dict(self._abstraction_cache) if self._abstraction_cache is not None else None
         out: dict[str, Any] = {}
         for key, method_name, payload_type in (
             ("user_abstraction", "query_user_abstraction_state", "userAbstraction"),
@@ -152,6 +185,13 @@ class HyperliquidAPI:
                 )
             except Exception as exc:
                 out[key] = {"query_error": str(exc)}
+        if self._abstraction_mode(out) != "unresolved":
+            with self._state_cache_lock:
+                self._abstraction_cache = dict(out)
+                self._abstraction_cache_at = now
+            return out
+        if prior is not None:
+            return prior
         return out
 
     @staticmethod
@@ -171,15 +211,42 @@ class HyperliquidAPI:
             return "dex_abstraction"
         return "unresolved"
 
-    def spot_user_state(self) -> dict[str, Any]:
+    def spot_user_state(self, *, force: bool = False) -> dict[str, Any]:
+        """Return cached official spotClearinghouseState for unified collateral.
+
+        Transient endpoint failures never overwrite a recently verified collateral
+        state with a fabricated zero balance.
+        """
+        self._ensure_state_cache()
+        now = time.monotonic()
+        refresh_sec = max(5.0, float(_cfg("HYPERLIQUID_SPOT_STATE_REFRESH_SEC", 15.0)))
+        stale_max = max(refresh_sec, float(_cfg("HYPERLIQUID_SPOT_STATE_STALE_MAX_SEC", 120.0)))
+        with self._state_cache_lock:
+            if not force and self._spot_state_cache is not None and now - self._spot_state_cache_at <= refresh_sec:
+                return dict(self._spot_state_cache)
+            prior = dict(self._spot_state_cache) if self._spot_state_cache is not None and now - self._spot_state_cache_at <= stale_max else None
         try:
             fn = getattr(self.info, "spot_user_state", None)
             raw = fn(self.account_address) if callable(fn) else self.info.post(
                 "/info", {"type": "spotClearinghouseState", "user": self.account_address}
             )
-            return dict(raw or {})
+            state = dict(raw or {})
+            if not state:
+                raise RuntimeError("empty_spot_clearinghouse_state")
+            with self._state_cache_lock:
+                self._spot_state_cache = state
+                self._spot_state_cache_at = now
+            return state
         except Exception as exc:
-            logger.warning("Hyperliquid spot clearinghouse state failed: %s", exc)
+            if prior is not None:
+                with self._state_cache_lock:
+                    should_warn = now - self._state_warning_at >= max(30.0, refresh_sec)
+                    if should_warn:
+                        self._state_warning_at = now
+                if should_warn:
+                    logger.warning("Hyperliquid spot clearinghouse state refresh failed; retaining last verified snapshot: %s", exc)
+                return prior
+            logger.warning("Hyperliquid spot clearinghouse state failed with no verified snapshot available: %s", exc)
             return {}
 
     def user_state(self, coin: str | None = None, *, dex: str | None = None) -> Dict[str, Any]:
@@ -210,10 +277,17 @@ class HyperliquidAPI:
                 "balance_verified": False,
                 "reason": "hip3_balance_requires_confirmed_standard_or_unified_portfolio_account_mode",
             }
-            logger.error("Hyperliquid HIP-3 balance is unverifiable for dex=%s: account abstraction mode unresolved; venue is fail-closed", dex)
+            logger.warning("Hyperliquid HIP-3 balance authority unresolved for dex=%s; venue is fail-closed until verified", dex)
             return out
         if mode in {"unified_account", "portfolio_margin"}:
             spot = self.spot_user_state()
+            if not spot:
+                return {
+                    "available": 0.0, "locked": 0.0, "total": 0.0, "currency": "USDC",
+                    "source": f"hyperliquid_spot_clearinghouse_state:{mode}:unavailable",
+                    "dex": dex or "main", "account_mode": mode, "abstraction_state": abstraction,
+                    "balance_verified": False, "reason": "verified_unified_balance_snapshot_unavailable",
+                }
             usdc = next(
                 (row for row in list(spot.get("balances") or []) if str((row or {}).get("coin") or "").upper() == "USDC"),
                 {},
@@ -300,6 +374,22 @@ class HyperliquidAPI:
         scale = 10 ** decimals
         rounded = math.floor(max(0.0, float(size or 0.0)) * scale) / scale
         return float(f"{rounded:.{decimals}f}")
+
+    def round_price(self, coin: str, price: float) -> float:
+        """Return a Hyperliquid-valid perp price using official precision rules.
+
+        Perp prices accept at most five significant figures and at most
+        ``6 - szDecimals`` decimals; integer prices remain valid at any magnitude.
+        """
+        value = float(price or 0.0)
+        if value <= 0 or not math.isfinite(value):
+            raise ValueError(f"invalid_hyperliquid_price:{price}")
+        size_decimals = max(0, min(6, self.size_decimals(coin)))
+        decimal_cap = max(0, 6 - size_decimals)
+        integer_digits = math.floor(math.log10(abs(value))) + 1 if value > 0 else 1
+        significant_decimal_cap = max(0, 5 - integer_digits)
+        decimals = min(decimal_cap, significant_decimal_cap)
+        return float(f"{round(value, decimals):.{decimals}f}")
 
     @staticmethod
     def _statuses(resp: Any) -> list:

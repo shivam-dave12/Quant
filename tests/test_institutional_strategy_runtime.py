@@ -745,17 +745,21 @@ def test_selected_broker_balance_controls_final_position_size_not_delta_balance(
     }.get(name, default))
     strategy = InstitutionalStrategy(instrument=_silver_instrument())
     delta_funded_risk = SimpleNamespace(get_available_balance=lambda: {"available": 180.31, "source": "delta"})
-    selected_hyperliquid = SimpleNamespace(get_balance=lambda: {"available": 20.0, "source": "hyperliquid.user_state"})
+    # Hyperliquid has a documented $10 minimum order notional; provide enough
+    # venue-local collateral for this test to exercise approval rather than the
+    # separate minimum-notional rejection path.
+    selected_hyperliquid = SimpleNamespace(get_balance=lambda: {"available": 100.0, "source": "hyperliquid.user_state"})
     decision = strategy._size_position(
         "DESK_A_METALS", "xyz:SILVER", Direction.LONG, 30.0, 100.0, 1.0,
         ProtectionPlan(30.0, 29.0, 32.0, "VENUE_NATIVE_BRACKET", True), delta_funded_risk,
         venue="hyperliquid", balance_source=selected_hyperliquid,
     )
-    assert decision.available_cash_used == 20.0
+    assert decision.available_cash_used == 100.0
     assert decision.capital_venue == "hyperliquid"
     assert decision.balance_source == "hyperliquid.user_state"
-    assert decision.margin_required <= 20.0
-    assert decision.notional <= 20.0 * 0.20 + 1e-9
+    assert decision.margin_required <= 100.0
+    assert decision.notional <= 100.0 * 0.20 + 1e-9
+    assert decision.notional >= 10.0
     assert decision.reasons[0] == "broker_local_cash_sizing_approved:hyperliquid"
 
 
@@ -807,3 +811,29 @@ def test_current_venue_cannot_trade_when_route_model_values_it_at_a_loss(tmp_pat
     decision = InstitutionalStrategy(instrument=_instrument()).evaluate(_Data([100.0] * 5), _Orders(), _Risk(), 1)
     assert decision.decision is DecisionOutput.NO_TRADE_EXECUTION_UNSAFE
     assert decision.reasons[0].startswith("selected_route_cost_exceeds_limit:")
+
+
+def test_hyperliquid_subminimum_notional_is_rejected_before_submission(tmp_path, monkeypatch):
+    from strategy.domain import Direction, ProtectionPlan
+
+    monkeypatch.setattr("strategy.institutional_strategy._cfg", lambda name, default: {
+        "RESEARCH_STORE_PATH": str(tmp_path),
+        "VENUE_SELECTION_ENABLED": True,
+        "INSTITUTIONAL_RISK_FRACTION_PER_TRADE": 1.0,
+        "INSTITUTIONAL_QUARTER_KELLY": 1.0,
+        "INSTITUTIONAL_TARGET_OBSERVATION_VOL_BPS": 100000.0,
+        "LEVERAGE": 5.0,
+        "INSTITUTIONAL_MAX_SELECTED_LEVERAGE": 5.0,
+        "HYPERLIQUID_MIN_ORDER_NOTIONAL_USD": 10.0,
+    }.get(name, default))
+    strategy = InstitutionalStrategy(instrument=_silver_instrument())
+    risk = SimpleNamespace(get_available_balance=lambda: {"available": 180.31, "source": "delta"})
+    hyperliquid = SimpleNamespace(get_balance=lambda: {"available": 20.0, "source": "hyperliquid.user_state"})
+    decision = strategy._size_position(
+        "DESK_A_METALS", "xyz:SILVER", Direction.LONG, 30.0, 100.0, 1.0,
+        ProtectionPlan(30.0, 29.0, 32.0, "VENUE_NATIVE_BRACKET", True), risk,
+        venue="hyperliquid", balance_source=hyperliquid,
+    )
+    assert decision.approved is False
+    assert decision.notional < 10.0
+    assert decision.reasons[0].startswith("order_notional_below_venue_minimum:hyperliquid:")

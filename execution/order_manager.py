@@ -1987,6 +1987,10 @@ class _HyperliquidAdapter:
             q = math.floor(float(quantity) / step) * step
         return max(0.0, q)
 
+    def _round_px(self, price: float) -> float:
+        """Apply Hyperliquid's significant-figure/decimal price contract."""
+        return float(self.api.round_price(self.symbol, float(price)))
+
     @staticmethod
     def _order_node(raw: Dict) -> Dict:
         if not isinstance(raw, dict):
@@ -2054,6 +2058,12 @@ class _HyperliquidAdapter:
         on_order_placed=None,
     ) -> Optional[Dict]:
         qty = self._round_qty(quantity)
+        try:
+            limit_price = self._round_px(limit_price)
+            sl_price = self._round_px(sl_price)
+            tp_price = self._round_px(tp_price)
+        except Exception as exc:
+            return {"_error": True, "_sc": 0, "_raw": {"error": f"hyperliquid_price_rounding_failed:{exc}"}}
         if qty <= 0:
             return {"_error": True, "_sc": 0, "_raw": {"error": "hyperliquid_qty_rounded_to_zero"}}
         api_side = str(side or "").upper()
@@ -2173,11 +2183,12 @@ class _HyperliquidAdapter:
                 resp = self.api.market_close(self.symbol, qty)
                 parsed = self.api.first_order_result(resp)
             else:
+                wire_price = self._round_px(float(price or 0.0))
                 resp = self.api.place_limit_order(
                     coin=self.symbol,
                     is_buy=is_buy,
                     size=qty,
-                    limit_px=float(price or 0.0),
+                    limit_px=wire_price,
                     reduce_only=bool(reduce_only),
                     tif="Ioc" if str(order_type or "").upper() == "MARKET" else "Gtc",
                 )
@@ -3018,6 +3029,23 @@ class OrderManager:
         self.last_order_error = None
         if not hasattr(self._adapter, "place_bracket_limit_entry"):
             return None  # Adapter does not expose protected entry routing.
+
+        if self._exchange_name == "hyperliquid":
+            formatter = getattr(self._adapter, "_round_px", None)
+            if callable(formatter):
+                try:
+                    limit_price = formatter(float(limit_price))
+                    sl_price = formatter(float(sl_price))
+                    tp_price = formatter(float(tp_price))
+                except Exception as exc:
+                    self.last_order_error = {
+                        "stage": "hyperliquid_price_precision_validation",
+                        "status_code": 0,
+                        "reason": str(exc),
+                        "raw": {"error": str(exc)},
+                    }
+                    logger.error("Hyperliquid executable price normalisation failed before submission: %s", exc)
+                    return None
 
         cur = self._currency_symbol()
         qty_note = ""

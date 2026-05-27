@@ -1021,8 +1021,24 @@ validate_live_control_plane()
 # warmup or background state-refresh services. Hyperliquid publishes these live
 # feeds through its official WebSocket subscription contract.
 HYPERLIQUID_WS_CANDLE_INTERVALS = ("1m", "5m", "15m", "1h", "4h", "1d")
-VENUE_BALANCE_REFRESH_SEC = 2.0
-VENUE_BALANCE_SNAPSHOT_MAX_AGE_SEC = 10.0
+# One shared collateral authority service refreshes each broker independently.
+# It retains the last verified snapshot through transient 429 responses and
+# fails closed only after freshness expires; market ticks never query balances.
+VENUE_BALANCE_REFRESH_SEC = 30.0  # isolated compatibility path only
+VENUE_BALANCE_SNAPSHOT_MAX_AGE_SEC = 120.0  # legacy alias
+BROKER_COLLATERAL_REFRESH_DELTA_SEC = 15.0
+BROKER_COLLATERAL_REFRESH_COINSWITCH_SEC = 45.0
+BROKER_COLLATERAL_REFRESH_HYPERLIQUID_SEC = 20.0
+BROKER_COLLATERAL_REFRESH_DEFAULT_SEC = 30.0
+BROKER_COLLATERAL_SNAPSHOT_MAX_AGE_SEC = 120.0
+BROKER_COLLATERAL_MAX_BACKOFF_SEC = 300.0
+BROKER_COLLATERAL_ERROR_LOG_THROTTLE_SEC = 60.0
+HYPERLIQUID_ACCOUNT_MODE_CACHE_SEC = 900.0
+HYPERLIQUID_SPOT_STATE_REFRESH_SEC = 15.0
+HYPERLIQUID_SPOT_STATE_STALE_MAX_SEC = 120.0
+# Hyperliquid rejects orders below USD 10 notional; routes smaller than this
+# are non-executable and must be rejected before protected-order submission.
+HYPERLIQUID_MIN_ORDER_NOTIONAL_USD = 10.0
 SCANNER_CONTEXT_WORKERS_ENABLED = True
 SCANNER_MARKET_TICK_MAX_LATENCY_MULTIPLIER = 2.0
 INSTITUTIONAL_TELEMETRY_SELECTED_VENUE_REQUIRED = True

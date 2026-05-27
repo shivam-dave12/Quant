@@ -27,6 +27,7 @@ from core.instruments import ExchangeName, TradableInstrument
 from core.market_policy import active_policy
 from core.pnl import gross_pnl_usd
 from execution.venue_selection import select_execution_venue
+from execution.collateral_service import BrokerCollateralSnapshotService
 from intelligence.cross_venue_btc import BTCCompositeState, build_btc_composite_state
 from intelligence.composite_asset_state import CompositeAssetDecision, CompositeIntelligenceBus
 from intelligence.venue_market_state import (
@@ -76,6 +77,19 @@ def _num(value: Any, default: float = 0.0) -> float:
         return out if math.isfinite(out) else default
     except Exception:
         return default
+
+
+def _hyperliquid_price_increment(price: float, qty_step: float) -> float:
+    """Compute the current valid Hyperliquid perp price increment without API I/O."""
+    value = max(0.0, float(price or 0.0))
+    if value <= 0:
+        return 0.0
+    step = max(float(qty_step or 0.00001), 1e-12)
+    size_decimals = max(0, min(6, int(round(-math.log10(step))) if step < 1 else 0))
+    decimal_cap = max(0, 6 - size_decimals)
+    integer_digits = math.floor(math.log10(value)) + 1
+    decimals = min(decimal_cap, max(0, 5 - integer_digits))
+    return float(10 ** (-decimals))
 
 
 def _live_routing_permission(venue: str) -> tuple[bool, str]:
@@ -189,7 +203,7 @@ class DailyRiskGate:
 class InstitutionalStrategy:
     """Runtime adapter exposing the bot-facing strategy API."""
 
-    def __init__(self, order_manager=None, *, instrument: TradableInstrument | None = None, intelligence_bus: CompositeIntelligenceBus | None = None) -> None:
+    def __init__(self, order_manager=None, *, instrument: TradableInstrument | None = None, intelligence_bus: CompositeIntelligenceBus | None = None, collateral_service: BrokerCollateralSnapshotService | None = None) -> None:
         self._om = order_manager
         self._instrument = instrument
         self._asset_id = getattr(instrument, "asset_id", str(_cfg("SYMBOL", "BTC")))
@@ -215,6 +229,8 @@ class InstitutionalStrategy:
         # Shared normalised factor bus: executable alpha transfers only inside
         # validated equivalence groups; related products remain context-only.
         self._composite_bus = intelligence_bus or CompositeIntelligenceBus()
+        # Portfolio-owned broker-state service deduplicates REST balance authority reads across desks.
+        self._collateral_service = collateral_service
         # Operator telemetry is state/change driven. The model can evaluate on
         # every market event without emitting an INFO-scale JSON payload per tick.
         self._telemetry_last_signature: tuple[Any, ...] | None = None
@@ -241,12 +257,18 @@ class InstitutionalStrategy:
         self._portfolio_submission_gate = gate
 
     def start_runtime_services(self, order_manager) -> None:
-        """Start non-blocking broker-state refresh used by the route model.
+        """Register broker balance authority with the shared asynchronous cache.
 
-        Market ticks consume cached collateral only. Final approved orders still
-        perform a broker-local risk revalidation before submission.
+        Live market decisions consume immutable collateral snapshots only.  A
+        portfolio-owned service deduplicates REST reads across every strategy
+        context so CoinSwitch/Hyperliquid account endpoints are not flooded.
         """
         self._runtime_order_manager = order_manager
+        if self._collateral_service is not None:
+            self._collateral_service.register_router(order_manager)
+            self._collateral_service.start()
+            return
+        # Compatibility path for isolated tests/single-strategy callers.
         if self._venue_cash_refresh_thread is not None and self._venue_cash_refresh_thread.is_alive():
             return
         self._venue_cash_refresh_stop.clear()
@@ -256,10 +278,12 @@ class InstitutionalStrategy:
         self._venue_cash_refresh_thread.start()
 
     def stop_runtime_services(self) -> None:
-        self._venue_cash_refresh_stop.set()
+        # Shared portfolio service is owned and stopped by the orchestrator.
+        if self._collateral_service is None:
+            self._venue_cash_refresh_stop.set()
 
     def _venue_cash_refresh_loop(self) -> None:
-        interval = max(0.5, float(_cfg("VENUE_BALANCE_REFRESH_SEC", 2.0)))
+        interval = max(15.0, float(_cfg("VENUE_BALANCE_REFRESH_SEC", 30.0)))
         while not self._venue_cash_refresh_stop.is_set():
             order_manager = self._runtime_order_manager
             if order_manager is not None:
@@ -267,10 +291,11 @@ class InstitutionalStrategy:
                     manager = self._execution_manager_for(order_manager, venue)
                     try:
                         bal = manager.get_balance() if manager is not None and hasattr(manager, "get_balance") else {}
-                        available = max(0.0, _num((bal or {}).get("available"), 0.0))
-                        source = str((bal or {}).get("source") or f"{venue}_live_balance")
-                        with self._venue_cash_lock:
-                            self._venue_cash_cache[str(venue).lower()] = (time.monotonic(), available, source)
+                        if isinstance(bal, dict) and not bal.get("error") and bal.get("balance_verified") is not False:
+                            available = max(0.0, _num((bal or {}).get("available"), 0.0))
+                            source = str((bal or {}).get("source") or f"{venue}_live_balance")
+                            with self._venue_cash_lock:
+                                self._venue_cash_cache[str(venue).lower()] = (time.monotonic(), available, source)
                     except Exception as exc:
                         logger.debug("async venue collateral refresh unavailable venue=%s: %s", venue, exc)
             self._venue_cash_refresh_stop.wait(interval)
@@ -925,6 +950,8 @@ class InstitutionalStrategy:
             desk, instrument, direction, price, net_edge, liquidity_score, protection, risk_manager,
             venue=venue, balance_source=self._execution_manager_for(order_manager, venue),
             venue_market_state=market_states.get(str(venue).lower()),
+            available_cash_snapshot=(venue_available_cash.get(str(venue).lower()) if venue_available_cash else None),
+            balance_source_label=(f"shared_verified_collateral_snapshot:{str(venue).lower()}" if venue_available_cash else None),
         )
         if not sizing.approved:
             return self._decision(
@@ -983,7 +1010,9 @@ class InstitutionalStrategy:
             )
 
         gate_allowed, gate_reason = self._entry_risk_gate(
-            risk_manager, balance_source=self._execution_manager_for(order_manager, venue)
+            risk_manager,
+            balance_source=self._execution_manager_for(order_manager, venue),
+            cached_equity=float(getattr(sizing, "available_cash_used", 0.0) or 0.0),
         )
         if not gate_allowed:
             return self._decision(
@@ -2201,12 +2230,15 @@ class InstitutionalStrategy:
             policy = active_policy(self._instrument)
         except Exception:
             policy = None
+        executable_price_tick = float(mapping.price_tick or 0.0)
+        if str(venue or "").lower() == "hyperliquid":
+            executable_price_tick = max(executable_price_tick, _hyperliquid_price_increment(price, mapping.qty_step))
         market_state = {
             "asset_id": self._asset_id,
             "venue": str(venue or "").lower(),
             "instrument": instrument or self._asset_id,
             "spread_bps": spread_bps,
-            "price_tick": float(mapping.price_tick or 0.0),
+            "price_tick": executable_price_tick,
             "near_touch_depth_usd": near_depth,
             "liquidity_score": liquidity_score,
             "regime": getattr(regime, "value", regime) if regime is not None else "",
@@ -2216,7 +2248,7 @@ class InstitutionalStrategy:
             "venue_local_robust_vol_bps": float(venue_market_state.robust_one_minute_vol_bps) if venue_market_state is not None and venue_market_state.ready else None,
         }
         if venue_market_state is not None and venue_market_state.ready:
-            volatility_price = max(price * float(venue_market_state.robust_one_minute_vol_bps) / 10_000.0, float(mapping.price_tick or 0.0))
+            volatility_price = max(price * float(venue_market_state.robust_one_minute_vol_bps) / 10_000.0, executable_price_tick)
             market_state["volatility_source"] = f"venue_local_confirmed_candles:{str(venue or '').lower()}"
         else:
             volatility_price = self._realized_vol_price()
@@ -2231,16 +2263,22 @@ class InstitutionalStrategy:
 
     def _size_position(
         self, desk: str, instrument: str, direction: Direction, price: float, net_edge: float, liquidity_score: float, protection: ProtectionPlan, risk_manager, venue: str | None = None, balance_source=None, venue_market_state: VenueMarketState | None = None,
+        available_cash_snapshot: float | None = None, balance_source_label: str | None = None,
     ) -> PositionSizingDecision:
         _ = direction
         capital_venue = str(venue or "").strip().lower()
         bal: Mapping[str, Any] = {}
         balance_label = ""
         try:
-            if balance_source is not None and hasattr(balance_source, "get_balance"):
+            if available_cash_snapshot is not None:
+                cash = max(0.0, float(available_cash_snapshot))
+                balance_label = str(balance_source_label or f"verified_collateral_snapshot:{capital_venue or 'selected'}")
+                bal = {"available": cash, "source": balance_label}
+            elif balance_source is not None and hasattr(balance_source, "get_balance"):
                 raw_balance = balance_source.get_balance() or {}
                 bal = raw_balance if isinstance(raw_balance, Mapping) else {}
                 balance_label = str(bal.get("source") or f"{capital_venue or 'selected'}_live_balance")
+                cash = _num(bal.get("available"), 0.0)
             elif capital_venue and bool(_cfg("VENUE_SELECTION_ENABLED", True)):
                 # A selected multi-venue route may never silently borrow the
                 # primary/default broker balance merely because its adapter is
@@ -2316,6 +2354,16 @@ class InstitutionalStrategy:
         notional = qty * unit_notional
         margin = notional if leverage is None else notional / max(leverage, 1.0)
         risk_after = qty * risk_per_unit
+        min_order_notional = self._venue_min_order_notional_usd(capital_venue)
+        if qty > 0 and min_order_notional > 0.0 and notional + 1e-9 < min_order_notional:
+            return PositionSizingDecision(
+                desk=desk, instrument=instrument, approved=False, quantity=qty, notional=notional,
+                margin_required=margin, leverage_selected=leverage, risk_to_invalidation=risk_after,
+                expected_net_edge=net_edge, liquidity_capacity_cap=liquidity_cap,
+                portfolio_risk_before=0.0, portfolio_risk_after=risk_after,
+                reasons=[f"order_notional_below_venue_minimum:{capital_venue}:{notional:.4f}<{min_order_notional:.4f}"],
+                capital_venue=capital_venue, available_cash_used=cash, balance_source=balance_label,
+            )
         approved = qty > 0 and margin <= cash and net_edge > 0 and risk_after <= risk_budget + 1e-9
         reasons = ([f"broker_local_cash_sizing_approved:{capital_venue or 'single_venue'}"] if approved
                    else [f"broker_local_cash_sizing_rejected:{capital_venue or 'single_venue'}"])
@@ -2456,17 +2504,19 @@ class InstitutionalStrategy:
         """
         if self._runtime_order_manager is None:
             self.start_runtime_services(order_manager)
+        requested = {str(v).lower() for v in (venues or self._routeable_venues(order_manager))}
+        if self._collateral_service is not None:
+            return self._collateral_service.cash_by_venue(order_manager, requested)
         now = time.monotonic()
-        max_age = max(1.0, float(_cfg("VENUE_BALANCE_SNAPSHOT_MAX_AGE_SEC", 10.0)))
+        max_age = max(5.0, float(_cfg("BROKER_COLLATERAL_SNAPSHOT_MAX_AGE_SEC", _cfg("VENUE_BALANCE_SNAPSHOT_MAX_AGE_SEC", 120.0))))
         out: dict[str, float] = {}
-        for venue in sorted(venues or self._routeable_venues(order_manager)):
-            key = str(venue).lower()
+        for venue in sorted(requested):
             with self._venue_cash_lock:
-                cached = self._venue_cash_cache.get(key)
+                cached = self._venue_cash_cache.get(venue)
             if cached is None or now - float(cached[0]) > max_age:
-                out[key] = 0.0
+                out[venue] = 0.0
                 continue
-            out[key] = max(0.0, float(cached[1]))
+            out[venue] = max(0.0, float(cached[1]))
         return out
 
     def _protection_capable_venues(self, order_manager, venues: set[str] | None = None) -> set[str]:
@@ -2479,6 +2529,18 @@ class InstitutionalStrategy:
             if callable(getattr(manager, "place_bracket_limit_entry", None)) or callable(getattr(adapter, "place_bracket_limit_entry", None)):
                 protected.add(str(venue).lower())
         return protected
+
+    def _venue_min_order_notional_usd(self, venue: str | None) -> float:
+        """Return hard broker-contract minimum order notional for execution gating.
+
+        Minimum order values are execution constraints, not an invitation to
+        increase size beyond liquidity/risk budgets.  A route that cannot meet
+        its broker's minimum at the model-approved size is rejected fail-closed.
+        """
+        key = str(venue or "").strip().lower()
+        if key == "hyperliquid":
+            return max(10.0, float(_cfg("HYPERLIQUID_MIN_ORDER_NOTIONAL_USD", 10.0) or 10.0))
+        return 0.0
 
     def _venue_selection_budgets(self, available_cash_by_venue: Mapping[str, float]) -> tuple[dict[str, float], dict[str, float]]:
         """Build cost-comparison sizes from each venue's own free collateral.
@@ -2503,12 +2565,27 @@ class InstitutionalStrategy:
                 caps.append(venue_cap)
             leverage = max(1.0, min(caps))
             notional = cash * fraction
+            min_order_notional = self._venue_min_order_notional_usd(key)
+            if min_order_notional > 0.0 and 0.0 < notional + 1e-9 < min_order_notional:
+                # Cost the venue at its smallest executable contract value only
+                # when that minimum can be funded within the same broker-local
+                # margin allocation.  This permits a genuinely feasible route
+                # to compete while final SL/risk sizing remains authoritative.
+                margin_allocation = cash * fraction
+                min_required_margin = min_order_notional / leverage
+                notional = min_order_notional if min_required_margin <= margin_allocation + 1e-9 else 0.0
             notionals[key] = notional
             margins[key] = max(min_margin, notional / leverage) if notional > 0 else min_margin
         return notionals, margins
 
-    def _entry_risk_gate(self, risk_manager, *, balance_source=None) -> tuple[bool, str]:
-        """Gate live entries through the same risk controls that record entries."""
+    def _entry_risk_gate(self, risk_manager, *, balance_source=None, cached_equity: float | None = None) -> tuple[bool, str]:
+        """Gate live entries through the same risk controls that record entries.
+
+        For multi-venue runtime the approved sizing calculation already consumed a
+        verified, freshness-gated broker-local collateral snapshot.  Reuse that
+        conservative available-cash value rather than generating another REST call
+        immediately before order submission.
+        """
         if not self._pos.is_flat():
             return False, "position_already_active"
         gate = getattr(risk_manager, "can_trade", None)
@@ -2521,17 +2598,18 @@ class InstitutionalStrategy:
                     return False, f"risk_manager_gate:{reason}"
             except Exception as exc:
                 return False, f"risk_manager_gate_error:{exc}"
-        equity = 0.0
+        equity = max(0.0, float(cached_equity or 0.0)) if cached_equity is not None else 0.0
         try:
-            if balance_source is not None and hasattr(balance_source, "get_balance"):
-                bal = balance_source.get_balance() or {}
-            else:
-                bal = risk_manager.get_available_balance() or {}
-            equity = max(
-                _num(bal.get("equity"), 0.0),
-                _num(bal.get("total"), 0.0),
-                _num(bal.get("available"), 0.0),
-            )
+            if cached_equity is None:
+                if balance_source is not None and hasattr(balance_source, "get_balance"):
+                    bal = balance_source.get_balance() or {}
+                else:
+                    bal = risk_manager.get_available_balance() or {}
+                equity = max(
+                    _num(bal.get("equity"), 0.0),
+                    _num(bal.get("total"), 0.0),
+                    _num(bal.get("available"), 0.0),
+                )
         except Exception:
             equity = _num(_cfg("INITIAL_BALANCE", 0.0), 0.0)
         if equity > 0 and self._risk_gate.opening_balance <= 0:

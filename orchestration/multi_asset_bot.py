@@ -25,6 +25,7 @@ from core.pnl import gross_pnl_usd
 from execution.instrument_registry import InstrumentRegistry, DiscoveryReport
 from execution.order_manager import OrderManager
 from execution.router import ExecutionRouter
+from execution.collateral_service import BrokerCollateralSnapshotService
 try:
     from exchanges.coinswitch.api import FuturesAPI as CoinSwitchAPI
     from exchanges.coinswitch.data_manager import CoinSwitchDataManager
@@ -114,6 +115,8 @@ class MultiAssetInstitutionalBot:
         # One bus for the portfolio: all verified normalised feeds contribute to
         # factor intelligence while execution alpha remains product-aware.
         self._composite_intelligence_bus = CompositeIntelligenceBus()
+        # One broker-state authority cache for all desk workers; balance APIs are never polled per context.
+        self._collateral_service = BrokerCollateralSnapshotService()
         self._worker_threads: list[threading.Thread] = []
         # Market calculations are parallel; only final slot reservation / order
         # submission is serialized to prevent concurrent capacity oversubscription.
@@ -1079,7 +1082,7 @@ class MultiAssetInstitutionalBot:
             contexts_getter=lambda: list(self.contexts) if self.contexts else list(ctx_holder.values()),
             manager=self.guard,
         )
-        strategy = InstitutionalStrategy(router, instrument=inst, intelligence_bus=self._composite_intelligence_bus)
+        strategy = InstitutionalStrategy(router, instrument=inst, intelligence_bus=self._composite_intelligence_bus, collateral_service=self._collateral_service)
         strategy.bind_market_wakeup(self._market_wakeup.set)
         data.register_strategy(strategy)
         ctx = AssetContext(inst, data, router, risk, strategy)
@@ -1429,6 +1432,7 @@ class MultiAssetInstitutionalBot:
         logger.info("Stopping multi-asset bot...")
         self.running = False
         self._market_wakeup.set()
+        self._collateral_service.stop()
         for ctx in self.contexts:
             try:
                 service_stop = getattr(ctx.strategy, "stop_runtime_services", None)
