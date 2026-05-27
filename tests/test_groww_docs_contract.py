@@ -182,6 +182,7 @@ def test_runtime_image_prepares_only_groww_sdk_feed_cache_file_for_botuser():
     from pathlib import Path
 
     dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text(encoding="utf-8")
-    assert 'Path(growwapi.__file__).resolve().parent / "instruments.csv"' in dockerfile
+    assert 'sdk_root / "instruments.csv"' in dockerfile
+    assert 'sdk_root / "common" / "a.creds"' in dockerfile
     assert "os.chown(cache, user.pw_uid, user.pw_gid)" in dockerfile
     assert "chown -R botuser:botuser /usr/local/lib/python3.11/site-packages" not in dockerfile
