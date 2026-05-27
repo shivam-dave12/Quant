@@ -149,6 +149,7 @@ class TelegramBotController:
         self.chat_id        = str(telegram_config.TELEGRAM_CHAT_ID)
         self.last_update_id = 0
         self.running        = False
+        self._external_shutdown_requested = threading.Event()
 
         # SPAM-FIX 2026-04-26: rate-limit getUpdates HTTP error logs.
         # Telegram occasionally bursts 8–15 consecutive 429/502 responses on
@@ -1295,6 +1296,12 @@ class TelegramBotController:
             logger.error(f"Bot crashed: {e}", exc_info=True)
             self.send_message(f"❌ <b>Bot crashed</b>\n<code>{_esc(e)}</code>")
         finally:
+            active = bot_instance
+            if active is not None:
+                try:
+                    active.stop()
+                except Exception:
+                    logger.exception("Bot cleanup failed during thread shutdown")
             with bot_state_lock:
                 bot_running = False
                 bot_starting = False
@@ -1365,7 +1372,8 @@ class TelegramBotController:
         while self.running:
             try:
                 self._maybe_run_groww_premarket_refresh()
-                updates = self.get_updates(timeout=10)
+                poll_timeout = max(1, min(5, int(float(getattr(config, "TELEGRAM_LONG_POLL_TIMEOUT_SEC", 2.0) or 2.0))))
+                updates = self.get_updates(timeout=poll_timeout)
                 for upd in updates:
                     self.last_update_id = upd.get("update_id", self.last_update_id)
                     msg     = upd.get("message") or {}
@@ -1403,16 +1411,32 @@ class TelegramBotController:
                     if response:
                         self.send_message(response)
             except KeyboardInterrupt:
-                logger.warning(
-                    "KeyboardInterrupt ignored by Telegram-only shutdown guard; "
-                    "use /stop from Telegram to stop the bot."
-                )
-                continue
+                self.request_external_shutdown("KeyboardInterrupt")
+                break
             except Exception as e:
                 logger.error(f"Command loop error: {e}", exc_info=True)
                 time.sleep(2.0)
 
+        if self._external_shutdown_requested.is_set():
+            self.stop()
         logger.info("Controller stopped")
+
+    def request_external_shutdown(self, signal_name: str = "SIGTERM") -> None:
+        """Non-blocking signal callback: stop polling and wake the trading runtime."""
+        if not self._external_shutdown_requested.is_set():
+            logger.info("External lifecycle stop %s accepted; stopping controller and trading runtime gracefully", signal_name)
+        self._external_shutdown_requested.set()
+        self.running = False
+        active = bot_instance
+        if active is not None:
+            request_stop = getattr(active, "request_external_shutdown", None)
+            if callable(request_stop):
+                request_stop(signal_name)
+            else:
+                try:
+                    active.running = False
+                except Exception:
+                    pass
 
     def stop(self):
         self.running = False
@@ -1446,13 +1470,14 @@ def main():
     _sh.setFormatter(_fmt)
     logging.basicConfig(level=getattr(config, "LOG_LEVEL", "INFO"), handlers=[_fh, _sh], force=True)
 
-    if threading.current_thread() is threading.main_thread():
-        from runtime_shutdown_guard import install_telegram_only_shutdown_guard
-
-        install_telegram_only_shutdown_guard(logger, "telegram-controller")
-
     try:
         controller = TelegramBotController()
+        if threading.current_thread() is threading.main_thread():
+            from runtime_shutdown_guard import install_graceful_shutdown_handler
+
+            install_graceful_shutdown_handler(
+                logger, "telegram-controller", controller.request_external_shutdown
+            )
         controller.start()
     except KeyboardInterrupt:
         logger.info("Shutdown requested")

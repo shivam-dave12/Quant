@@ -61,11 +61,11 @@ def main() -> None:
     bot = MultiAssetInstitutionalBot()
     if threading.current_thread() is threading.main_thread():
         try:
-            from runtime_shutdown_guard import install_telegram_only_shutdown_guard
+            from runtime_shutdown_guard import install_graceful_shutdown_handler
 
-            install_telegram_only_shutdown_guard(logger, "institutional-main")
+            install_graceful_shutdown_handler(logger, "institutional-main", bot.request_external_shutdown)
         except Exception:
-            logger.warning("shutdown guard unavailable", exc_info=True)
+            logger.warning("graceful shutdown handler unavailable", exc_info=True)
     if not bot.initialize():
         sys.exit(1)
     if not bot.start():
@@ -74,8 +74,9 @@ def main() -> None:
         bot.run()
     except Exception:
         logger.exception("fatal runtime error")
-        bot.stop()
         sys.exit(1)
+    finally:
+        bot.stop()
 
 
 if __name__ == "__main__":

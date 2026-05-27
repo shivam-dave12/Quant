@@ -47,12 +47,16 @@ if not DELTA_API_KEY and not COINSWITCH_API_KEY and not (GROWW_ACCESS_TOKEN or G
 
 # ── Symbol / Leverage ─────────────────────────────────────────────────────────
 SYMBOL                   = "BTCUSDT"
-LEVERAGE                 = 45
+LEVERAGE                 = 5   # hard execution ceiling; do not expose the account to 45x config drift
 DELTA_SYMBOL             = "BTCUSD"
 DELTA_CONTRACT_VALUE_BTC = 0.001
 DELTA_BALANCE_CURRENCY   = "USD"
 COINSWITCH_SYMBOL        = "BTCUSDT"
 COINSWITCH_EXCHANGE      = "EXCHANGE_2"
+# Read-only reference feed for BTC leader/follower research; it never routes orders.
+HYPERLIQUID_REFERENCE_ENABLED = os.getenv("HYPERLIQUID_REFERENCE_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+HYPERLIQUID_TESTNET          = os.getenv("HYPERLIQUID_TESTNET", "false").lower() in ("1", "true", "yes", "on")
+HYPERLIQUID_RECONNECT_SEC    = float(os.getenv("HYPERLIQUID_RECONNECT_SEC", "3.0"))
 
 # ── Position sizing ───────────────────────────────────────────────────────────
 MIN_MARGIN_PER_TRADE     = 0       # 0 = no arbitrary dollar floor; exchange min_qty/step controls executability
@@ -208,6 +212,24 @@ AGG_PRIMARY_WEIGHT   = 0.55
 AGG_SECONDARY_WEIGHT = 0.45
 AGG_OB_DEPTH_LEVELS  = 10
 AGG_TRADE_WINDOW_SEC = 30.0
+
+# ── Microstructure alpha baseline (kept in shadow mode until forward labels validate it) ──
+INSTITUTIONAL_ENABLE_LIVE_ENTRIES = os.getenv("INSTITUTIONAL_ENABLE_LIVE_ENTRIES", "false").lower() in ("1", "true", "yes", "on")
+INSTITUTIONAL_REQUIRE_BTC_CROSS_VENUE = os.getenv("INSTITUTIONAL_REQUIRE_BTC_CROSS_VENUE", "true").lower() in ("1", "true", "yes", "on")
+INSTITUTIONAL_MIN_EXECUTION_QUALITY = 0.40
+INSTITUTIONAL_MIN_FLOW_AGREEMENT = 0.55
+INSTITUTIONAL_MAX_CROSS_VENUE_DISPERSION_BPS = 15.0
+INSTITUTIONAL_MIN_SIGNAL_BPS = 0.50
+INSTITUTIONAL_MIN_NET_EDGE_BPS = 3.0
+INSTITUTIONAL_FLOW_OFI_WEIGHT = 1.0
+INSTITUTIONAL_FLOW_TFI_WEIGHT = 0.30
+INSTITUTIONAL_FLOW_MICROPRICE_WEIGHT = 0.35
+INSTITUTIONAL_FLOW_DISLOCATION_WEIGHT = 0.50
+INSTITUTIONAL_RISK_FRACTION_PER_TRADE = 0.0025
+INSTITUTIONAL_QUARTER_KELLY = 0.25
+INSTITUTIONAL_TARGET_OBSERVATION_VOL_BPS = 10.0
+INSTITUTIONAL_CORRELATED_EXPOSURE_CAP_FRACTION = float(os.getenv("INSTITUTIONAL_CORRELATED_EXPOSURE_CAP_FRACTION", "0.35"))
+RESEARCH_STORE_PATH = os.getenv("RESEARCH_STORE_PATH", "research_output")
 
 # ── Institutional Strategy ────────────────────────────────────────────────────────────
 INSTITUTIONAL_MARGIN_PCT               = 0.50
@@ -459,6 +481,13 @@ GROWW_REQUIRE_STATIC_IP_FOR_LIVE_ORDERS = os.getenv("GROWW_REQUIRE_STATIC_IP_FOR
 GROWW_APPROVED_STATIC_IPS = tuple(x.strip() for x in os.getenv("GROWW_APPROVED_STATIC_IPS", "").split(",") if x.strip())
 GROWW_OUTBOUND_IP_CHECK_URL = os.getenv("GROWW_OUTBOUND_IP_CHECK_URL", "https://api.ipify.org?format=json")
 GROWW_OUTBOUND_IP_OVERRIDE = os.getenv("GROWW_OUTBOUND_IP_OVERRIDE", "").strip()
+# Groww SDK exposes order_reference_id (8-20 chars) for traceability. Broker-side
+# algo registration/whitelisting must be confirmed before live India execution.
+GROWW_REQUIRE_SEBI_ALGO_CONFIRMATION_FOR_LIVE_ORDERS = os.getenv("GROWW_REQUIRE_SEBI_ALGO_CONFIRMATION_FOR_LIVE_ORDERS", "true").lower() in ("1", "true", "yes", "on")
+GROWW_SEBI_ALGO_REGISTRATION_CONFIRMED = os.getenv("GROWW_SEBI_ALGO_REGISTRATION_CONFIRMED", "false").lower() in ("1", "true", "yes", "on")
+GROWW_SEBI_STRATEGY_PREFIX = os.getenv("GROWW_SEBI_STRATEGY_PREFIX", "instv2")[:6]
+GROWW_OPTION_MIN_LIVE_IV_COVERAGE = float(os.getenv("GROWW_OPTION_MIN_LIVE_IV_COVERAGE", "0.60"))
+GROWW_OPTION_LONG_MAX_VRP = float(os.getenv("GROWW_OPTION_LONG_MAX_VRP", "-0.02"))
 
 GROWW_NIFTY_TREND_liquidity_event_ENABLED = os.getenv("GROWW_NIFTY_TREND_liquidity_event_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 GROWW_NIFTY_TREND_liquidity_event_MIN_PHASE_SCORE = float(os.getenv("GROWW_NIFTY_TREND_liquidity_event_MIN_PHASE_SCORE", "0.30"))
@@ -723,4 +752,5 @@ def _float_env(name: str, default: float) -> float:
 
 TELEGRAM_GETUPDATES_BACKOFF_BASE_SEC = _float_env("TELEGRAM_GETUPDATES_BACKOFF_BASE_SEC", 2.0)
 TELEGRAM_GETUPDATES_BACKOFF_MAX_SEC = _float_env("TELEGRAM_GETUPDATES_BACKOFF_MAX_SEC", 30.0)
+TELEGRAM_LONG_POLL_TIMEOUT_SEC = _float_env("TELEGRAM_LONG_POLL_TIMEOUT_SEC", 2.0)  # fast graceful container stop
 

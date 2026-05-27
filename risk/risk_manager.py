@@ -20,6 +20,7 @@ from collections import deque
 import sys, os as _os; sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import config
 from core.pnl import gross_pnl_usd
+from risk.portfolio_exposure import PortfolioExposureTracker
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,9 @@ class RiskManager:
         self._position_is_open: bool = False
         self._pending_reset:    bool = False
 
+        # Portfolio-level gross delta controls for correlated macro buckets.
+        self._exposure_tracker = PortfolioExposureTracker()
+
         # Shared API (CoinSwitchAPI, DeltaAPI, or ExecutionRouter)
         if shared_api is not None:
             self.api = shared_api
@@ -98,6 +102,34 @@ class RiskManager:
             logger.warning("RiskManager: no shared_api — balance queries disabled")
 
         logger.info("✅ RiskManager initialized (liquidity-first mode)")
+
+
+    # =========================================================================
+    # CORRELATED PORTFOLIO EXPOSURE
+    # =========================================================================
+
+    def can_add_exposure(self, *, asset_id: str, position_key: str, signed_delta_usd: float, available_cash: float) -> tuple[bool, str, dict]:
+        cap = max(0.0, float(available_cash)) * float(getattr(config, "INSTITUTIONAL_CORRELATED_EXPOSURE_CAP_FRACTION", 0.35))
+        with self._lock:
+            decision = self._exposure_tracker.evaluate_increment(
+                asset_id=asset_id, position_key=position_key, signed_delta_usd=signed_delta_usd, cap_usd=cap
+            )
+        return decision.approved, decision.reason, {
+            "bucket": decision.bucket, "existing_gross_delta_usd": decision.existing_gross_delta_usd,
+            "proposed_gross_delta_usd": decision.proposed_gross_delta_usd, "cap_usd": decision.cap_usd,
+        }
+
+    def record_open_exposure(self, *, asset_id: str, position_key: str, signed_delta_usd: float) -> None:
+        with self._lock:
+            self._exposure_tracker.record(asset_id=asset_id, position_key=position_key, signed_delta_usd=signed_delta_usd)
+
+    def remove_open_exposure(self, position_key: str) -> None:
+        with self._lock:
+            self._exposure_tracker.remove(position_key)
+
+    def exposure_snapshot(self) -> Dict[str, float]:
+        with self._lock:
+            return dict(self._exposure_tracker.snapshot())
 
     # =========================================================================
     # BALANCE

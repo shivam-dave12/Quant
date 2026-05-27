@@ -221,6 +221,7 @@ class GrowwLongOptionExecutor:
         fill_timeout_sec: float = 30.0,
         poll_interval_sec: float = 1.0,
         require_static_ip: bool = False,
+        require_algo_confirmation: bool = False,
     ) -> GrowwLongOptionLifecycleResult:
         audit: list[dict[str, Any]] = []
         reasons: list[str] = []
@@ -240,6 +241,15 @@ class GrowwLongOptionExecutor:
                 blocked_new_entries=True,
                 reasons=reasons,
                 audit_trail=audit,
+            )
+
+        if require_algo_confirmation and not bool(_cfg("GROWW_SEBI_ALGO_REGISTRATION_CONFIRMED", False)):
+            reason = "GROWW_ALGO_REGISTRATION_UNCONFIRMED: broker confirmation required before live API order"
+            reasons.append(reason)
+            step(GrowwLongOptionExecutionState.REJECTED, reason=reason)
+            return GrowwLongOptionLifecycleResult(
+                state=GrowwLongOptionExecutionState.REJECTED, approved=False, blocked_new_entries=True,
+                reasons=reasons, audit_trail=audit,
             )
 
         validation_error = self._validate(candidate, quantity, limit_price, protection)
@@ -418,7 +428,7 @@ class GrowwLongOptionExecutor:
             "order_type": _const(self.api, "ORDER_TYPE_LIMIT", "LIMIT"),
             "transaction_type": _const(self.api, "TRANSACTION_TYPE_BUY", "BUY"),
             "price": f"{float(limit_price):.2f}",
-            "order_reference_id": _reference_id(self.api, "groww"),
+            "order_reference_id": _reference_id(self.api, str(_cfg("GROWW_SEBI_STRATEGY_PREFIX", "instv2"))),
         }
 
     def _oco_body(

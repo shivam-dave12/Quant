@@ -21,6 +21,9 @@ import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirna
 import config
 from core.instruments import ExchangeName
 from core.candle import Candle, wrap_candles
+from market_data.feed_health import score_feed_health
+from market_data.normalizer import InstrumentMapping, build_venue_microstate
+from market_data.microstructure import LatencyBaseline, MicrostructureTracker
 from exchanges.coinswitch.api import FuturesAPI
 from exchanges.coinswitch.websocket import CoinSwitchWebSocket
 
@@ -99,6 +102,13 @@ class CoinSwitchDataManager:
         self._last_orderbook_update_time: float = 0.0
         self._orderbook:              Dict  = {"bids": [], "asks": []}
         self._recent_trades:          deque = deque(maxlen=500)
+        # Queue-flow and trade-flow are stored separately in comparable USD notional.
+        self._microstructure = MicrostructureTracker(self._instrument_mapping())
+        self._latency_baseline = LatencyBaseline()
+        self._latest_latency_ms: float | None = None
+        self._latest_latency_z: float | None = None
+        self._sequence_valid = True
+        self._snapshot_ready = False
 
         self._lock         = threading.RLock()
         self._forming_ts:  Dict[str, int] = {}
@@ -109,6 +119,45 @@ class CoinSwitchDataManager:
         self.is_streaming  = False
 
         logger.info(f"CoinSwitchDataManager initialised ({self.symbol})")
+
+    def _instrument_mapping(self) -> InstrumentMapping:
+        raw = getattr(self.exchange_instrument, "raw", {}) or {}
+        return InstrumentMapping(
+            venue="coinswitch", venue_symbol=self.symbol, canonical_underlying=str(getattr(self.instrument, "asset_id", "BTC")),
+            product_class=str(raw.get("contract_type") or "linear_perp"),
+            quote_currency=str(raw.get("quote_asset") or "USDT"),
+            contract_multiplier=float(raw.get("contract_multiplier") or raw.get("contract_value") or 1.0),
+            settlement_currency=str(raw.get("settlement_currency") or "USDT"),
+            price_tick=float(raw.get("tick_size") or getattr(config, "TICK_SIZE_COINSWITCH", 0.1)),
+            qty_step=float(raw.get("lot_step") or raw.get("qty_step") or 0.001), execution_enabled=True,
+            notional_model="linear",
+        )
+
+    @staticmethod
+    def _payload_ts_ns(data: Dict) -> int | None:
+        for key in ("timestamp", "time", "ts", "t"):
+            try:
+                value = float(data.get(key) or 0.0)
+            except Exception:
+                value = 0.0
+            if value <= 0:
+                continue
+            if value > 1e17:
+                return int(value)
+            if value > 1e14:
+                return int(value * 1_000)
+            if value > 1e11:
+                return int(value * 1_000_000)
+            return int(value * 1_000_000_000)
+        return None
+
+    def _record_latency(self, data: Dict, receive_ts_ns: int) -> None:
+        exchange_ts_ns = self._payload_ts_ns(data)
+        if exchange_ts_ns is None:
+            return
+        latency_ms = max(0.0, (receive_ts_ns - exchange_ts_ns) / 1_000_000.0)
+        self._latest_latency_ms = latency_ms
+        self._latest_latency_z = self._latency_baseline.observe(latency_ms)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -348,11 +397,15 @@ class CoinSwitchDataManager:
             callback = None
             quote_price = 0.0
             with self._lock:
+                receive_ts_ns = time.time_ns()
                 self._orderbook = {
                     "bids": data.get("bids", []),
                     "asks": data.get("asks", []),
                 }
-                self._last_orderbook_update_time = time.time()
+                self._last_orderbook_update_time = receive_ts_ns / 1_000_000_000.0
+                self._snapshot_ready = bool(self._orderbook["bids"] and self._orderbook["asks"])
+                self._microstructure.update_book(self._orderbook["bids"], self._orderbook["asks"], self._last_orderbook_update_time)
+                self._record_latency(data, receive_ts_ns)
                 bids = self._orderbook["bids"]
                 asks = self._orderbook["asks"]
                 if bids and asks:
@@ -388,12 +441,14 @@ class CoinSwitchDataManager:
                 if price > 0:
                     self._last_price = price
                     self._last_price_update_time = time.time()
+                    trade_ts = time.time()
                     self._recent_trades.append({
                         "price":     price,
                         "quantity":  qty,
                         "side":      side,
-                        "timestamp": time.time(),
+                        "timestamp": trade_ts,
                     })
+                    self._microstructure.record_trade(price=price, quantity=qty, buyer_aggressor=(str(side).lower() == "buy"), timestamp_s=trade_ts)
                     if self._strategy_ref is not None:
                         _callback = getattr(self._strategy_ref, "_on_realtime_trade", None)
                 self.stats.record_trade()
@@ -450,6 +505,41 @@ class CoinSwitchDataManager:
                 "asks": list(self._orderbook.get("asks", [])),
                 "timestamp": float(self._last_orderbook_update_time or 0.0),
             }
+
+    def get_microstructure_flow(self) -> Dict[str, float]:
+        with self._lock:
+            return self._microstructure.snapshot(time.time()).asdict()
+
+    def get_feed_reliability(self) -> Dict:
+        with self._lock:
+            snapshot_ready = bool(self._snapshot_ready)
+            connected = bool(self.is_streaming)
+            return {
+                "connected": connected,
+                "heartbeat_ok": connected,
+                "sequence_valid": bool(self._sequence_valid),
+                "snapshot_ready": snapshot_ready,
+                "exchange_timestamp_available": self._latest_latency_ms is not None,
+                "latency_ms": self._latest_latency_ms,
+                "latency_vs_baseline_z": self._latest_latency_z,
+                "no_change_heartbeat_valid": connected and snapshot_ready,
+                "latency_baseline_samples": self._latency_baseline.sample_count,
+            }
+
+    def get_venue_microstate(self):
+        with self._lock:
+            bids = list(self._orderbook.get("bids", []))
+            asks = list(self._orderbook.get("asks", []))
+            recv_ts_ns = int((self._last_orderbook_update_time or time.time()) * 1_000_000_000)
+            flows = self._microstructure.snapshot(time.time()).asdict()
+            reliability = self.get_feed_reliability()
+        if not bids or not asks:
+            return None
+        health = score_feed_health(**{k: reliability[k] for k in ("connected", "heartbeat_ok", "sequence_valid", "snapshot_ready", "exchange_timestamp_available", "latency_vs_baseline_z", "no_change_heartbeat_valid")})
+        return build_venue_microstate(
+            mapping=self._instrument_mapping(), bids=bids, asks=asks, feed_health=health,
+            receive_ts_ns=recv_ts_ns, **flows,
+        )
 
     def get_recent_trades_raw(self) -> List[Dict]:
         with self._lock:

@@ -11,7 +11,7 @@ import math
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
-from typing import Any, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 try:
     import config
@@ -404,3 +404,160 @@ class IndianOptionsDesk:
                 if f > 0:
                     return f
         return 0.0
+
+
+@dataclass(frozen=True)
+class OptionVolatilityContext:
+    """Live option-chain valuation state; never treats an IV prior as market data."""
+
+    atm_iv: float | None
+    realized_vol_yang_zhang: float | None
+    vrp: float | None
+    skew_25d: float | None
+    term_slope: float | None
+    gross_gamma_exposure: float | None
+    signed_dealer_gex: float | None
+    live_iv_coverage: float
+    ready_for_long_premium_decision: bool
+    reasons: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def yang_zhang_realized_vol(
+    candles: Sequence[Mapping[str, Any]], *, window: int = 10, periods_per_year: float = 252.0
+) -> float | None:
+    """Annualised Yang-Zhang realised volatility using genuine OHLC observations."""
+    rows = list(candles or [])[-max(int(window), 2):]
+    if len(rows) < 2:
+        return None
+    parsed: list[tuple[float, float, float, float]] = []
+    for row in rows:
+        o = safe_float(row.get("open") or row.get("Open"), 0.0)
+        h = safe_float(row.get("high") or row.get("High"), 0.0)
+        l = safe_float(row.get("low") or row.get("Low"), 0.0)
+        c = safe_float(row.get("close") or row.get("Close"), 0.0)
+        if min(o, h, l, c) <= 0 or h < l:
+            continue
+        parsed.append((o, h, l, c))
+    if len(parsed) < 2:
+        return None
+    overnight = [math.log(parsed[i][0] / parsed[i - 1][3]) for i in range(1, len(parsed))]
+    close_open = [math.log(c / o) for o, _, _, c in parsed]
+    rogers_satchell = [
+        math.log(h / o) * math.log(h / c) + math.log(l / o) * math.log(l / c)
+        for o, h, l, c in parsed
+    ]
+    n = len(parsed)
+    k = 0.34 / (1.34 + (n + 1.0) / max(n - 1.0, 1.0))
+    overnight_var = sum(x * x for x in overnight) / max(len(overnight), 1)
+    open_close_var = sum(x * x for x in close_open) / n
+    rs_var = sum(rogers_satchell) / n
+    per_period_var = max(0.0, overnight_var + k * open_close_var + (1.0 - k) * rs_var)
+    return math.sqrt(per_period_var * float(periods_per_year))
+
+
+def compute_vrp(*, atm_iv: float | None, realized_vol_yz: float | None) -> float | None:
+    """Volatility risk premium: positive means implied volatility exceeds realised volatility."""
+    if atm_iv is None or realized_vol_yz is None:
+        return None
+    return float(atm_iv) - float(realized_vol_yz)
+
+
+def _row_iv(row: Mapping[str, Any]) -> float | None:
+    iv = safe_float(row.get("iv") or row.get("implied_volatility") or row.get("impliedVolatility"), 0.0)
+    if iv > 3.0:
+        iv /= 100.0
+    return iv if iv > 0 else None
+
+
+def _row_expiry(row: Mapping[str, Any]) -> datetime | None:
+    return _parse_expiry(row.get("expiry_date") or row.get("ExpiryDate") or row.get("expiry") or row.get("Expiry"))
+
+
+def _row_strike(row: Mapping[str, Any]) -> float:
+    return safe_float(row.get("strike_price") or row.get("StrikePrice") or row.get("strike") or row.get("Strike"), 0.0)
+
+
+def build_option_volatility_context(
+    *, chain: Iterable[Mapping[str, Any]], underlying_candles: Sequence[Mapping[str, Any]], spot: float,
+    lot_size: int, risk_free_rate: float = 0.065, now: datetime | None = None,
+) -> OptionVolatilityContext:
+    """Derive VRP, skew, term structure and gamma exposure only from live chain inputs.
+
+    Gross gamma exposure is computable from open interest. Directed dealer GEX is returned
+    only when the input row supplies `dealer_position_sign`; it is not invented from option right.
+    """
+    if float(spot) <= 0:
+        return OptionVolatilityContext(None, None, None, None, None, None, None, 0.0, False, ("invalid_spot",))
+    now = now or datetime.now(timezone.utc)
+    rows = [dict(row) for row in chain or []]
+    live_rows: list[dict[str, Any]] = []
+    gross_gex = 0.0
+    signed_gex = 0.0
+    signed_available = False
+    for row in rows:
+        iv = _row_iv(row)
+        strike = _row_strike(row)
+        expiry = _row_expiry(row)
+        right = _right(row)
+        oi = safe_float(row.get("open_interest") or row.get("openInterest") or row.get("oi"), 0.0)
+        if iv is None or strike <= 0 or expiry is None or right not in {"call", "put"}:
+            continue
+        dte = max((expiry - now).total_seconds() / 86400.0, 0.0)
+        bs = BlackScholesModel.greeks(right, float(spot), strike, dte, float(risk_free_rate), iv)
+        if bs is None:
+            continue
+        enriched = {**row, "_iv": iv, "_strike": strike, "_expiry": expiry, "_right": right, "_bs": bs}
+        live_rows.append(enriched)
+        if oi > 0:
+            exposure = bs.gamma * oi * max(int(lot_size), 1) * float(spot) * float(spot) * 0.01
+            gross_gex += exposure
+            provided_sign = row.get("dealer_position_sign")
+            if provided_sign is not None:
+                sign = 1.0 if safe_float(provided_sign, 0.0) > 0 else -1.0 if safe_float(provided_sign, 0.0) < 0 else 0.0
+                signed_gex += exposure * sign
+                signed_available = True
+    coverage = len(live_rows) / max(len(rows), 1)
+    if not live_rows:
+        rv = yang_zhang_realized_vol(underlying_candles)
+        return OptionVolatilityContext(None, rv, None, None, None, None, None, coverage, False, ("live_iv_chain_unavailable",))
+    expiries = sorted({r["_expiry"] for r in live_rows})
+    front_expiry = expiries[0]
+    front = [r for r in live_rows if r["_expiry"] == front_expiry]
+    atm = min(front, key=lambda r: abs(r["_strike"] - float(spot)))
+    atm_iv = float(atm["_iv"])
+    next_atm_iv = None
+    if len(expiries) > 1:
+        next_rows = [r for r in live_rows if r["_expiry"] == expiries[1]]
+        if next_rows:
+            next_atm_iv = float(min(next_rows, key=lambda r: abs(r["_strike"] - float(spot)))["_iv"])
+    calls = [r for r in front if r["_right"] == "call"]
+    puts = [r for r in front if r["_right"] == "put"]
+    call_25 = min(calls, key=lambda r: abs(abs(r["_bs"].delta) - 0.25)) if calls else None
+    put_25 = min(puts, key=lambda r: abs(abs(r["_bs"].delta) - 0.25)) if puts else None
+    skew = float(put_25["_iv"] - call_25["_iv"]) if put_25 and call_25 else None
+    term = float(atm_iv - next_atm_iv) if next_atm_iv is not None else None
+    rv = yang_zhang_realized_vol(underlying_candles)
+    vrp = compute_vrp(atm_iv=atm_iv, realized_vol_yz=rv)
+    min_coverage = float(_cfg("GROWW_OPTION_MIN_LIVE_IV_COVERAGE", 0.60))
+    max_long_vrp = float(_cfg("GROWW_OPTION_LONG_MAX_VRP", -0.02))
+    reasons: list[str] = []
+    if rv is None:
+        reasons.append("yang_zhang_realized_vol_unavailable")
+    if coverage < min_coverage:
+        reasons.append("insufficient_live_iv_coverage")
+    if vrp is None:
+        reasons.append("vrp_unavailable")
+    elif vrp > max_long_vrp:
+        reasons.append("long_premium_not_cheap_on_vrp")
+    ready = rv is not None and coverage >= min_coverage and vrp is not None and vrp <= max_long_vrp
+    if signed_available is False:
+        reasons.append("directed_dealer_gex_requires_position_sign_input")
+    return OptionVolatilityContext(
+        atm_iv=atm_iv, realized_vol_yang_zhang=rv, vrp=vrp, skew_25d=skew, term_slope=term,
+        gross_gamma_exposure=gross_gex if gross_gex > 0 else None,
+        signed_dealer_gex=signed_gex if signed_available else None,
+        live_iv_coverage=coverage, ready_for_long_premium_decision=ready, reasons=tuple(reasons),
+    )

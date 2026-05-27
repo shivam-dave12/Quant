@@ -34,6 +34,10 @@ except Exception:  # optional venue dependency; other desks remain operational
 from exchanges.delta.api import DeltaAPI
 from exchanges.delta.data_manager import DeltaDataManager
 try:
+    from exchanges.hyperliquid.data_manager import HyperliquidReferenceDataManager
+except Exception:
+    HyperliquidReferenceDataManager = None  # type: ignore
+try:
     from exchanges.groww.api import GrowwRestClient
     from exchanges.groww.data_manager import GrowwOptionDataManager
     from exchanges.groww.market_session import groww_market_session_state
@@ -100,6 +104,8 @@ class MultiAssetInstitutionalBot:
         self._last_scan_report = 0.0
         self._lock = threading.RLock()
         self._market_wakeup = threading.Event()
+        self._external_shutdown_requested = threading.Event()
+        self._stopped = False
         self._groww_premarket_refresh_day: str = ""
 
     def _build_api_clients(self):
@@ -993,10 +999,14 @@ class MultiAssetInstitutionalBot:
             return None
         router = ExecutionRouter(coinswitch_om=cs_om, delta_om=delta_om, groww_om=groww_om, default=primary_ex.value)
 
+        reference_dms = []
         if primary_ex == ExchangeName.DELTA:
             primary_dm = DeltaDataManager(instrument=inst)
             secondary_dm = CoinSwitchDataManager(instrument=inst) if ExchangeName.COINSWITCH in inst.by_exchange and cs_api else None
             analysis_dm = None
+            if (inst.asset_id.upper() == "BTC" and bool(getattr(config, "HYPERLIQUID_REFERENCE_ENABLED", False))
+                    and HyperliquidReferenceDataManager is not None):
+                reference_dms.append(HyperliquidReferenceDataManager("BTC"))
         elif primary_ex == ExchangeName.GROWW:
             if GrowwOptionDataManager is None or GrowwUnderlyingDataManager is None or groww_api is None:
                 logger.warning("%s skipped: Groww data managers unavailable", inst.asset_id)
@@ -1008,7 +1018,7 @@ class MultiAssetInstitutionalBot:
             primary_dm = CoinSwitchDataManager(instrument=inst)
             secondary_dm = DeltaDataManager(instrument=inst) if ExchangeName.DELTA in inst.by_exchange and delta_api else None
             analysis_dm = None
-        data = MarketAggregator(primary_dm=primary_dm, secondary_dm=secondary_dm, instrument=inst, analysis_dm=analysis_dm)
+        data = MarketAggregator(primary_dm=primary_dm, secondary_dm=secondary_dm, instrument=inst, analysis_dm=analysis_dm, reference_dms=reference_dms)
 
         # Context is created after the risk manager, so use a tiny holder to let
         # PortfolioRiskManager resolve its owning context at call-time.
@@ -1239,11 +1249,8 @@ class MultiAssetInstitutionalBot:
                 self._market_wakeup.wait(timeout=float(getattr(config, "SCANNER_TICK_SLEEP_SEC", 0.25)))
                 self._market_wakeup.clear()
             except KeyboardInterrupt:
-                logger.warning(
-                    "KeyboardInterrupt ignored by Telegram-only shutdown guard; "
-                    "use /stop from Telegram to stop the bot."
-                )
-                continue
+                self.request_external_shutdown("KeyboardInterrupt")
+                break
             except Exception:
                 logger.exception("Multi-asset loop error")
                 time.sleep(1.0)
@@ -1298,23 +1305,39 @@ class MultiAssetInstitutionalBot:
         except Exception as e:
             logger.debug("heartbeat failed for %s: %s", ctx.instrument.asset_id, e)
 
+    def request_external_shutdown(self, signal_name: str = "SIGTERM") -> None:
+        """Non-blocking lifecycle stop request; resource cleanup runs in stop()."""
+        if not self._external_shutdown_requested.is_set():
+            logger.info("External lifecycle stop %s accepted by multi-asset runtime", signal_name)
+        self._external_shutdown_requested.set()
+        self.running = False
+        self._market_wakeup.set()
+
     def stop(self) -> None:
+        with self._lock:
+            if self._stopped:
+                return
+            self._stopped = True
         logger.info("Stopping multi-asset bot...")
         self.running = False
+        self._market_wakeup.set()
         for ctx in self.contexts:
             try:
                 ctx.data_manager.stop()
             except Exception:
-                pass
-        send_telegram_message("🛑 <b>MULTI-ASSET INSTITUTIONAL BOT STOPPED</b>")
+                logger.debug("Data manager stop failed for %s", ctx.instrument.asset_id, exc_info=True)
+        if self._external_shutdown_requested.is_set():
+            logger.info("External lifecycle shutdown cleanup complete; Telegram stop notification skipped to avoid delaying container exit")
+        else:
+            send_telegram_message("🛑 <b>MULTI-ASSET INSTITUTIONAL BOT STOPPED</b>")
 
 
 def main() -> None:
     bot = MultiAssetInstitutionalBot()
     if threading.current_thread() is threading.main_thread():
-        from runtime_shutdown_guard import install_telegram_only_shutdown_guard
+        from runtime_shutdown_guard import install_graceful_shutdown_handler
 
-        install_telegram_only_shutdown_guard(logger, "multi-asset-main")
+        install_graceful_shutdown_handler(logger, "multi-asset-main", bot.request_external_shutdown)
     if not bot.initialize():
         sys.exit(1)
     if not bot.start():
@@ -1323,8 +1346,9 @@ def main() -> None:
         bot.run()
     except Exception:
         logger.exception("Fatal multi-asset runtime error")
-        bot.stop()
         sys.exit(1)
+    finally:
+        bot.stop()
 
 
 if __name__ == "__main__":

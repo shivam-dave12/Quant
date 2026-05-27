@@ -1527,6 +1527,11 @@ class _GrowwAdapter(_GrowwBaseAdapter):
     def _enriched_contract_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
         out = dict(row or {})
         symbol = str(out.get("trading_symbol") or out.get("TradingSymbol") or out.get("symbol") or "").strip()
+        # The selected contract already comes from discovery with exact identity and lot size.
+        # Do not perform a synchronous security-master download on the execution path.
+        has_lot = any(self._num(out.get(key), 0.0) > 0 for key in ("runtime_lot_size", "LotSize", "lot_size", "MinimumLotQty"))
+        if symbol and has_lot and super()._has_contract_identity(out):
+            return out
         master = self._instrument_for_symbol(symbol)
         if master:
             out.setdefault("stock_code", str(master.get("underlying_symbol") or "").upper())
@@ -1628,7 +1633,7 @@ class _GrowwAdapter(_GrowwBaseAdapter):
             "transaction_type": self.api.const("TRANSACTION_TYPE_SELL", "SELL") if reduce_only else self.api.const("TRANSACTION_TYPE_BUY", "BUY"),
             "price": str(px) if px is not None and float(px or 0.0) > 0 and sdk_order_type != self.api.const("ORDER_TYPE_MARKET", "MARKET") else None,
             "trigger_price": str(trigger_price) if is_stop and trigger_price is not None and float(trigger_price or 0.0) > 0 else None,
-            "order_reference_id": getattr(self.api, "reference_id", lambda prefix="groww": f"groww{int(time.time())}")("groww"),
+            "order_reference_id": getattr(self.api, "reference_id", lambda prefix="instv2": f"instv2{int(time.time())}")(str(getattr(config, "GROWW_SEBI_STRATEGY_PREFIX", "instv2"))),
         }
         return {k: v for k, v in body.items() if v not in (None, "")}
 
@@ -2554,6 +2559,7 @@ class OrderManager:
             fill_timeout_sec=timeout_sec,
             poll_interval_sec=float(getattr(config, "GROWW_ORDER_FILL_POLL_SEC", 1.0)),
             require_static_ip=bool(getattr(config, "GROWW_REQUIRE_STATIC_IP_FOR_LIVE_ORDERS", True)),
+            require_algo_confirmation=bool(getattr(config, "GROWW_REQUIRE_SEBI_ALGO_CONFIRMATION_FOR_LIVE_ORDERS", True)),
         )
 
     def place_bracket_limit_entry(self, side: str, quantity: float,

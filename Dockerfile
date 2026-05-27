@@ -39,4 +39,6 @@ assert find_spec("pyotp") is not None
 print("Runtime dependencies ready for Groww live trading")
 PY
 
+STOPSIGNAL SIGTERM
+
 CMD ["python", "telegram/controller.py"]

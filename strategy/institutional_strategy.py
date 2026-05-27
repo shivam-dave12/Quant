@@ -21,13 +21,14 @@ from enum import Enum
 from typing import Any, Callable, Mapping, Optional
 
 from core.instruments import ExchangeName, TradableInstrument
+from intelligence.cross_venue_btc import BTCCompositeState, build_btc_composite_state
 from market_data.feed_health import FeedHealth, score_feed_health
 from market_data.normalizer import (
     InstrumentMapping,
     VenueMicrostate,
     build_venue_microstate,
 )
-from research.store import JsonlResearchStore, ResearchDecisionRecord
+from research.store import ForwardLabelWriter, JsonlResearchStore, ResearchDecisionRecord, ResearchExecutionRecord
 from strategy.domain import (
     DecisionOutput,
     DeskId,
@@ -170,6 +171,8 @@ class InstitutionalStrategy:
         self._market_wakeup: Callable[[], Any] | None = None
         store_root = str(_cfg("RESEARCH_STORE_PATH", "research_output"))
         self._research_store = JsonlResearchStore(store_root)
+        self._forward_labels = ForwardLabelWriter(self._research_store)
+        self._last_candidate_id = ""
 
     def bind_market_wakeup(self, callback: Callable[[], Any]) -> None:
         self._market_wakeup = callback
@@ -215,7 +218,7 @@ class InstitutionalStrategy:
         if order_manager is not None:
             self._om = order_manager
         if not self._pos.is_flat():
-            self._monitor_position(data_manager, order_manager)
+            self._monitor_position(data_manager, order_manager, risk_manager)
             return
         decision = self.evaluate(data_manager, order_manager, risk_manager, now_ms)
         self._last_decision = decision
@@ -234,6 +237,8 @@ class InstitutionalStrategy:
         regime = self._regime()
         feed_health = self._feed_health(data_manager)
         execution_quality = feed_health.quality_score
+        if price > 0:
+            self._forward_labels.observe(now_ts_ns=time.time_ns(), current_price=price)
         if feed_health.quality_score <= 0:
             return self._decision(
                 desk=desk,
@@ -253,8 +258,13 @@ class InstitutionalStrategy:
                 research_features={"price": price, "feed_health": asdict(feed_health)},
             )
 
-        liquidity_score, zones = self._liquidity_score(data_manager, instrument, price)
-        direction, directional_edge_bps, direction_reason = self._direction_and_edge(desk, price, liquidity_score)
+        execution_state, btc_composite = self._microstructure_context(data_manager, venue, instrument, feed_health)
+        liquidity_score, zones = self._liquidity_score(data_manager, instrument, price, execution_state=execution_state)
+        if btc_composite is not None:
+            execution_quality = btc_composite.delta_execution_quality_score
+        direction, directional_edge_bps, direction_reason = self._direction_and_edge(
+            desk, price, liquidity_score, execution_state=execution_state, btc_composite=btc_composite
+        )
         costs_bps = self._execution_cost_bps(data_manager)
         uncertainty_bps = self._uncertainty_bps(regime, liquidity_score, execution_quality)
         net_edge = directional_edge_bps - costs_bps
@@ -266,7 +276,25 @@ class InstitutionalStrategy:
             "liquidity_score": liquidity_score,
             "execution_quality": execution_quality,
             "regime": regime.value,
+            "signal_source": direction_reason,
         }
+        if execution_state is not None:
+            model_values.update({
+                "ofi_usd_1s": execution_state.ofi_usd_1s,
+                "ofi_usd_10s": execution_state.ofi_usd_10s,
+                "tfi_usd_1s": execution_state.tfi_usd_1s,
+                "tfi_usd_10s": execution_state.tfi_usd_10s,
+                "microprice": execution_state.microprice,
+                "spread_bps": execution_state.spread_bps,
+            })
+        if btc_composite is not None:
+            model_values.update({
+                "flow_agreement_score": btc_composite.flow_agreement_score,
+                "cross_venue_dispersion_bps": btc_composite.cross_venue_dispersion_bps,
+                "delta_dislocation_bps": btc_composite.delta_dislocation_bps,
+                "delta_execution_quality": btc_composite.delta_execution_quality_score,
+                "candidate_leader_venue": btc_composite.candidate_leader_venue,
+            })
         features = {
             "price": price,
             "feed_health": asdict(feed_health),
@@ -375,13 +403,15 @@ class InstitutionalStrategy:
 
     def _persist_decision(self, decision: OpportunityDecision, now_ms: int) -> None:
         try:
+            candidate_id = f"{decision.desk}:{decision.instrument}:{now_ms}"
+            self._last_candidate_id = candidate_id
             self._research_store.append_decision(
                 ResearchDecisionRecord(
                     observation_ts_ns=int(now_ms) * 1_000_000,
                     desk=decision.desk,
                     venue=decision.venue,
                     instrument=decision.instrument,
-                    candidate_id=f"{decision.desk}:{decision.instrument}:{now_ms}",
+                    candidate_id=candidate_id,
                     decision=decision.decision.value,
                     model_values=decision.model_values,
                     reasons=decision.reasons,
@@ -411,12 +441,37 @@ class InstitutionalStrategy:
         )
         if not result:
             return
+        fill_price = float(result.get("fill_price") or protection.entry_price)
+        fill_ts_ns = time.time_ns()
+        try:
+            self._research_store.append_execution(ResearchExecutionRecord(
+                observation_ts_ns=fill_ts_ns, desk=decision.desk, venue=decision.venue, instrument=decision.instrument,
+                candidate_id=self._last_candidate_id or f"{decision.desk}:{decision.instrument}:{fill_ts_ns}",
+                requested_order={"side": side, "quantity": sizing.quantity, "entry": protection.entry_price, "stop": protection.stop_price, "target": protection.target_price},
+                actual_fill={"quantity": float(result.get("quantity") or sizing.quantity), "fill_price": fill_price, "order_id": str(result.get("order_id") or "")},
+                protection_state={"confirmed": bool(result.get("bracket_child_verified") or result.get("protection_confirmed")), "model": str(result.get("protection_model") or protection.protection_type)},
+                realised_costs={"expected_execution_cost_bps": float(decision.model_values.get("costs_bps", 0.0))},
+            ))
+            if decision.venue == "delta":
+                all_costs = float(decision.model_values.get("costs_bps", 0.0))
+                self._forward_labels.record_fill(
+                    fill_ts_ns=fill_ts_ns, side=side, candidate_id=self._last_candidate_id, fill_price=fill_price,
+                    spread_cost_bps=float(decision.model_values.get("spread_bps", 0.0)),
+                    fee_cost_bps=float(_cfg("INSTITUTIONAL_DEFAULT_FEE_BPS", 1.5)),
+                    slippage_estimate_bps=max(0.0, all_costs - float(decision.model_values.get("spread_bps", 0.0)) - float(_cfg("INSTITUTIONAL_DEFAULT_FEE_BPS", 1.5))),
+                )
+        except Exception:
+            pass
         self._risk_gate.record_trade_start()
+        record_exposure = getattr(risk_manager, "record_open_exposure", None)
+        if callable(record_exposure):
+            signed_delta = sizing.notional if side == "BUY" else -sizing.notional
+            record_exposure(asset_id=self._asset_id, position_key=f"{decision.desk}:{decision.instrument}", signed_delta_usd=signed_delta)
         self._pos = PositionState(
             phase=PositionPhase.ACTIVE,
             side="long" if side == "BUY" else "short",
             quantity=float(result.get("quantity") or sizing.quantity),
-            entry_price=float(result.get("fill_price") or protection.entry_price),
+            entry_price=fill_price,
             sl_price=protection.stop_price,
             tp_price=protection.target_price,
             entry_order_id=str(result.get("order_id") or ""),
@@ -435,10 +490,11 @@ class InstitutionalStrategy:
             quant_components=decision.model_values,
         )
 
-    def _monitor_position(self, data_manager, order_manager) -> None:
+    def _monitor_position(self, data_manager, order_manager, risk_manager) -> None:
         price = self._safe_price(data_manager)
         if price <= 0:
             return
+        self._forward_labels.observe(now_ts_ns=time.time_ns(), current_price=price)
         if self._pos.side.lower() == "long":
             target_hit = price >= self._pos.tp_price > 0
             stop_hit = price <= self._pos.sl_price if self._pos.sl_price > 0 else False
@@ -452,6 +508,9 @@ class InstitutionalStrategy:
         try:
             broker_pos = order_manager.get_open_position()
             if isinstance(broker_pos, Mapping) and _num(broker_pos.get("size"), 0.0) <= 0:
+                remove_exposure = getattr(risk_manager, "remove_open_exposure", None)
+                if callable(remove_exposure):
+                    remove_exposure(f"{self._desk_id(self._pos.exchange, self._pos.execution_symbol)}:{self._pos.execution_symbol}")
                 self._pos = PositionState(asset_id=self._asset_id)
         except Exception:
             pass
@@ -496,30 +555,23 @@ class InstitutionalStrategy:
             no_change_heartbeat_valid=bool(raw.get("no_change_heartbeat_valid", False)),
         )
 
-    def _liquidity_score(self, data_manager, instrument: str, price: float) -> tuple[float, list[LiquidityZoneScore]]:
+    def _liquidity_score(self, data_manager, instrument: str, price: float, *, execution_state: VenueMicrostate | None = None) -> tuple[float, list[LiquidityZoneScore]]:
         orderbook_getter = getattr(data_manager, "get_orderbook", None)
         bid_depth = ask_depth = 0.0
         spread_bps = 999.0
         try:
-            book = orderbook_getter() if callable(orderbook_getter) else {}
-            bids = book.get("bids") if isinstance(book, Mapping) else []
-            asks = book.get("asks") if isinstance(book, Mapping) else []
-            if bids and asks and price > 0:
-                mapping = self._instrument_mapping(instrument)
-                state = build_venue_microstate(
-                    mapping=mapping,
-                    bids=bids,
-                    asks=asks,
-                    feed_health=score_feed_health(
-                        connected=True,
-                        heartbeat_ok=True,
-                        sequence_valid=True,
-                        snapshot_ready=True,
-                        exchange_timestamp_available=True,
-                        latency_vs_baseline_z=0.0,
-                    ),
-                    receive_ts_ns=int(time.time() * 1_000_000_000),
-                )
+            state = execution_state
+            if state is None:
+                book = orderbook_getter() if callable(orderbook_getter) else {}
+                bids = book.get("bids") if isinstance(book, Mapping) else []
+                asks = book.get("asks") if isinstance(book, Mapping) else []
+                if bids and asks and price > 0:
+                    state = build_venue_microstate(
+                        mapping=self._instrument_mapping(instrument), bids=bids, asks=asks,
+                        feed_health=score_feed_health(connected=True, heartbeat_ok=True, sequence_valid=True, snapshot_ready=True, exchange_timestamp_available=True, latency_vs_baseline_z=0.0),
+                        receive_ts_ns=time.time_ns(),
+                    )
+            if state is not None:
                 bid_depth = state.bid_depth_usd_by_band.get("0-1", 0.0) + state.bid_depth_usd_by_band.get("1-3", 0.0)
                 ask_depth = state.ask_depth_usd_by_band.get("0-1", 0.0) + state.ask_depth_usd_by_band.get("1-3", 0.0)
                 spread_bps = state.spread_bps
@@ -550,32 +602,85 @@ class InstitutionalStrategy:
         )
         return score, [zone]
 
-    def _direction_and_edge(self, desk: str, price: float, liquidity_score: float) -> tuple[Direction, float, str]:
-        if price <= 0 or len(self._price_window) < 30:
-            return Direction.NO_TRADE, 0.0, "insufficient_market_history"
-        returns = []
-        last = None
-        for px in self._price_window:
-            if last and last > 0 and px > 0:
-                returns.append(math.log(px / last))
-            last = px
-        if not returns:
-            return Direction.NO_TRADE, 0.0, "insufficient_return_history"
-        short = sum(returns[-6:]) if len(returns) >= 6 else sum(returns)
-        vol = math.sqrt(sum(r * r for r in returns[-60:]) / max(1, min(len(returns), 60))) * 10_000.0
-        signal_bps = short * 10_000.0
-        edge = abs(signal_bps) * max(0.0, liquidity_score) - 0.15 * vol
+    def _microstructure_context(
+        self, data_manager, venue: str, instrument: str, feed_health: FeedHealth
+    ) -> tuple[VenueMicrostate | None, BTCCompositeState | None]:
+        states: dict[str, VenueMicrostate] = {}
+        getter = getattr(data_manager, "get_venue_microstates", None)
+        if callable(getter):
+            try:
+                states = {str(k).lower(): v for k, v in dict(getter() or {}).items() if isinstance(v, VenueMicrostate)}
+            except Exception:
+                states = {}
+        if not states:
+            getter = getattr(data_manager, "get_venue_microstate", None)
+            if callable(getter):
+                try:
+                    state = getter()
+                    if isinstance(state, VenueMicrostate):
+                        states[state.venue.lower()] = state
+                except Exception:
+                    pass
+        execution_state = states.get(str(venue).lower())
+        if execution_state is None:
+            try:
+                book = data_manager.get_orderbook()
+                bids, asks = book.get("bids", []), book.get("asks", [])
+                if bids and asks:
+                    flows_getter = getattr(data_manager, "get_microstructure_flow", None)
+                    flows = dict(flows_getter() or {}) if callable(flows_getter) else {}
+                    execution_state = build_venue_microstate(
+                        mapping=self._instrument_mapping(instrument), bids=bids, asks=asks, feed_health=feed_health,
+                        receive_ts_ns=time.time_ns(), **{k: float(flows.get(k, 0.0)) for k in ("ofi_usd_1s", "ofi_usd_10s", "ofi_usd_60s", "tfi_usd_1s", "tfi_usd_10s", "tfi_usd_60s")},
+                    )
+            except Exception:
+                execution_state = None
+        composite = None
+        if self._asset_id.upper() == "BTC" and "delta" in states:
+            refs = {k: v for k, v in states.items() if k != "delta"}
+            if refs:
+                composite = build_btc_composite_state(delta_state=states["delta"], reference_states=refs)
+        return execution_state, composite
+
+    def _direction_and_edge(
+        self, desk: str, price: float, liquidity_score: float, *, execution_state: VenueMicrostate | None, btc_composite: BTCCompositeState | None
+    ) -> tuple[Direction, float, str]:
         if desk == DeskId.INDIA_OPTIONS.value:
-            if signal_bps > 0:
-                return Direction.BULLISH, edge, "underlying_positive_return_state"
-            if signal_bps < 0:
-                return Direction.BEARISH, edge, "underlying_negative_return_state"
-        else:
-            if signal_bps > 0:
-                return Direction.LONG, edge, "positive_return_state"
-            if signal_bps < 0:
-                return Direction.SHORT, edge, "negative_return_state"
-        return Direction.NO_TRADE, 0.0, "flat_return_state"
+            return Direction.NO_TRADE, 0.0, "options_volatility_context_required"
+        if price <= 0 or execution_state is None:
+            return Direction.NO_TRADE, 0.0, "microstructure_state_unavailable"
+        if not execution_state.usable_for_decision:
+            return Direction.NO_TRADE, 0.0, "execution_microstate_unhealthy"
+        execution_quality = btc_composite.delta_execution_quality_score if btc_composite else execution_state.feed_quality_score
+        if execution_quality < float(_cfg("INSTITUTIONAL_MIN_EXECUTION_QUALITY", 0.40)):
+            return Direction.NO_TRADE, 0.0, f"execution_quality_low:{execution_quality:.3f}"
+        if desk == DeskId.BTC.value and bool(_cfg("INSTITUTIONAL_REQUIRE_BTC_CROSS_VENUE", True)):
+            if btc_composite is None or not btc_composite.reference_states:
+                return Direction.NO_TRADE, 0.0, "btc_reference_microstate_unavailable"
+            if btc_composite.flow_agreement_score < float(_cfg("INSTITUTIONAL_MIN_FLOW_AGREEMENT", 0.55)):
+                return Direction.NO_TRADE, 0.0, f"venue_flow_disagreement:{btc_composite.flow_agreement_score:.3f}"
+            if btc_composite.cross_venue_dispersion_bps > float(_cfg("INSTITUTIONAL_MAX_CROSS_VENUE_DISPERSION_BPS", 15.0)):
+                return Direction.NO_TRADE, 0.0, f"cross_venue_dispersion_high:{btc_composite.cross_venue_dispersion_bps:.3f}"
+        near_depth = sum(float(execution_state.bid_depth_usd_by_band.get(k, 0.0) + execution_state.ask_depth_usd_by_band.get(k, 0.0)) for k in ("0-1", "1-3"))
+        if near_depth <= 0:
+            return Direction.NO_TRADE, 0.0, "near_touch_depth_unavailable"
+        ofi_norm = (execution_state.ofi_usd_1s + 0.50 * execution_state.ofi_usd_10s) / near_depth
+        tfi_norm = (execution_state.tfi_usd_1s + 0.50 * execution_state.tfi_usd_10s) / near_depth
+        micro_deviation_bps = (execution_state.microprice / max(execution_state.mid, 1e-9) - 1.0) * 10_000.0
+        dislocation_bps = float(btc_composite.delta_dislocation_bps or 0.0) if btc_composite else 0.0
+        signal_bps = (
+            float(_cfg("INSTITUTIONAL_FLOW_OFI_WEIGHT", 1.0)) * ofi_norm * 100.0
+            + float(_cfg("INSTITUTIONAL_FLOW_TFI_WEIGHT", 0.30)) * tfi_norm * 100.0
+            + float(_cfg("INSTITUTIONAL_FLOW_MICROPRICE_WEIGHT", 0.35)) * micro_deviation_bps
+            - float(_cfg("INSTITUTIONAL_FLOW_DISLOCATION_WEIGHT", 0.50)) * dislocation_bps
+        )
+        edge = abs(signal_bps) * max(0.0, min(1.0, execution_quality)) * max(0.0, min(1.0, liquidity_score))
+        threshold = float(_cfg("INSTITUTIONAL_MIN_SIGNAL_BPS", 0.50))
+        if signal_bps > threshold:
+            return Direction.LONG, edge, "ofi_tfi_microprice_long"
+        if signal_bps < -threshold:
+            return Direction.SHORT, edge, "ofi_tfi_microprice_short"
+        return Direction.NO_TRADE, 0.0, "flow_signal_flat"
 
     def _regime(self) -> Regime:
         if len(self._price_window) < 20:
@@ -651,70 +756,73 @@ class InstitutionalStrategy:
         )
 
     def _size_position(
-        self,
-        desk: str,
-        instrument: str,
-        direction: Direction,
-        price: float,
-        net_edge: float,
-        liquidity_score: float,
-        protection: ProtectionPlan,
-        risk_manager,
+        self, desk: str, instrument: str, direction: Direction, price: float, net_edge: float, liquidity_score: float, protection: ProtectionPlan, risk_manager,
     ) -> PositionSizingDecision:
         _ = direction
-        cash = 0.0
         try:
-            bal = risk_manager.get_available_balance()
-            cash = _num((bal or {}).get("available"), 0.0)
+            bal = risk_manager.get_available_balance() or {}
+            cash = _num(bal.get("available"), 0.0)
         except Exception:
             cash = _num(_cfg("INITIAL_BALANCE", 0.0), 0.0)
         if cash <= 0:
             return PositionSizingDecision(desk, instrument, False, 0.0, 0.0, 0.0, None, 0.0, net_edge, 0.0, 0.0, 0.0, ["cash_unavailable"])
-        risk_budget = cash * float(_cfg("INSTITUTIONAL_RISK_FRACTION_PER_TRADE", 0.0025))
-        risk_per_unit = abs(price - protection.stop_price)
-        if risk_per_unit <= 0:
+        mapping = self._instrument_mapping(instrument)
+        stop_distance_pct = abs(price - protection.stop_price) / max(price, 1e-9)
+        if stop_distance_pct <= 0:
             return PositionSizingDecision(desk, instrument, False, 0.0, 0.0, 0.0, None, 0.0, net_edge, 0.0, 0.0, 0.0, ["invalid_stop_distance"])
+        inverse = "inverse" in mapping.notional_model.lower()
+        unit_notional = mapping.contract_multiplier if inverse else price * mapping.contract_multiplier
+        risk_per_unit = unit_notional * stop_distance_pct
+        risk_budget = cash * float(_cfg("INSTITUTIONAL_RISK_FRACTION_PER_TRADE", 0.0025))
         liquidity_cap = max(0.0, cash * min(1.0, liquidity_score) * 0.20)
+        edge_pct = max(0.0, net_edge) / 10_000.0
+        kelly_notional = cash * (edge_pct / max(stop_distance_pct, 1e-9)) * float(_cfg("INSTITUTIONAL_QUARTER_KELLY", 0.25))
+        observation_vol_bps = self._realized_vol_log() * 10_000.0
+        vol_scalar = min(1.0, float(_cfg("INSTITUTIONAL_TARGET_OBSERVATION_VOL_BPS", 10.0)) / max(observation_vol_bps, 1e-6))
+        risk_limited_notional = risk_budget / max(stop_distance_pct, 1e-9)
+        target_notional = min(liquidity_cap, risk_limited_notional, kelly_notional * vol_scalar)
         if desk == DeskId.INDIA_OPTIONS.value:
-            lot = int(_cfg("GROWW_OPTION_DEFAULT_LOT_SIZE", 0) or 0)
-            lot = lot if lot > 0 else 1
-            lots = math.floor(min(risk_budget, liquidity_cap) / max(price * lot, 1e-9))
-            qty = float(max(0, lots * lot))
-            notional = qty * price
+            lot = int(_cfg("GROWW_OPTION_DEFAULT_LOT_SIZE", 0) or 0) or 1
+            qty = float(max(0, math.floor(target_notional / max(unit_notional * lot, 1e-9)) * lot))
             leverage = None
-            margin = notional
         else:
-            raw_qty = min(risk_budget / risk_per_unit, liquidity_cap / max(price, 1e-9))
-            qty = max(0.0, raw_qty)
-            notional = qty * price
+            step = max(float(mapping.qty_step or 0.0), 1e-12)
+            raw_qty = target_notional / max(unit_notional, 1e-9)
+            qty = math.floor(raw_qty / step) * step
             leverage = min(float(_cfg("LEVERAGE", 1.0)), 5.0)
-            margin = notional / max(leverage, 1.0)
-        approved = qty > 0 and margin <= cash and net_edge > 0
-        reasons = ["approved"] if approved else ["quantity_or_margin_rejected"]
+        notional = qty * unit_notional
+        margin = notional if leverage is None else notional / max(leverage, 1.0)
+        risk_after = qty * risk_per_unit
+        approved = qty > 0 and margin <= cash and net_edge > 0 and risk_after <= risk_budget + 1e-9
+        reasons = ["quarter_kelly_vol_scaled_risk_approved"] if approved else ["kelly_vol_liquidity_or_margin_rejected"]
+        exposure_check = getattr(risk_manager, "can_add_exposure", None)
+        if approved and callable(exposure_check):
+            signed_delta = notional if direction in {Direction.LONG, Direction.BULLISH} else -notional
+            exposure_ok, exposure_reason, _exposure_meta = exposure_check(
+                asset_id=self._asset_id, position_key=f"{desk}:{instrument}", signed_delta_usd=signed_delta, available_cash=cash
+            )
+            if not exposure_ok:
+                approved = False
+                reasons = [str(exposure_reason)]
+            else:
+                reasons.append(str(exposure_reason))
         return PositionSizingDecision(
-            desk=desk,
-            instrument=instrument,
-            approved=approved,
-            quantity=qty,
-            notional=notional,
-            margin_required=margin,
-            leverage_selected=leverage,
-            risk_to_invalidation=qty * risk_per_unit,
-            expected_net_edge=net_edge,
-            liquidity_capacity_cap=liquidity_cap,
-            portfolio_risk_before=0.0,
-            portfolio_risk_after=qty * risk_per_unit,
-            reasons=reasons,
+            desk=desk, instrument=instrument, approved=approved, quantity=qty, notional=notional, margin_required=margin, leverage_selected=leverage,
+            risk_to_invalidation=risk_after, expected_net_edge=net_edge, liquidity_capacity_cap=liquidity_cap, portfolio_risk_before=0.0, portfolio_risk_after=risk_after, reasons=reasons,
         )
 
+    def _realized_vol_log(self, window: int = 60) -> float:
+        prices = list(self._price_window)[-(window + 1):]
+        if len(prices) < 3:
+            return 0.002
+        returns = [math.log(prices[i] / prices[i - 1]) for i in range(1, len(prices)) if prices[i] > 0 and prices[i - 1] > 0]
+        if not returns:
+            return 0.002
+        return math.sqrt(sum(r * r for r in returns) / len(returns))
+
     def _realized_vol_price(self) -> float:
-        if len(self._price_window) < 10:
-            px = self._price_window[-1] if self._price_window else 0.0
-            return px * 0.002
-        diffs = [self._price_window[i] - self._price_window[i - 1] for i in range(1, len(self._price_window))]
-        n = min(60, len(diffs))
-        tail = diffs[-n:]
-        return math.sqrt(sum(x * x for x in tail) / max(1, n))
+        price = self._price_window[-1] if self._price_window else 0.0
+        return max(price * self._realized_vol_log(), price * 0.00025)
 
     def _instrument_mapping(self, instrument: str) -> InstrumentMapping:
         venue = "delta"
@@ -732,7 +840,7 @@ class InstitutionalStrategy:
             canonical_underlying=self._asset_id,
             product_class=str(raw.get("contract_type") or raw.get("product_type") or ""),
             quote_currency=str(raw.get("quote_asset") or "USD").upper(),
-            contract_multiplier=max(contract_multiplier, 1.0),
+            contract_multiplier=max(contract_multiplier, 1e-12),
             settlement_currency=str(raw.get("settlement_currency") or raw.get("settling_asset") or "USD").upper(),
             price_tick=_num(raw.get("tick_size"), 0.01),
             qty_step=_num(raw.get("qty_step") or raw.get("lot_step"), 1.0),

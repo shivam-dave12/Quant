@@ -1,7 +1,11 @@
+from datetime import datetime, timezone
 from pathlib import Path
+
+import pytest
 
 from intelligence.cross_venue_btc import build_btc_composite_state
 from market_data.feed_health import score_feed_health
+from market_data.microstructure import LatencyBaseline, MicrostructureTracker, top_of_book_ofi_usd
 from market_data.normalizer import (
     InstrumentMapping,
     aggregate_depth_usd_by_band,
@@ -14,6 +18,7 @@ from research.store import (
     JsonlResearchStore,
     ResearchDecisionRecord,
     ResearchExecutionRecord,
+    ForwardLabelWriter,
 )
 
 
@@ -218,3 +223,42 @@ def test_research_store_records_rejections_executions_and_forward_labels(tmp_pat
     assert executions[0]["protection_state"]["oco_status"] == "ACTIVE"
     assert labels[0]["net_executable_return_bps"] == 0.9
 
+
+
+def test_microstructure_tracker_computes_usd_ofi_and_tfi_with_correct_signs():
+    mapping = _linear_mapping("coinswitch", "BTCUSDT", execution=False)
+    raw_ofi = top_of_book_ofi_usd(
+        previous_bids=[(100.0, 2.0)], previous_asks=[(101.0, 2.0)],
+        current_bids=[(100.0, 3.0)], current_asks=[(101.0, 1.0)], mapping=mapping,
+    )
+    assert raw_ofi == 201.0  # $100 added to bid queue and $101 removed from ask queue.
+    tracker = MicrostructureTracker(mapping)
+    tracker.update_book([(100.0, 2.0)], [(101.0, 2.0)], 1.0)
+    tracker.update_book([(100.0, 3.0)], [(101.0, 1.0)], 2.0)
+    tracker.record_trade(price=101.0, quantity=2.0, buyer_aggressor=True, timestamp_s=2.0)
+    snapshot = tracker.snapshot(2.0)
+    assert snapshot.ofi_usd_1s > 0
+    assert snapshot.tfi_usd_1s == 202.0
+
+
+def test_latency_baseline_is_relative_to_venue_observations_not_hardcoded_ms():
+    tracker = LatencyBaseline(window=50, warmup=5)
+    for sample in (10.0, 11.0, 10.5, 9.5, 10.0, 10.2, 9.8, 10.1, 10.3, 9.7):
+        assert tracker.observe(sample) is None
+    z = tracker.observe(30.0)
+    assert z is not None and z > 5.0
+
+
+def test_forward_label_writer_records_only_elapsed_observations(tmp_path: Path):
+    store = JsonlResearchStore(tmp_path / "labels")
+    writer = ForwardLabelWriter(store, horizons_s=(1, 10))
+    writer.record_fill(
+        fill_ts_ns=1_000_000_000, side="BUY", candidate_id="btc1", fill_price=100.0,
+        spread_cost_bps=1.0, fee_cost_bps=1.0, slippage_estimate_bps=0.5,
+    )
+    assert writer.observe(now_ts_ns=1_500_000_000, current_price=101.0) == []
+    writer.observe(now_ts_ns=2_000_000_000, current_price=101.0)
+    labels = store.read_records("delta_forward_labels.jsonl")
+    assert len(labels) == 1 and labels[0]["horizon"] == "1s"
+    assert labels[0]["gross_markout_bps"] == pytest.approx(100.0)
+    assert labels[0]["net_executable_return_bps"] == pytest.approx(97.5)

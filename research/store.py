@@ -117,3 +117,81 @@ def append_many(store: JsonlResearchStore, records: Iterable[Any]) -> list[Path]
             raise TypeError(f"unsupported research record type: {type(record)!r}")
     return paths
 
+
+@dataclass
+class _PendingForwardObservation:
+    fill_ts_ns: int
+    side: str
+    candidate_id: str
+    fill_price: float
+    spread_cost_bps: float
+    fee_cost_bps: float
+    slippage_estimate_bps: float
+    written_horizons: set[int] = field(default_factory=set)
+    favorable_bps: float = 0.0
+    adverse_bps: float = 0.0
+
+
+class ForwardLabelWriter:
+    """Creates executable forward-return labels from live post-fill observations.
+
+    A label is written only after the requested horizon has actually elapsed.
+    No future return is fabricated during order submission.
+    """
+
+    def __init__(self, store: JsonlResearchStore, horizons_s: tuple[int, ...] = (1, 10, 60, 300)) -> None:
+        self.store = store
+        self.horizons_s = tuple(sorted({int(h) for h in horizons_s if int(h) > 0}))
+        self._pending: list[_PendingForwardObservation] = []
+
+    def record_fill(
+        self,
+        *,
+        fill_ts_ns: int,
+        side: str,
+        candidate_id: str,
+        fill_price: float,
+        spread_cost_bps: float,
+        fee_cost_bps: float,
+        slippage_estimate_bps: float,
+    ) -> None:
+        if float(fill_price) <= 0:
+            return
+        self._pending.append(_PendingForwardObservation(
+            fill_ts_ns=int(fill_ts_ns), side=str(side).lower(), candidate_id=str(candidate_id),
+            fill_price=float(fill_price), spread_cost_bps=float(spread_cost_bps),
+            fee_cost_bps=float(fee_cost_bps), slippage_estimate_bps=float(slippage_estimate_bps),
+        ))
+
+    def observe(self, *, now_ts_ns: int, current_price: float) -> list[Path]:
+        if float(current_price) <= 0:
+            return []
+        written: list[Path] = []
+        remaining: list[_PendingForwardObservation] = []
+        for obs in self._pending:
+            direction = 1.0 if obs.side in {"buy", "long"} else -1.0
+            markout = (float(current_price) / obs.fill_price - 1.0) * 10_000.0 * direction
+            obs.favorable_bps = max(obs.favorable_bps, markout, 0.0)
+            obs.adverse_bps = min(obs.adverse_bps, markout, 0.0)
+            elapsed_s = max(0.0, (int(now_ts_ns) - obs.fill_ts_ns) / 1_000_000_000.0)
+            for horizon in self.horizons_s:
+                if horizon in obs.written_horizons or elapsed_s < horizon:
+                    continue
+                net_bps = markout - obs.spread_cost_bps - obs.fee_cost_bps - obs.slippage_estimate_bps
+                written.append(self.store.append_delta_forward_label(DeltaForwardLabel(
+                    observation_ts_ns=obs.fill_ts_ns,
+                    horizon=f"{horizon}s",
+                    side=obs.side,
+                    gross_markout_bps=markout,
+                    spread_cost_bps=obs.spread_cost_bps,
+                    fee_cost_bps=obs.fee_cost_bps,
+                    slippage_estimate_bps=obs.slippage_estimate_bps,
+                    net_executable_return_bps=net_bps,
+                    favorable_excursion_bps=obs.favorable_bps,
+                    adverse_excursion_bps=obs.adverse_bps,
+                )))
+                obs.written_horizons.add(horizon)
+            if len(obs.written_horizons) < len(self.horizons_s):
+                remaining.append(obs)
+        self._pending = remaining
+        return written

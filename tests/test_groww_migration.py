@@ -198,6 +198,7 @@ def test_groww_rest_client_place_order_passes_official_payload():
 
 def test_groww_long_option_lifecycle_buys_then_arms_exit_oco_after_fill(monkeypatch):
     monkeypatch.setattr("execution.order_manager.config.GROWW_REQUIRE_STATIC_IP_FOR_LIVE_ORDERS", False, raising=False)
+    monkeypatch.setattr("execution.order_manager.config.GROWW_REQUIRE_SEBI_ALGO_CONFIRMATION_FOR_LIVE_ORDERS", False, raising=False)
     api = _client()
     om = OrderManager(api, exchange_name="groww", instrument=_groww_inst())
     data = om.place_bracket_limit_entry("BUY", 50, limit_price=118.75, sl_price=95.0, tp_price=160.0, timeout_sec=0.0)
@@ -225,6 +226,7 @@ def test_groww_long_option_lifecycle_buys_then_arms_exit_oco_after_fill(monkeypa
 
 def test_groww_lifecycle_partial_fill_protects_actual_qty_and_cancels_remainder(monkeypatch):
     monkeypatch.setattr("execution.order_manager.config.GROWW_REQUIRE_STATIC_IP_FOR_LIVE_ORDERS", False, raising=False)
+    monkeypatch.setattr("execution.order_manager.config.GROWW_REQUIRE_SEBI_ALGO_CONFIRMATION_FOR_LIVE_ORDERS", False, raising=False)
     fake = FakeGrowwSDK(fill_status="PARTIALLY_FILLED", filled_qty=50, fill_price=118.50)
     api = _client(fake)
     om = OrderManager(api, exchange_name="groww", instrument=_groww_inst())
@@ -241,6 +243,7 @@ def test_groww_lifecycle_partial_fill_protects_actual_qty_and_cancels_remainder(
 
 def test_groww_lifecycle_oco_failure_blocks_new_entries_and_emergency_exits(monkeypatch):
     monkeypatch.setattr("execution.order_manager.config.GROWW_REQUIRE_STATIC_IP_FOR_LIVE_ORDERS", False, raising=False)
+    monkeypatch.setattr("execution.order_manager.config.GROWW_REQUIRE_SEBI_ALGO_CONFIRMATION_FOR_LIVE_ORDERS", False, raising=False)
     fake = FakeGrowwSDK(fill_status="FILLED", filled_qty=50, fill_price=118.75, smart_ok=False)
     api = _client(fake)
     om = OrderManager(api, exchange_name="groww", instrument=_groww_inst())
@@ -300,3 +303,19 @@ def test_execution_router_accepts_groww_manager():
     router = ExecutionRouter(coinswitch_om=None, delta_om=None, groww_om=om, default="groww")
     assert router.active_exchange == "groww"
     assert router.active is om
+
+
+def test_groww_live_execution_blocks_until_algo_registration_is_confirmed(monkeypatch):
+    fake = FakeGrowwSDK()
+    api = _client(fake)
+    monkeypatch.setattr("execution.groww_long_option_execution.config.GROWW_SEBI_ALGO_REGISTRATION_CONFIRMED", False, raising=False)
+    executor = GrowwLongOptionExecutor(api, static_ip_validator=lambda: {"approved": True})
+    result = executor.execute(
+        candidate=_candidate(), quantity=50, limit_price=118.75,
+        protection=GrowwProtectionPlan(target_price=160.0, stop_trigger_price=95.0, stop_limit_price=94.95),
+        fill_timeout_sec=0.0, require_static_ip=True, require_algo_confirmation=True,
+    )
+    assert result.state is GrowwLongOptionExecutionState.REJECTED
+    assert result.blocked_new_entries is True
+    assert "GROWW_ALGO_REGISTRATION_UNCONFIRMED" in result.reasons[0]
+    assert fake.place_orders == []

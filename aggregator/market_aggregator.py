@@ -108,11 +108,15 @@ class MarketAggregator:
         secondary_dm,  # DeltaDataManager | CoinSwitchDataManager | None
         instrument=None,
         analysis_dm=None,
+        reference_dms=None,
     ) -> None:
         self.instrument = instrument
         self._primary   = primary_dm
         self._secondary = secondary_dm
         self._analysis  = analysis_dm
+        # Read-only context feeds (e.g. Hyperliquid) are never executable and
+        # are kept as independent microstates rather than merged depth.
+        self._references = list(reference_dms or [])
 
         self._lock = threading.RLock()
 
@@ -139,7 +143,8 @@ class MarketAggregator:
             f"[{getattr(instrument, 'asset_id', 'compatibility')}] "
             f"(primary={type(primary_dm).__name__} "
             f"secondary={'none' if secondary_dm is None else type(secondary_dm).__name__} "
-            f"analysis={'none' if analysis_dm is None else type(analysis_dm).__name__})"
+            f"analysis={'none' if analysis_dm is None else type(analysis_dm).__name__} "
+            f"references={[type(x).__name__ for x in self._references]})"
         )
 
     def _requires_analysis_feed(self) -> bool:
@@ -263,6 +268,11 @@ class MarketAggregator:
                 return False
             logger.warning("Analysis DM unavailable; primary candles will be used for structure")
 
+        for ref in self._references:
+            try:
+                ref.start()
+            except Exception as exc:
+                logger.warning("Read-only reference feed %s failed to start: %s", type(ref).__name__, exc)
         return True
 
     def stop(self) -> None:
@@ -277,6 +287,11 @@ class MarketAggregator:
                 self._secondary.stop()
             except Exception:
                 pass
+        for ref in self._references:
+            try:
+                ref.stop()
+            except Exception:
+                pass
 
     def restart_streams(self) -> bool:
         ok = self._primary.restart_streams()
@@ -288,6 +303,11 @@ class MarketAggregator:
         if self._secondary:
             try:
                 self._secondary.restart_streams()
+            except Exception:
+                pass
+        for ref in self._references:
+            try:
+                ref.stop(); ref.start()
             except Exception:
                 pass
         return ok
@@ -502,36 +522,49 @@ class MarketAggregator:
         return p_price
 
     def get_feed_reliability(self) -> Dict:
-        """
-        Return data-quality metadata consumed by operator UI and strategy.
-
-        Reliability is not an alpha signal. It is a confidence multiplier for
-        raw monitoring features. When the secondary feed is unavailable, raw trade/quote telemetry
-        information remains usable but must be treated as single-venue evidence.
-        """
-        primary_ready = bool(getattr(self._primary, "is_ready", False))
-        analysis_ready = bool(self._analysis is not None and getattr(self._analysis, "is_ready", False))
-        secondary_configured = self._secondary is not None
-        secondary_ready = bool(
-            secondary_configured and self._secondary_alive
-            and getattr(self._secondary, "is_ready", True)
-        )
-        sources = 1 + int(secondary_ready)
-        microstructure_weight = 1.0 if secondary_ready else 0.62
-        return {
-            "primary_ready": primary_ready,
-            "analysis_ready": analysis_ready,
-            "secondary_configured": secondary_configured,
+        """Execution-venue health, enriched with independent context-feed status."""
+        getter = getattr(self._primary, "get_feed_reliability", None)
+        if callable(getter):
+            try:
+                out = dict(getter() or {})
+            except Exception:
+                out = {}
+        else:
+            ready = bool(getattr(self._primary, "is_ready", False))
+            out = {
+                "connected": ready, "heartbeat_ok": ready, "sequence_valid": True,
+                "snapshot_ready": ready, "exchange_timestamp_available": False,
+                "latency_vs_baseline_z": None, "no_change_heartbeat_valid": ready,
+            }
+        secondary_ready = bool(self._secondary is not None and self._secondary_alive and getattr(self._secondary, "is_ready", True))
+        reference_ready = sum(1 for dm in self._references if bool(getattr(dm, "is_ready", False)))
+        out.update({
+            "primary_ready": bool(getattr(self._primary, "is_ready", False)),
+            "analysis_ready": bool(self._analysis is not None and getattr(self._analysis, "is_ready", False)),
+            "secondary_configured": self._secondary is not None,
             "secondary_alive": secondary_ready,
-            "sources": sources,
-            "microstructure_weight": microstructure_weight,
-            "mode": "analysis_underlying" if analysis_ready else ("dual" if secondary_ready else "single"),
-            "note": (
-                "underlying-analysis + executable option premium" if analysis_ready else
-                "dual-feed microstructure" if secondary_ready
-                else "single-feed microstructure; structural engine does not consume raw trade/quote telemetry"
-            ),
-        }
+            "reference_feeds_ready": reference_ready,
+            "sources": 1 + int(secondary_ready) + reference_ready,
+            "mode": "analysis_underlying" if self._analysis is not None else ("cross_venue" if secondary_ready or reference_ready else "single"),
+        })
+        return out
+
+    def get_venue_microstates(self) -> Dict[str, object]:
+        """Return separate venue states; no cross-venue depth summation is permitted."""
+        out: Dict[str, object] = {}
+        for dm in [self._primary, self._secondary, *self._references]:
+            if dm is None:
+                continue
+            getter = getattr(dm, "get_venue_microstate", None)
+            if not callable(getter):
+                continue
+            try:
+                state = getter()
+            except Exception:
+                state = None
+            if state is not None:
+                out[str(getattr(state, "venue", type(dm).__name__)).lower()] = state
+        return out
 
     def get_data_quality(self) -> Dict:
         """Backward-compatible alias for dashboards/controllers."""
