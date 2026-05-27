@@ -1378,6 +1378,27 @@ class GrowwOptionDataManager:
         )
         return choice
 
+    def get_active_option_contract_state(self) -> dict[str, Any]:
+        """Expose the exact activated option identity and live premium for risk supervision.
+
+        Greeks are intentionally not calculated here because the underlying index
+        lives in the independent analysis feed owned by MarketAggregator.
+        """
+        choice = self._selected_contract
+        if choice is None:
+            return {}
+        raw = dict(getattr(choice, "raw", {}) or {})
+        return {
+            "symbol": str(getattr(choice, "selected_symbol", "") or ""),
+            "right": str(getattr(choice, "right", "") or ""),
+            "strike": float(getattr(choice, "strike", 0.0) or 0.0),
+            "expiry": str(getattr(choice, "expiry", "") or ""),
+            "premium": float(self._last_price or 0.0),
+            "entry_iv": float(raw.get("bs_volatility", 0.0) or 0.0),
+            "delta_at_selection": float(getattr(choice, "delta", 0.0) or 0.0),
+            "theta_to_premium_at_selection": float(getattr(choice, "theta_to_premium", 0.0) or 0.0),
+        }
+
     def release_execution_vehicle(self) -> None:
         """Return to the session CE/PE book after a confirmed flat position.
 

@@ -63,11 +63,13 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import datetime, timezone
 from collections import deque
 from typing import Dict, List, Optional
 
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
+from agents.indian_options_desk import BlackScholesModel
 
 logger = logging.getLogger(__name__)
 
@@ -482,6 +484,41 @@ class MarketAggregator:
                 return {"status": "ERROR"}
         return {"status": "UNSUPPORTED"}
 
+    def get_active_option_risk_state(self) -> Dict:
+        """Calculate current long-option Greeks from live premium and NIFTY spot.
+
+        This method is only meaningful for the Groww option desk: the premium
+        comes from the official execution feed and spot comes from the official
+        index-value analysis feed.
+        """
+        getter = getattr(self._primary, "get_active_option_contract_state", None)
+        if not callable(getter):
+            return {}
+        state = dict(getter() or {})
+        premium = float(state.get("premium", 0.0) or 0.0)
+        strike = float(state.get("strike", 0.0) or 0.0)
+        spot = float(self.get_analysis_price() or 0.0)
+        expiry = str(state.get("expiry") or "")
+        try:
+            # NSE option expiry/session close is 15:30 IST, i.e. 10:00 UTC.
+            expiry_dt = datetime.strptime(expiry, "%Y-%m-%d").replace(hour=10, minute=0, tzinfo=timezone.utc)
+            dte = max((expiry_dt - datetime.now(timezone.utc)).total_seconds() / 86400.0, 1e-6)
+        except Exception:
+            dte = 0.0
+        right = str(state.get("right") or "").lower()
+        option_type = "put" if right in {"put", "pe", "p"} else "call"
+        rate = float(getattr(config, "INDIA_RISK_FREE_RATE", 0.065))
+        iv = BlackScholesModel.implied_volatility(option_type, spot, strike, dte, rate, premium) if min(spot, strike, premium, dte) > 0 else None
+        greeks = BlackScholesModel.greeks(option_type, spot, strike, dte, rate, iv, premium=premium) if iv else None
+        state.update({"underlying_spot": spot, "dte": dte, "current_iv": iv})
+        if greeks is not None:
+            state.update({
+                "current_delta": greeks.delta,
+                "current_theta_to_premium": greeks.theta_to_premium,
+                "current_vega_per_vol_point": greeks.vega_per_vol_point,
+            })
+        return state
+
     def get_execution_feed_status(self) -> Dict:
         """Expose the orderable instrument feed separately from analysis feed.
 
@@ -614,6 +651,21 @@ class MarketAggregator:
             if state is not None:
                 out[str(getattr(state, "venue", type(dm).__name__)).lower()] = state
         return out
+
+    def get_microstructure_research_state(self) -> Dict:
+        """Exit-model input from the executable primary venue only.
+
+        Kyle impact and VPIN must be calibrated against the venue where the
+        liquidation order would execute; secondary/reference depth is context,
+        not executable liquidity.
+        """
+        getter = getattr(self._primary, "get_microstructure_research_state", None)
+        if callable(getter):
+            try:
+                return dict(getter() or {})
+            except Exception:
+                return {}
+        return {}
 
     def get_data_quality(self) -> Dict:
         """Backward-compatible alias for dashboards/controllers."""

@@ -120,6 +120,9 @@ def test_invalid_feed_produces_explicit_execution_unsafe_rejection(tmp_path, mon
 
 
 def test_shadow_mode_blocks_live_order_even_when_flow_edge_is_positive(tmp_path, monkeypatch):
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_SIGNAL_DECAY_READY", False, raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_FOR_DELTA", False, raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_FOR_DELTA", False, raising=False)
     def cfg(name, default):
         values = {"RESEARCH_STORE_PATH": str(tmp_path), "INSTITUTIONAL_ENABLE_LIVE_ENTRIES": False,
                   "INSTITUTIONAL_MIN_NET_EDGE_BPS": 0.1, "INSTITUTIONAL_MIN_SIGNAL_BPS": 0.01}
@@ -153,6 +156,9 @@ def test_momentum_without_flow_is_not_a_trade_signal(tmp_path, monkeypatch):
 
 
 def test_live_entry_requires_protection_confirmation(tmp_path, monkeypatch):
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_SIGNAL_DECAY_READY", False, raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_FOR_DELTA", False, raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_FOR_DELTA", False, raising=False)
     def cfg(name, default):
         values = {"RESEARCH_STORE_PATH": str(tmp_path), "INSTITUTIONAL_ENABLE_LIVE_ENTRIES": True,
                   "INSTITUTIONAL_MIN_NET_EDGE_BPS": 0.1, "INSTITUTIONAL_MIN_SIGNAL_BPS": 0.01,
@@ -295,6 +301,9 @@ def _groww_instrument_for_strategy():
 
 
 def test_groww_ready_context_activates_ce_and_reaches_shadow_decision(tmp_path, monkeypatch):
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_SIGNAL_DECAY_READY", False, raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_FOR_DELTA", False, raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_FOR_DELTA", False, raising=False)
     def cfg(name, default):
         values = {"RESEARCH_STORE_PATH": str(tmp_path), "INSTITUTIONAL_ENABLE_LIVE_ENTRIES": False, "INSTITUTIONAL_MIN_NET_EDGE_BPS": 0.0,
                   "INSTITUTIONAL_RISK_FRACTION_PER_TRADE": 1.0, "INSTITUTIONAL_QUARTER_KELLY": 1.0, "INSTITUTIONAL_TARGET_OBSERVATION_VOL_BPS": 100000.0}
@@ -311,6 +320,9 @@ def test_groww_ready_context_activates_ce_and_reaches_shadow_decision(tmp_path, 
 
 
 def test_groww_live_decision_places_buy_with_oco_only_after_all_gates(tmp_path, monkeypatch):
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_SIGNAL_DECAY_READY", False, raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_FOR_DELTA", False, raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_FOR_DELTA", False, raising=False)
     def cfg(name, default):
         values = {"RESEARCH_STORE_PATH": str(tmp_path), "INSTITUTIONAL_ENABLE_LIVE_ENTRIES": True, "INSTITUTIONAL_MIN_NET_EDGE_BPS": 0.0,
                   "INSTITUTIONAL_RISK_FRACTION_PER_TRADE": 1.0, "INSTITUTIONAL_QUARTER_KELLY": 1.0, "INSTITUTIONAL_TARGET_OBSERVATION_VOL_BPS": 100000.0}
@@ -327,6 +339,9 @@ def test_groww_live_decision_places_buy_with_oco_only_after_all_gates(tmp_path, 
 
 
 def test_groww_option_edge_deducts_hold_horizon_theta_carry(tmp_path, monkeypatch):
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_SIGNAL_DECAY_READY", False, raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_FOR_DELTA", False, raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_FOR_DELTA", False, raising=False)
     def cfg(name, default):
         values = {
             "RESEARCH_STORE_PATH": str(tmp_path), "INSTITUTIONAL_ENABLE_LIVE_ENTRIES": False,

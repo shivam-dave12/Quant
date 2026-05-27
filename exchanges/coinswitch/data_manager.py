@@ -510,6 +510,11 @@ class CoinSwitchDataManager:
         with self._lock:
             return self._microstructure.snapshot(time.time()).asdict()
 
+    def get_microstructure_research_state(self) -> Dict[str, List[Dict[str, float]]]:
+        """Raw USD-normalised event stream for dynamic protection calibration."""
+        with self._lock:
+            return self._microstructure.research_state(time.time())
+
     def get_feed_reliability(self) -> Dict:
         with self._lock:
             snapshot_ready = bool(self._snapshot_ready)

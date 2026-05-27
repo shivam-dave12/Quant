@@ -31,6 +31,7 @@ from market_data.normalizer import (
     build_venue_microstate,
 )
 from research.store import ForwardLabelWriter, JsonlResearchStore, ResearchDecisionRecord, ResearchExecutionRecord
+from strategy.dynamic_protection import DynamicProtectionPlanBuilder
 from strategy.domain import (
     DecisionOutput,
     DeskId,
@@ -195,6 +196,7 @@ class InstitutionalStrategy:
         self._research_store = JsonlResearchStore(store_root)
         self._forward_labels = ForwardLabelWriter(self._research_store)
         self._last_candidate_id = ""
+        self._protection_engine = DynamicProtectionPlanBuilder(asset_id=self._asset_id)
         # Operator telemetry is state/change driven. The model can evaluate on
         # every market event without emitting an INFO-scale JSON payload per tick.
         self._telemetry_last_signature: tuple[Any, ...] | None = None
@@ -491,6 +493,15 @@ class InstitutionalStrategy:
         costs_bps = cost_components["total_cost_bps"]
         uncertainty_bps = self._uncertainty_bps(regime, liquidity_score, execution_quality)
         net_edge = directional_edge_bps - costs_bps
+        research_state_getter = getattr(data_manager, "get_microstructure_research_state", None)
+        research_state = research_state_getter() if callable(research_state_getter) else {}
+        self._protection_engine.observe(
+            signal_bps=_num(signal_breakdown.get("weighted_signal_bps"), 0.0),
+            timestamp_s=time.time(), research_state=research_state,
+        )
+        decay_state = self._protection_engine.signal_decay(current_edge_bps=directional_edge_bps, total_exit_cost_bps=costs_bps)
+        impact_state = self._protection_engine.kyle_impact(exit_notional=0.0)
+        toxicity_state = self._protection_engine.vpin()
         model_values = {
             "directional_edge_bps": directional_edge_bps,
             "costs_bps": costs_bps,
@@ -501,6 +512,11 @@ class InstitutionalStrategy:
             "execution_quality": execution_quality,
             "regime": regime.value,
             "signal_source": direction_reason,
+            "exit_model_state": {
+                "signal_decay": asdict(decay_state),
+                "kyle_impact": asdict(impact_state),
+                "vpin": asdict(toxicity_state),
+            },
         }
         model_values.update(signal_breakdown)
         if execution_state is not None:
@@ -546,7 +562,11 @@ class InstitutionalStrategy:
                 research_features=features,
             )
 
-        protection = self._protection_plan(desk, direction, price, liquidity_score)
+        protection = self._protection_plan(
+            desk, direction, price, liquidity_score, data_manager=data_manager,
+            gross_edge_bps=directional_edge_bps, costs_bps=costs_bps,
+        )
+        model_values["dynamic_protection_plan"] = protection.diagnostics if protection is not None else {}
         if protection is None or not protection.protection_feasible:
             return self._decision(
                 desk=desk,
@@ -584,6 +604,21 @@ class InstitutionalStrategy:
                 reasons=sizing.reasons,
                 model_values=model_values,
                 research_features=features,
+            )
+
+        protection = self._protection_plan(
+            desk, direction, price, liquidity_score, data_manager=data_manager,
+            gross_edge_bps=directional_edge_bps, costs_bps=costs_bps,
+            position_notional=sizing.notional, quantity=sizing.quantity,
+        )
+        model_values["dynamic_protection_plan"] = protection.diagnostics if protection is not None else {}
+        if protection is None or not protection.protection_feasible:
+            return self._decision(
+                desk=desk, venue=venue, instrument=instrument, decision=DecisionOutput.NO_TRADE_EXECUTION_UNSAFE,
+                direction=direction, regime=regime, expected_net_edge_bps=net_edge, uncertainty_bps=uncertainty_bps,
+                liquidity_score=liquidity_score, execution_quality_score=execution_quality, sizing=sizing,
+                protection_plan=protection, reasons=(protection.reasons if protection else ["sized_dynamic_protection_unavailable"]),
+                model_values=model_values, research_features=features,
             )
 
         live_allowed, live_reason = _live_routing_permission(venue)
@@ -664,6 +699,15 @@ class InstitutionalStrategy:
             )
         thesis, underlying_edge_bps, thesis_reason, thesis_features = self._india_underlying_structural_thesis(data_manager, underlying_price)
         model_values.update(thesis_features)
+        # Keep the decay estimator live before a trade triggers: the structural pressure
+        # series is continuous, while the executable BULLISH/BEARISH thesis is discrete.
+        signed_thesis_edge = (
+            _num(thesis_features.get("break_up_bps"), 0.0)
+            - _num(thesis_features.get("break_down_bps"), 0.0)
+            + 0.25 * _num(thesis_features.get("alignment_15m_bps"), 0.0)
+        )
+        self._protection_engine.observe(signal_bps=signed_thesis_edge, timestamp_s=time.time(), research_state={})
+        model_values["underlying_structural_pressure_bps"] = signed_thesis_edge
         if thesis is Direction.NO_TRADE:
             return self._decision(
                 desk=DeskId.INDIA_OPTIONS.value, venue=venue, instrument=instrument,
@@ -759,7 +803,17 @@ class InstitutionalStrategy:
                 reasons=[thesis_reason, "option_premium_edge_does_not_clear_cost_and_uncertainty"],
                 model_values=model_values, research_features=features,
             )
-        protection = self._option_premium_protection_plan(data_manager, option_price)
+        option_state = {
+            "selected_option_symbol": getattr(choice, "selected_symbol", ""),
+            "selected_option_delta": delta,
+            "theta_to_premium_per_day": theta_day_ratio,
+            "volatility_context": volatility_context,
+        }
+        protection = self._option_premium_protection_plan(
+            data_manager, option_price, thesis, premium_edge_bps, costs_bps + theta_carry_bps,
+            option_state=option_state,
+        )
+        model_values["dynamic_protection_plan"] = protection.diagnostics if protection is not None else {}
         if protection is None or not protection.protection_feasible:
             return self._decision(
                 desk=DeskId.INDIA_OPTIONS.value, venue=venue, instrument=instrument,
@@ -782,6 +836,21 @@ class InstitutionalStrategy:
                 sizing=sizing, protection_plan=protection, reasons=sizing.reasons,
                 model_values=model_values, research_features=features,
             )
+        protection = self._option_premium_protection_plan(
+            data_manager, option_price, thesis, premium_edge_bps, costs_bps + theta_carry_bps,
+            position_notional=sizing.notional, quantity=sizing.quantity, option_state=option_state,
+        )
+        model_values["dynamic_protection_plan"] = protection.diagnostics if protection is not None else {}
+        if protection is None or not protection.protection_feasible:
+            return self._decision(
+                desk=DeskId.INDIA_OPTIONS.value, venue=venue, instrument=instrument,
+                decision=DecisionOutput.NO_TRADE_EXECUTION_UNSAFE, direction=thesis, regime=regime,
+                expected_net_edge_bps=net_edge, uncertainty_bps=uncertainty_bps, liquidity_score=liquidity_score,
+                execution_quality_score=feed_health.quality_score, sizing=sizing, protection_plan=protection,
+                reasons=(protection.reasons if protection else ["sized_option_dynamic_protection_unavailable"]),
+                model_values=model_values, research_features=features,
+            )
+
         live_allowed, live_reason = _live_routing_permission(venue)
         if not live_allowed:
             return self._decision(
@@ -846,13 +915,16 @@ class InstitutionalStrategy:
             return Direction.BEARISH, break_down_bps + 0.25 * abs(align_bps), "nifty_liquidity_break_displacement_bearish", metrics
         return Direction.NO_TRADE, 0.0, "nifty_no_valid_structural_displacement", metrics
 
-    def _option_premium_protection_plan(self, data_manager, premium: float) -> ProtectionPlan | None:
+    def _option_premium_protection_plan(
+        self, data_manager, premium: float, direction: Direction, gross_edge_bps: float, execution_cost_bps: float,
+        *, position_notional: float = 0.0, quantity: float = 0.0, option_state: Mapping[str, Any] | None = None,
+    ) -> ProtectionPlan | None:
         try:
             candles = list(data_manager.get_execution_candles("1m", 40) or [])
         except Exception:
             candles = []
         if premium <= 0 or len(candles) < int(_cfg("GROWW_OPTION_PROTECTION_MIN_ATR_BARS", 10)):
-            return ProtectionPlan(premium, premium, premium, "GROWW_OCO_AFTER_FILL", False, ["option_premium_atr_warmup_unavailable"])
+            return ProtectionPlan(premium, premium, premium, "GROWW_OCO_AFTER_FILL", False, ["option_premium_dynamic_volatility_warmup_unavailable"], diagnostics={})
         ranges: list[float] = []
         previous = None
         for row in candles[-20:]:
@@ -866,19 +938,13 @@ class InstitutionalStrategy:
             ranges.append(max(h - l, abs(h - previous), abs(l - previous)) if previous else h - l)
             previous = c
         if len(ranges) < 5:
-            return ProtectionPlan(premium, premium, premium, "GROWW_OCO_AFTER_FILL", False, ["option_premium_atr_invalid"])
-        atr = sum(ranges[-14:]) / min(len(ranges), 14)
-        min_risk = premium * float(_cfg("GROWW_OPTION_MIN_PREMIUM_RISK_PCT", 0.14))
-        max_risk = premium * float(_cfg("GROWW_OPTION_MAX_PREMIUM_RISK_PCT", 0.58))
-        stop_distance = min(max(max(atr * float(_cfg("GROWW_OPTION_SLTP_DELTA_MULT", 1.0)), min_risk), 0.05), max_risk)
-        if stop_distance <= 0 or stop_distance >= premium:
-            return ProtectionPlan(premium, premium, premium, "GROWW_OCO_AFTER_FILL", False, ["option_premium_stop_not_executable"])
-        rr = float(_cfg("GROWW_OPTION_TARGET_RR", 1.60))
-        target_distance = max(stop_distance * rr, premium * float(_cfg("GROWW_OPTION_MIN_TP_PREMIUM_PCT", 0.18)))
-        return ProtectionPlan(
-            entry_price=premium, stop_price=max(0.05, premium - stop_distance), target_price=premium + target_distance,
-            protection_type="GROWW_OCO_AFTER_FILL", protection_feasible=True,
-            reasons=[f"premium_domain_atr_protection atr={atr:.4f} stop_dist={stop_distance:.4f} target_dist={target_distance:.4f} rr={rr:.3f}", "groww_long_option_oco_required"],
+            return ProtectionPlan(premium, premium, premium, "GROWW_OCO_AFTER_FILL", False, ["option_premium_dynamic_volatility_invalid"], diagnostics={})
+        premium_realized_range = sum(ranges[-14:]) / min(len(ranges), 14)
+        return self._protection_engine.build_plan(
+            direction=direction, entry_price=premium, volatility_price=premium_realized_range,
+            gross_edge_bps=gross_edge_bps, execution_cost_bps=execution_cost_bps,
+            protection_type="GROWW_OCO_AFTER_FILL", asset_class="option",
+            position_notional=position_notional, quantity=quantity, option_state=option_state,
         )
 
     def _decision(self, **kwargs: Any) -> OpportunityDecision:
@@ -899,8 +965,8 @@ class InstitutionalStrategy:
                     model_values=decision.model_values,
                     reasons=decision.reasons,
                     features=decision.research_features,
-                    model_version="observable-groww-carry-aware-v2.11",
-                    policy_version="config-owned-protected-execution-v2.11",
+                    model_version="dynamic-state-dependent-protection-v2.12",
+                    policy_version="config-owned-protected-execution-v2.12",
                 )
             )
         except Exception:
@@ -978,6 +1044,7 @@ class InstitutionalStrategy:
         if price <= 0:
             return
         self._forward_labels.observe(now_ts_ns=time.time_ns(), current_price=price)
+        self._dynamic_exit_supervision(data_manager, order_manager)
         if self._pos.side.lower() == "long":
             target_hit = price >= self._pos.tp_price > 0
             stop_hit = price <= self._pos.sl_price if self._pos.sl_price > 0 else False
@@ -997,6 +1064,82 @@ class InstitutionalStrategy:
                 self._pos = PositionState(asset_id=self._asset_id)
         except Exception:
             pass
+
+    def _dynamic_exit_supervision(self, data_manager, order_manager) -> None:
+        """Audit state-dependent early exits without silently defeating hard protection.
+
+        Entry always carries the venue-native bracket/OCO generated by the
+        dynamic protection plan.  Alpha-expiry and option-Greek exits are
+        calculated continuously; live early liquidation is disabled by default
+        until a cancel/replace-and-close lifecycle is explicitly enabled and
+        validated for each venue.
+        """
+        if self._pos.is_flat() or self._pos.phase is not PositionPhase.ACTIVE:
+            return
+        components = self._pos.quant_components if isinstance(self._pos.quant_components, dict) else {}
+        plan = components.get("dynamic_protection_plan") or {}
+        elapsed = max(0.0, time.time() - float(self._pos.entry_time or time.time()))
+        exit_reasons: list[str] = []
+        decay = plan.get("signal_decay") if isinstance(plan, Mapping) else {}
+        optimal_hold = _num((decay or {}).get("optimal_hold_sec"), 0.0) if isinstance(decay, Mapping) else 0.0
+        if optimal_hold > 0 and elapsed >= optimal_hold:
+            exit_reasons.append("signal_alpha_cost_crossing_horizon_reached")
+
+        option_diag: dict[str, Any] = {}
+        if str(self._pos.exchange or "").lower() == "groww":
+            getter = getattr(data_manager, "get_active_option_risk_state", None)
+            if callable(getter):
+                try:
+                    live = dict(getter() or {})
+                    entry_state = plan.get("option_state_at_entry", {}) if isinstance(plan, Mapping) else {}
+                    vol_ctx = entry_state.get("volatility_context", {}) if isinstance(entry_state, Mapping) else {}
+                    current_delta = live.get("current_delta")
+                    abs_delta = abs(float(current_delta)) if current_delta is not None and math.isfinite(float(current_delta)) else None
+                    diag = self._protection_engine.option_exit_diagnostics(
+                        abs_delta=abs_delta,
+                        current_iv=live.get("current_iv"),
+                        entry_iv=entry_state.get("iv") if isinstance(entry_state, Mapping) else None,
+                        theta_to_premium_per_day=live.get("current_theta_to_premium"),
+                        dte=live.get("dte"),
+                        vrp=vol_ctx.get("vrp") if isinstance(vol_ctx, Mapping) else None,
+                    )
+                    option_diag = asdict(diag)
+                    components["dynamic_option_exit_state"] = option_diag
+                    exit_reasons.extend(list(diag.reasons) if diag.exit_required else [])
+                except Exception as exc:
+                    option_diag = {"ready": False, "reason": f"option_exit_diagnostics_error:{exc}"}
+                    components["dynamic_option_exit_state"] = option_diag
+
+        if not exit_reasons:
+            return
+        deduped_reasons = sorted(set(exit_reasons))
+        key = "dynamic_exit_alerted:" + "|".join(deduped_reasons)
+        if components.get(key):
+            return
+        components[key] = True
+        auto_enabled = bool(_cfg("DYNAMIC_EXIT_AUTOMATED_EARLY_LIQUIDATION_ENABLED", False))
+        payload = {
+            "asset": self._pos.asset_id,
+            "venue": self._pos.exchange,
+            "symbol": self._pos.execution_symbol,
+            "side": self._pos.side,
+            "elapsed_sec": round(elapsed, 3),
+            "optimal_hold_sec": round(optimal_hold, 3) if optimal_hold > 0 else None,
+            "reasons": deduped_reasons,
+            "option_exit": option_diag,
+            "automated_early_liquidation_enabled": auto_enabled,
+            "hard_protection_remains_active": True,
+        }
+        logger.warning("🧮 DYNAMIC_EXIT_SIGNAL %s", json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str))
+        if auto_enabled:
+            # This path is deliberately opt-in: emergency flatten is only used
+            # after the operator accepts the venue-specific cancel/close lifecycle.
+            flatten = getattr(order_manager, "emergency_flatten", None)
+            if callable(flatten):
+                result = flatten(reason="dynamic_exit:" + ",".join(deduped_reasons))
+                if result:
+                    self._pos.phase = PositionPhase.EXITING
+                    self._pos.manual_exit_reason = "dynamic_exit:" + ",".join(deduped_reasons)
 
     def _safe_price(self, data_manager) -> float:
         for name in ("get_analysis_price", "get_last_price"):
@@ -1230,28 +1373,18 @@ class InstitutionalStrategy:
         }[regime]
         return base + (1.0 - liquidity_score) * 6.0 + (1.0 - execution_quality) * 8.0
 
-    def _protection_plan(self, desk: str, direction: Direction, price: float, liquidity_score: float) -> ProtectionPlan | None:
+    def _protection_plan(
+        self, desk: str, direction: Direction, price: float, liquidity_score: float, *, data_manager,
+        gross_edge_bps: float, costs_bps: float, position_notional: float = 0.0, quantity: float = 0.0,
+    ) -> ProtectionPlan | None:
         if price <= 0 or liquidity_score <= 0:
             return None
-        vol = self._realized_vol_price()
-        stop_dist = max(price * 0.0015, vol * 1.25)
-        target_dist = max(stop_dist * 1.6, price * 0.0025)
-        if direction in {Direction.LONG, Direction.BULLISH}:
-            stop = price - stop_dist
-            target = price + target_dist
-        elif direction in {Direction.SHORT, Direction.BEARISH}:
-            stop = price + stop_dist
-            target = price - target_dist
-        else:
-            return None
-        protection_type = "GROWW_OCO_AFTER_FILL" if desk == DeskId.INDIA_OPTIONS.value else "VENUE_NATIVE_BRACKET"
-        return ProtectionPlan(
-            entry_price=price,
-            stop_price=max(0.01, stop),
-            target_price=max(0.01, target),
-            protection_type=protection_type,
-            protection_feasible=True,
-            reasons=[],
+        asset_class = "crypto" if desk == DeskId.BTC.value else "commodity"
+        return self._protection_engine.build_plan(
+            direction=direction, entry_price=price, volatility_price=self._realized_vol_price(),
+            gross_edge_bps=gross_edge_bps, execution_cost_bps=costs_bps,
+            protection_type="VENUE_NATIVE_BRACKET", asset_class=asset_class,
+            position_notional=position_notional, quantity=quantity,
         )
 
     def _size_position(

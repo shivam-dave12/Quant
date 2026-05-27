@@ -90,6 +90,7 @@ class ProtectionPlan:
     protection_type: str
     protection_feasible: bool
     reasons: list[str] = field(default_factory=list)
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

@@ -149,6 +149,21 @@ class MicrostructureTracker:
         self._tfi = ExponentialFlowAccumulator()
         self._previous_bids: list[Sequence[object] | Mapping[str, object] | BookLevel] = []
         self._previous_asks: list[Sequence[object] | Mapping[str, object] | BookLevel] = []
+        # Raw event records are retained for calibrated exit models (Kyle/VPIN).
+        # They are not mixed across venues and are never used as synthetic depth.
+        self._book_events: deque[dict[str, float]] = deque(maxlen=2000)
+        self._trade_events: deque[dict[str, float]] = deque(maxlen=4000)
+
+    @staticmethod
+    def _microprice(bids, asks) -> float:
+        bid = _top(bids, is_bid=True)
+        ask = _top(asks, is_bid=False)
+        if bid is None or ask is None or bid.price <= 0 or ask.price <= 0:
+            return 0.0
+        total = bid.displayed_size + ask.displayed_size
+        if total <= 0:
+            return (bid.price + ask.price) / 2.0
+        return (ask.price * bid.displayed_size + bid.price * ask.displayed_size) / total
 
     def update_book(self, bids, asks, timestamp_s: float) -> tuple[float, float, float]:
         raw = 0.0
@@ -162,15 +177,30 @@ class MicrostructureTracker:
             )
         self._previous_bids = list(bids or [])
         self._previous_asks = list(asks or [])
+        microprice = self._microprice(bids, asks)
+        if microprice > 0:
+            self._book_events.append({
+                "timestamp_s": float(timestamp_s),
+                "microprice": float(microprice),
+                "signed_ofi_usd": float(raw),
+            })
         return self._ofi.update(raw, timestamp_s)
 
     def record_trade(self, *, price: float, quantity: float, buyer_aggressor: bool, timestamp_s: float) -> tuple[float, float, float]:
         signed_usd = signed_trade_notional_usd(
             price=price, quantity=quantity, buyer_aggressor=buyer_aggressor, mapping=self.mapping
         )
+        self._trade_events.append({"timestamp_s": float(timestamp_s), "signed_notional_usd": float(signed_usd)})
         return self._tfi.update(signed_usd, timestamp_s)
 
     def snapshot(self, timestamp_s: float | None = None) -> FlowSnapshot:
         ofi = self._ofi.snapshot(timestamp_s)
         tfi = self._tfi.snapshot(timestamp_s)
         return FlowSnapshot(*ofi, *tfi)
+
+    def research_state(self, timestamp_s: float | None = None, window_s: float = 600.0) -> dict[str, list[dict[str, float]]]:
+        now = float(timestamp_s or 0.0)
+        cutoff = now - max(1.0, float(window_s)) if now > 0 else 0.0
+        books = [dict(row) for row in self._book_events if float(row.get("timestamp_s", 0.0)) >= cutoff]
+        trades = [dict(row) for row in self._trade_events if float(row.get("timestamp_s", 0.0)) >= cutoff]
+        return {"book_events": books, "trade_events": trades}
