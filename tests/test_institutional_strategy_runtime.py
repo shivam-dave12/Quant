@@ -111,6 +111,92 @@ def _instrument():
     return TradableInstrument("BTC", "Bitcoin", AssetClass.CRYPTO, ExchangeName.DELTA, {ExchangeName.DELTA: ei})
 
 
+def _silver_instrument():
+    delta = ExchangeInstrument(
+        exchange=ExchangeName.DELTA, symbol="SLVONUSD", ws_symbol="SLVONUSD", display_symbol="SLVONUSD",
+        asset_id="SILVER", asset_class=AssetClass.COMMODITY, quote_asset="USD", base_asset="SLVON",
+        status="active", tick_size=0.01, lot_step=0.01, min_qty=0.01,
+        raw={"contract_type": "linear_perp", "contract_value": 1.0, "tick_size": 0.01},
+    )
+    hl = ExchangeInstrument(
+        exchange=ExchangeName.HYPERLIQUID, symbol="xyz:SILVER", ws_symbol="xyz:SILVER", display_symbol="xyz:SILVER",
+        asset_id="SILVER", asset_class=AssetClass.COMMODITY, quote_asset="USD", base_asset="SILVER",
+        status="active", tick_size=0.01, lot_step=0.01, min_qty=0.01, max_leverage=25.0,
+        raw={"contract_type": "linear_perp", "tick_size": 0.01, "qty_step": 0.01},
+    )
+    return TradableInstrument("SILVER", "Silver token derivatives", AssetClass.COMMODITY, ExchangeName.DELTA, {ExchangeName.DELTA: delta, ExchangeName.HYPERLIQUID: hl})
+
+
+class _SilverRouteData:
+    def get_last_price(self):
+        return 30.0
+
+    def get_feed_reliability(self):
+        return {
+            "connected": True,
+            "heartbeat_ok": True,
+            "sequence_valid": True,
+            "snapshot_ready": True,
+            "exchange_timestamp_available": True,
+            "latency_vs_baseline_z": 0.0,
+        }
+
+    def get_orderbook(self):
+        return {"bids": [(29.995, 10.0)], "asks": [(30.005, 10.0)]}
+
+    def get_venue_microstates(self):
+        health = score_feed_health(
+            connected=True,
+            heartbeat_ok=True,
+            sequence_valid=True,
+            snapshot_ready=True,
+            exchange_timestamp_available=True,
+            latency_vs_baseline_z=0.0,
+        )
+        ts = time.time_ns()
+        mapping_delta = InstrumentMapping(
+            venue="delta", venue_symbol="SLVONUSD", canonical_underlying="SILVER", product_class="linear_perp",
+            quote_currency="USD", contract_multiplier=1.0, settlement_currency="USD", price_tick=0.01,
+            qty_step=0.01, execution_enabled=True, notional_model="linear",
+        )
+        mapping_hl = InstrumentMapping(
+            venue="hyperliquid", venue_symbol="xyz:SILVER", canonical_underlying="SILVER", product_class="linear_perp",
+            quote_currency="USD", contract_multiplier=1.0, settlement_currency="USDC", price_tick=0.01,
+            qty_step=0.01, execution_enabled=True, notional_model="linear",
+        )
+        delta = build_venue_microstate(
+            mapping=mapping_delta,
+            bids=[(29.995, 25.0), (29.985, 25.0)],
+            asks=[(30.005, 25.0), (30.015, 25.0)],
+            feed_health=health,
+            receive_ts_ns=ts,
+            exchange_ts_ns=ts - 1_000_000,
+            ofi_usd_1s=3000.0,
+            ofi_usd_10s=1500.0,
+            tfi_usd_1s=500.0,
+        )
+        hyperliquid = build_venue_microstate(
+            mapping=mapping_hl,
+            bids=[(29.995, 6000.0), (29.985, 6000.0)],
+            asks=[(30.005, 6000.0), (30.015, 6000.0)],
+            feed_health=health,
+            receive_ts_ns=ts,
+            exchange_ts_ns=ts - 1_000_000,
+            ofi_usd_1s=-300000.0,
+            ofi_usd_10s=-150000.0,
+            tfi_usd_1s=-50000.0,
+        )
+        return {"delta": delta, "hyperliquid": hyperliquid}
+
+
+class _MultiVenueOrders(_Orders):
+    def available_exchanges(self):
+        return {"delta", "hyperliquid"}
+
+    def manager_for(self, venue):
+        return self
+
+
 def test_invalid_feed_produces_explicit_execution_unsafe_rejection(tmp_path, monkeypatch):
     monkeypatch.setattr("strategy.institutional_strategy._cfg", lambda name, default: str(tmp_path) if name == "RESEARCH_STORE_PATH" else default)
     strategy = InstitutionalStrategy(instrument=_instrument())
@@ -179,6 +265,57 @@ def test_live_entry_requires_protection_confirmation(tmp_path, monkeypatch):
     assert orders.placed
 
 
+def test_live_entry_is_blocked_by_risk_manager_trade_gate(tmp_path, monkeypatch):
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_SIGNAL_DECAY_READY", False, raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_FOR_DELTA", False, raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_FOR_DELTA", False, raising=False)
+
+    def cfg(name, default):
+        values = {
+            "RESEARCH_STORE_PATH": str(tmp_path),
+            "INSTITUTIONAL_ENABLE_LIVE_ENTRIES": True,
+            "INSTITUTIONAL_MIN_NET_EDGE_BPS": 0.1,
+            "INSTITUTIONAL_MIN_SIGNAL_BPS": 0.01,
+            "LEVERAGE": 2.0,
+        }
+        return values.get(name, default)
+
+    class _BlockedRisk(_Risk):
+        def can_trade(self):
+            return False, "Cooldown: 120s remaining"
+
+    monkeypatch.setattr("strategy.institutional_strategy._cfg", cfg)
+    strategy = InstitutionalStrategy(instrument=_instrument())
+    data = _Data([100.0 + i * 0.02 for i in range(80)], feed_ok=True)
+    orders = _Orders()
+    decision = strategy.evaluate(data, orders, _BlockedRisk(), 1)
+    assert decision.decision is DecisionOutput.NO_TRADE_RISK_BUDGET
+    assert decision.reasons == ["risk_manager_gate:Cooldown: 120s remaining"]
+    assert orders.placed == []
+
+
+def test_selected_venue_signal_disagreement_blocks_silver_route(tmp_path, monkeypatch):
+    monkeypatch.setattr("strategy.institutional_strategy._cfg", lambda name, default: {
+        "RESEARCH_STORE_PATH": str(tmp_path),
+        "INSTITUTIONAL_ENABLE_LIVE_ENTRIES": False,
+        "INSTITUTIONAL_MIN_SIGNAL_BPS": 0.01,
+        "INSTITUTIONAL_MIN_NET_EDGE_BPS": 0.0,
+    }.get(name, default))
+    monkeypatch.setattr("execution.venue_selection._cfg", lambda name, default: {
+        "VENUE_FEE_BPS": {"delta": 1.5, "hyperliquid": 4.5},
+        "SILVER_HYPERLIQUID_PREFERENCE_BPS": 8.0,
+        "SILVER_DELTA_ILLIQUIDITY_PENALTY_BPS": 15.0,
+        "SILVER_DELTA_MIN_NEAR_DEPTH_USD": 50000.0,
+        "VENUE_SELECTION_MIN_IMPROVEMENT_BPS": 0.0,
+    }.get(name, default))
+    strategy = InstitutionalStrategy(instrument=_silver_instrument())
+    decision = strategy.evaluate(_SilverRouteData(), _MultiVenueOrders(), _Risk(), 1)
+    assert decision.decision is DecisionOutput.NO_TRADE_INSUFFICIENT_EDGE
+    assert decision.direction.value == "NO_TRADE"
+    assert decision.venue == "hyperliquid"
+    assert decision.reasons[0].startswith("selected_venue_signal_disagreement:")
+
+
 def test_groww_direction_is_no_trade_until_options_volatility_context_is_available(tmp_path, monkeypatch):
     monkeypatch.setattr("strategy.institutional_strategy._cfg", lambda name, default: str(tmp_path) if name == "RESEARCH_STORE_PATH" else default)
     ei = ExchangeInstrument(
@@ -244,6 +381,57 @@ def test_groww_position_sizing_rejects_without_verified_lot(tmp_path, monkeypatc
     )
     assert decision.approved is False
     assert decision.reasons == ["verified_nfo_lot_size_unavailable"]
+
+
+def test_delta_contract_value_sizes_exposure_units_not_raw_contracts(tmp_path, monkeypatch):
+    from execution.order_manager import _DeltaAdapter
+    from strategy.domain import Direction, ProtectionPlan
+
+    def cfg(name, default):
+        values = {
+            "RESEARCH_STORE_PATH": str(tmp_path),
+            "INSTITUTIONAL_RISK_FRACTION_PER_TRADE": 1.0,
+            "INSTITUTIONAL_QUARTER_KELLY": 1.0,
+            "INSTITUTIONAL_TARGET_OBSERVATION_VOL_BPS": 100000.0,
+            "LEVERAGE": 5.0,
+        }
+        return values.get(name, default)
+
+    monkeypatch.setattr("strategy.institutional_strategy._cfg", cfg)
+    raw = {"contract_type": "perpetual_futures", "contract_value": 0.001, "tick_size": 0.01}
+    ei = ExchangeInstrument(
+        exchange=ExchangeName.DELTA,
+        symbol="PAXGUSD",
+        ws_symbol="PAXGUSD",
+        display_symbol="PAXGUSD",
+        asset_id="GOLD",
+        asset_class=AssetClass.COMMODITY,
+        quote_asset="USD",
+        base_asset="PAXG",
+        status="active",
+        tick_size=0.01,
+        lot_step=0.001,
+        min_qty=0.001,
+        contract_value_btc=0.001,
+        raw=raw,
+    )
+    inst = TradableInstrument("GOLD", "Gold token derivatives", AssetClass.COMMODITY, ExchangeName.DELTA, {ExchangeName.DELTA: ei})
+    strategy = InstitutionalStrategy(instrument=inst)
+    decision = strategy._size_position(
+        "DESK_A_METALS",
+        "PAXGUSD",
+        Direction.SHORT,
+        4484.55,
+        100.0,
+        0.90,
+        ProtectionPlan(4484.55, 4491.007752, 4467.418645719423, "VENUE_NATIVE_BRACKET", True),
+        SimpleNamespace(get_available_balance=lambda: {"available": 100.0}),
+    )
+
+    assert decision.approved is True
+    assert decision.quantity == 0.004
+    assert abs(decision.notional - decision.quantity * 4484.55) < 1e-9
+    assert _DeltaAdapter(None, exchange_instrument=ei)._qty_to_contracts(decision.quantity) == 4
 
 
 

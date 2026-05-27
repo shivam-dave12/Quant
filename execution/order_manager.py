@@ -1,8 +1,8 @@
 """
 execution/order_manager.py — Exchange-Agnostic Order Manager
 =============================================================
-Single OrderManager class that works with any exchange API adapter
-(CoinSwitchAPI or DeltaAPI) via constructor injection.
+Single OrderManager class that works with exchange API adapters via
+constructor injection.
 
 The ExecutionRouter (router.py) instantiates one of each and routes
 all calls to the active one.  Switching exchanges at runtime is a
@@ -51,6 +51,10 @@ import config
 from core.instruments import ExchangeName
 
 logger = logging.getLogger(__name__)
+
+
+def _cfg(name: str, default: Any) -> Any:
+    return getattr(config, name, default)
 
 
 # ── Cancel result enum (exported; strategy imports from here) ─────────────────
@@ -104,6 +108,7 @@ class _RateLimiter:
 _CS_LIMITER    = _RateLimiter(min_interval_sec=3.0)
 _DELTA_LIMITER = _RateLimiter(min_interval_sec=0.25)
 _GROWW_LIMITER = _RateLimiter(min_interval_sec=float(getattr(config, "GROWW_MIN_CALL_GAP_SEC", 0.25)))
+_HL_LIMITER    = _RateLimiter(min_interval_sec=float(getattr(config, "HYPERLIQUID_MIN_CALL_GAP_SEC", 0.25)))
 
 # Also keep a module-level alias for compatibility imports (quant_strategy does
 # `from execution.order_manager import GlobalRateLimiter`)
@@ -643,6 +648,9 @@ class _DeltaAdapter:
         result = resp.get("result", {}) if isinstance(resp, dict) else {}
         result["order_id"] = oid
         result["submitted_contracts"] = int(contracts)
+        result["quantity"] = float(quantity)
+        result["size_btc"] = float(quantity)
+        result["size_contracts"] = int(contracts)
         result["submitted_prices"] = prices
         return result
 
@@ -1845,6 +1853,328 @@ class _GrowwAdapter(_GrowwBaseAdapter):
         return {"success": True, "leverage": 1, "message": "Groww long-premium options are fully funded; leverage is not applicable"}
 
 
+class _HyperliquidAdapter:
+    """Normalises Hyperliquid SDK responses to canonical dicts."""
+
+    def __init__(self, api, exchange_instrument=None) -> None:
+        self.api = api
+        self.limiter = _HL_LIMITER
+        self.exchange_instrument = exchange_instrument
+        self.symbol = (exchange_instrument.symbol if exchange_instrument is not None else "BTC")
+        self.display_symbol = (exchange_instrument.display_symbol if exchange_instrument is not None else self.symbol)
+        self.tick_size = float(getattr(exchange_instrument, "tick_size", 0.0) or 0.01) if exchange_instrument is not None else 0.01
+        self.lot_step = float(getattr(exchange_instrument, "lot_step", 0.0) or 0.00001) if exchange_instrument is not None else 0.00001
+        self.min_qty = float(getattr(exchange_instrument, "min_qty", 0.0) or 0.0) if exchange_instrument is not None else 0.0
+        self.max_qty = float(getattr(exchange_instrument, "max_qty", 0.0) or 0.0) if exchange_instrument is not None else 0.0
+
+    @staticmethod
+    def _num(value, default: float = 0.0) -> float:
+        try:
+            if value is None or value == "":
+                return float(default)
+            out = float(value)
+            return out if math.isfinite(out) else float(default)
+        except Exception:
+            return float(default)
+
+    def _round_qty(self, quantity: float) -> float:
+        try:
+            q = float(self.api.round_size(self.symbol, float(quantity)))
+        except Exception:
+            step = max(float(self.lot_step or 0.0), 1e-12)
+            q = math.floor(float(quantity) / step) * step
+        return max(0.0, q)
+
+    @staticmethod
+    def _order_node(raw: Dict) -> Dict:
+        if not isinstance(raw, dict):
+            return {}
+        node = raw.get("order")
+        if isinstance(node, dict):
+            nested = node.get("order")
+            if isinstance(nested, dict):
+                return {**nested, "status": node.get("status", nested.get("status")), "statusTimestamp": node.get("statusTimestamp")}
+            return node
+        return raw
+
+    def extract_status(self, order_data: Dict) -> str:
+        node = self._order_node(order_data)
+        raw = str(node.get("status", order_data.get("status", ""))).upper()
+        mapping = {
+            "FILLED": "FILLED",
+            "OPEN": "PENDING",
+            "RESTING": "PENDING",
+            "TRIGGERED": "PENDING",
+            "CANCELED": "CANCELLED",
+            "CANCELLED": "CANCELLED",
+            "REJECTED": "CANCELLED",
+            "MARGIN_CANCELED": "CANCELLED",
+        }
+        return mapping.get(raw, "UNKNOWN")
+
+    def extract_fill_price(self, order_data: Dict) -> Optional[float]:
+        node = self._order_node(order_data)
+        for key in ("avgPx", "avgFillPrice", "fillPrice", "limitPx", "limit_px", "price"):
+            value = node.get(key, order_data.get(key))
+            price = self._num(value, 0.0)
+            if price > 0:
+                return price
+        return None
+
+    def extract_filled_qty(self, order_data: Dict) -> float:
+        node = self._order_node(order_data)
+        for key in ("totalSz", "filledSz", "origSz", "sz", "size"):
+            qty = self._num(node.get(key, order_data.get(key)), 0.0)
+            if qty > 0:
+                return qty
+        return 0.0
+
+    def _entry_status(self, oid: str, fallback_price: float, fallback_qty: float) -> Dict:
+        raw = self.get_order(oid) or {}
+        status = self.extract_status(raw)
+        return {
+            "status": status,
+            "fill_price": float(self.extract_fill_price(raw) or fallback_price),
+            "filled_qty": float(self.extract_filled_qty(raw) or (fallback_qty if status == "FILLED" else 0.0)),
+            "raw_order": raw,
+            "paid_commission": 0.0,
+            "paid_commission_exact": False,
+        }
+
+    def place_bracket_limit_entry(
+        self,
+        side: str,
+        quantity: float,
+        limit_price: float,
+        sl_price: float,
+        tp_price: float,
+        timeout_sec: float,
+        on_order_placed=None,
+    ) -> Optional[Dict]:
+        qty = self._round_qty(quantity)
+        if qty <= 0:
+            return {"_error": True, "_sc": 0, "_raw": {"error": "hyperliquid_qty_rounded_to_zero"}}
+        api_side = str(side or "").upper()
+        is_buy = api_side in {"BUY", "LONG"}
+        self.limiter.wait()
+        try:
+            entry_resp = self.api.place_limit_order(
+                coin=self.symbol,
+                is_buy=is_buy,
+                size=qty,
+                limit_px=float(limit_price),
+                reduce_only=False,
+                tif="Gtc",
+            )
+            parsed = self.api.first_order_result(entry_resp)
+        except Exception as exc:
+            return {"_error": True, "_sc": 0, "_raw": {"error": str(exc)}}
+        if not parsed.get("ok"):
+            return {"_error": True, "_sc": 200, "_raw": parsed.get("raw", entry_resp), "_err_msg": parsed.get("error")}
+        oid = str(parsed.get("oid") or "")
+        if not oid:
+            return {"_error": True, "_sc": 200, "_raw": parsed.get("raw", entry_resp), "_err_msg": "missing_entry_oid"}
+        if on_order_placed is not None:
+            try:
+                on_order_placed(oid)
+            except Exception:
+                pass
+
+        fill_price = float(parsed.get("avg_px") or limit_price)
+        filled_qty = float(parsed.get("total_sz") or 0.0)
+        deadline = time.time() + max(1.0, float(timeout_sec or _cfg("HYPERLIQUID_ENTRY_FILL_TIMEOUT_SEC", 45.0)))
+        poll = max(0.25, float(_cfg("HYPERLIQUID_ENTRY_POLL_SEC", 1.0)))
+        while parsed.get("status") != "FILLED" and time.time() < deadline:
+            time.sleep(poll)
+            state = self._entry_status(oid, float(limit_price), qty)
+            if state["status"] == "FILLED":
+                fill_price = float(state["fill_price"] or limit_price)
+                filled_qty = float(state["filled_qty"] or qty)
+                break
+            if state["status"] == "CANCELLED":
+                return {"_error": True, "_sc": 200, "_raw": state.get("raw_order", {}), "_err_msg": "entry_cancelled_before_fill"}
+        else:
+            if parsed.get("status") == "FILLED":
+                filled_qty = float(parsed.get("total_sz") or qty)
+
+        if filled_qty <= 0:
+            try:
+                self.cancel_order(oid)
+            except Exception:
+                pass
+            return {"_error": True, "_sc": 0, "_raw": {"error": "hyperliquid_entry_fill_timeout", "oid": oid}}
+
+        exit_is_buy = not is_buy
+        try:
+            self.limiter.wait()
+            tpsl_resp = self.api.place_reduce_only_tpsl(
+                coin=self.symbol,
+                is_buy=exit_is_buy,
+                size=filled_qty,
+                stop_px=float(sl_price),
+                target_px=float(tp_price),
+            )
+            child_oids = self.api.child_order_ids(tpsl_resp)
+        except Exception as exc:
+            child_oids = []
+            tpsl_resp = {"error": str(exc)}
+        if len(child_oids) < 2:
+            close_resp = None
+            if bool(_cfg("HYPERLIQUID_EMERGENCY_CLOSE_ON_PROTECTION_FAILURE", True)):
+                try:
+                    close_resp = self.api.market_close(
+                        self.symbol,
+                        filled_qty,
+                        slippage=float(_cfg("HYPERLIQUID_PROTECTION_FAILURE_CLOSE_SLIPPAGE_PCT", 0.05)),
+                    )
+                except Exception as exc:
+                    close_resp = {"error": str(exc)}
+            return {
+                "_error": True,
+                "_sc": 200,
+                "_raw": {"entry_oid": oid, "tpsl_response": tpsl_resp, "emergency_close": close_resp},
+                "_err_msg": "hyperliquid_protection_orders_not_confirmed",
+            }
+
+        return {
+            "order_id": oid,
+            "status": "FILLED",
+            "quantity": float(filled_qty),
+            "price": float(limit_price),
+            "fill_type": "maker",
+            "fill_price": float(fill_price),
+            "bracket_order": True,
+            "bracket_child_verified": True,
+            "bracket_sl_order_id": str(child_oids[0]),
+            "bracket_tp_order_id": str(child_oids[1]),
+            "bracket_sl_price": float(sl_price),
+            "bracket_tp_price": float(tp_price),
+            "protection_model": "HYPERLIQUID_TPSL_AFTER_FILL",
+            "protection_confirmed": True,
+            "paid_commission": 0.0,
+            "paid_commission_exact": False,
+            "_raw_entry": parsed.get("raw", entry_resp),
+            "_raw_tpsl": tpsl_resp,
+        }
+
+    def place_order(self, side: str, order_type: str, quantity: float,
+                    price: Optional[float] = None,
+                    trigger_price: Optional[float] = None,
+                    reduce_only: bool = False,
+                    stop_order_type: Optional[str] = None) -> Optional[Dict]:
+        _ = (trigger_price, stop_order_type)
+        api_side = str(side or "").upper()
+        is_buy = api_side in {"BUY", "LONG"}
+        qty = self._round_qty(quantity)
+        try:
+            if str(order_type or "").upper() == "MARKET" and reduce_only:
+                resp = self.api.market_close(self.symbol, qty)
+                parsed = self.api.first_order_result(resp)
+            else:
+                resp = self.api.place_limit_order(
+                    coin=self.symbol,
+                    is_buy=is_buy,
+                    size=qty,
+                    limit_px=float(price or 0.0),
+                    reduce_only=bool(reduce_only),
+                    tif="Ioc" if str(order_type or "").upper() == "MARKET" else "Gtc",
+                )
+                parsed = self.api.first_order_result(resp)
+        except Exception as exc:
+            return {"_raw": {"error": str(exc)}, "_sc": 0, "_error": True}
+        if not parsed.get("ok"):
+            return {"_raw": parsed.get("raw", resp), "_sc": 200, "_error": True}
+        return {
+            "order_id": str(parsed.get("oid") or ""),
+            "status": "FILLED" if parsed.get("status") == "FILLED" else "PENDING",
+            "quantity": float(parsed.get("total_sz") or qty),
+            "fill_price": float(parsed.get("avg_px") or price or 0.0),
+            "_raw": parsed.get("raw", resp),
+        }
+
+    def cancel_order(self, order_id: str) -> Dict:
+        self.limiter.wait()
+        return self.api.cancel_order(self.symbol, int(order_id)) or {}
+
+    def get_order(self, order_id: str) -> Optional[Dict]:
+        self.limiter.wait()
+        try:
+            return self.api.query_order(int(order_id))
+        except Exception:
+            return None
+
+    def resolve_order_execution(self, order_id: str) -> Optional[Dict]:
+        raw = self.get_order(str(order_id or "").strip())
+        if not isinstance(raw, dict):
+            return None
+        status = self.extract_status(raw)
+        return {
+            "status": status,
+            "fill_price": float(self.extract_fill_price(raw) or 0.0),
+            "filled_qty": float(self.extract_filled_qty(raw) or 0.0),
+            "paid_commission": 0.0,
+            "paid_commission_exact": False,
+            "raw_order": raw,
+        }
+
+    def get_open_orders(self, symbol: str) -> Optional[list]:
+        self.limiter.wait()
+        rows = self.api.open_orders()
+        sym = str(symbol or self.symbol)
+        return [r for r in rows if str(r.get("coin", "")).upper() == sym.upper()]
+
+    def get_positions(self, symbol: str) -> Optional[Dict]:
+        self.limiter.wait()
+        return self.api.user_state()
+
+    def get_balance(self) -> Dict:
+        self.limiter.wait()
+        state = self.api.user_state()
+        summary = state.get("marginSummary") or state.get("crossMarginSummary") or {}
+        account_value = self._num(summary.get("accountValue"), 0.0)
+        withdrawable = self._num(state.get("withdrawable"), account_value)
+        return {
+            "available": withdrawable,
+            "available_raw": withdrawable,
+            "total": account_value,
+            "total_raw": account_value,
+            "currency": "USDC",
+            "source": "hyperliquid_user_state",
+            "raw": state,
+        }
+
+    def set_leverage(self, leverage: int, product_id: Optional[int] = None) -> Dict:
+        _ = product_id
+        self.limiter.wait()
+        resp = self.api.update_leverage(
+            self.symbol,
+            int(leverage),
+            is_cross=bool(getattr(config, "HYPERLIQUID_USE_CROSS_MARGIN", True)),
+        )
+        ok = isinstance(resp, dict) and str(resp.get("status", "")).lower() == "ok"
+        return {"success": ok, "leverage": int(leverage), "raw": resp}
+
+    def normalise_position(self, raw) -> Optional[Dict]:
+        positions = raw.get("assetPositions", []) if isinstance(raw, dict) else []
+        sym = self.symbol.upper()
+        for row in positions:
+            pos = row.get("position", row) if isinstance(row, dict) else {}
+            coin = str(pos.get("coin", "")).upper()
+            if coin != sym:
+                continue
+            signed = self._num(pos.get("szi"), 0.0)
+            size = abs(signed)
+            side = "LONG" if signed > 0 else "SHORT" if signed < 0 else None
+            return {
+                "side": side,
+                "size": size,
+                "entry_price": self._num(pos.get("entryPx"), 0.0),
+                "unrealized_pnl": self._num(pos.get("unrealizedPnl"), 0.0),
+                "raw": pos,
+            }
+        return {"side": None, "size": 0.0, "entry_price": 0.0, "unrealized_pnl": 0.0}
+
+
 class OrderManager:
     """
     Exchange-agnostic order manager.
@@ -1870,6 +2200,8 @@ class OrderManager:
             self._adapter = _DeltaAdapter(api, exchange_instrument=exchange_instrument)
         elif exch == "groww":
             self._adapter = _GrowwAdapter(api, exchange_instrument=exchange_instrument)
+        elif exch == "hyperliquid":
+            self._adapter = _HyperliquidAdapter(api, exchange_instrument=exchange_instrument)
         else:
             self._adapter = _CoinSwitchAdapter(api, exchange_instrument=exchange_instrument)
 
@@ -2590,10 +2922,64 @@ class OrderManager:
             return None  # Adapter does not expose protected entry routing.
 
         cur = self._currency_symbol()
+        qty_note = ""
+        qty_to_contracts = getattr(self._adapter, "_qty_to_contracts", None)
+        if callable(qty_to_contracts):
+            try:
+                qty_note = f" ({int(qty_to_contracts(quantity))} contracts)"
+            except Exception:
+                qty_note = ""
         logger.info(
-            f"[PROTECTED_ENTRY] {side.upper()} {quantity} @ {cur}{limit_price:.2f} "
+            f"[PROTECTED_ENTRY] {side.upper()} {quantity}{qty_note} @ {cur}{limit_price:.2f} "
             f"SL={cur}{sl_price:.2f} TP={cur}{tp_price:.2f} (timeout={timeout_sec:.0f}s)"
         )
+
+        if self._exchange_name == "hyperliquid":
+            try:
+                data = self._adapter.place_bracket_limit_entry(
+                    side=side,
+                    quantity=quantity,
+                    limit_price=limit_price,
+                    sl_price=sl_price,
+                    tp_price=tp_price,
+                    timeout_sec=timeout_sec,
+                    on_order_placed=on_order_placed,
+                )
+            except Exception as exc:
+                self.last_order_error = {
+                    "stage": "hyperliquid_fill_first_tpsl_lifecycle",
+                    "status_code": 0,
+                    "reason": str(exc),
+                    "raw": {"error": str(exc)},
+                }
+                logger.error("Hyperliquid TP/SL lifecycle failed before entry: %s", exc, exc_info=True)
+                return None
+            if not data or data.get("_error"):
+                raw = (data or {}).get("_raw", {})
+                self.last_order_error = {
+                    "stage": "hyperliquid_fill_first_tpsl_lifecycle",
+                    "status_code": (data or {}).get("_sc", 0),
+                    "reason": (data or {}).get("_err_msg") or self._compact_error(raw),
+                    "raw": raw,
+                }
+                logger.error("Hyperliquid protected entry failed: %s raw=%s", self.last_order_error["reason"], raw)
+                return None
+            self._record_order(str(data.get("order_id", "")), {
+                "order_id": str(data.get("order_id", "")),
+                "side": side,
+                "type": "HYPERLIQUID_TPSL_AFTER_FILL",
+                "quantity": float(data.get("quantity", quantity) or quantity),
+                "price": float(limit_price),
+                "status": "FILLED",
+                "timestamp": datetime.now().isoformat(),
+                "bracket_sl_order_id": data.get("bracket_sl_order_id"),
+                "bracket_tp_order_id": data.get("bracket_tp_order_id"),
+            })
+            logger.info(
+                "Hyperliquid protected entry filled order=%s SL=%s TP=%s",
+                data.get("order_id"), data.get("bracket_sl_order_id"), data.get("bracket_tp_order_id"),
+            )
+            return data
 
         if self._exchange_name == "groww":
             try:
@@ -2702,8 +3088,10 @@ class OrderManager:
 
             if status == "FILLED":
                 fill_px = float(details.get("fill_price") or limit_price)
+                filled_qty = float(details.get("filled_qty") or data.get("quantity") or quantity)
                 data["fill_type"]    = "maker"
                 data["fill_price"]   = fill_px
+                data["quantity"]     = filled_qty
                 data["bracket_order"] = True
                 # Propagate exact entry fee from Delta paid_commission
                 data["paid_commission"] = float(details.get("paid_commission", 0) or 0)
@@ -2712,7 +3100,7 @@ class OrderManager:
                             f" fee={cur}{data['paid_commission']:.4f}"
                             f" exact={data['paid_commission_exact']}")
 
-                if data.get("protection_model") in {"GROWW_OCO_AFTER_FILL"}:
+                if data.get("protection_model") in {"GROWW_OCO_AFTER_FILL", "HYPERLIQUID_TPSL_AFTER_FILL"}:
                     # Groww OCO protection was already confirmed after the actual
                     # option fill; do not search the normal order book for
                     # Delta-style bracket children.

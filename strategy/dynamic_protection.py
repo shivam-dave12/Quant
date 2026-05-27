@@ -46,6 +46,16 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, float(value)))
 
 
+def _lookup_float_map(name: str, keys: Iterable[str], default: float = 0.0) -> float:
+    raw = _cfg(name, {})
+    if not isinstance(raw, Mapping):
+        return float(default)
+    for key in keys:
+        if key in raw:
+            return _num(raw.get(key), default)
+    return float(default)
+
+
 @dataclass(frozen=True)
 class SignalDecayEstimate:
     ready: bool
@@ -281,10 +291,14 @@ class DynamicProtectionPlanBuilder:
         position_notional: float = 0.0,
         quantity: float = 0.0,
         option_state: Mapping[str, Any] | None = None,
+        market_state: Mapping[str, Any] | None = None,
     ) -> ProtectionPlan:
         price = max(0.0, float(entry_price or 0.0))
         if price <= 0 or volatility_price <= 0:
             return ProtectionPlan(price, price, price, protection_type, False, ["dynamic_protection_volatility_unavailable"], diagnostics={})
+        market = dict(market_state or {})
+        asset_key = str(market.get("asset_id") or self.asset_id or asset_class or "").upper()
+        venue_key = str(market.get("venue") or "").lower()
         impact = self.kyle_impact(exit_notional=position_notional) if asset_class != "option" else KyleImpactEstimate(False, 0, exit_notional=position_notional, reason="option_feed_has_no_signed_ofi_impact_estimator")
         impact_bps = float(impact.expected_exit_impact_bps or 0.0)
         total_exit_cost_bps = max(1e-9, float(execution_cost_bps or 0.0) + impact_bps)
@@ -301,15 +315,46 @@ class DynamicProtectionPlanBuilder:
             diagnostics = {"signal_decay": asdict(decay), "kyle_impact": asdict(impact), "vpin": asdict(toxicity)}
             return ProtectionPlan(price, price, price, protection_type, False, [toxicity.reason], diagnostics=diagnostics)
         stop_mult = toxicity.stop_multiplier if toxicity.ready else 1.0
-        base_stop = max(
-            float(volatility_price) * float(_cfg("DYNAMIC_PROTECTION_VOL_STOP_MULT", 1.25)),
-            price * float(_cfg("DYNAMIC_PROTECTION_MIN_STOP_BPS", 8.0)) / 10000.0,
+        geometry_enabled = bool(_cfg("DYNAMIC_PROTECTION_MARKET_AWARE_GEOMETRY_ENABLED", True))
+        base_min_stop_bps = float(_cfg("DYNAMIC_PROTECTION_MIN_STOP_BPS", 8.0))
+        asset_min_stop_bps = _lookup_float_map("DYNAMIC_PROTECTION_ASSET_MIN_STOP_BPS", (asset_key,), 0.0)
+        venue_min_stop_bps = _lookup_float_map(
+            "DYNAMIC_PROTECTION_VENUE_ASSET_MIN_STOP_BPS",
+            (f"{venue_key}:{asset_key}", venue_key, asset_key),
+            0.0,
         )
+        min_stop_bps = max(base_min_stop_bps, asset_min_stop_bps, venue_min_stop_bps)
+        vol_floor = float(volatility_price) * float(_cfg("DYNAMIC_PROTECTION_VOL_STOP_MULT", 1.25))
+        min_bps_floor = price * min_stop_bps / 10000.0
+        spread_bps = max(0.0, _num(market.get("spread_bps"), 0.0))
+        tick_size = max(0.0, _num(market.get("price_tick"), 0.0))
+        near_depth = max(0.0, _num(market.get("near_touch_depth_usd"), 0.0))
+        spread_floor = price * spread_bps * float(_cfg("DYNAMIC_PROTECTION_SPREAD_STOP_MULT", 6.0)) / 10000.0 if geometry_enabled else 0.0
+        tick_floor = tick_size * float(_cfg("DYNAMIC_PROTECTION_MIN_STOP_TICKS", 12.0)) if geometry_enabled else 0.0
+        cost_floor = price * total_exit_cost_bps * float(_cfg("DYNAMIC_PROTECTION_COST_STOP_MULT", 2.5)) / 10000.0 if geometry_enabled else 0.0
+        depth_floor = 0.0
+        if geometry_enabled and asset_class != "option" and position_notional > 0:
+            min_coverage = max(1e-9, float(_cfg("DYNAMIC_PROTECTION_DEPTH_STRESS_MIN_COVERAGE", 4.0)))
+            stress_bps = max(0.0, float(_cfg("DYNAMIC_PROTECTION_DEPTH_STRESS_STOP_BPS", 18.0)))
+            coverage = near_depth / max(float(position_notional), 1e-9)
+            if coverage < min_coverage:
+                depth_floor = price * stress_bps * (1.0 - max(0.0, coverage) / min_coverage) / 10000.0
+        base_stop = max(vol_floor, min_bps_floor, spread_floor, tick_floor, cost_floor, depth_floor)
         stop_distance = base_stop * stop_mult
         floor_rr = float(_cfg("DYNAMIC_PROTECTION_OPTION_RR_FLOOR", 1.10) if asset_class == "option" else _cfg("DYNAMIC_PROTECTION_RR_FLOOR", 1.15))
+        policy_min_rr = _num(market.get("policy_min_rr"), 0.0)
+        if policy_min_rr > 0:
+            floor_rr = max(floor_rr, policy_min_rr)
         ceiling_rr = float(_cfg("DYNAMIC_PROTECTION_RR_CAP", 5.0))
+        policy_max_rr = _num(market.get("policy_max_rr"), 0.0)
+        if policy_max_rr > 0:
+            ceiling_rr = min(ceiling_rr, max(policy_max_rr, floor_rr))
+        ceiling_rr = max(floor_rr, ceiling_rr)
         edge_scalar = _clamp(float(gross_edge_bps or 0.0) / total_exit_cost_bps, floor_rr, ceiling_rr)
-        target_distance = stop_distance * edge_scalar
+        min_target_bps = _lookup_float_map("DYNAMIC_PROTECTION_ASSET_MIN_TARGET_BPS", (asset_key,), 0.0)
+        min_target_rr = (price * min_target_bps / 10000.0) / max(stop_distance, 1e-9) if min_target_bps > 0 else 0.0
+        target_rr = _clamp(max(edge_scalar, min_target_rr), floor_rr, ceiling_rr)
+        target_distance = stop_distance * target_rr
         if direction in {Direction.LONG, Direction.BULLISH}:
             stop_price = price - stop_distance
             target_price = price + target_distance
@@ -326,9 +371,28 @@ class DynamicProtectionPlanBuilder:
             "stop_distance": stop_distance,
             "target_distance": target_distance,
             "edge_scalar_rr": edge_scalar,
+            "target_rr": target_rr,
             "gross_edge_bps": gross_edge_bps,
             "execution_cost_bps": execution_cost_bps,
             "total_exit_cost_including_impact_bps": total_exit_cost_bps,
+            "market_geometry": {
+                "enabled": geometry_enabled,
+                "asset_id": asset_key,
+                "venue": venue_key,
+                "spread_bps": spread_bps,
+                "price_tick": tick_size,
+                "near_touch_depth_usd": near_depth,
+                "min_stop_bps": min_stop_bps,
+                "volatility_floor_distance": vol_floor,
+                "min_bps_floor_distance": min_bps_floor,
+                "spread_floor_distance": spread_floor,
+                "tick_floor_distance": tick_floor,
+                "cost_floor_distance": cost_floor,
+                "depth_floor_distance": depth_floor,
+                "policy_min_rr": policy_min_rr,
+                "policy_max_rr": policy_max_rr,
+                "asset_min_target_bps": min_target_bps,
+            },
             "signal_decay": asdict(decay),
             "kyle_impact": asdict(impact),
             "vpin": asdict(toxicity),

@@ -1,8 +1,9 @@
-"""Read-only Hyperliquid reference feed for cross-venue BTC alpha.
+"""Hyperliquid public market-data feed.
 
-This manager is intentionally market-data only.  It never exposes order routing
-or credentials and cannot become the execution venue.  It subscribes to the
-official public ``l2Book`` and ``trades`` WebSocket channels.
+It subscribes to the official public ``l2Book`` and ``trades`` WebSocket
+channels.  Whether the state is executable is set explicitly by the caller;
+order routing still lives in ``exchanges.hyperliquid.api`` and
+``execution.order_manager``.
 """
 from __future__ import annotations
 
@@ -10,6 +11,7 @@ import json
 import logging
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict
 
 import websocket
@@ -31,25 +33,44 @@ def _cfg(name: str, default: Any) -> Any:
 
 
 class HyperliquidReferenceDataManager:
-    """Public BTC reference-state stream; excluded automatically when unhealthy."""
+    """Public Hyperliquid stream; excluded automatically when unhealthy."""
 
     venue = "hyperliquid"
 
-    def __init__(self, coin: str = "BTC", *, testnet: bool | None = None) -> None:
-        self.coin = str(coin or "BTC").upper()
+    def __init__(
+        self,
+        coin: str = "BTC",
+        *,
+        testnet: bool | None = None,
+        execution_enabled: bool = False,
+        instrument=None,
+        canonical_underlying: str | None = None,
+        price_tick: float = 0.01,
+        qty_step: float = 0.00001,
+    ) -> None:
+        self.instrument = instrument
+        raw_coin = str(coin or "BTC").strip()
+        if ":" in raw_coin:
+            dex, name = raw_coin.split(":", 1)
+            self.coin = f"{dex.lower()}:{name.upper()}"
+        else:
+            self.coin = raw_coin.upper()
         use_testnet = bool(_cfg("HYPERLIQUID_TESTNET", False) if testnet is None else testnet)
         self.url = "wss://api.hyperliquid-testnet.xyz/ws" if use_testnet else "wss://api.hyperliquid.xyz/ws"
         self.symbol = self.coin
         self._mapping = InstrumentMapping(
-            venue="hyperliquid", venue_symbol=self.coin, canonical_underlying=self.coin,
+            venue="hyperliquid",
+            venue_symbol=self.coin,
+            canonical_underlying=str(canonical_underlying or getattr(instrument, "asset_id", self.coin)).upper(),
             product_class="linear_perp", quote_currency="USD", contract_multiplier=1.0,
-            settlement_currency="USDC", price_tick=0.01, qty_step=0.00001,
-            execution_enabled=False, notional_model="linear",
+            settlement_currency="USDC", price_tick=float(price_tick or 0.01), qty_step=float(qty_step or 0.00001),
+            execution_enabled=bool(execution_enabled), notional_model="linear",
         )
         self._tracker = MicrostructureTracker(self._mapping)
         self._latency = LatencyBaseline()
         self._lock = threading.RLock()
         self._book: dict[str, list[list[float]]] = {"bids": [], "asks": []}
+        self._recent_trades: list[dict[str, Any]] = []
         self._last_update_s = 0.0
         self._latest_latency_ms: float | None = None
         self._latest_latency_z: float | None = None
@@ -173,6 +194,15 @@ class HyperliquidReferenceDataManager:
                         side = str(row.get("side") or "").upper()
                         if px > 0 and qty > 0:
                             self._tracker.record_trade(price=px, quantity=qty, buyer_aggressor=(side == "B"), timestamp_s=now)
+                            self._recent_trades.append({
+                                "price": px,
+                                "quantity": qty,
+                                "side": "buy" if side == "B" else "sell",
+                                "timestamp": now,
+                                "source": "hyperliquid",
+                            })
+                            if len(self._recent_trades) > 500:
+                                del self._recent_trades[:-500]
         except Exception as exc:
             logger.debug("Hyperliquid reference message parse failed: %s", exc)
 
@@ -197,3 +227,86 @@ class HyperliquidReferenceDataManager:
         rel = self.get_feed_reliability()
         health = score_feed_health(**rel)
         return build_venue_microstate(mapping=self._mapping, bids=bids, asks=asks, feed_health=health, receive_ts_ns=ts_ns, **flows)
+
+    def register_strategy(self, strategy) -> None:
+        self._strategy_ref = strategy
+
+    def get_last_price(self) -> float:
+        with self._lock:
+            bids, asks = self._book["bids"], self._book["asks"]
+            if bids and asks:
+                return (float(bids[0][0]) + float(asks[0][0])) / 2.0
+        return 0.0
+
+    def get_orderbook(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "bids": list(self._book["bids"]),
+                "asks": list(self._book["asks"]),
+                "timestamp": self._last_update_s or time.time(),
+            }
+
+    def get_recent_trades_raw(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self._recent_trades)
+
+    def get_last_update(self):
+        with self._lock:
+            ts = self._last_update_s
+        return datetime.fromtimestamp(ts, tz=timezone.utc) if ts > 0 else None
+
+    def is_price_fresh(self, max_stale_seconds: float = 90.0) -> bool:
+        with self._lock:
+            ts = float(self._last_update_s or 0.0)
+        return ts > 0 and (time.time() - ts) <= float(max_stale_seconds)
+
+    def get_candles(self, timeframe: str = "5m", limit: int = 100) -> list[dict[str, Any]]:
+        try:
+            from hyperliquid.info import Info
+            from hyperliquid.utils import constants
+
+            use_testnet = bool(_cfg("HYPERLIQUID_TESTNET", False))
+            base_url = constants.TESTNET_API_URL if use_testnet else constants.MAINNET_API_URL
+            dexs = list(_cfg("HYPERLIQUID_PERP_DEXS", ("", "xyz", "km")) or [""])
+            info = Info(base_url, skip_ws=True, perp_dexs=dexs, timeout=float(_cfg("REQUEST_TIMEOUT", 30.0)))
+            tf = str(timeframe or "5m")
+            minutes = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}.get(tf, 5)
+            end_ms = int(time.time() * 1000)
+            start_ms = end_ms - max(1, int(limit)) * minutes * 60_000
+            rows = info.candles_snapshot(self.coin, tf, start_ms, end_ms) or []
+            out = []
+            for row in rows[-max(1, int(limit)):]:
+                out.append({
+                    "timestamp": float(row.get("t", 0) or 0) / 1000.0,
+                    "open": float(row.get("o", 0.0) or 0.0),
+                    "high": float(row.get("h", 0.0) or 0.0),
+                    "low": float(row.get("l", 0.0) or 0.0),
+                    "close": float(row.get("c", 0.0) or 0.0),
+                    "volume": float(row.get("v", 0.0) or 0.0),
+                })
+            return out
+        except Exception as exc:
+            logger.debug("Hyperliquid candles unavailable for %s %s: %s", self.coin, timeframe, exc)
+            return []
+
+
+class HyperliquidDataManager(HyperliquidReferenceDataManager):
+    """Executable Hyperliquid market-data manager for a confirmed instrument."""
+
+    def __init__(self, instrument=None, coin: str | None = None, **kwargs) -> None:
+        ex_inst = None
+        try:
+            from core.instruments import ExchangeName
+            ex_inst = (instrument.by_exchange or {}).get(ExchangeName.HYPERLIQUID)
+        except Exception:
+            ex_inst = None
+        symbol = coin or getattr(ex_inst, "symbol", None) or "BTC"
+        super().__init__(
+            symbol,
+            instrument=instrument,
+            canonical_underlying=str(getattr(instrument, "asset_id", symbol)).upper(),
+            execution_enabled=bool(kwargs.pop("execution_enabled", True)),
+            price_tick=float(getattr(ex_inst, "tick_size", 0.01) or 0.01),
+            qty_step=float(getattr(ex_inst, "lot_step", 0.00001) or 0.00001),
+            **kwargs,
+        )

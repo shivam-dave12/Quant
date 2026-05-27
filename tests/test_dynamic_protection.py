@@ -87,6 +87,41 @@ def test_dynamic_plan_uses_signal_edge_cost_and_liquidation_schedule(monkeypatch
     assert plan.diagnostics["almgren_chriss"]["ready"] is True
 
 
+def test_dynamic_plan_uses_spread_tick_and_policy_floors_for_silver(monkeypatch):
+    monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_REQUIRE_SIGNAL_DECAY_READY", False, raising=False)
+    monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_FOR_DELTA", False, raising=False)
+    monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_FOR_DELTA", False, raising=False)
+    monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_ASSET_MIN_STOP_BPS", {"SILVER": 45.0}, raising=False)
+    monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_VENUE_ASSET_MIN_STOP_BPS", {"hyperliquid:SILVER": 60.0}, raising=False)
+    monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_ASSET_MIN_TARGET_BPS", {"SILVER": 100.0}, raising=False)
+    engine = DynamicProtectionPlanBuilder("SILVER")
+    plan = engine.build_plan(
+        direction=Direction.LONG,
+        entry_price=30.0,
+        volatility_price=0.01,
+        gross_edge_bps=12.0,
+        execution_cost_bps=2.0,
+        protection_type="VENUE_NATIVE_BRACKET",
+        asset_class="commodity",
+        position_notional=5000.0,
+        quantity=100.0,
+        market_state={
+            "asset_id": "SILVER",
+            "venue": "hyperliquid",
+            "spread_bps": 10.0,
+            "price_tick": 0.01,
+            "near_touch_depth_usd": 20000.0,
+            "policy_min_rr": 2.20,
+            "policy_max_rr": 5.50,
+        },
+    )
+    stop_distance = plan.entry_price - plan.stop_price
+    target_distance = plan.target_price - plan.entry_price
+    assert stop_distance >= 30.0 * 60.0 / 10000.0 - 1e-9
+    assert target_distance / stop_distance >= 2.20
+    assert plan.diagnostics["market_geometry"]["spread_floor_distance"] >= 30.0 * 60.0 / 10000.0
+
+
 def test_option_greek_exit_diagnostics_fires_on_delta_iv_and_theta(monkeypatch):
     monkeypatch.setattr(dp.config, "DYNAMIC_OPTION_EXIT_MIN_ABS_DELTA", 0.10, raising=False)
     monkeypatch.setattr(dp.config, "DYNAMIC_OPTION_EXIT_IV_COLLAPSE_ABS", 0.02, raising=False)

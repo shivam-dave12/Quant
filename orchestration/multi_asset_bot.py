@@ -34,8 +34,11 @@ except Exception:  # optional venue dependency; other desks remain operational
 from exchanges.delta.api import DeltaAPI
 from exchanges.delta.data_manager import DeltaDataManager
 try:
-    from exchanges.hyperliquid.data_manager import HyperliquidReferenceDataManager
+    from exchanges.hyperliquid.api import HyperliquidAPI
+    from exchanges.hyperliquid.data_manager import HyperliquidDataManager, HyperliquidReferenceDataManager
 except Exception:
+    HyperliquidAPI = None  # type: ignore
+    HyperliquidDataManager = None  # type: ignore
     HyperliquidReferenceDataManager = None  # type: ignore
 try:
     from exchanges.groww.api import GrowwRestClient
@@ -51,7 +54,7 @@ from risk.risk_manager import RiskManager
 from orchestration.portfolio_manager import PortfolioManager, PortfolioRiskManager
 from core.market_policy import active_policy
 from strategy.institutional_strategy import InstitutionalStrategy
-from telegram.notifier import send_telegram_message
+from telegram.notifier import TelegramLogHandler, install_global_telegram_log_handler, send_telegram_message
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +114,8 @@ class MultiAssetInstitutionalBot:
     def _build_api_clients(self):
         has_delta = bool(config.DELTA_API_KEY and config.DELTA_SECRET_KEY)
         has_cs = bool(config.COINSWITCH_API_KEY and config.COINSWITCH_SECRET_KEY and CoinSwitchAPI is not None and CoinSwitchDataManager is not None)
+        wants_hl = bool(getattr(config, "HYPERLIQUID_REFERENCE_ENABLED", False) or getattr(config, "HYPERLIQUID_EXECUTION_ENABLED", False))
+        has_hl = bool(wants_hl and HyperliquidAPI is not None)
 
         wants_groww_discovery = bool(getattr(config, "GROWW_DISCOVERY_ENABLED", False))
         wants_groww_runtime = bool(getattr(config, "GROWW_OPTIONS_RUNTIME_ENABLED", False))
@@ -126,13 +131,14 @@ class MultiAssetInstitutionalBot:
         delta_api = DeltaAPI(config.DELTA_API_KEY, config.DELTA_SECRET_KEY,
                              testnet=getattr(config, "DELTA_TESTNET", False)) if has_delta else None
         cs_api = CoinSwitchAPI(config.COINSWITCH_API_KEY, config.COINSWITCH_SECRET_KEY) if has_cs else None
+        hl_api = HyperliquidAPI.from_config() if has_hl else None
         groww_api = GrowwRestClient() if has_groww else None
         if wants_groww_runtime and not has_groww_runtime_keys:
             logger.warning(
                 "Groww runtime enabled but access token/API key credentials are missing; "
                 "NIFTY discovery can continue, protected Groww data/order calls will wait for credentials."
             )
-        return delta_api, cs_api, groww_api
+        return delta_api, cs_api, hl_api, groww_api
 
     @staticmethod
     def _is_groww_context(ctx: AssetContext) -> bool:
@@ -932,16 +938,23 @@ class MultiAssetInstitutionalBot:
 
     def initialize(self) -> bool:
         try:
+            root_logger = logging.getLogger()
+            if not any(isinstance(h, TelegramLogHandler) for h in root_logger.handlers):
+                install_global_telegram_log_handler(
+                    level=getattr(logging, str(getattr(config, "TELEGRAM_LOG_LEVEL", "WARNING")).upper(), logging.WARNING),
+                    throttle_seconds=float(getattr(config, "TELEGRAM_LOG_THROTTLE_SEC", 5.0)),
+                )
             logger.info("=" * 92)
             logger.info("⚡ MULTI-ASSET INSTITUTIONAL LIQUIDITY SCANNER")
             logger.info("   Live exchange catalogs only — stock desk suspended; no synthetic feeds")
             logger.info("=" * 92)
-            delta_api, cs_api, groww_api = self._build_api_clients()
+            delta_api, cs_api, hl_api, groww_api = self._build_api_clients()
             self.registry = InstrumentRegistry(execution_preference=getattr(config, "EXECUTION_EXCHANGE", "delta"))
             requested = self._filter_suspended_requests(getattr(config, "MULTI_ASSET_REQUESTS", None))
             self.discovery_report = self.registry.discover(
                 delta_api=delta_api,
                 coinswitch_api=cs_api,
+                hyperliquid_api=hl_api,
                 groww_api=groww_api,
                 include_exchanges=getattr(config, "UNIVERSE_INCLUDE_EXCHANGES", "delta,coinswitch"),
                 groww_security_master_url=getattr(config, "GROWW_INSTRUMENTS_CSV_URL", None),
@@ -956,7 +969,7 @@ class MultiAssetInstitutionalBot:
                 return False
 
             for inst in self.discovery_report.matched:
-                ctx = self._build_asset_context(inst, delta_api, cs_api, groww_api)
+                ctx = self._build_asset_context(inst, delta_api, cs_api, hl_api, groww_api)
                 if ctx is not None:
                     self.contexts.append(ctx)
             if not self.contexts:
@@ -968,30 +981,46 @@ class MultiAssetInstitutionalBot:
             logger.exception("MultiAssetInstitutionalBot initialisation failed")
             return False
 
-    def _build_asset_context(self, inst: TradableInstrument, delta_api, cs_api, groww_api=None) -> Optional[AssetContext]:
+    def _build_asset_context(self, inst: TradableInstrument, delta_api, cs_api, hl_api=None, groww_api=None) -> Optional[AssetContext]:
         primary_ex = inst.primary_exchange
         cs_om = None
         delta_om = None
         groww_om = None
+        hl_om = None
         if ExchangeName.COINSWITCH in inst.by_exchange and cs_api is not None:
             cs_om = OrderManager(cs_api, exchange_name="coinswitch", instrument=inst)
         if ExchangeName.DELTA in inst.by_exchange and delta_api is not None:
             delta_om = OrderManager(delta_api, exchange_name="delta", instrument=inst)
         if ExchangeName.GROWW in inst.by_exchange and groww_api is not None:
             groww_om = OrderManager(groww_api, exchange_name="groww", instrument=inst)
-        if not cs_om and not delta_om and not groww_om:
+        if (
+            ExchangeName.HYPERLIQUID in inst.by_exchange
+            and hl_api is not None
+            and getattr(hl_api, "exchange", None) is not None
+            and bool(getattr(config, "HYPERLIQUID_EXECUTION_ENABLED", False))
+        ):
+            hl_om = OrderManager(hl_api, exchange_name="hyperliquid", instrument=inst)
+        if not cs_om and not delta_om and not groww_om and not hl_om:
             logger.warning("%s skipped: no executable order manager", inst.asset_id)
             return None
-        router = ExecutionRouter(coinswitch_om=cs_om, delta_om=delta_om, groww_om=groww_om, default=primary_ex.value)
+        router = ExecutionRouter(coinswitch_om=cs_om, delta_om=delta_om, groww_om=groww_om, hyperliquid_om=hl_om, default=primary_ex.value)
 
         reference_dms = []
+        def add_hyperliquid_reference() -> None:
+            if not bool(getattr(config, "HYPERLIQUID_REFERENCE_ENABLED", False)):
+                return
+            if HyperliquidDataManager is None or ExchangeName.HYPERLIQUID not in inst.by_exchange:
+                return
+            reference_dms.append(HyperliquidDataManager(
+                instrument=inst,
+                execution_enabled=hl_om is not None,
+            ))
+
         if primary_ex == ExchangeName.DELTA:
             primary_dm = DeltaDataManager(instrument=inst)
             secondary_dm = CoinSwitchDataManager(instrument=inst) if ExchangeName.COINSWITCH in inst.by_exchange and cs_api else None
             analysis_dm = None
-            if (inst.asset_id.upper() == "BTC" and bool(getattr(config, "HYPERLIQUID_REFERENCE_ENABLED", False))
-                    and HyperliquidReferenceDataManager is not None):
-                reference_dms.append(HyperliquidReferenceDataManager("BTC"))
+            add_hyperliquid_reference()
         elif primary_ex == ExchangeName.GROWW:
             if GrowwOptionDataManager is None or GrowwUnderlyingDataManager is None or groww_api is None:
                 logger.warning("%s skipped: Groww data managers unavailable", inst.asset_id)
@@ -999,10 +1028,24 @@ class MultiAssetInstitutionalBot:
             primary_dm = GrowwOptionDataManager(instrument=inst, api=groww_api)
             secondary_dm = None
             analysis_dm = GrowwUnderlyingDataManager(instrument=inst, api=groww_api)
+            add_hyperliquid_reference()
+        elif primary_ex == ExchangeName.HYPERLIQUID:
+            if HyperliquidDataManager is None:
+                logger.warning("%s skipped: Hyperliquid data manager unavailable", inst.asset_id)
+                return None
+            primary_dm = HyperliquidDataManager(instrument=inst, execution_enabled=hl_om is not None)
+            if ExchangeName.DELTA in inst.by_exchange and delta_api is not None:
+                secondary_dm = DeltaDataManager(instrument=inst)
+            elif ExchangeName.COINSWITCH in inst.by_exchange and cs_api is not None:
+                secondary_dm = CoinSwitchDataManager(instrument=inst)
+            else:
+                secondary_dm = None
+            analysis_dm = None
         else:
             primary_dm = CoinSwitchDataManager(instrument=inst)
             secondary_dm = DeltaDataManager(instrument=inst) if ExchangeName.DELTA in inst.by_exchange and delta_api else None
             analysis_dm = None
+            add_hyperliquid_reference()
         data = MarketAggregator(primary_dm=primary_dm, secondary_dm=secondary_dm, instrument=inst, analysis_dm=analysis_dm, reference_dms=reference_dms)
 
         # Context is created after the risk manager, so use a tiny holder to let
@@ -1360,4 +1403,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

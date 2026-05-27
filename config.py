@@ -18,21 +18,31 @@ load_dotenv()
 # ── OPERATOR CONTROL PANEL — change policy only here, never in .env ───────────
 # LIVE TRADING MASTER SWITCH. Keep False for shadow validation. Change only this
 # line to True once the live venues below are explicitly approved.
-LIVE_TRADING_ENABLED = True
+LIVE_TRADING_ENABLED = False
 
 # Analysis may run across all configured feeds. Orders may route ONLY to venues
 # explicitly listed in LIVE_EXECUTION_VENUES when LIVE_TRADING_ENABLED=True.
 # Safe first-live default: Groww/NIFTY only; add "delta" deliberately later.
-ANALYSIS_DATA_VENUES = ("delta", "coinswitch", "groww")
-LIVE_EXECUTION_VENUES = ("groww","delta", "coinswitch")
+ANALYSIS_DATA_VENUES = ("delta", "coinswitch", "hyperliquid", "groww")
+LIVE_EXECUTION_VENUES = ("groww", "delta", "coinswitch", "hyperliquid")
 EXECUTION_EXCHANGE = "delta"  # legacy discovery preference; not live-order permission
 
 # Venue activation / environments are runtime policy, not secrets.
 DELTA_TESTNET = False
 GROWW_ENABLED = True
-HYPERLIQUID_REFERENCE_ENABLED = False  # read-only BTC reference feed; never routes orders
+HYPERLIQUID_REFERENCE_ENABLED = True
+HYPERLIQUID_EXECUTION_ENABLED = True
 HYPERLIQUID_TESTNET = False
 HYPERLIQUID_RECONNECT_SEC = 3.0
+HYPERLIQUID_PERP_DEXS = ("", "xyz", "km")
+HYPERLIQUID_REFERENCE_COIN_BY_ASSET = {
+    "BTC": "BTC",
+    "GOLD": "PAXG",
+    "SILVER": "xyz:SILVER",
+}
+PREFERRED_EXECUTION_VENUE_BY_ASSET = {
+    "SILVER": "hyperliquid",
+}
 
 # ── Credentials — .env may contain ONLY values in this section ────────────────
 DELTA_API_KEY             = os.getenv("DELTA_API_KEY",    "")
@@ -46,6 +56,10 @@ def _first_env(*names: str) -> str:
         if str(value or "").strip():
             return str(value).strip()
     return ""
+
+HYPERLIQUID_MAIN_API_KEY   = _first_env("HYPERLIQUID_MAIN_API_KEY", "HYPERLIQUID_ACCOUNT_ADDRESS")
+HYPERLIQUID_WALLET_API_KEY = _first_env("HYPERLIQUID_WALLET_API_KEY", "HYPERLIQUID_API_WALLET_ADDRESS")
+HYPERLIQUID_PRIVATE_KEY    = _first_env("HYPERLIQUID_PRIVATE_KEY")
 
 # Official Groww credential modes:
 #   TOTP: GROWW_TOTP_TOKEN + GROWW_TOTP_SECRET
@@ -65,12 +79,12 @@ GROWW_AUTH_CONFIGURED     = bool(
 TELEGRAM_BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID          = os.getenv("TELEGRAM_CHAT_ID",   "")
 
-if not DELTA_API_KEY and not COINSWITCH_API_KEY and not GROWW_AUTH_CONFIGURED:
+if not DELTA_API_KEY and not COINSWITCH_API_KEY and not GROWW_AUTH_CONFIGURED and not HYPERLIQUID_PRIVATE_KEY:
     raise ValueError("No exchange credentials in .env. For Groww TOTP set GROWW_TOTP_TOKEN and GROWW_TOTP_SECRET.")
 
 # ── Symbol / Leverage ─────────────────────────────────────────────────────────
 SYMBOL                   = "BTCUSDT"
-LEVERAGE                 = 5   # hard execution ceiling; do not expose the account to 45x config drift
+LEVERAGE                 = 15  # aggressive, still bounded by live product caps and SL-risk sizing
 DELTA_SYMBOL             = "BTCUSD"
 DELTA_CONTRACT_VALUE_BTC = 0.001
 DELTA_BALANCE_CURRENCY   = "USD"
@@ -127,6 +141,17 @@ REQUEST_TIMEOUT                  = 30
 # + standalone conditionals. CoinSwitch still uses standalone SL/TP because it
 # has no Delta-style native bracket endpoint.
 DELTA_REQUIRE_NATIVE_BRACKET      = True
+
+# Hyperliquid protected-entry lifecycle. Entry is a priced limit; after an
+# acknowledged fill the adapter submits reduce-only TP/SL trigger orders. If
+# protection cannot be armed, the adapter sends a reduce-only market close when
+# enabled below and reports the failure to Telegram through the strategy.
+HYPERLIQUID_ENTRY_FILL_TIMEOUT_SEC = 45.0
+HYPERLIQUID_ENTRY_POLL_SEC = 1.0
+HYPERLIQUID_TRIGGER_MARKET_SLIPPAGE_PCT = 0.10
+HYPERLIQUID_EMERGENCY_CLOSE_ON_PROTECTION_FAILURE = True
+HYPERLIQUID_PROTECTION_FAILURE_CLOSE_SLIPPAGE_PCT = 0.05
+HYPERLIQUID_USE_CROSS_MARGIN = True
 
 # ── Data / Readiness ──────────────────────────────────────────────────────────
 READY_TIMEOUT_SEC    = 120.0
@@ -247,8 +272,25 @@ INSTITUTIONAL_FLOW_DISLOCATION_WEIGHT = 0.50
 INSTITUTIONAL_RISK_FRACTION_PER_TRADE = 0.0025
 INSTITUTIONAL_QUARTER_KELLY = 0.25
 INSTITUTIONAL_TARGET_OBSERVATION_VOL_BPS = 10.0
+INSTITUTIONAL_MAX_SELECTED_LEVERAGE = 15.0
 INSTITUTIONAL_CORRELATED_EXPOSURE_CAP_FRACTION = 0.35
 RESEARCH_STORE_PATH = "research_output"
+
+# Cross-venue execution venue selection. The selector prices spread, depth
+# impact, taker fee assumptions and same-asset basis before choosing the venue.
+VENUE_SELECTION_ENABLED = True
+VENUE_SELECTION_MIN_IMPROVEMENT_BPS = 0.50
+VENUE_SELECTION_NOTIONAL_FRACTION = 0.25
+VENUE_SELECTION_MAX_COST_BPS = 100.0
+VENUE_FEE_BPS = {
+    "delta": 1.50,
+    "coinswitch": 2.00,
+    "hyperliquid": 4.50,
+}
+VENUE_SLIPPAGE_IMPACT_MULTIPLIER = 35.0
+SILVER_HYPERLIQUID_PREFERENCE_BPS = 8.0
+SILVER_DELTA_ILLIQUIDITY_PENALTY_BPS = 15.0
+SILVER_DELTA_MIN_NEAR_DEPTH_USD = 50000.0
 
 # ── Dynamic state-dependent TP/SL and exit model ─────────────────────────────
 # One protection authority for BTC, Delta commodities and Groww long options.
@@ -271,6 +313,26 @@ DYNAMIC_PROTECTION_VPIN_STOP_MULT_MIN = 0.80
 DYNAMIC_PROTECTION_VPIN_STOP_MULT_MAX = 1.80
 DYNAMIC_PROTECTION_VOL_STOP_MULT = 1.25
 DYNAMIC_PROTECTION_MIN_STOP_BPS = 8.0
+DYNAMIC_PROTECTION_MARKET_AWARE_GEOMETRY_ENABLED = True
+DYNAMIC_PROTECTION_SPREAD_STOP_MULT = 6.0
+DYNAMIC_PROTECTION_MIN_STOP_TICKS = 12.0
+DYNAMIC_PROTECTION_COST_STOP_MULT = 2.5
+DYNAMIC_PROTECTION_DEPTH_STRESS_MIN_COVERAGE = 4.0
+DYNAMIC_PROTECTION_DEPTH_STRESS_STOP_BPS = 18.0
+DYNAMIC_PROTECTION_ASSET_MIN_STOP_BPS = {
+    "BTC": 10.0,
+    "GOLD": 22.0,
+    "SILVER": 45.0,
+}
+DYNAMIC_PROTECTION_VENUE_ASSET_MIN_STOP_BPS = {
+    "hyperliquid:SILVER": 55.0,
+    "delta:SILVER": 65.0,
+}
+DYNAMIC_PROTECTION_ASSET_MIN_TARGET_BPS = {
+    "BTC": 20.0,
+    "GOLD": 45.0,
+    "SILVER": 100.0,
+}
 DYNAMIC_PROTECTION_RR_FLOOR = 1.15
 DYNAMIC_PROTECTION_OPTION_RR_FLOOR = 1.10
 DYNAMIC_PROTECTION_RR_CAP = 5.0
@@ -808,7 +870,7 @@ TELEGRAM_LONG_POLL_TIMEOUT_SEC = 2.0  # fast graceful container stop
 def validate_live_control_plane() -> None:
     """Fail closed on live-order policy before any desk can route an order."""
     errors: list[str] = []
-    allowed = {"delta", "coinswitch", "groww"}
+    allowed = {"delta", "coinswitch", "groww", "hyperliquid"}
     live_venues = {str(v).strip().lower() for v in LIVE_EXECUTION_VENUES}
     unknown = live_venues - allowed
     if unknown:
@@ -820,9 +882,11 @@ def validate_live_control_plane() -> None:
             errors.append("Groww live requires GROWW_APPROVED_STATIC_IPS configured in config.py")
         if GROWW_REQUIRE_SEBI_ALGO_CONFIRMATION_FOR_LIVE_ORDERS and not GROWW_SEBI_ALGO_REGISTRATION_CONFIRMED:
             errors.append("Groww live requires GROWW_SEBI_ALGO_REGISTRATION_CONFIRMED=True after broker confirmation")
+    if LIVE_TRADING_ENABLED and "hyperliquid" in live_venues:
+        if HYPERLIQUID_EXECUTION_ENABLED and not HYPERLIQUID_PRIVATE_KEY:
+            errors.append("Hyperliquid live requires HYPERLIQUID_PRIVATE_KEY in .env")
     if errors:
         raise ValueError("Invalid live control plane: " + "; ".join(errors))
 
 
 validate_live_control_plane()
-

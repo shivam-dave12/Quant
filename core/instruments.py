@@ -31,6 +31,7 @@ class ExchangeName(str, Enum):
     DELTA = "delta"
     COINSWITCH = "coinswitch"
     GROWW = "groww"
+    HYPERLIQUID = "hyperliquid"
 
 
 @dataclass(frozen=True)

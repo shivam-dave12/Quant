@@ -23,6 +23,9 @@ from enum import Enum
 from typing import Any, Callable, Mapping, Optional
 
 from core.instruments import ExchangeName, TradableInstrument
+from core.market_policy import active_policy
+from core.pnl import gross_pnl_usd
+from execution.venue_selection import select_execution_venue
 from intelligence.cross_venue_btc import BTCCompositeState, build_btc_composite_state
 from market_data.feed_health import FeedHealth, score_feed_health
 from market_data.normalizer import (
@@ -482,14 +485,79 @@ class InstitutionalStrategy:
                 instrument=instrument, underlying_price=price, regime=regime, feed_health=feed_health,
             )
 
-        execution_state, btc_composite = self._microstructure_context(data_manager, venue, instrument, feed_health)
+        states = self._venue_states(data_manager)
+        execution_state, btc_composite = self._microstructure_context(data_manager, venue, instrument, feed_health, states=states)
         liquidity_score, zones = self._liquidity_score(data_manager, instrument, price, execution_state=execution_state)
         if btc_composite is not None:
             execution_quality = btc_composite.delta_execution_quality_score
         direction, directional_edge_bps, direction_reason, signal_breakdown = self._direction_and_edge(
             desk, price, liquidity_score, execution_state=execution_state, btc_composite=btc_composite
         )
-        cost_components = self._execution_cost_components(data_manager)
+        venue_selection = None
+        if (
+            bool(_cfg("VENUE_SELECTION_ENABLED", True))
+            and direction is not Direction.NO_TRADE
+            and states
+        ):
+            try:
+                routeable = self._routeable_venues(order_manager)
+                venue_selection = select_execution_venue(
+                    states=states,
+                    direction=direction,
+                    asset_id=self._asset_id,
+                    current_venue=venue,
+                    routeable_venues=routeable,
+                    notional_usd=self._venue_selection_notional(risk_manager),
+                )
+                selected_state = states.get(str(venue_selection.selected_venue).lower())
+                if selected_state is not None and venue_selection.selected_venue:
+                    venue = str(venue_selection.selected_venue).lower()
+                    instrument = self._symbol_for_venue(venue, instrument)
+                    desk = self._desk_id(venue, instrument)
+                    execution_state = selected_state
+                    if float(selected_state.mid or 0.0) > 0:
+                        price = float(selected_state.mid)
+                    liquidity_score, zones = self._liquidity_score(data_manager, instrument, price, execution_state=execution_state)
+                    execution_quality = min(execution_quality, float(selected_state.feed_quality_score or 0.0))
+                    selected_composite = btc_composite
+                    if self._asset_id.upper() == "BTC" and "delta" in states:
+                        refs = {k: v for k, v in states.items() if k != "delta"}
+                        selected_composite = build_btc_composite_state(delta_state=states["delta"], reference_states=refs) if refs else None
+                    venue_direction, venue_edge_bps, venue_reason, venue_breakdown = self._direction_and_edge(
+                        desk, price, liquidity_score, execution_state=execution_state, btc_composite=selected_composite
+                    )
+                    if venue_direction is Direction.NO_TRADE:
+                        direction = Direction.NO_TRADE
+                        directional_edge_bps = 0.0
+                        direction_reason = f"selected_venue_signal_reject:{venue}:{venue_reason}"
+                        signal_breakdown = venue_breakdown
+                    elif venue_direction is not direction:
+                        original_direction = direction.value
+                        direction = Direction.NO_TRADE
+                        directional_edge_bps = 0.0
+                        direction_reason = f"selected_venue_signal_disagreement:{original_direction}->{venue_direction.value}:{venue}"
+                        signal_breakdown = {
+                            **venue_breakdown,
+                            "selected_venue_signal_reason": venue_reason,
+                            "pre_selection_direction": original_direction,
+                        }
+                    else:
+                        direction = venue_direction
+                        directional_edge_bps = venue_edge_bps
+                        direction_reason = f"selected_venue_validated:{venue}:{venue_reason}"
+                        signal_breakdown = {
+                            **venue_breakdown,
+                            "selected_venue_signal_reason": venue_reason,
+                        }
+                        btc_composite = selected_composite
+            except Exception as exc:
+                logger.debug("venue selection unavailable: %s", exc)
+                venue_selection = None
+        cost_components = self._execution_cost_components(data_manager, execution_state=execution_state)
+        if venue_selection is not None:
+            cost_components["venue_selection_cost_bps"] = float(venue_selection.selected_cost_bps)
+            if str(venue_selection.selected_venue).lower() != str(venue_selection.current_venue).lower():
+                cost_components["total_cost_bps"] = max(0.0, float(venue_selection.selected_cost_bps))
         costs_bps = cost_components["total_cost_bps"]
         uncertainty_bps = self._uncertainty_bps(regime, liquidity_score, execution_quality)
         net_edge = directional_edge_bps - costs_bps
@@ -512,6 +580,8 @@ class InstitutionalStrategy:
             "execution_quality": execution_quality,
             "regime": regime.value,
             "signal_source": direction_reason,
+            "selected_execution_venue": venue,
+            "selected_execution_symbol": instrument,
             "exit_model_state": {
                 "signal_decay": asdict(decay_state),
                 "kyle_impact": asdict(impact_state),
@@ -519,6 +589,8 @@ class InstitutionalStrategy:
             },
         }
         model_values.update(signal_breakdown)
+        if venue_selection is not None:
+            model_values["venue_selection"] = venue_selection.as_dict()
         if execution_state is not None:
             model_values.update({
                 "ofi_usd_1s": execution_state.ofi_usd_1s,
@@ -565,6 +637,7 @@ class InstitutionalStrategy:
         protection = self._protection_plan(
             desk, direction, price, liquidity_score, data_manager=data_manager,
             gross_edge_bps=directional_edge_bps, costs_bps=costs_bps,
+            venue=venue, instrument=instrument, execution_state=execution_state, regime=regime,
         )
         model_values["dynamic_protection_plan"] = protection.diagnostics if protection is not None else {}
         if protection is None or not protection.protection_feasible:
@@ -586,7 +659,10 @@ class InstitutionalStrategy:
                 research_features=features,
             )
 
-        sizing = self._size_position(desk, instrument, direction, price, net_edge, liquidity_score, protection, risk_manager)
+        sizing = self._size_position(
+            desk, instrument, direction, price, net_edge, liquidity_score, protection, risk_manager,
+            venue=venue, balance_source=self._execution_manager_for(order_manager, venue),
+        )
         if not sizing.approved:
             return self._decision(
                 desk=desk,
@@ -610,6 +686,7 @@ class InstitutionalStrategy:
             desk, direction, price, liquidity_score, data_manager=data_manager,
             gross_edge_bps=directional_edge_bps, costs_bps=costs_bps,
             position_notional=sizing.notional, quantity=sizing.quantity,
+            venue=venue, instrument=instrument, execution_state=execution_state, regime=regime,
         )
         model_values["dynamic_protection_plan"] = protection.diagnostics if protection is not None else {}
         if protection is None or not protection.protection_feasible:
@@ -637,6 +714,28 @@ class InstitutionalStrategy:
                 sizing=sizing,
                 protection_plan=protection,
                 reasons=[live_reason],
+                model_values=model_values,
+                research_features=features,
+            )
+
+        gate_allowed, gate_reason = self._entry_risk_gate(
+            risk_manager, balance_source=self._execution_manager_for(order_manager, venue)
+        )
+        if not gate_allowed:
+            return self._decision(
+                desk=desk,
+                venue=venue,
+                instrument=instrument,
+                decision=DecisionOutput.NO_TRADE_RISK_BUDGET,
+                direction=direction,
+                regime=regime,
+                expected_net_edge_bps=net_edge,
+                uncertainty_bps=uncertainty_bps,
+                liquidity_score=liquidity_score,
+                execution_quality_score=execution_quality,
+                sizing=sizing,
+                protection_plan=protection,
+                reasons=[gate_reason],
                 model_values=model_values,
                 research_features=features,
             )
@@ -861,6 +960,16 @@ class InstitutionalStrategy:
                 sizing=sizing, protection_plan=protection, reasons=[live_reason],
                 model_values=model_values, research_features=features,
             )
+        gate_allowed, gate_reason = self._entry_risk_gate(risk_manager)
+        if not gate_allowed:
+            return self._decision(
+                desk=DeskId.INDIA_OPTIONS.value, venue=venue, instrument=instrument,
+                decision=DecisionOutput.NO_TRADE_RISK_BUDGET, direction=thesis,
+                regime=regime, expected_net_edge_bps=net_edge, uncertainty_bps=uncertainty_bps,
+                liquidity_score=liquidity_score, execution_quality_score=feed_health.quality_score,
+                sizing=sizing, protection_plan=protection, reasons=[gate_reason],
+                model_values=model_values, research_features=features,
+            )
         return self._decision(
             desk=DeskId.INDIA_OPTIONS.value, venue=venue, instrument=instrument,
             decision=DecisionOutput.TRADE_APPROVED_WITH_PROTECTION_PLAN, direction=thesis,
@@ -973,7 +1082,6 @@ class InstitutionalStrategy:
             pass
 
     def _execute_approved(self, decision: OpportunityDecision, order_manager, risk_manager) -> None:
-        _ = risk_manager
         sizing = decision.sizing
         protection = decision.protection_plan
         if sizing is None or protection is None:
@@ -981,7 +1089,40 @@ class InstitutionalStrategy:
         side = "BUY" if decision.direction in {Direction.LONG, Direction.BULLISH} else "SELL"
         if decision.venue == "groww":
             side = "BUY"
-        result = order_manager.place_bracket_limit_entry(
+        execution_manager = self._execution_manager_for(order_manager, decision.venue)
+        set_leverage = getattr(execution_manager, "set_leverage", None)
+        if decision.venue != "groww" and sizing.leverage_selected and callable(set_leverage):
+            try:
+                lev = max(1, int(round(float(sizing.leverage_selected))))
+                lev_res = set_leverage(lev)
+                ok = isinstance(lev_res, Mapping) and bool(lev_res.get("success", True)) and not lev_res.get("_error")
+                if not ok:
+                    try:
+                        execution_manager.last_order_error = {
+                            "stage": "set_leverage",
+                            "status_code": 0,
+                            "reason": str(lev_res)[:300],
+                            "raw": lev_res,
+                        }
+                    except Exception:
+                        pass
+                    self._notify_order_error(decision, execution_manager)
+                    logger.error("%s leverage set failed before protected entry: %s", decision.venue.upper(), lev_res)
+                    return
+            except Exception as exc:
+                try:
+                    execution_manager.last_order_error = {
+                        "stage": "set_leverage",
+                        "status_code": 0,
+                        "reason": str(exc),
+                        "raw": {"error": str(exc)},
+                    }
+                except Exception:
+                    pass
+                self._notify_order_error(decision, execution_manager)
+                logger.error("%s leverage set exception before protected entry: %s", decision.venue.upper(), exc, exc_info=True)
+                return
+        result = execution_manager.place_bracket_limit_entry(
             side,
             sizing.quantity,
             protection.entry_price,
@@ -989,6 +1130,7 @@ class InstitutionalStrategy:
             protection.target_price,
         )
         if not result:
+            self._notify_order_error(decision, execution_manager)
             return
         fill_price = float(result.get("fill_price") or protection.entry_price)
         fill_ts_ns = time.time_ns()
@@ -1012,14 +1154,22 @@ class InstitutionalStrategy:
         except Exception:
             pass
         self._risk_gate.record_trade_start()
+        for method_name, arg in (("notify_entry_placed", None), ("set_position_open", True)):
+            method = getattr(risk_manager, method_name, None)
+            if callable(method):
+                try:
+                    method() if arg is None else method(arg)
+                except Exception:
+                    pass
         record_exposure = getattr(risk_manager, "record_open_exposure", None)
         if callable(record_exposure):
             signed_delta = sizing.notional if side == "BUY" else -sizing.notional
             record_exposure(asset_id=self._asset_id, position_key=f"{decision.desk}:{decision.instrument}", signed_delta_usd=signed_delta)
+        quantity_filled = float(result.get("quantity") or sizing.quantity)
         self._pos = PositionState(
             phase=PositionPhase.ACTIVE,
             side="long" if side == "BUY" else "short",
-            quantity=float(result.get("quantity") or sizing.quantity),
+            quantity=quantity_filled,
             entry_price=fill_price,
             sl_price=protection.stop_price,
             tp_price=protection.target_price,
@@ -1033,16 +1183,27 @@ class InstitutionalStrategy:
             pnl_model="inverse_btcusd" if decision.venue == "delta" and decision.instrument.upper() == "BTCUSD" else "linear",
             currency_symbol="₹" if decision.venue == "groww" else "$",
             currency_code="INR" if decision.venue == "groww" else "USD",
+            quantity_unit=self._quantity_unit_label(decision.venue),
             entry_leverage=float(sizing.leverage_selected or 1.0),
+            entry_fee_paid=float(result.get("paid_commission", 0.0) or 0.0),
+            entry_fee_exact=bool(result.get("paid_commission_exact", False)),
             protection_confirmed=bool(result.get("bracket_child_verified") or result.get("protection_confirmed")),
             protection_model=str(result.get("protection_model") or protection.protection_type),
             quant_components=decision.model_values,
         )
+        self._notify_entry_opened(decision, sizing, protection, result, fill_price, quantity_filled)
 
     def _monitor_position(self, data_manager, order_manager, risk_manager) -> None:
         price = self._safe_price(data_manager)
+        try:
+            state = self._venue_states(data_manager).get(str(self._pos.exchange).lower())
+            if state is not None and float(state.mid or 0.0) > 0:
+                price = float(state.mid)
+        except Exception:
+            pass
         if price <= 0:
             return
+        order_manager = self._execution_manager_for(order_manager, self._pos.exchange)
         self._forward_labels.observe(now_ts_ns=time.time_ns(), current_price=price)
         self._dynamic_exit_supervision(data_manager, order_manager)
         if self._pos.side.lower() == "long":
@@ -1051,19 +1212,234 @@ class InstitutionalStrategy:
         else:
             target_hit = price <= self._pos.tp_price if self._pos.tp_price > 0 else False
             stop_hit = price >= self._pos.sl_price > 0
-        if target_hit or stop_hit:
+        if (target_hit or stop_hit) and self._pos.phase is PositionPhase.ACTIVE:
             self._pos.phase = PositionPhase.EXITING
             self._pos.manual_exit_reason = "target_reached" if target_hit else "stop_reached"
+            self._notify_exit_level_hit("tp_hit" if target_hit else "sl_hit", price)
             return
         try:
             broker_pos = order_manager.get_open_position()
             if isinstance(broker_pos, Mapping) and _num(broker_pos.get("size"), 0.0) <= 0:
+                if not self._finalise_confirmed_exit(order_manager, risk_manager, price):
+                    self._pos.phase = PositionPhase.RECONCILIATION_REQUIRED
+                    self._notify_exit_reconciliation_required(price)
+                    return
                 remove_exposure = getattr(risk_manager, "remove_open_exposure", None)
                 if callable(remove_exposure):
                     remove_exposure(f"{self._desk_id(self._pos.exchange, self._pos.execution_symbol)}:{self._pos.execution_symbol}")
                 self._pos = PositionState(asset_id=self._asset_id)
         except Exception:
             pass
+
+    def _quantity_unit_label(self, venue: str) -> str:
+        try:
+            ei = self._exchange_instrument(venue)
+            base = str(getattr(ei, "base_asset", "") or "").upper()
+            if base:
+                return base
+        except Exception:
+            pass
+        if str(venue or "").lower() == "groww":
+            return "NFO_UNITS"
+        return str(self._asset_id or "units").upper()
+
+    def _notify_order_error(self, decision: OpportunityDecision, order_manager) -> None:
+        try:
+            from telegram.notifier import send_telegram_message
+            err = getattr(order_manager, "last_order_error", None) or {}
+            sizing = decision.sizing
+            protection = decision.protection_plan
+            lines = [
+                "<b>ORDER ERROR</b>",
+                f"<code>{decision.venue.upper()}:{decision.instrument}</code>",
+                f"<code>stage={err.get('stage', 'order_submission')} status={err.get('status_code', '-')}</code>",
+                f"<code>reason={err.get('reason', 'unknown')}</code>",
+            ]
+            if sizing is not None:
+                lines.append(
+                    f"<code>qty={sizing.quantity:.8g} notional={sizing.notional:.4f} "
+                    f"margin={sizing.margin_required:.4f} risk={sizing.risk_to_invalidation:.4f}</code>"
+                )
+            if protection is not None:
+                lines.append(
+                    f"<code>entry={protection.entry_price:.4f} sl={protection.stop_price:.4f} "
+                    f"tp={protection.target_price:.4f}</code>"
+                )
+            send_telegram_message("\n".join(lines), instrument=self._instrument, event_type="ORDER ERROR")
+        except Exception:
+            pass
+
+    def _notify_entry_opened(
+        self,
+        decision: OpportunityDecision,
+        sizing: PositionSizingDecision,
+        protection: ProtectionPlan,
+        result: Mapping[str, Any],
+        fill_price: float,
+        quantity_filled: float,
+    ) -> None:
+        try:
+            from telegram.notifier import format_entry_alert, send_telegram_message
+            risk = abs(quantity_filled * (fill_price - protection.stop_price))
+            rr = abs(protection.target_price - fill_price) / max(abs(fill_price - protection.stop_price), 1e-12)
+            msg = format_entry_alert(
+                side="long" if decision.direction in {Direction.LONG, Direction.BULLISH} else "short",
+                entry=fill_price,
+                sl=protection.stop_price,
+                tp=protection.target_price,
+                qty=quantity_filled,
+                leverage=float(sizing.leverage_selected or 1.0),
+                rr=rr,
+                risk_usd=risk,
+                margin_used=float(sizing.margin_required or 0.0),
+                fee_status=(
+                    f"broker exact {self._pos.currency_symbol}{float(result.get('paid_commission', 0.0) or 0.0):.4f}"
+                    if bool(result.get("paid_commission_exact", False)) else "broker fee pending"
+                ),
+                decision_path=decision.decision.value,
+                instrument=self._instrument,
+            )
+            send_telegram_message(
+                msg,
+                instrument=self._instrument,
+                event_type="ENTRY FILL",
+                context={"entry_leverage": sizing.leverage_selected, "price": fill_price, "state": self._pos.phase.value},
+            )
+        except Exception:
+            pass
+
+    def _estimated_gross_pnl(self, exit_price: float) -> float:
+        return gross_pnl_usd(
+            side=self._pos.side,
+            entry_price=self._pos.entry_price,
+            exit_price=exit_price,
+            quantity_btc=self._pos.quantity,
+            inverse=str(self._pos.pnl_model or "").lower() == "inverse_btcusd",
+        )
+
+    def _notify_exit_level_hit(self, reason: str, price: float) -> None:
+        components = self._pos.quant_components if isinstance(self._pos.quant_components, dict) else {}
+        key = f"exit_level_notified:{reason}"
+        if components.get(key):
+            return
+        components[key] = True
+        try:
+            from telegram.notifier import format_exit_alert, send_telegram_message
+            gross = self._estimated_gross_pnl(price)
+            msg = format_exit_alert(
+                side=self._pos.side,
+                entry_price=self._pos.entry_price,
+                exit_price=price,
+                pnl=gross - float(self._pos.entry_fee_paid or 0.0),
+                reason=f"{reason}_pending_broker_confirmation",
+                venue=self._pos.exchange,
+                qty=self._pos.quantity,
+                gross=gross,
+                fees=float(self._pos.entry_fee_paid or 0.0),
+                exact_fees=False,
+                pnl_provisional=True,
+            )
+            send_telegram_message(msg, instrument=self._instrument, event_type=reason.upper(), context={"price": price, "state": self._pos.phase.value})
+        except Exception:
+            pass
+
+    def _notify_exit_reconciliation_required(self, price: float) -> None:
+        components = self._pos.quant_components if isinstance(self._pos.quant_components, dict) else {}
+        if components.get("exit_reconciliation_required_notified"):
+            return
+        components["exit_reconciliation_required_notified"] = True
+        try:
+            from telegram.notifier import send_telegram_message
+            send_telegram_message(
+                "\n".join([
+                    "<b>EXIT UNCONFIRMED</b>",
+                    f"<code>{self._pos.exchange.upper()}:{self._pos.execution_symbol}</code>",
+                    "<code>broker flat but known SL/TP fill could not be confirmed</code>",
+                    f"<code>mark={price:.4f} entry={self._pos.entry_price:.4f} qty={self._pos.quantity:.8g}</code>",
+                ]),
+                instrument=self._instrument,
+                event_type="EXIT RECONCILIATION",
+                context={"price": price, "state": PositionPhase.RECONCILIATION_REQUIRED.value},
+            )
+        except Exception:
+            pass
+
+    def _finalise_confirmed_exit(self, order_manager, risk_manager, mark_price: float) -> bool:
+        identifier = getattr(order_manager, "identify_exit_order", None)
+        if not callable(identifier):
+            return False
+        details = identifier(self._pos.sl_order_id, self._pos.tp_order_id)
+        if not isinstance(details, Mapping) or not bool(details.get("confirmed", False)):
+            return False
+        exit_price = _num(details.get("fill_price"), 0.0)
+        if exit_price <= 0:
+            return False
+        exit_type = str(details.get("exit_type") or self._pos.manual_exit_reason or "exit")
+        gross = self._estimated_gross_pnl(exit_price)
+        entry_fee = float(self._pos.entry_fee_paid or 0.0)
+        exit_fee = float(details.get("fee_paid", 0.0) or 0.0)
+        fees_exact = bool(self._pos.entry_fee_exact and details.get("fee_exact", False))
+        known_fees = entry_fee + exit_fee
+        if fees_exact:
+            fees = known_fees
+        else:
+            fee_rate = max(0.0, float(_cfg("COMMISSION_RATE", 0.00055) or 0.0))
+            conservative_fee_estimate = (self._pos.entry_price + exit_price) * self._pos.quantity * fee_rate
+            fees = max(known_fees, conservative_fee_estimate)
+        net = gross - fees
+        try:
+            recorder = getattr(risk_manager, "record_trade", None)
+            if callable(recorder):
+                recorder(
+                    side=self._pos.side,
+                    entry_price=self._pos.entry_price,
+                    exit_price=exit_price,
+                    quantity=self._pos.quantity,
+                    reason=exit_type,
+                    pnl_override=net,
+                    entry_leverage=self._pos.entry_leverage,
+                    pnl_model=self._pos.pnl_model,
+                    currency_code=self._pos.currency_code,
+                    quantity_unit=self._pos.quantity_unit,
+                )
+            state_setter = getattr(risk_manager, "set_position_open", None)
+            if callable(state_setter):
+                state_setter(False)
+        except Exception:
+            pass
+        self._risk_gate.record_trade_result(net)
+        self._trade_history.append({
+            "ts": time.time(),
+            "side": self._pos.side,
+            "entry": self._pos.entry_price,
+            "exit": exit_price,
+            "qty": self._pos.quantity,
+            "pnl": net,
+            "reason": exit_type,
+        })
+        try:
+            from telegram.notifier import format_exit_alert, send_telegram_message
+            msg = format_exit_alert(
+                side=self._pos.side,
+                entry_price=self._pos.entry_price,
+                exit_price=exit_price,
+                pnl=net,
+                reason=exit_type,
+                venue=self._pos.exchange,
+                qty=self._pos.quantity,
+                residual_qty=0.0,
+                partial_qty=self._pos.quantity,
+                gross=gross,
+                fees=fees,
+                margin_used=(self._pos.entry_price * self._pos.quantity) / max(self._pos.entry_leverage, 1.0),
+                exact_fees=fees_exact,
+                pnl_provisional=not fees_exact,
+                fee_source="entry exact / exit exact" if fees_exact else "broker fill exact / conservative fee estimate",
+            )
+            send_telegram_message(msg, instrument=self._instrument, event_type="EXIT FILL", context={"price": mark_price, "state": "FLAT"})
+        except Exception:
+            pass
+        return True
 
     def _dynamic_exit_supervision(self, data_manager, order_manager) -> None:
         """Audit state-dependent early exits without silently defeating hard protection.
@@ -1229,15 +1605,9 @@ class InstitutionalStrategy:
         return score, [zone]
 
     def _microstructure_context(
-        self, data_manager, venue: str, instrument: str, feed_health: FeedHealth
+        self, data_manager, venue: str, instrument: str, feed_health: FeedHealth, states: dict[str, VenueMicrostate] | None = None
     ) -> tuple[VenueMicrostate | None, BTCCompositeState | None]:
-        states: dict[str, VenueMicrostate] = {}
-        getter = getattr(data_manager, "get_venue_microstates", None)
-        if callable(getter):
-            try:
-                states = {str(k).lower(): v for k, v in dict(getter() or {}).items() if isinstance(v, VenueMicrostate)}
-            except Exception:
-                states = {}
+        states = dict(states or {})
         if not states:
             getter = getattr(data_manager, "get_venue_microstate", None)
             if callable(getter):
@@ -1267,6 +1637,16 @@ class InstitutionalStrategy:
             if refs:
                 composite = build_btc_composite_state(delta_state=states["delta"], reference_states=refs)
         return execution_state, composite
+
+    def _venue_states(self, data_manager) -> dict[str, VenueMicrostate]:
+        states: dict[str, VenueMicrostate] = {}
+        getter = getattr(data_manager, "get_venue_microstates", None)
+        if callable(getter):
+            try:
+                states = {str(k).lower(): v for k, v in dict(getter() or {}).items() if isinstance(v, VenueMicrostate)}
+            except Exception:
+                states = {}
+        return states
 
     def _direction_and_edge(
         self, desk: str, price: float, liquidity_score: float, *, execution_state: VenueMicrostate | None, btc_composite: BTCCompositeState | None
@@ -1342,19 +1722,22 @@ class InstitutionalStrategy:
             return Regime.EXPANSION
         return Regime.BALANCE
 
-    def _execution_cost_components(self, data_manager) -> dict[str, float]:
+    def _execution_cost_components(self, data_manager, execution_state: VenueMicrostate | None = None) -> dict[str, float]:
         spread = 2.0
-        try:
-            book = data_manager.get_orderbook()
-            bids = book.get("bids") if isinstance(book, Mapping) else []
-            asks = book.get("asks") if isinstance(book, Mapping) else []
-            if bids and asks:
-                bid = _num(bids[0][0] if not isinstance(bids[0], Mapping) else bids[0].get("price") or bids[0].get("limit_price"), 0.0)
-                ask = _num(asks[0][0] if not isinstance(asks[0], Mapping) else asks[0].get("price") or asks[0].get("limit_price"), 0.0)
-                mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0
-                spread = (ask - bid) / mid * 10_000.0 if mid > 0 else spread
-        except Exception:
-            pass
+        if execution_state is not None:
+            spread = float(execution_state.spread_bps or spread)
+        else:
+            try:
+                book = data_manager.get_orderbook()
+                bids = book.get("bids") if isinstance(book, Mapping) else []
+                asks = book.get("asks") if isinstance(book, Mapping) else []
+                if bids and asks:
+                    bid = _num(bids[0][0] if not isinstance(bids[0], Mapping) else bids[0].get("price") or bids[0].get("limit_price"), 0.0)
+                    ask = _num(asks[0][0] if not isinstance(asks[0], Mapping) else asks[0].get("price") or asks[0].get("limit_price"), 0.0)
+                    mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0
+                    spread = (ask - bid) / mid * 10_000.0 if mid > 0 else spread
+            except Exception:
+                pass
         fee = float(_cfg("INSTITUTIONAL_DEFAULT_FEE_BPS", 1.5))
         slippage = float(_cfg("INSTITUTIONAL_STRESS_SLIPPAGE_BPS", 1.0))
         return {"spread_bps": max(0.0, spread), "fee_bps": max(0.0, fee), "slippage_bps": max(0.0, slippage), "total_cost_bps": max(0.0, spread + fee + slippage)}
@@ -1376,34 +1759,67 @@ class InstitutionalStrategy:
     def _protection_plan(
         self, desk: str, direction: Direction, price: float, liquidity_score: float, *, data_manager,
         gross_edge_bps: float, costs_bps: float, position_notional: float = 0.0, quantity: float = 0.0,
+        venue: str | None = None, instrument: str = "", execution_state: VenueMicrostate | None = None,
+        regime: Regime | None = None,
     ) -> ProtectionPlan | None:
         if price <= 0 or liquidity_score <= 0:
             return None
         asset_class = "crypto" if desk == DeskId.BTC.value else "commodity"
+        mapping = self._instrument_mapping(instrument or self._asset_id, venue=venue)
+        near_depth = 0.0
+        spread_bps = 0.0
+        if execution_state is not None:
+            spread_bps = float(execution_state.spread_bps or 0.0)
+            near_depth = sum(
+                float(execution_state.bid_depth_usd_by_band.get(k, 0.0) + execution_state.ask_depth_usd_by_band.get(k, 0.0))
+                for k in ("0-1", "1-3")
+            )
+        try:
+            policy = active_policy(self._instrument)
+        except Exception:
+            policy = None
+        market_state = {
+            "asset_id": self._asset_id,
+            "venue": str(venue or "").lower(),
+            "instrument": instrument or self._asset_id,
+            "spread_bps": spread_bps,
+            "price_tick": float(mapping.price_tick or 0.0),
+            "near_touch_depth_usd": near_depth,
+            "liquidity_score": liquidity_score,
+            "regime": getattr(regime, "value", regime) if regime is not None else "",
+            "policy_min_rr": float(getattr(policy, "min_rr", 0.0) or 0.0),
+            "policy_max_rr": float(getattr(policy, "max_rr", 0.0) or 0.0),
+        }
         return self._protection_engine.build_plan(
             direction=direction, entry_price=price, volatility_price=self._realized_vol_price(),
             gross_edge_bps=gross_edge_bps, execution_cost_bps=costs_bps,
             protection_type="VENUE_NATIVE_BRACKET", asset_class=asset_class,
             position_notional=position_notional, quantity=quantity,
+            market_state=market_state,
         )
 
     def _size_position(
-        self, desk: str, instrument: str, direction: Direction, price: float, net_edge: float, liquidity_score: float, protection: ProtectionPlan, risk_manager,
+        self, desk: str, instrument: str, direction: Direction, price: float, net_edge: float, liquidity_score: float, protection: ProtectionPlan, risk_manager, venue: str | None = None, balance_source=None,
     ) -> PositionSizingDecision:
         _ = direction
         try:
-            bal = risk_manager.get_available_balance() or {}
+            if balance_source is not None and hasattr(balance_source, "get_balance"):
+                bal = balance_source.get_balance() or {}
+            else:
+                bal = risk_manager.get_available_balance() or {}
             cash = _num(bal.get("available"), 0.0)
         except Exception:
             cash = _num(_cfg("INITIAL_BALANCE", 0.0), 0.0)
         if cash <= 0:
             return PositionSizingDecision(desk, instrument, False, 0.0, 0.0, 0.0, None, 0.0, net_edge, 0.0, 0.0, 0.0, ["cash_unavailable"])
-        mapping = self._instrument_mapping(instrument)
+        mapping = self._instrument_mapping(instrument, venue=venue)
         stop_distance_pct = abs(price - protection.stop_price) / max(price, 1e-9)
         if stop_distance_pct <= 0:
             return PositionSizingDecision(desk, instrument, False, 0.0, 0.0, 0.0, None, 0.0, net_edge, 0.0, 0.0, 0.0, ["invalid_stop_distance"])
-        inverse = "inverse" in mapping.notional_model.lower()
-        unit_notional = mapping.contract_multiplier if inverse else price * mapping.contract_multiplier
+        # Strategy/order-manager quantity is exposure quantity, not raw venue
+        # contract count. Delta's adapter is the sole boundary that converts
+        # exposure quantity to integer contracts using contract_value.
+        unit_notional = price
         risk_per_unit = unit_notional * stop_distance_pct
         risk_budget = cash * float(_cfg("INSTITUTIONAL_RISK_FRACTION_PER_TRADE", 0.0025))
         liquidity_cap = max(0.0, cash * min(1.0, liquidity_score) * 0.20)
@@ -1429,7 +1845,13 @@ class InstitutionalStrategy:
             step = max(float(mapping.qty_step or 0.0), 1e-12)
             raw_qty = target_notional / max(unit_notional, 1e-9)
             qty = math.floor(raw_qty / step) * step
-            leverage = min(float(_cfg("LEVERAGE", 1.0)), 5.0)
+            configured_lev = float(_cfg("LEVERAGE", 1.0))
+            code_cap = float(_cfg("INSTITUTIONAL_MAX_SELECTED_LEVERAGE", configured_lev))
+            venue_cap = self._venue_max_leverage(venue)
+            caps = [configured_lev, code_cap]
+            if venue_cap > 0:
+                caps.append(venue_cap)
+            leverage = max(1.0, min(caps))
         notional = qty * unit_notional
         margin = notional if leverage is None else notional / max(leverage, 1.0)
         risk_after = qty * risk_per_unit
@@ -1464,26 +1886,60 @@ class InstitutionalStrategy:
         price = self._price_window[-1] if self._price_window else 0.0
         return max(price * self._realized_vol_log(), price * 0.00025)
 
-    def _instrument_mapping(self, instrument: str) -> InstrumentMapping:
-        venue = "delta"
+    def _exchange_instrument(self, venue: str | None = None):
+        if self._instrument is None:
+            return None
         try:
-            if self._instrument is not None:
-                venue = self._instrument.primary_exchange.value
+            if venue:
+                return self._instrument.by_exchange.get(ExchangeName(str(venue).lower()))
         except Exception:
             pass
-        raw = getattr(getattr(self._instrument, "primary", None), "raw", {}) if self._instrument is not None else {}
-        contract_multiplier = _num(raw.get("contract_multiplier") or raw.get("contract_value") or raw.get("contract_value_btc"), 1.0)
-        notional_model = "inverse_usd_contract" if venue == "delta" and instrument.upper() == "BTCUSD" else "linear"
+        try:
+            return self._instrument.primary
+        except Exception:
+            return None
+
+    def _venue_max_leverage(self, venue: str | None = None) -> float:
+        ei = self._exchange_instrument(venue)
+        try:
+            return float(getattr(ei, "max_leverage", 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+    def _instrument_mapping(self, instrument: str, venue: str | None = None) -> InstrumentMapping:
+        venue_name = str(venue).lower() if venue else "delta"
+        try:
+            if not venue and self._instrument is not None:
+                venue_name = self._instrument.primary_exchange.value
+        except Exception:
+            pass
+        primary = self._exchange_instrument(venue_name)
+        raw = getattr(primary, "raw", {}) if primary is not None else {}
+        contract_multiplier = _num(
+            raw.get("contract_multiplier")
+            or raw.get("contract_value")
+            or raw.get("contract_value_btc")
+            or getattr(primary, "contract_value_btc", 0.0),
+            1.0,
+        )
+        qty_step = _num(
+            raw.get("qty_step")
+            or raw.get("lot_step")
+            or getattr(primary, "lot_step", 0.0)
+            or (contract_multiplier if venue_name == "delta" else 0.0),
+            1.0,
+        )
+        notional_model = "inverse_usd_contract" if venue_name == "delta" and instrument.upper() == "BTCUSD" else "linear"
         return InstrumentMapping(
-            venue=venue,
-            venue_symbol=instrument,
+            venue=venue_name,
+            venue_symbol=str(getattr(primary, "symbol", instrument) or instrument),
             canonical_underlying=self._asset_id,
             product_class=str(raw.get("contract_type") or raw.get("product_type") or ""),
-            quote_currency=str(raw.get("quote_asset") or "USD").upper(),
+            quote_currency=str(raw.get("quote_asset") or getattr(primary, "quote_asset", "") or "USD").upper(),
             contract_multiplier=max(contract_multiplier, 1e-12),
             settlement_currency=str(raw.get("settlement_currency") or raw.get("settling_asset") or "USD").upper(),
-            price_tick=_num(raw.get("tick_size"), 0.01),
-            qty_step=_num(raw.get("qty_step") or raw.get("lot_step"), 1.0),
+            price_tick=_num(raw.get("tick_size") or getattr(primary, "tick_size", 0.0), 0.01),
+            qty_step=max(qty_step, 1e-12),
             execution_enabled=True,
             notional_model=notional_model,
         )
@@ -1507,6 +1963,76 @@ class InstitutionalStrategy:
         except Exception:
             pass
         return str(_cfg("EXECUTION_EXCHANGE", "delta")).lower()
+
+    def _routeable_venues(self, order_manager) -> set[str]:
+        getter = getattr(order_manager, "available_exchanges", None)
+        if callable(getter):
+            try:
+                return {str(v).lower() for v in getter()}
+            except Exception:
+                pass
+        return {self._venue(order_manager)}
+
+    def _execution_manager_for(self, order_manager, venue: str):
+        getter = getattr(order_manager, "manager_for", None)
+        if callable(getter):
+            try:
+                return getter(str(venue).lower())
+            except Exception:
+                pass
+        return order_manager
+
+    def _venue_selection_notional(self, risk_manager) -> float:
+        try:
+            bal = risk_manager.get_available_balance() or {}
+            cash = _num(bal.get("available"), 0.0)
+        except Exception:
+            cash = _num(_cfg("INITIAL_BALANCE", 0.0), 0.0)
+        return max(0.0, cash * float(_cfg("VENUE_SELECTION_NOTIONAL_FRACTION", 0.25)))
+
+    def _entry_risk_gate(self, risk_manager, *, balance_source=None) -> tuple[bool, str]:
+        """Gate live entries through the same risk controls that record entries."""
+        if not self._pos.is_flat():
+            return False, "position_already_active"
+        gate = getattr(risk_manager, "can_trade", None)
+        if callable(gate):
+            try:
+                result = gate()
+                allowed = bool(result[0]) if isinstance(result, tuple) and result else bool(result)
+                reason = str(result[1]) if isinstance(result, tuple) and len(result) > 1 else ("OK" if allowed else "risk_manager_rejected")
+                if not allowed:
+                    return False, f"risk_manager_gate:{reason}"
+            except Exception as exc:
+                return False, f"risk_manager_gate_error:{exc}"
+        equity = 0.0
+        try:
+            if balance_source is not None and hasattr(balance_source, "get_balance"):
+                bal = balance_source.get_balance() or {}
+            else:
+                bal = risk_manager.get_available_balance() or {}
+            equity = max(
+                _num(bal.get("equity"), 0.0),
+                _num(bal.get("total"), 0.0),
+                _num(bal.get("available"), 0.0),
+            )
+        except Exception:
+            equity = _num(_cfg("INITIAL_BALANCE", 0.0), 0.0)
+        if equity > 0 and self._risk_gate.opening_balance <= 0:
+            self._risk_gate.set_opening_balance(equity)
+        allowed, reason = self._risk_gate.can_trade(equity)
+        if not allowed:
+            return False, f"strategy_daily_gate:{reason}"
+        return True, "entry_frequency_and_daily_risk_validated"
+
+    def _symbol_for_venue(self, venue: str, fallback: str) -> str:
+        try:
+            ei = self._exchange_instrument(venue)
+            sym = str(getattr(ei, "symbol", "") or "").strip()
+            if sym:
+                return sym
+        except Exception:
+            pass
+        return str(fallback)
 
     def _symbol(self, data_manager, order_manager) -> str:
         for obj in (order_manager, data_manager):

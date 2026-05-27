@@ -16,7 +16,7 @@ def test_env_cannot_override_non_secret_runtime_policy(monkeypatch):
     assert reloaded.LIVE_TRADING_ENABLED is False
     assert reloaded.INSTITUTIONAL_ENABLE_LIVE_ENTRIES is False
     assert reloaded.EXECUTION_EXCHANGE == "delta"
-    assert reloaded.UNIVERSE_INCLUDE_EXCHANGES == "delta,coinswitch,groww"
+    assert reloaded.UNIVERSE_INCLUDE_EXCHANGES == "delta,coinswitch,hyperliquid,groww"
     assert reloaded.GROWW_SESSION_MODEL_AUDIT_FULL_INFO is False
 
 

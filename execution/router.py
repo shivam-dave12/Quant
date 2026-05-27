@@ -25,7 +25,7 @@ import config
 from core.types  import Exchange
 from execution.order_manager import (
     OrderManager, CancelResult, GlobalRateLimiter,
-    _CS_LIMITER, _DELTA_LIMITER, _GROWW_LIMITER,
+    _CS_LIMITER, _DELTA_LIMITER, _GROWW_LIMITER, _HL_LIMITER,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,6 +42,7 @@ class ExecutionRouter:
         coinswitch_om: Optional[OrderManager],
         delta_om:      Optional[OrderManager],
         groww_om:      Optional[OrderManager] = None,
+        hyperliquid_om: Optional[OrderManager] = None,
         default:       str = "delta",
     ) -> None:
         self._lock        = threading.RLock()
@@ -53,6 +54,8 @@ class ExecutionRouter:
             self._managers[Exchange.DELTA.value] = delta_om
         if groww_om is not None:
             self._managers[Exchange.GROWW.value] = groww_om
+        if hyperliquid_om is not None:
+            self._managers[Exchange.HYPERLIQUID.value] = hyperliquid_om
 
         if not self._managers:
             raise RuntimeError("ExecutionRouter requires at least one OrderManager")
@@ -76,6 +79,8 @@ class ExecutionRouter:
             limiter = _DELTA_LIMITER
         elif self._active_key == Exchange.GROWW.value:
             limiter = _GROWW_LIMITER
+        elif self._active_key == Exchange.HYPERLIQUID.value:
+            limiter = _HL_LIMITER
         else:
             limiter = _CS_LIMITER
         GlobalRateLimiter.set_active(limiter)
@@ -92,6 +97,17 @@ class ExecutionRouter:
     def active_exchange(self) -> str:
         with self._lock:
             return self._active_key
+
+    def available_exchanges(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(self._managers.keys())
+
+    def manager_for(self, exchange: str) -> OrderManager:
+        key = Exchange.from_str(str(exchange)).value
+        with self._lock:
+            if key not in self._managers:
+                raise KeyError(f"Execution manager unavailable for {key}")
+            return self._managers[key]
 
     @property
     def api(self):
@@ -180,4 +196,3 @@ class ExecutionRouter:
         if isinstance(pid, int):
             return pid
         return None
-
