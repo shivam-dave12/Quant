@@ -495,14 +495,19 @@ class MarketAggregator:
 
     def register_strategy(self, strategy) -> None:
         self._strategy_ref = strategy
-        self._primary.register_strategy(strategy)
-        if self._analysis is not None:
+        # Every independent venue is an information source and must be able to
+        # wake this context. The strategy callback only sets an event; it never
+        # executes trading logic on a WebSocket thread, so duplicate market
+        # observations cannot create duplicate orders.
+        seen: set[int] = set()
+        for dm in [self._primary, self._secondary, *self._references, self._analysis]:
+            if dm is None or id(dm) in seen:
+                continue
+            seen.add(id(dm))
             try:
-                self._analysis.register_strategy(strategy)
+                dm.register_strategy(strategy)
             except Exception:
                 pass
-        # Secondary does NOT register strategy — we don't want double
-        # on_realtime_trade calls.  The tap above handles secondary trades.
 
     # ── Candles — primary exchange only ──────────────────────────────────────
 

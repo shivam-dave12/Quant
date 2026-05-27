@@ -48,6 +48,7 @@ class StreamStats:
 
 
 class DeltaDataManager:
+    venue = "delta"
     """
     Delta Exchange data manager.
     Same public interface as CoinSwitchDataManager.
@@ -101,6 +102,8 @@ class DeltaDataManager:
         self._snapshot_ready = False
         self._funding_rate: float | None = None
         self._last_market_meta_refresh_s: float = 0.0
+        self._metadata_stop = threading.Event()
+        self._metadata_thread: threading.Thread | None = None
 
         self._lock            = threading.RLock()
         self._forming_ts:     Dict[str, int] = {}
@@ -170,6 +173,19 @@ class DeltaDataManager:
         except Exception as exc:
             logger.debug("Delta funding metadata refresh failed for %s: %s", self.symbol, exc)
 
+    def _start_metadata_refresh_worker(self) -> None:
+        if self._metadata_thread is not None and self._metadata_thread.is_alive():
+            return
+        self._metadata_stop.clear()
+        self._metadata_thread = threading.Thread(target=self._metadata_refresh_loop, name=f"metadata-{self.venue}-{self.symbol}", daemon=True)
+        self._metadata_thread.start()
+
+    def _metadata_refresh_loop(self) -> None:
+        interval = max(5.0, float(getattr(config, "VENUE_MARKET_META_REFRESH_SEC", 30.0)))
+        while not self._metadata_stop.is_set():
+            self._refresh_market_metadata()
+            self._metadata_stop.wait(interval)
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self) -> bool:
@@ -210,6 +226,7 @@ class DeltaDataManager:
 
             self.is_streaming = True
             logger.info(f"✅ Delta WS streams started for {symbol}")
+            self._start_metadata_refresh_worker()
 
             # REST warmup
             logger.info(f"Delta DM[{symbol}]: starting REST warmup...")
@@ -258,6 +275,7 @@ class DeltaDataManager:
     def stop(self) -> None:
         try:
             self.is_ready = self.is_streaming = False
+            self._metadata_stop.set()
             if self.ws:
                 self.ws.disconnect()
             logger.info("Delta DM stopped")
@@ -834,7 +852,7 @@ class DeltaDataManager:
         return {}
 
     def get_venue_microstate(self):
-        self._refresh_market_metadata()
+        # Live decision path consumes the asynchronously refreshed funding cache only.
         with self._lock:
             bids = list(self._orderbook.get("bids", []))
             asks = list(self._orderbook.get("asks", []))

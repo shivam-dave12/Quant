@@ -19,7 +19,7 @@ import math
 import time
 import threading
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from typing import Any, Callable, Mapping, Optional
 
@@ -201,6 +201,11 @@ class InstitutionalStrategy:
         self._last_tick_time = 0.0
         self._price_window: deque[float] = deque(maxlen=240)
         self._market_wakeup: Callable[[], Any] | None = None
+        # Venue events wake only this context worker; evaluation is never run on
+        # a WebSocket callback thread. This preserves market-data ingestion speed.
+        self._market_event = threading.Event()
+        self._latest_event_price = 0.0
+        self._latest_event_ts = 0.0
         store_root = str(_cfg("RESEARCH_STORE_PATH", "research_output"))
         self._research_store = JsonlResearchStore(store_root)
         self._forward_labels = ForwardLabelWriter(self._research_store)
@@ -216,7 +221,13 @@ class InstitutionalStrategy:
         self._telemetry_last_emit_ts: float = 0.0
         # Per-venue collateral snapshots prevent the route model selecting a
         # cheaper-looking exchange that cannot actually fund the approved trade.
-        self._venue_cash_cache: dict[str, tuple[float, float]] = {}
+        self._venue_cash_cache: dict[str, tuple[float, float, str]] = {}
+        self._venue_cash_lock = threading.RLock()
+        self._venue_cash_refresh_stop = threading.Event()
+        self._venue_cash_refresh_thread: threading.Thread | None = None
+        self._runtime_order_manager = None
+        self._submission_lock = None
+        self._portfolio_submission_gate = None
         # Protected entry confirmation may wait for fill/bracket acknowledgements.
         # It must never block fresh market evaluation on the strategy thread.
         self._entry_lock = threading.RLock()
@@ -225,11 +236,77 @@ class InstitutionalStrategy:
     def bind_market_wakeup(self, callback: Callable[[], Any]) -> None:
         self._market_wakeup = callback
 
+    def bind_portfolio_submission_guard(self, lock, gate: Callable[[], tuple[bool, str]]) -> None:
+        self._submission_lock = lock
+        self._portfolio_submission_gate = gate
+
+    def start_runtime_services(self, order_manager) -> None:
+        """Start non-blocking broker-state refresh used by the route model.
+
+        Market ticks consume cached collateral only. Final approved orders still
+        perform a broker-local risk revalidation before submission.
+        """
+        self._runtime_order_manager = order_manager
+        if self._venue_cash_refresh_thread is not None and self._venue_cash_refresh_thread.is_alive():
+            return
+        self._venue_cash_refresh_stop.clear()
+        self._venue_cash_refresh_thread = threading.Thread(
+            target=self._venue_cash_refresh_loop, name=f"venue-collateral-{self._asset_id}", daemon=True
+        )
+        self._venue_cash_refresh_thread.start()
+
+    def stop_runtime_services(self) -> None:
+        self._venue_cash_refresh_stop.set()
+
+    def _venue_cash_refresh_loop(self) -> None:
+        interval = max(0.5, float(_cfg("VENUE_BALANCE_REFRESH_SEC", 2.0)))
+        while not self._venue_cash_refresh_stop.is_set():
+            order_manager = self._runtime_order_manager
+            if order_manager is not None:
+                for venue in sorted(self._routeable_venues(order_manager)):
+                    manager = self._execution_manager_for(order_manager, venue)
+                    try:
+                        bal = manager.get_balance() if manager is not None and hasattr(manager, "get_balance") else {}
+                        available = max(0.0, _num((bal or {}).get("available"), 0.0))
+                        source = str((bal or {}).get("source") or f"{venue}_live_balance")
+                        with self._venue_cash_lock:
+                            self._venue_cash_cache[str(venue).lower()] = (time.monotonic(), available, source)
+                    except Exception as exc:
+                        logger.debug("async venue collateral refresh unavailable venue=%s: %s", venue, exc)
+            self._venue_cash_refresh_stop.wait(interval)
+
+    def _signal_market_event(self, price: float = 0.0) -> None:
+        if price > 0:
+            self._latest_event_price = float(price)
+        self._latest_event_ts = time.time()
+        self._market_event.set()
+        if callable(self._market_wakeup):
+            try:
+                self._market_wakeup()
+            except Exception:
+                pass
+
+    def _on_realtime_quote(self, price: float) -> None:
+        self._signal_market_event(float(price or 0.0))
+
+    def _on_realtime_trade(self, price: float, quantity: float = 0.0, side: str = "") -> None:
+        _ = quantity, side
+        self._signal_market_event(float(price or 0.0))
+
     def consume_market_event(self) -> bool:
-        return False
+        signalled = self._market_event.is_set()
+        if signalled:
+            self._market_event.clear()
+        return bool(signalled)
+
+    def wait_for_market_event(self, timeout: float) -> bool:
+        signalled = self._market_event.wait(max(0.0, float(timeout)))
+        if signalled:
+            self._market_event.clear()
+        return bool(signalled)
 
     def has_urgent_structural_monitor(self) -> bool:
-        return False
+        return bool(not self._pos.is_flat())
 
     def get_position(self) -> dict[str, Any] | None:
         return self._pos.to_public_dict()
@@ -273,6 +350,25 @@ class InstitutionalStrategy:
             self._monitor_position(data_manager, order_manager, risk_manager)
             return
         decision = self.evaluate(data_manager, order_manager, risk_manager, now_ms)
+        if decision.approved and self._submission_lock is not None and callable(self._portfolio_submission_gate):
+            with self._submission_lock:
+                allowed, reason = self._portfolio_submission_gate()
+                if not allowed:
+                    decision = replace(
+                        decision, decision=DecisionOutput.NO_TRADE_RISK_BUDGET,
+                        reasons=[f"atomic_portfolio_submission_gate:{reason}"],
+                        model_values={**dict(decision.model_values or {}), "atomic_submission_recheck": reason},
+                    )
+                else:
+                    self._last_decision = decision
+                    self._last_decision_ts = time.time()
+                    self._log_decision_calculation(decision)
+                    self._persist_decision(decision, now_ms)
+                    if bool(_cfg("EXECUTION_ASYNC_ENTRY_LIFECYCLE_ENABLED", False)) and decision.venue != "groww":
+                        self._submit_approved_async(decision, order_manager, risk_manager)
+                    else:
+                        self._execute_approved(decision, order_manager, risk_manager)
+                    return
         self._last_decision = decision
         self._last_decision_ts = time.time()
         self._log_decision_calculation(decision)
@@ -422,6 +518,36 @@ class InstitutionalStrategy:
                     "dislocation": self._round_or_none(model.get("dislocation_component_bps")),
                 },
             }
+            composite = model.get("composite_asset_intelligence", {}) if isinstance(model.get("composite_asset_intelligence"), dict) else {}
+            if composite:
+                payload["composite"] = {
+                    "factor_id": composite.get("factor_id"),
+                    "equivalence_group": composite.get("equivalence_group"),
+                    "execution_sources": composite.get("execution_sources", []),
+                    "factor_sources": composite.get("factor_sources", []),
+                    "transferable_structural_alpha_bps": self._round_or_none(composite.get("transferable_structural_alpha_bps")),
+                    "transferable_microstructure_alpha_bps": self._round_or_none(composite.get("transferable_microstructure_alpha_bps")),
+                    "factor_context_alpha_bps": self._round_or_none(composite.get("factor_context_alpha_bps")),
+                    "basis_translation_enabled": bool(composite.get("basis_translation_enabled", False)),
+                }
+            venue_selection = model.get("venue_selection", {}) if isinstance(model.get("venue_selection"), dict) else {}
+            if venue_selection:
+                payload["route"] = {
+                    "selected_venue": venue_selection.get("selected_venue"),
+                    "selected_symbol": venue_selection.get("selected_symbol"),
+                    "selected_cost_bps": self._round_or_none(venue_selection.get("selected_cost_bps")),
+                    "reason": venue_selection.get("reason"),
+                }
+            venue_state = model.get("venue_market_state", {}) if isinstance(model.get("venue_market_state"), dict) else {}
+            selected_state = venue_state.get(str(decision.venue).lower(), {}) if isinstance(venue_state, dict) else {}
+            if isinstance(selected_state, dict) and selected_state:
+                payload["selected_venue_market_state"] = {
+                    "venue": decision.venue, "symbol": decision.instrument,
+                    "signed_alpha_bps": self._round_or_none(selected_state.get("signed_alpha_bps")),
+                    "confidence": self._round_or_none(selected_state.get("confidence")),
+                    "regime": selected_state.get("regime_label"),
+                    "reason": selected_state.get("reason"),
+                }
         if decision.sizing is not None:
             payload["sizing"] = asdict(decision.sizing)
         if decision.protection_plan is not None:
@@ -2322,30 +2448,25 @@ class InstitutionalStrategy:
         return order_manager
 
     def _venue_available_cash(self, order_manager, venues: set[str] | None = None) -> dict[str, float]:
-        """Return executable free collateral by venue with a short cache TTL.
+        """Return asynchronous broker-local collateral snapshots only.
 
-        Routing on book price alone is invalid when collateral is fragmented
-        across exchanges. A venue with zero free margin is data-only for this
-        candidate even when it has the tightest spread.
+        This method is part of the market-decision hot path and therefore never
+        performs broker HTTP/RPC calls. A missing or stale snapshot makes that
+        venue non-routeable for this decision rather than blocking every desk.
         """
+        if self._runtime_order_manager is None:
+            self.start_runtime_services(order_manager)
         now = time.monotonic()
-        ttl = max(0.5, float(_cfg("VENUE_BALANCE_CACHE_TTL_SEC", 8.0)))
+        max_age = max(1.0, float(_cfg("VENUE_BALANCE_SNAPSHOT_MAX_AGE_SEC", 10.0)))
         out: dict[str, float] = {}
         for venue in sorted(venues or self._routeable_venues(order_manager)):
             key = str(venue).lower()
-            cached = self._venue_cash_cache.get(key)
-            if cached is not None and now - cached[0] <= ttl:
-                out[key] = cached[1]
+            with self._venue_cash_lock:
+                cached = self._venue_cash_cache.get(key)
+            if cached is None or now - float(cached[0]) > max_age:
+                out[key] = 0.0
                 continue
-            manager = self._execution_manager_for(order_manager, key)
-            cash = 0.0
-            try:
-                bal = manager.get_balance() if manager is not None and hasattr(manager, "get_balance") else {}
-                cash = max(0.0, _num((bal or {}).get("available"), 0.0))
-            except Exception as exc:
-                logger.debug("venue collateral snapshot unavailable venue=%s: %s", key, exc)
-            self._venue_cash_cache[key] = (now, cash)
-            out[key] = cash
+            out[key] = max(0.0, float(cached[1]))
         return out
 
     def _protection_capable_venues(self, order_manager, venues: set[str] | None = None) -> set[str]:

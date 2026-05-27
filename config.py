@@ -1015,3 +1015,14 @@ def validate_live_control_plane() -> None:
 
 
 validate_live_control_plane()
+
+# ── Institutional streaming/runtime architecture v9 ─────────────────────────
+# Live signal evaluation must be I/O-free: REST is allowed only in async startup
+# warmup or background state-refresh services. Hyperliquid publishes these live
+# feeds through its official WebSocket subscription contract.
+HYPERLIQUID_WS_CANDLE_INTERVALS = ("1m", "5m", "15m", "1h", "4h", "1d")
+VENUE_BALANCE_REFRESH_SEC = 2.0
+VENUE_BALANCE_SNAPSHOT_MAX_AGE_SEC = 10.0
+SCANNER_CONTEXT_WORKERS_ENABLED = True
+SCANNER_MARKET_TICK_MAX_LATENCY_MULTIPLIER = 2.0
+INSTITUTIONAL_TELEMETRY_SELECTED_VENUE_REQUIRED = True

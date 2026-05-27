@@ -114,6 +114,10 @@ class MultiAssetInstitutionalBot:
         # One bus for the portfolio: all verified normalised feeds contribute to
         # factor intelligence while execution alpha remains product-aware.
         self._composite_intelligence_bus = CompositeIntelligenceBus()
+        self._worker_threads: list[threading.Thread] = []
+        # Market calculations are parallel; only final slot reservation / order
+        # submission is serialized to prevent concurrent capacity oversubscription.
+        self._submission_arbitration_lock = threading.RLock()
 
     def _build_api_clients(self):
         has_delta = bool(config.DELTA_API_KEY and config.DELTA_SECRET_KEY)
@@ -1080,6 +1084,10 @@ class MultiAssetInstitutionalBot:
         data.register_strategy(strategy)
         ctx = AssetContext(inst, data, router, risk, strategy)
         ctx_holder["ctx"] = ctx
+        strategy.bind_portfolio_submission_guard(
+            self._submission_arbitration_lock,
+            lambda: self.guard.can_evaluate_entry(ctx, self.contexts),
+        )
         return ctx
 
     def _start_one_context(self, ctx: AssetContext) -> bool:
@@ -1146,6 +1154,9 @@ class MultiAssetInstitutionalBot:
                 else:
                     ctx.start_state = "READY"
                     logger.info("✅ %s ready @ %.4f | venues=%s | %s", inst.asset_id, ctx.data_manager.get_last_price(), venues, self.guard.report_line(ctx))
+                service_start = getattr(ctx.strategy, "start_runtime_services", None)
+                if callable(service_start):
+                    service_start(ctx.execution_router)
                 return True
         except Exception:
             ctx.ready = False
@@ -1262,55 +1273,80 @@ class MultiAssetInstitutionalBot:
         return "\n".join(lines)
 
 
+    def _run_context_worker(self, ctx: AssetContext) -> None:
+        """Independent desk worker; no venue or desk can stall another desk."""
+        logger.info("🧵 CONTEXT_WORKER active asset=%s cadence=%.3fs", ctx.instrument.asset_id, self.guard.evaluation_interval(ctx))
+        next_due = 0.0
+        while self.running:
+            try:
+                if not ctx.ready:
+                    self._maybe_start_dormant_groww_context(ctx)
+                    time.sleep(0.25)
+                    continue
+                if self._is_indian_options_context(ctx):
+                    session_open, session_reason, broker_label = self._indian_market_open(ctx)
+                    if not session_open:
+                        ctx.ready = False
+                        ctx.start_state = f"{broker_label}_MARKET_CLOSED"
+                        self._log_throttled_asset(ctx, f"{broker_label} market closed: {session_reason}; NIFTY desk dormant, no analysis/entries.")
+                        continue
+                interval = self.guard.evaluation_interval(ctx)
+                now = time.time()
+                wait_for = max(0.0, next_due - now)
+                event_wait = getattr(ctx.strategy, "wait_for_market_event", None)
+                if wait_for > 0:
+                    if callable(event_wait):
+                        event_wait(min(wait_for, max(interval, 0.05)))
+                    else:
+                        time.sleep(min(wait_for, max(interval, 0.05)))
+                    if time.time() < next_due and not ctx.has_position:
+                        continue
+                allowed, reason = self.guard.can_evaluate_entry(ctx, self.contexts)
+                if not allowed and not ctx.has_position:
+                    self._log_throttled_asset(ctx, f"Portfolio exposure gate: {reason}")
+                    next_due = time.time() + interval
+                    continue
+                if not self.trading_enabled and not ctx.has_position:
+                    next_due = time.time() + interval
+                    continue
+                now_ms = int(time.time() * 1000)
+                with instrument_scope(ctx.instrument):
+                    t0 = time.time()
+                    ctx.strategy.on_tick(ctx.data_manager, ctx.execution_router, ctx.risk_manager, now_ms, event_driven=True)
+                    dt_ms = (time.time() - t0) * 1000.0
+                ctx.last_tick_time = time.time()
+                next_due = ctx.last_tick_time + interval
+                slow_limit_ms = max(250.0, interval * 1000.0 * 2.0)
+                if dt_ms > slow_limit_ms:
+                    logger.warning("%s on_tick latency breach actual=%.1fms cadence=%.1fms", ctx.instrument.asset_id, dt_ms, interval * 1000.0)
+                self._maybe_analysis_audit(ctx, dt_ms)
+                self._maybe_asset_heartbeat(ctx)
+            except Exception:
+                logger.exception("Context worker error asset=%s", ctx.instrument.asset_id)
+                time.sleep(0.25)
+        logger.info("🧵 CONTEXT_WORKER stopped asset=%s", ctx.instrument.asset_id)
+
     def run(self) -> None:
-        logger.info("📊 Multi-asset loop active")
+        logger.info("📊 Multi-asset event-driven workers active; portfolio order/risk arbitration remains shared")
         self._maybe_groww_premarket_refresh()
+        self._worker_threads = []
+        for ctx in list(self.contexts):
+            thread = threading.Thread(target=self._run_context_worker, args=(ctx,), name=f"context-worker-{ctx.instrument.asset_id}", daemon=True)
+            thread.start()
+            self._worker_threads.append(thread)
         while self.running:
             try:
                 self._maybe_groww_premarket_refresh()
-                now_ms = int(time.time() * 1000)
-                for ctx in list(self.contexts):
-                    if not ctx.ready:
-                        self._maybe_start_dormant_groww_context(ctx)
-                        continue
-                    if self._is_indian_options_context(ctx):
-                        session_open, session_reason, broker_label = self._indian_market_open(ctx)
-                        if not session_open:
-                            ctx.ready = False
-                            ctx.start_state = f"{broker_label}_MARKET_CLOSED"
-                            self._log_throttled_asset(
-                                ctx,
-                                f"{broker_label} market closed: {session_reason}; NIFTY desk dormant, no analysis/entries.",
-                            )
-                            continue
-                    interval = self.guard.evaluation_interval(ctx)
-                    event_driven = bool(ctx.strategy.consume_market_event())
-                    urgent = bool(event_driven and ctx.strategy.has_urgent_structural_monitor())
-                    if not ctx.has_position and not urgent and ctx.last_tick_time > 0 and time.time() - ctx.last_tick_time < interval:
-                        continue
-                    allowed, reason = self.guard.can_evaluate_entry(ctx, self.contexts)
-                    if not allowed and not ctx.has_position:
-                        self._log_throttled_asset(ctx, f"Portfolio exposure gate: {reason}")
-                        continue
-                    if not self.trading_enabled and not ctx.has_position:
-                        continue
-                    with instrument_scope(ctx.instrument):
-                        t0 = time.time()
-                        ctx.strategy.on_tick(ctx.data_manager, ctx.execution_router, ctx.risk_manager, now_ms, event_driven=urgent)
-                        dt_ms = (time.time() - t0) * 1000.0
-                    ctx.last_tick_time = time.time()
-                    if dt_ms > 5000:
-                        logger.warning("%s on_tick took %.0fms", ctx.instrument.asset_id, dt_ms)
-                    self._maybe_analysis_audit(ctx, dt_ms)
-                    self._maybe_asset_heartbeat(ctx)
-                self._market_wakeup.wait(timeout=float(getattr(config, "SCANNER_TICK_SLEEP_SEC", 0.25)))
+                self._market_wakeup.wait(timeout=1.0)
                 self._market_wakeup.clear()
             except KeyboardInterrupt:
                 self.request_external_shutdown("KeyboardInterrupt")
                 break
             except Exception:
-                logger.exception("Multi-asset loop error")
+                logger.exception("Multi-asset supervisor loop error")
                 time.sleep(1.0)
+        for thread in self._worker_threads:
+            thread.join(timeout=1.0)
         self.running = False
 
     def _log_throttled_asset(self, ctx: AssetContext, msg: str, interval: float = 60.0) -> None:
@@ -1346,9 +1382,11 @@ class MultiAssetInstitutionalBot:
                 reasons = list(getattr(decision, "reasons", []) or [])
                 block = str(reasons[0] if reasons else getattr(getattr(decision, "decision", None), "value", "DECISION_AVAILABLE"))
             with instrument_scope(inst):
+                selected_venue = str(getattr(decision, "venue", "") or inst.primary_exchange.value).upper()
+                selected_symbol = str(getattr(decision, "instrument", "") or inst.display_symbol)
                 logger.info(
-                    "🩺 DESK_HEALTH asset=%s venue=%s symbol=%s state=%s block=%s mark=%.4f eval_ms=%.1f slots=%d/%d %s",
-                    inst.asset_id, inst.primary_exchange.value.upper(), inst.display_symbol,
+                    "🩺 DESK_HEALTH asset=%s decision_venue=%s decision_symbol=%s context_bootstrap=%s:%s state=%s block=%s mark=%.4f eval_ms=%.1f slots=%d/%d %s",
+                    inst.asset_id, selected_venue, selected_symbol, inst.primary_exchange.value.upper(), inst.display_symbol,
                     state, block, price, dt_ms, self.guard.count_open(self.contexts), self.guard.max_open_positions,
                     self.guard.report_line(ctx),
                 )
@@ -1365,8 +1403,11 @@ class MultiAssetInstitutionalBot:
             pos = ctx.strategy.get_position()
             state = "IN_POSITION" if pos else "SCANNING"
             with instrument_scope(ctx.instrument):
-                logger.info("%s %s %s | price %.4f | %s | open=%d/%d",
-                            ctx.instrument.asset_id, ctx.instrument.primary_exchange.value.upper(),
+                decision = getattr(ctx.strategy, "_last_decision", None)
+                venue = str(getattr(decision, "venue", "") or ctx.instrument.primary_exchange.value).upper()
+                symbol = str(getattr(decision, "instrument", "") or ctx.instrument.display_symbol)
+                logger.info("%s selected=%s:%s bootstrap=%s:%s | price %.4f | %s | open=%d/%d",
+                            ctx.instrument.asset_id, venue, symbol, ctx.instrument.primary_exchange.value.upper(),
                             ctx.instrument.display_symbol, price, state,
                             self.guard.count_open(self.contexts), self.guard.max_open_positions)
         except Exception as e:
@@ -1390,6 +1431,9 @@ class MultiAssetInstitutionalBot:
         self._market_wakeup.set()
         for ctx in self.contexts:
             try:
+                service_stop = getattr(ctx.strategy, "stop_runtime_services", None)
+                if callable(service_stop):
+                    service_stop()
                 ctx.data_manager.stop()
             except Exception:
                 logger.debug("Data manager stop failed for %s", ctx.instrument.asset_id, exc_info=True)

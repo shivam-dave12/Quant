@@ -240,7 +240,7 @@ class DiscoveryReport:
             lines.append("   activated:")
             for inst in self.matched:
                 exs = ", ".join(f"{ex.value}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items())
-                lines.append(f"     ✅ {inst.asset_id:<8} primary={inst.primary_exchange.value:<10} {exs}")
+                lines.append(f"     ✅ {inst.asset_id:<12} bootstrap={inst.primary_exchange.value:<10} dynamic_execution=true {exs}")
         if self.unavailable:
             lines.append("   unavailable / skipped:")
             for aid, reason in self.unavailable.items():
