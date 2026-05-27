@@ -177,6 +177,10 @@ class InstitutionalStrategy:
         self._research_store = JsonlResearchStore(store_root)
         self._forward_labels = ForwardLabelWriter(self._research_store)
         self._last_candidate_id = ""
+        # Operator telemetry is state/change driven. The model can evaluate on
+        # every market event without emitting an INFO-scale JSON payload per tick.
+        self._telemetry_last_signature: tuple[Any, ...] | None = None
+        self._telemetry_last_emit_ts: float = 0.0
 
     def bind_market_wakeup(self, callback: Callable[[], Any]) -> None:
         self._market_wakeup = callback
@@ -232,29 +236,161 @@ class InstitutionalStrategy:
         if decision.approved:
             self._execute_approved(decision, order_manager, risk_manager)
 
-    def _log_decision_calculation(self, decision: OpportunityDecision) -> None:
-        """Publish the exact calculated state used for every decision.
+    @staticmethod
+    def _round_or_none(value: Any, digits: int = 3) -> float | None:
+        try:
+            out = float(value)
+            return round(out, digits) if math.isfinite(out) else None
+        except Exception:
+            return None
 
-        This intentionally logs rejected/no-trade decisions as well as approved
-        entries so the operator can audit every input, model output and gate.
-        Secrets/tokens never enter ``model_values`` and are not logged here.
+    def _decision_telemetry_signature(self, decision: OpportunityDecision) -> tuple[Any, ...]:
+        model = decision.model_values or {}
+        option_context = model.get("option_volatility_context", {}) if isinstance(model.get("option_volatility_context"), dict) else {}
+        execution_feed = model.get("execution_feed", {}) if isinstance(model.get("execution_feed"), dict) else {}
+        session_book = model.get("session_execution_book", {}) if isinstance(model.get("session_execution_book"), dict) else {}
+        reasons = list(decision.reasons[:2])
+        signal_source = str(model.get("signal_source", ""))
+        direction_key = decision.direction.value
+        raw_non_actionable = {"ofi_tfi_microprice_long", "ofi_tfi_microprice_short", "flow_signal_flat"}
+        collapse_unqualified = (
+            not bool(_cfg("INSTITUTIONAL_DECISION_TELEMETRY_LOG_UNQUALIFIED_SIGNAL_FLIPS", False))
+            and decision.decision is DecisionOutput.NO_TRADE_INSUFFICIENT_EDGE
+            and reasons and reasons[0] in raw_non_actionable
+            and "net_edge_does_not_clear_uncertainty_and_minimum" in reasons
+        )
+        if collapse_unqualified:
+            # Raw flow may alternate LONG/SHORT on every event while still far below
+            # executable edge. Keep the live value in periodic summaries, but do not
+            # treat non-actionable flips as operational state transitions.
+            reasons = ["unqualified_signal_below_required_edge", "net_edge_does_not_clear_uncertainty_and_minimum"]
+            signal_source = "unqualified_signal"
+            direction_key = "UNQUALIFIED_SIGNAL"
+        return (
+            decision.decision.value, direction_key, decision.regime.value, tuple(reasons),
+            signal_source, str(model.get("thesis_reason", "")),
+            bool(option_context.get("ready_for_long_premium_decision", False)),
+            str(execution_feed.get("status", "")), str(session_book.get("status", "")),
+            str(model.get("selected_option_symbol", "")),
+        )
+
+    @staticmethod
+    def _compact_session_execution_book(status: Mapping[str, Any] | None) -> dict[str, Any]:
+        status = dict(status or {})
+        def side(name: str) -> dict[str, Any]:
+            row = status.get(name, {}) if isinstance(status.get(name), dict) else {}
+            return {
+                "symbol": row.get("symbol", ""), "premium": row.get("live_premium") or row.get("premium"),
+                "bid": row.get("live_bid"), "ask": row.get("live_ask"), "delta": row.get("delta"),
+                "iv": row.get("iv"), "lot": row.get("lot"), "fresh": bool(row.get("ws_fresh", False)),
+            }
+        return {
+            "status": status.get("status", "UNKNOWN"),
+            "execution_feed_status": status.get("execution_feed_status", "UNKNOWN"),
+            "call": side("call"), "put": side("put"),
+        }
+
+    def _compact_decision_payload(self, decision: OpportunityDecision, event: str) -> dict[str, Any]:
+        model = decision.model_values or {}
+        payload: dict[str, Any] = {
+            "event": event, "desk": decision.desk, "instrument": decision.instrument,
+            "decision": decision.decision.value, "direction": decision.direction.value,
+            "regime": decision.regime.value, "net_edge_bps": self._round_or_none(decision.expected_net_edge_bps),
+            "required_edge_bps": self._round_or_none(max(float(_cfg("INSTITUTIONAL_MIN_NET_EDGE_BPS", 3.0)), decision.uncertainty_bps)),
+            "liquidity_score": self._round_or_none(decision.liquidity_score),
+            "execution_quality": self._round_or_none(decision.execution_quality_score),
+            "reason": list(decision.reasons[:2]),
+        }
+        if decision.desk == DeskId.INDIA_OPTIONS.value:
+            vol = model.get("option_volatility_context", {}) if isinstance(model.get("option_volatility_context"), dict) else {}
+            payload["domains"] = model.get("pricing_domains", {"signal": "NIFTY_UNDERLYING", "execution": "OPTION_PREMIUM"})
+            payload["underlying"] = {
+                "spot": self._round_or_none(model.get("underlying_price"), 2),
+                "alignment_15m_bps": self._round_or_none(model.get("alignment_15m_bps")),
+                "break_up_bps": self._round_or_none(model.get("break_up_bps")),
+                "break_down_bps": self._round_or_none(model.get("break_down_bps")),
+                "atr_5m": self._round_or_none(model.get("atr_5m"), 2),
+            }
+            payload["volatility"] = {
+                "atm_iv_pct": self._round_or_none(_num(vol.get("atm_iv"), 0.0) * 100.0, 2),
+                "realized_vol_pct": self._round_or_none(_num(vol.get("realized_vol_yang_zhang"), 0.0) * 100.0, 2),
+                "vrp_pct": self._round_or_none(_num(vol.get("vrp"), 0.0) * 100.0, 2),
+                "skew_25d_pct": self._round_or_none(_num(vol.get("skew_25d"), 0.0) * 100.0, 3),
+                "term_slope_pct": self._round_or_none(_num(vol.get("term_slope"), 0.0) * 100.0, 3),
+                "iv_coverage_pct": self._round_or_none(_num(vol.get("live_iv_coverage"), 0.0) * 100.0, 1),
+                "long_premium_context_ready": bool(vol.get("ready_for_long_premium_decision", False)),
+            }
+            session_book = model.get("session_execution_book")
+            if isinstance(session_book, dict) and session_book:
+                payload["session_book"] = session_book
+            if model.get("selected_option_symbol"):
+                payload["active_option"] = {
+                    "symbol": model.get("selected_option_symbol"),
+                    "premium": self._round_or_none(model.get("selected_option_premium"), 2),
+                    "delta": self._round_or_none(model.get("selected_option_delta"), 4),
+                    "premium_edge_bps": self._round_or_none(model.get("premium_delta_edge_bps")),
+                    "theta_hold_bps": self._round_or_none(model.get("theta_carry_bps_expected_hold")),
+                    "cost_bps": self._round_or_none(model.get("costs_bps")),
+                }
+            if decision.liquidity_score == 0.0 and decision.direction is Direction.NO_TRADE:
+                payload["liquidity_score_scope"] = "NO_DIRECTION_ACTIVATED_OPTION_YET; SEE_SESSION_BOOK_FOR_LIVE_CE_PE_BOOKS"
+        else:
+            costs = model.get("execution_cost_components", {}) if isinstance(model.get("execution_cost_components"), dict) else {}
+            payload["microstructure"] = {
+                "source": model.get("signal_source", ""),
+                "edge_bps": self._round_or_none(model.get("directional_edge_bps")),
+                "spread_bps": self._round_or_none(model.get("spread_bps", costs.get("spread_bps"))),
+                "total_cost_bps": self._round_or_none(model.get("costs_bps")),
+                "ofi_1s_usd": self._round_or_none(model.get("ofi_usd_1s"), 2),
+                "ofi_10s_usd": self._round_or_none(model.get("ofi_usd_10s"), 2),
+                "tfi_1s_usd": self._round_or_none(model.get("tfi_usd_1s"), 2),
+                "tfi_10s_usd": self._round_or_none(model.get("tfi_usd_10s"), 2),
+            }
+        if decision.sizing is not None:
+            payload["sizing"] = asdict(decision.sizing)
+        if decision.protection_plan is not None:
+            payload["protection"] = asdict(decision.protection_plan)
+        return payload
+
+    def _log_decision_calculation(self, decision: OpportunityDecision) -> None:
+        """Emit live, decision-useful telemetry without INFO log flooding.
+
+        The strategy may evaluate several times per second. INFO output is emitted
+        immediately on state/signature transitions, periodically for a stable
+        state, and with full details only for approved trades or when explicitly
+        configured for troubleshooting. The append-only research record remains
+        independent from operator log throttling.
         """
         if not bool(_cfg("INSTITUTIONAL_DECISION_TELEMETRY_ENABLED", True)):
             return
-        sizing = asdict(decision.sizing) if decision.sizing is not None else None
-        protection = asdict(decision.protection_plan) if decision.protection_plan is not None else None
-        payload = {
-            "desk": decision.desk, "venue": decision.venue, "instrument": decision.instrument,
-            "decision": decision.decision.value, "direction": decision.direction.value,
-            "regime": decision.regime.value, "net_edge_bps": decision.expected_net_edge_bps,
-            "uncertainty_bps": decision.uncertainty_bps, "liquidity_score": decision.liquidity_score,
-            "execution_quality": decision.execution_quality_score, "reasons": decision.reasons,
-            "model": decision.model_values, "sizing": sizing, "protection": protection,
-        }
+        now = time.time()
+        signature = self._decision_telemetry_signature(decision)
+        transition = signature != self._telemetry_last_signature
+        heartbeat_sec = max(5.0, float(_cfg("INSTITUTIONAL_DECISION_TELEMETRY_HEARTBEAT_SEC", 30.0)))
+        debug_every_tick = bool(_cfg("INSTITUTIONAL_DECISION_TELEMETRY_DEBUG_EVERY_TICK", False))
+        if not transition and not decision.approved and not debug_every_tick and now - self._telemetry_last_emit_ts < heartbeat_sec:
+            return
+        event = "APPROVED" if decision.approved else ("TRANSITION" if transition else "HEARTBEAT")
         try:
-            logger.info("🧮 DECISION_CALC %s", json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str))
+            compact = self._compact_decision_payload(decision, event)
+            logger.info("🧮 DECISION_%s %s", event, json.dumps(compact, sort_keys=True, separators=(",", ":"), default=str))
+            full_detail = bool(decision.approved or debug_every_tick or (transition and _cfg("INSTITUTIONAL_DECISION_TELEMETRY_FULL_ON_TRANSITION", False)))
+            if full_detail:
+                sizing = asdict(decision.sizing) if decision.sizing is not None else None
+                protection = asdict(decision.protection_plan) if decision.protection_plan is not None else None
+                payload = {
+                    "desk": decision.desk, "venue": decision.venue, "instrument": decision.instrument,
+                    "decision": decision.decision.value, "direction": decision.direction.value,
+                    "regime": decision.regime.value, "net_edge_bps": decision.expected_net_edge_bps,
+                    "uncertainty_bps": decision.uncertainty_bps, "liquidity_score": decision.liquidity_score,
+                    "execution_quality": decision.execution_quality_score, "reasons": decision.reasons,
+                    "model": decision.model_values, "sizing": sizing, "protection": protection,
+                }
+                logger.info("🧾 DECISION_DETAIL %s", json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str))
         except Exception as exc:
-            logger.warning("DECISION_CALC serialization failed: %s", exc)
+            logger.warning("DECISION telemetry serialization failed: %s", exc)
+        self._telemetry_last_signature = signature
+        self._telemetry_last_emit_ts = now
 
     def evaluate(self, data_manager, order_manager, risk_manager, now_ms: int) -> OpportunityDecision:
         venue = self._venue(order_manager)
@@ -456,6 +592,12 @@ class InstitutionalStrategy:
             "option_volatility_context": volatility_context,
             "pricing_domains": {"signal": "NIFTY_UNDERLYING", "execution": "OPTION_PREMIUM"},
         }
+        session_status_getter = getattr(data_manager, "get_session_contract_book_status", None)
+        if callable(session_status_getter):
+            try:
+                model_values["session_execution_book"] = self._compact_session_execution_book(session_status_getter() or {})
+            except Exception as exc:
+                model_values["session_execution_book"] = {"status": "STATUS_ERROR", "error": str(exc)}
         features: dict[str, Any] = {"underlying_price": underlying_price, "feed_health": asdict(feed_health), "option_volatility_context": volatility_context}
         if not bool(volatility_context.get("ready_for_long_premium_decision", False)):
             reasons = list(volatility_context.get("reasons") or ["options_volatility_context_not_ready"])
@@ -703,8 +845,8 @@ class InstitutionalStrategy:
                     model_values=decision.model_values,
                     reasons=decision.reasons,
                     features=decision.research_features,
-                    model_version="observable-groww-carry-aware-v2.8",
-                    policy_version="official-feed-protected-execution-v2.8",
+                    model_version="observable-groww-carry-aware-v2.9",
+                    policy_version="official-feed-protected-execution-v2.9",
                 )
             )
         except Exception:

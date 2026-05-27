@@ -539,3 +539,34 @@ def test_live_books_without_current_model_pair_keep_nifty_analysis_live_for_resc
     assert manager.prepare_session_contract_book(23950.0, 25852.96) is True
     assert raw["session_contract_book_status"] == "MONITORING_NO_POLICY_ELIGIBLE_PAIR"
     assert raw["session_contract_diagnostics"]["call"]["rejected"]["delta_outside_vehicle_band"] == 1
+
+
+def test_long_option_valuation_diagnostic_is_signed_and_not_mislabeled_as_edge(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+    from agents import groww_chain_architect as chain
+
+    expiry = (datetime.now(timezone.utc) + timedelta(days=6)).strftime("%Y-%m-%d")
+    instrument = SimpleNamespace(
+        asset_id="NIFTY",
+        primary=SimpleNamespace(raw={
+            "desk_id": "GROWW_INDEX_OPTIONS", "stock_code": "NIFTY", "underlying": "NIFTY",
+            "chain_source": "official_instrument_csv_plus_get_option_chain",
+            "chain_candidates": [
+                {"right": "Call", "option_type": "CE", "TradingSymbol": "CE", "trading_symbol": "CE", "strike_price": 24000, "expiry_date": expiry, "runtime_lot_size": 25, "ltp": 100.0, "iv": 12.0, "open_interest": 1000, "volume": 1000},
+                {"right": "Put", "option_type": "PE", "TradingSymbol": "PE", "trading_symbol": "PE", "strike_price": 23800, "expiry_date": expiry, "runtime_lot_size": 25, "ltp": 100.0, "iv": 12.0, "open_interest": 1000, "volume": 1000},
+            ],
+        })
+    )
+    quotes = {
+        "CE": {"bid_price": 99.9, "offer_price": 100.1, "bid_quantity": 100, "offer_quantity": 100},
+        "PE": {"bid_price": 99.9, "offer_price": 100.1, "bid_quantity": 100, "offer_quantity": 100},
+    }
+    monkeypatch.setattr(chain.config, "GROWW_SESSION_BOOK_DELTA_RESELECT_BAND", 1.0, raising=False)
+    book = chain.build_session_contract_book(instrument, underlying_spot=23900.0, available_funds=100000.0, option_quote_by_symbol=quotes, commit=False)
+    assert book is not None
+    for raw in (book.call.raw, book.put.raw):
+        signed = raw["bs_value_vs_premium_bps"]
+        absolute = raw["bs_model_deviation_abs_bps"]
+        assert absolute == pytest.approx(abs(signed))
+        assert "bs_model_edge_bps" not in raw

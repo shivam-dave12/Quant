@@ -382,98 +382,82 @@ class MultiAssetInstitutionalBot:
         return self.format_assets_report()
 
     def format_portfolio_thinking_report(self) -> str:
-        """On-demand multi-desk calculation book; never fabricates missing numeric stages."""
-        def val(info: Dict[str, Any], key: str, fmt: str = ".4f", missing: str = "N/A") -> str:
+        """Current decision book from the active institutional models.
+
+        This report reads the same ``OpportunityDecision`` object used by order
+        execution. It intentionally replaces the retired entry-engine view so
+        Telegram never reports stale or disconnected calculations.
+        """
+        def fmt(value: Any, digits: int = 2, signed: bool = False) -> str:
             try:
-                raw = info.get(key, None)
-                if raw is None:
-                    return missing
-                f = float(raw)
-                return format(f, fmt) if f == f else missing
+                v = float(value)
+                prefix = "+" if signed and v >= 0 else ""
+                return f"{prefix}{v:.{digits}f}"
             except Exception:
-                return missing
+                return "N/A"
+
         lines = [
-            "🏛 <b>INSTITUTIONAL market_state DECISION BOOK</b>",
-            "<code>Liquidity state | net edge | protected execution</code>",
-            "<i>Every number below is sourced; N/A means that calculation stage has not been reached.</i>",
+            "🧠 <b>LIVE INSTITUTIONAL DECISION BOOK</b>",
+            "<code>official feed → model → executable edge → protected order</code>",
+            "<i>Updated on model transition and periodic heartbeat; /thinking reads the latest calculation directly.</i>",
         ]
         for ctx in self.contexts:
             inst = ctx.instrument
-            eng = getattr(ctx.strategy, "_entry_engine", None)
-            info = eng.analysis_info if eng is not None else {}
-            quality = dict(getattr(ctx.strategy, "_last_data_integrity_context", {}) or {})
-            lineage = dict(quality.get("lineage", {}) or {})
-            is_indian = self._is_indian_options_context(ctx)
-            is_groww = is_indian
-            unit = "NIFTYpts" if is_groww or str(lineage.get("analysis_domain", "")).upper() == "UNDERLYING" else self._currency_for_instrument(inst)
-            try:
-                analysis_getter = getattr(ctx.data_manager, "get_analysis_price", None)
-                mark_raw = analysis_getter() if callable(analysis_getter) else ctx.data_manager.get_last_price()
-                mark = float(mark_raw) if mark_raw is not None and float(mark_raw) > 0.0 else None
-            except Exception:
-                fallback_mark = info.get("price", None)
-                try:
-                    mark = float(fallback_mark) if fallback_mark is not None and float(fallback_mark) > 0.0 else None
-                except Exception:
-                    mark = None
-            state = str(info.get("state", "WARMUP" if ctx.ready else "DORMANT"))
-            block = str(info.get("block_reason", "DATA_NOT_STARTED" if not ctx.ready else "WAIT"))
-            if not ctx.ready and is_indian:
-                is_open, reason, broker_label = self._indian_market_open(ctx)
-                if not is_open:
-                    state, block = "DORMANT", reason
-                else:
-                    state = ctx.start_state or "NOT_READY"
-                    block = f"{broker_label}_AUTO_START_PENDING" if state == "STARTING_AFTER_MARKET_OPEN" else state
-            lines.append(f"\n<b>{self._esc(inst.asset_id)} · {self._esc(inst.primary_exchange.value.upper())}:{self._esc(inst.display_symbol)}</b>  <code>{self._esc(state)}</code>")
-            mark_txt = f"{self._esc(unit)}{mark:,.4f}" if mark is not None else "N/A"
-            lines.append(f"<code>analysis mark {mark_txt} | block {self._esc(block)}</code>")
-            if quality:
-                frames = quality.get("frames", {}) or {}
-                qparts = []
-                for tf in ("5m", "15m", "4h"):
-                    q = frames.get(tf, {}) or {}
-                    age = "N/A" if q.get("last_age_sec") is None else f"{float(q.get('last_age_sec')):.0f}s"
-                    qparts.append(f"{tf}:n={q.get('bars','-')},age={age},dup={q.get('duplicates','-')},gap={q.get('gaps','-')},bad={q.get('invalid_ohlc','-')},vol={q.get('volume_status','-')}")
-                lines.append(f"<code>data {'PASS' if quality.get('ok') else 'BLOCK'} | analysis={self._esc(lineage.get('analysis_source','?'))}/{self._esc(lineage.get('analysis_domain','?'))} → execution={self._esc(lineage.get('execution_source','?'))}/{self._esc(lineage.get('execution_domain','?'))}</code>")
-                lines.append(f"<code>fresh={'Y' if quality.get('analysis_quote_fresh') else 'N'} | {' | '.join(qparts)}</code>")
-            if info:
-                threshold = val(info, "context_direction_threshold", ".2f")
+            decision = getattr(ctx.strategy, "_last_decision", None)
+            lines.append(f"\n<b>{self._esc(inst.asset_id)} · {self._esc(inst.primary_exchange.value.upper())}:{self._esc(inst.display_symbol)}</b>")
+            if decision is None:
+                lines.append("<code>WAITING_FOR_FIRST_DECISION</code>")
+                continue
+            compact_fn = getattr(ctx.strategy, "_compact_decision_payload", None)
+            compact = compact_fn(decision, "ON_DEMAND") if callable(compact_fn) else {}
+            lines.append(
+                f"<code>{self._esc(decision.decision.value)} | dir={self._esc(decision.direction.value)} "
+                f"regime={self._esc(decision.regime.value)} | edge={fmt(decision.expected_net_edge_bps,2,True)}bps "
+                f"need={fmt(compact.get('required_edge_bps'),2)}bps execQ={fmt(decision.execution_quality_score,2)} "
+                f"liq={fmt(decision.liquidity_score,2)}</code>"
+            )
+            if inst.asset_id == "NIFTY":
+                under = compact.get("underlying", {}) if isinstance(compact.get("underlying"), dict) else {}
+                vol = compact.get("volatility", {}) if isinstance(compact.get("volatility"), dict) else {}
+                book = compact.get("session_book", {}) if isinstance(compact.get("session_book"), dict) else {}
                 lines.append(
-                    f"<code>4H {self._esc(info.get('context_4h','WAIT'))} score={val(info,'context_4h_score','+.3f')} "
-                    f"=[slope {val(info,'context_4h_slope_component','+.3f')} + struct {val(info,'context_4h_structure_component','+.3f')}] "
-                    f"threshold=±{threshold} ATR={val(info,'context_4h_atr')}</code>"
+                    f"<code>underlying={fmt(under.get('spot'),2)} ATR5m={fmt(under.get('atr_5m'),2)} "
+                    f"align15m={fmt(under.get('alignment_15m_bps'),2,True)}bps "
+                    f"break↑={fmt(under.get('break_up_bps'),2,True)} break↓={fmt(under.get('break_down_bps'),2,True)}bps</code>"
                 )
                 lines.append(
-                    f"<code>15m {self._esc(info.get('context_15m','WAIT'))} score={val(info,'context_15m_score','+.3f')} "
-                    f"=[slope {val(info,'context_15m_slope_component','+.3f')} + struct {val(info,'context_15m_structure_component','+.3f')}] "
-                    f"threshold=±{threshold} ATR={val(info,'context_15m_atr')}</code>"
+                    f"<code>vol ATM_IV={fmt(vol.get('atm_iv_pct'),2)}% RV_YZ={fmt(vol.get('realized_vol_pct'),2)}% "
+                    f"VRP={fmt(vol.get('vrp_pct'),2,True)}% skew25={fmt(vol.get('skew_25d_pct'),3,True)}% "
+                    f"term={fmt(vol.get('term_slope_pct'),3,True)}% IVcov={fmt(vol.get('iv_coverage_pct'),1)}%</code>"
                 )
-                lines.append(f"<code>decision_path={self._esc(info.get('decision_path','DISCOVERY'))} | HTF delivery={self._esc(info.get('context_bias_path','AWAITING_DESTINATION'))} dir={self._esc(info.get('context_direction','none'))} score={val(info,'context_delivery_score','.2f')} strict={'Y' if info.get('context_aligned') else 'N'}</code>")
-                pct_value = {"pct": 100 * float(info.get("atr_percentile", 0.5) or 0.5)}
-                lines.append(f"<code>5m ATR={val(info,'entry_5m_atr')} pct={val(pct_value,'pct','.0f')}% trigger={self._esc(info.get('trigger','WAIT'))} minRR={val(info,'min_structural_rr','.2f')}</code>")
-                if info.get("liquidity_event_side"):
-                    lines.append(f"<code>liquidity_event accepted {self._esc(str(info.get('liquidity_event_side')).upper())} @{val(info,'liquidity_event_price')} wick={val(info,'liquidity_event_wick')} q={val(info,'liquidity_event_quality','.2f')} age={val(info,'liquidity_event_age_sec','.0f')}s</code>")
-                elif info.get("candidate_liquidity_event_side"):
-                    lines.append(f"<code>liquidity_event rejected {self._esc(str(info.get('candidate_liquidity_event_side')).upper())} @{val(info,'candidate_liquidity_event_price')} q={val(info,'candidate_liquidity_event_quality','.2f')} reason={self._esc(block)}</code>")
-                if info.get("liquidity_event_side") and not info.get("state_change_broken"):
-                    lines.append(f"<code>state_change={val(info,'state_change_level')} broken=N disp={val(info,'displacement_atr','.2f')}ATR | liquidity_gap=N/A (requires state_change break) | SL/TP=N/A</code>")
-                elif info.get("state_change_broken") and info.get("liquidity_gap_low") is None:
-                    lines.append(f"<code>state_change={val(info,'state_change_level')} broken=Y disp={val(info,'displacement_atr','.2f')}ATR | liquidity_gap=N/A (awaiting valid displacement gap) | SL/TP=N/A</code>")
-                elif info.get("liquidity_gap_low") is not None:
-                    lines.append(f"<code>state_change={val(info,'state_change_level')} broken=Y disp={val(info,'displacement_atr','.2f')}ATR | liquidity_gap=[{val(info,'liquidity_gap_low')},{val(info,'liquidity_gap_high')}] eq={val(info,'liquidity_gap_equilibrium')}</code>")
-                    calibrated = val(info, 'delivery_probability', '.3f') if info.get('probability_calibrated') else 'N/A'
-                    lines.append(f"<code>SL={val(info,'structural_stop')} clearance={val(info,'stop_clearance_atr','.2f')}ATR | target {self._esc(info.get('target_timeframe','N/A'))}@{val(info,'target_pool_price')} RR={val(info,'rr','.2f')} deliveryScore={val(info,'delivery_score','+.3f')} calibratedP={calibrated}</code>")
-            liq = getattr(ctx.strategy, "_liq_map", None)
-            native = getattr(liq, "_native_atr_by_tf", {}) or {}
-            if native:
-                lines.append("<code>native ATR pools: " + " | ".join(f"{tf}={float(native[tf]):.4f}" for tf in ("5m", "15m", "4h") if tf in native) + "</code>")
-            spread = getattr(ctx.strategy, "_last_spread_gate_context", {}) or {}
-            if spread:
-                age = "N/A" if spread.get("book_age_sec") is None else f"{float(spread.get('book_age_sec')):.2f}s"
-                lines.append(f"<code>execution book={self._esc(spread.get('book_status','N/A'))} age={age} spread={val(spread,'spread_bps','.2f')}bps/{val(spread,'spread_atr','.3f')}ATR size×{val(spread,'size_mult','.2f')} hard={'Y' if spread.get('hard_fail') else 'N'}</code>")
-            if ctx.strategy.get_position():
-                lines.append("🔒 <i>Broker-protected position active; exact-fill reconciliation armed.</i>")
+                for label, key in (("CE", "call"), ("PE", "put")):
+                    row = book.get(key, {}) if isinstance(book.get(key), dict) else {}
+                    if row.get("symbol"):
+                        lines.append(
+                            f"<code>{label} {self._esc(row.get('symbol',''))} prem={fmt(row.get('premium'),2)} "
+                            f"bid/ask={fmt(row.get('bid'),2)}/{fmt(row.get('ask'),2)} "
+                            f"Δ={fmt(row.get('delta'),3,True)} IV={fmt((float(row.get('iv') or 0.0) * 100.0),2)}% "
+                            f"lot={fmt(row.get('lot'),0)} fresh={'Y' if row.get('fresh') else 'N'}</code>"
+                        )
+                active = compact.get("active_option", {}) if isinstance(compact.get("active_option"), dict) else {}
+                if active:
+                    lines.append(
+                        f"<code>active={self._esc(active.get('symbol',''))} premiumEdge={fmt(active.get('premium_edge_bps'),2,True)}bps "
+                        f"thetaHold={fmt(active.get('theta_hold_bps'),2)}bps costs={fmt(active.get('cost_bps'),2)}bps</code>"
+                    )
+                elif decision.direction.value == "NO_TRADE":
+                    lines.append("<i>CE/PE execution books can be live while no underlying directional thesis is approved.</i>")
+            else:
+                micro = compact.get("microstructure", {}) if isinstance(compact.get("microstructure"), dict) else {}
+                lines.append(
+                    f"<code>signal={self._esc(micro.get('source',''))} rawEdge={fmt(micro.get('edge_bps'),2,True)}bps "
+                    f"spread={fmt(micro.get('spread_bps'),2)}bps cost={fmt(micro.get('total_cost_bps'),2)}bps</code>"
+                )
+                lines.append(
+                    f"<code>OFI $1s={fmt(micro.get('ofi_1s_usd'),2,True)} $10s={fmt(micro.get('ofi_10s_usd'),2,True)} "
+                    f"TFI $1s={fmt(micro.get('tfi_1s_usd'),2,True)} $10s={fmt(micro.get('tfi_10s_usd'),2,True)}</code>"
+                )
+            lines.append(f"<code>reason={self._esc('; '.join(str(x) for x in decision.reasons[:2]))}</code>")
         return "\n".join(lines)
 
     # ---------------------------------------------------------------------

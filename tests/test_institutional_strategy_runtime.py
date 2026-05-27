@@ -351,9 +351,15 @@ def test_groww_option_edge_deducts_hold_horizon_theta_carry(tmp_path, monkeypatc
     assert decision.model_values["net_edge_formula"] == "premium_delta_edge_bps - total_cost_bps - theta_carry_bps_expected_hold"
 
 
-def test_decision_telemetry_logs_calculation_payload(tmp_path, monkeypatch, caplog):
+def test_decision_telemetry_emits_compact_transition_not_every_tick(tmp_path, monkeypatch, caplog):
     def cfg(name, default):
-        values = {"RESEARCH_STORE_PATH": str(tmp_path), "INSTITUTIONAL_DECISION_TELEMETRY_ENABLED": True}
+        values = {
+            "RESEARCH_STORE_PATH": str(tmp_path),
+            "INSTITUTIONAL_DECISION_TELEMETRY_ENABLED": True,
+            "INSTITUTIONAL_DECISION_TELEMETRY_HEARTBEAT_SEC": 30.0,
+            "INSTITUTIONAL_DECISION_TELEMETRY_FULL_ON_TRANSITION": False,
+            "INSTITUTIONAL_DECISION_TELEMETRY_DEBUG_EVERY_TICK": False,
+        }
         return values.get(name, default)
     monkeypatch.setattr("strategy.institutional_strategy._cfg", cfg)
     inst = _groww_instrument_for_strategy()
@@ -369,5 +375,62 @@ def test_decision_telemetry_logs_calculation_payload(tmp_path, monkeypatch, capl
     import logging
     with caplog.at_level(logging.INFO):
         strategy._log_decision_calculation(decision)
-    assert "DECISION_CALC" in caplog.text
+        strategy._log_decision_calculation(decision)
+    assert caplog.text.count("DECISION_TRANSITION") == 1
+    assert "DECISION_DETAIL" not in caplog.text
+    assert "NO_DIRECTION_ACTIVATED_OPTION_YET" in caplog.text
+
+
+def test_decision_telemetry_can_emit_full_detail_on_transition(tmp_path, monkeypatch, caplog):
+    def cfg(name, default):
+        values = {
+            "RESEARCH_STORE_PATH": str(tmp_path),
+            "INSTITUTIONAL_DECISION_TELEMETRY_ENABLED": True,
+            "INSTITUTIONAL_DECISION_TELEMETRY_FULL_ON_TRANSITION": True,
+        }
+        return values.get(name, default)
+    monkeypatch.setattr("strategy.institutional_strategy._cfg", cfg)
+    inst = _groww_instrument_for_strategy()
+    strategy = InstitutionalStrategy(instrument=inst)
+    from strategy.domain import DecisionOutput, Direction, Regime
+    decision = strategy._decision(
+        desk="DESK_B_NIFTY_OPTIONS", venue="groww", instrument="NIFTY",
+        decision=DecisionOutput.NO_TRADE_INSUFFICIENT_EDGE, direction=Direction.NO_TRADE,
+        regime=Regime.BALANCE, expected_net_edge_bps=0.0, uncertainty_bps=1.0,
+        liquidity_score=0.0, execution_quality_score=1.0, sizing=None, protection_plan=None,
+        reasons=["audit"], model_values={"calculation": 42.0}, research_features={},
+    )
+    import logging
+    with caplog.at_level(logging.INFO):
+        strategy._log_decision_calculation(decision)
+    assert "DECISION_DETAIL" in caplog.text
     assert '"calculation":42.0' in caplog.text
+
+
+def test_telemetry_does_not_log_unqualified_microstructure_flips_as_transitions(tmp_path, monkeypatch, caplog):
+    def cfg(name, default):
+        values = {
+            "RESEARCH_STORE_PATH": str(tmp_path),
+            "INSTITUTIONAL_DECISION_TELEMETRY_ENABLED": True,
+            "INSTITUTIONAL_DECISION_TELEMETRY_HEARTBEAT_SEC": 30.0,
+            "INSTITUTIONAL_DECISION_TELEMETRY_LOG_UNQUALIFIED_SIGNAL_FLIPS": False,
+        }
+        return values.get(name, default)
+    monkeypatch.setattr("strategy.institutional_strategy._cfg", cfg)
+    inst = _groww_instrument_for_strategy()
+    strategy = InstitutionalStrategy(instrument=inst)
+    from strategy.domain import DecisionOutput, Direction, Regime
+    def decision(direction, source):
+        return strategy._decision(
+            desk="DESK_A_METALS", venue="delta", instrument="PAXGUSD",
+            decision=DecisionOutput.NO_TRADE_INSUFFICIENT_EDGE, direction=direction,
+            regime=Regime.BALANCE, expected_net_edge_bps=-1.0, uncertainty_bps=3.0,
+            liquidity_score=0.8, execution_quality_score=1.0, sizing=None, protection_plan=None,
+            reasons=[source, "net_edge_does_not_clear_uncertainty_and_minimum"],
+            model_values={"signal_source": source, "costs_bps": 2.5}, research_features={},
+        )
+    import logging
+    with caplog.at_level(logging.INFO):
+        strategy._log_decision_calculation(decision(Direction.LONG, "ofi_tfi_microprice_long"))
+        strategy._log_decision_calculation(decision(Direction.SHORT, "ofi_tfi_microprice_short"))
+    assert caplog.text.count("DECISION_TRANSITION") == 1

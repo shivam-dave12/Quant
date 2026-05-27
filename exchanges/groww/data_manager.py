@@ -868,8 +868,8 @@ class GrowwOptionDataManager:
                     if trial_book is not None:
                         logger.info(
                             "GROWW live stream discovery selectable books ready: requested=%d live_two_sided=%d "
-                            "basis=option_chain_rank_then_official_fno_ltp_market_depth model_audit=%s",
-                            len(states), len(live), trial_diagnostics,
+                            "basis=option_chain_rank_then_official_fno_ltp_market_depth audit=%s",
+                            len(states), len(live), self._compact_model_audit(trial_diagnostics),
                         )
                         return live
                 tick_event.wait(min(0.5, max(0.0, deadline - time.time())))
@@ -911,9 +911,9 @@ class GrowwOptionDataManager:
             self._last_stream_discovery_diagnostics = final_diagnostics
             logger.warning(
                 "GROWW live execution universe observed but no current CE/PE book selected within %.1fs: "
-                "subscribed=%d ltp_live=%d two_sided_depth=%d side_live=%s model_audit=%s sample_books=%s; "
+                "subscribed=%d ltp_live=%d two_sided_depth=%d side_live=%s audit=%s sample_books=%s; "
                 "analysis remains live and execution will be rescanned without fallback prices",
-                timeout, len(states), ltp_count, len(depth_rows), side_counts, final_diagnostics, sample,
+                timeout, len(states), ltp_count, len(depth_rows), side_counts, self._compact_model_audit(final_diagnostics), sample,
             )
             return live_after_timeout
         except Exception as exc:
@@ -925,6 +925,36 @@ class GrowwOptionDataManager:
                     hub.unsubscribe(discovery_ids)
                 except Exception as exc:
                     logger.warning("GROWW discovery stream unsubscribe failed after selection: %s", exc)
+
+
+    @staticmethod
+    def _compact_model_audit(diagnostics: dict[str, Any] | None) -> dict[str, Any]:
+        diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+        out: dict[str, Any] = {}
+        for side in ("call", "put"):
+            row = diagnostics.get(side, {}) if isinstance(diagnostics.get(side), dict) else {}
+            selected = row.get("selected", {}) if isinstance(row.get("selected"), dict) else {}
+            raw = selected.get("raw", {}) if isinstance(selected.get("raw"), dict) else {}
+            top = row.get("top_accepted", []) if isinstance(row.get("top_accepted"), list) else []
+            out[side] = {
+                "live_books": int(row.get("live_book_rows", 0) or 0),
+                "accepted": int(row.get("accepted", 0) or 0),
+                "rejected": dict(row.get("rejected", {}) or {}),
+                "selected": {
+                    "symbol": selected.get("selected_symbol", ""),
+                    "strike": selected.get("strike"),
+                    "premium": raw.get("selected_entry_premium"),
+                    "delta": selected.get("delta"),
+                    "spread_bps": raw.get("selection_spread_bps"),
+                    "depth": raw.get("selection_visible_depth"),
+                    "theta_hold_bps": raw.get("theta_carry_bps_expected_hold"),
+                    "value_vs_premium_bps": raw.get("bs_value_vs_premium_bps"),
+                    "valuation_deviation_abs_bps": raw.get("bs_model_deviation_abs_bps"),
+                    "iv": raw.get("bs_volatility"),
+                } if selected else {},
+                "alternatives": len(top),
+            }
+        return out
 
 
     def _prewarm_session_vehicle(self, choice) -> bool:
@@ -988,7 +1018,7 @@ class GrowwOptionDataManager:
                 raw["session_contract_diagnostics"] = diagnostics
             logger.warning(
                 "GROWW live execution books exist but no pair is currently model-eligible; NIFTY analysis remains live, "
-                "entries blocked until rescan. model_audit=%s", diagnostics,
+                "entries blocked until rescan. audit=%s", self._compact_model_audit(diagnostics),
             )
             return True
         if bool(_cfg("GROWW_SESSION_BOOK_PREWARM_EXECUTION_DATA", True)):
@@ -1015,11 +1045,13 @@ class GrowwOptionDataManager:
         logger.info(
             "GROWW SESSION CONTRACT BOOK %s [%s] reason=%s spot=%.2f funds=₹%.2f | "
             "CE=%s strike=%.2f expiry=%s lot=%.0f prem=₹%.2f score=%.3f delta=%+.3f theta/day=%.4f theta/hold=%.2fbps | "
-            "PE=%s strike=%.2f expiry=%s lot=%.0f prem=₹%.2f score=%.3f delta=%+.3f theta/day=%.4f theta/hold=%.2fbps | model_audit=%s",
+            "PE=%s strike=%.2f expiry=%s lot=%.0f prem=₹%.2f score=%.3f delta=%+.3f theta/day=%.4f theta/hold=%.2fbps | audit=%s",
             raw["session_contract_book_status"], book.trade_date_ist, reason, underlying_spot, available_funds,
             book.call.selected_symbol, book.call.strike, book.call.expiry, float(book.call.raw.get("runtime_lot_size", 0.0) or 0.0), float(book.call.raw.get("selected_entry_premium", 0.0) or 0.0), book.call.score, book.call.delta, book.call.theta_to_premium, float(book.call.raw.get("theta_carry_bps_expected_hold", 0.0) or 0.0),
-            book.put.selected_symbol, book.put.strike, book.put.expiry, float(book.put.raw.get("runtime_lot_size", 0.0) or 0.0), float(book.put.raw.get("selected_entry_premium", 0.0) or 0.0), book.put.score, book.put.delta, book.put.theta_to_premium, float(book.put.raw.get("theta_carry_bps_expected_hold", 0.0) or 0.0), diagnostics,
+            book.put.selected_symbol, book.put.strike, book.put.expiry, float(book.put.raw.get("runtime_lot_size", 0.0) or 0.0), float(book.put.raw.get("selected_entry_premium", 0.0) or 0.0), book.put.score, book.put.delta, book.put.theta_to_premium, float(book.put.raw.get("theta_carry_bps_expected_hold", 0.0) or 0.0), self._compact_model_audit(diagnostics),
         )
+        if bool(_cfg("GROWW_SESSION_MODEL_AUDIT_FULL_INFO", False)):
+            logger.info("GROWW SESSION MODEL_AUDIT_DETAIL %s", diagnostics)
         return True
 
     def ensure_session_contract_book(self, underlying_spot: float) -> bool:

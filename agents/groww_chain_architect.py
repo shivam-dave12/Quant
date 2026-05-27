@@ -680,9 +680,13 @@ def select_contract_for_thesis(
             carry_score = clamp(1.0 - theta_carry_bps / carry_reference_bps)
             delta_score = clamp(1.0 - abs(abs(bs.delta) - target_delta) / max(delta_band, 1e-6))
             moneyness_score = clamp(1.0 - abs(bs.moneyness - 1.0) / 0.10)
-            model_edge_bps = abs(bs.theoretical_price - prem) / max(prem, 1e-9) * 10000.0 if prem > 0 else 0.0
-            edge_score = clamp(1.0 - model_edge_bps / 2500.0)
-            bs_score = 0.36 * delta_score + 0.28 * carry_score + 0.20 * moneyness_score + 0.16 * edge_score
+            # This is a valuation consistency diagnostic, not forecast alpha.
+            # For a long option, theoretical < offer is negative value relative
+            # to purchase premium; never label its absolute magnitude as edge.
+            bs_value_vs_premium_bps = ((bs.theoretical_price - prem) / max(prem, 1e-9) * 10000.0) if prem > 0 else 0.0
+            bs_model_deviation_abs_bps = abs(bs_value_vs_premium_bps)
+            valuation_consistency_score = clamp(1.0 - bs_model_deviation_abs_bps / 2500.0)
+            bs_score = 0.36 * delta_score + 0.28 * carry_score + 0.20 * moneyness_score + 0.16 * valuation_consistency_score
             delta = bs.delta; theta = bs.theta_to_premium; mon = bs.moneyness
             row_audit["theta_carry_bps_expected_hold"] = round(theta_carry_bps, 3)
         else:
@@ -696,13 +700,15 @@ def select_contract_for_thesis(
         depth_score = clamp(visible_depth / max(lot * max(1.0, min_book_lots) * 4.0, 1.0))
         liquidity_score = 0.70 * spread_score + 0.30 * depth_score
         score = clamp(0.36 * bs_score + 0.14 * dte_score + 0.25 * liquidity_score + 0.10 * live_score + 0.15 * affordability_score)
-        reasons = [f"thesis={side}", f"buy_{desired}", f"dte={dte:.1f}", f"strike={strike:g}", f"spread={spread_bps:.1f}bps", f"depth={visible_depth:.0f}", f"cost={contract_cost:.0f}", f"funds_fit={contract_cost:.0f}/{max_contract_cost:.0f}", f"delta={delta:+.2f}", f"theta/day={theta:.2%}", f"theta_hold={theta_carry_bps:.1f}bps", f"iv={iv:.1%}", f"vol={iv_source}"]
+        reasons = [f"thesis={side}", f"buy_{desired}", f"dte={dte:.1f}", f"strike={strike:g}", f"spread={spread_bps:.1f}bps", f"depth={visible_depth:.0f}", f"cost={contract_cost:.0f}", f"funds_fit={contract_cost:.0f}/{max_contract_cost:.0f}", f"delta={delta:+.2f}", f"theta/day={theta:.2%}", f"theta_hold={theta_carry_bps:.1f}bps", f"value_vs_premium={bs_value_vs_premium_bps:+.1f}bps", f"iv={iv:.1%}", f"vol={iv_source}"]
         enriched = dict(c)
         enriched.update({
             "runtime_lot_size": lot, "selected_entry_premium": prem,
             "selected_contract_cost": contract_cost, "selected_max_contract_cost": max_contract_cost,
             "selected_contract_utilization": utilization, "bs_volatility": iv,
-            "bs_volatility_source": iv_source, "bs_model_edge_bps": model_edge_bps,
+            "bs_volatility_source": iv_source,
+            "bs_value_vs_premium_bps": bs_value_vs_premium_bps,
+            "bs_model_deviation_abs_bps": bs_model_deviation_abs_bps,
             "theta_carry_horizon_sec": expected_hold_sec, "theta_carry_bps_expected_hold": theta_carry_bps,
             "selection_liquidity_score": liquidity_score, "selection_spread_bps": spread_bps,
             "selection_visible_depth": visible_depth,
