@@ -1,0 +1,13 @@
+# Core runtime
+requests>=2.31.0
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+
+# Exchange transports
+websocket-client>=1.7.0
+python-socketio[client]>=5.11.0
+cryptography>=42.0.0
+
+# Official Groww Trading API SDK and TOTP helper for access-token generation.
+growwapi
+pyotp>=2.9.0
