@@ -68,6 +68,50 @@ class CoinSwitchWebSocket:
         self._setup_handlers()
         logger.info("CoinSwitchWebSocket initialised")
 
+    # ── Official Futures message normalisation ────────────────────────────────
+
+    @staticmethod
+    def normalise_orderbook_payload(payload: Dict) -> Optional[Dict]:
+        """Normalise the documented Futures book payload.
+
+        CoinSwitch publishes bids/asks under ``payload["data"]``.  The
+        top-level fallback is retained only for replay/backward-compatible
+        fixtures, not as the documented production contract.
+        """
+        if not isinstance(payload, dict) or "success" in payload:
+            return None
+        body = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        bids = body.get("bids", body.get("b", [])) if isinstance(body, dict) else []
+        asks = body.get("asks", body.get("a", [])) if isinstance(body, dict) else []
+        if not bids or not asks:
+            return None
+        ts = body.get("timestamp") or body.get("E") or body.get("t") or time.time()
+        return {"bids": bids, "asks": asks, "timestamp": ts, "symbol": body.get("symbol") or body.get("s")}
+
+    @staticmethod
+    def normalise_trade_payloads(payload: Dict) -> List[Dict]:
+        """Normalise the documented Futures trades array under ``data``."""
+        if not isinstance(payload, dict) or "success" in payload:
+            return []
+        body = payload.get("data")
+        rows = body if isinstance(body, list) else [payload if "p" in payload else body]
+        out: List[Dict] = []
+        for row in rows:
+            if not isinstance(row, dict) or row.get("p") is None:
+                continue
+            try:
+                event_ms = row.get("E") or row.get("timestamp") or row.get("t")
+                timestamp = float(event_ms) / 1000.0 if event_ms and float(event_ms) > 1e11 else (float(event_ms) if event_ms else time.time())
+                out.append({
+                    "price": float(row["p"]),
+                    "quantity": float(row.get("q", 0) or 0),
+                    "side": "sell" if bool(row.get("m")) else "buy",
+                    "timestamp": timestamp,
+                })
+            except (TypeError, ValueError):
+                continue
+        return out
+
     # ── Internal: event handlers ──────────────────────────────────────────────
 
     def _setup_handlers(self) -> None:
@@ -94,46 +138,34 @@ class CoinSwitchWebSocket:
         def on_orderbook(data):
             try:
                 self._last_message_time = datetime.now()
-                if not isinstance(data, dict):
+                normalised = self.normalise_orderbook_payload(data)
+                if normalised is None:
                     return
-                bids = data.get("bids", data.get("b", []))
-                asks = data.get("asks", data.get("a", []))
-                if not bids and not asks:
-                    return
-                normalised = {
-                    "bids":      bids,
-                    "asks":      asks,
-                    "timestamp": time.time(),
-                }
                 with self._lock:
                     cbs = list(self._ob_callbacks)
                 for cb in cbs:
                     try:
                         cb(normalised)
                     except Exception as e:
-                        logger.error(f"OB callback error: {e}")
+                        logger.error(f"orderbook callback error: {e}")
             except Exception as e:
-                logger.error(f"OB handler error: {e}")
+                logger.error(f"orderbook handler error: {e}")
 
         @self.sio.on(self._EV_TRADES, namespace=self.NAMESPACE)
         def on_trade(data):
             try:
                 self._last_message_time = datetime.now()
-                if not isinstance(data, dict) or "p" not in data:
+                rows = self.normalise_trade_payloads(data)
+                if not rows:
                     return
-                normalised = {
-                    "price":     float(data["p"]),
-                    "quantity":  float(data.get("q", 0)),
-                    "side":      "sell" if data.get("m") else "buy",
-                    "timestamp": time.time(),
-                }
                 with self._lock:
                     cbs = list(self._tr_callbacks)
-                for cb in cbs:
-                    try:
-                        cb(normalised)
-                    except Exception as e:
-                        logger.error(f"Trade callback error: {e}")
+                for normalised in rows:
+                    for cb in cbs:
+                        try:
+                            cb(normalised)
+                        except Exception as e:
+                            logger.error(f"Trade callback error: {e}")
             except Exception as e:
                 logger.error(f"Trade handler error: {e}")
 
@@ -202,7 +234,7 @@ class CoinSwitchWebSocket:
 
         logger.info(
             f"CoinSwitch WS: resubscribing "
-            f"{len(ob_subs)} OB, {len(cd_subs)} candles, {len(tr_subs)} trades"
+            f"{len(ob_subs)} orderbook, {len(cd_subs)} candles, {len(tr_subs)} trades"
         )
 
         for sub in ob_subs:
@@ -213,7 +245,7 @@ class CoinSwitchWebSocket:
                     namespace=self.NAMESPACE,
                 )
             except Exception as e:
-                logger.error(f"Resubscribe OB {sub.get('pair')}: {e}")
+                logger.error(f"Resubscribe orderbook {sub.get('pair')}: {e}")
 
         for sub in cd_subs:
             try:

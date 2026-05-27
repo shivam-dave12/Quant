@@ -7,7 +7,7 @@ Three responsibilities:
   1. Track true round-trip execution cost from live data
      (fee rate + rolling spread + EWMA realized slippage)
 
-  2. Compute a regime-adaptive minimum required gross TP move
+  2. Compute a market-cost-aware minimum required gross TP move
      that scales with ATR percentile and spread/ATR ratio —
      not a fixed multiplier
 
@@ -32,6 +32,7 @@ import config
 logger = logging.getLogger(__name__)
 
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SPREAD TRACKER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -40,6 +41,10 @@ def _cfg(name: str, default):
     """Read a config value at call-time so hot-reloads take effect."""
     val = getattr(config, name, None)
     return default if val is None else val
+
+
+def _is_delta_execution() -> bool:
+    return str(_cfg("EXECUTION_EXCHANGE", "") or "").lower() == "delta"
 
 
 def _ob_px(lvl) -> float:
@@ -180,7 +185,7 @@ class SlippageTracker:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REGIME-ADAPTIVE PROFIT FLOOR
+# MEASURED EXECUTION-COST PROFIT FLOOR
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ProfitFloorModel:
@@ -195,7 +200,7 @@ class ProfitFloorModel:
     We require a larger buffer — more deviation before entering.
 
     In a volatile market (high ATR percentile), moves are fat and the fee
-    is a small fraction of the expected swing. The buffer can be tighter.
+    is a small fraction of the expected move. The buffer can be tighter.
 
     The multiplier curve is a sigmoid anchored to two config-controlled points:
       - ATR pctile ≤ 0.10  → mult ≈ FEE_FLOOR_MULT_LOW   (quiet, fees dominate)
@@ -204,9 +209,9 @@ class ProfitFloorModel:
     An additional spread penalty applies when spread/ATR ratio exceeds
     FEE_SPREAD_ATR_WARN — this market is expensive relative to its moves.
 
-    Signal confidence from the composite score provides a bounded discount
-    (max FEE_CONF_MAX_DISCOUNT) — a conviction entry can afford a slightly
-    tighter floor, but the hard floor FEE_FLOOR_ABS_MIN_MULT always applies.
+    A replay-calibrated probability may provide a bounded execution-cost adjustment
+    after geometry is approved; uncalibrated structural evidence never discounts fees.
+    The hard floor FEE_FLOOR_ABS_MIN_MULT always applies.
     """
 
     def compute_multiplier(
@@ -215,21 +220,21 @@ class ProfitFloorModel:
         spread_bps: float,
         atr: float,
         price: float,
-        signal_confidence: float = 0.5,
+        delivery_probability: Optional[float] = None,
     ) -> float:
         """
         atr_percentile: 0..1, where current ATR sits in its own history
         spread_bps:     current median spread in basis points
         atr:            current ATR in price units
         price:          current mid-price
-        signal_confidence: composite signal strength mapped to 0..1
+        delivery_probability: optional replay-calibrated delivery probability; None leaves fee floor probability-neutral
 
         FEE_FLOOR_MULT calibration:
           Original FEE_FLOOR_MULT_LOW=5.5 was physically impossible.
-          At pctile=0.12, ATR=$63: mult=5.05 × rt_cost($88) = $445 TP required.
+          At pctile=0.12, ATR=63 price-units: mult=5.05 × rt_cost(88 price-units) = 445 price-units TP required.
           That is 7×ATR. No structural target exists 7×ATR away on a 1×ATR SL setup.
           The correct reasoning: fee cost needs 1.5-2× buffer, not 5×.
-          FEE_FLOOR_MULT_LOW=2.5 → at pctile=0.12: $88×2.3=$202 (taker) or $55×2.3=$127 (maker).
+          FEE_FLOOR_MULT_LOW=2.5 → at pctile=0.12: 88×2.3=202 price-units (taker) or 55×2.3=127 price-units (maker).
           Still enforces the fee floor. Never demands physically unreachable TP.
         """
         mult_low   = float(_cfg("FEE_FLOOR_MULT_LOW",    2.5))   # was 5.5 — caused 7×ATR TP demands
@@ -239,8 +244,8 @@ class ProfitFloorModel:
         abs_min    = float(_cfg("FEE_FLOOR_ABS_MIN_MULT", 1.2))  # was 1.4
         spread_warn = float(_cfg("FEE_SPREAD_ATR_WARN",  0.06))
         penalty_k  = float(_cfg("FEE_SPREAD_PENALTY_K",  4.0))
-        conf_neutral     = float(_cfg("FEE_CONF_NEUTRAL",      0.5))
-        conf_max_disc    = float(_cfg("FEE_CONF_MAX_DISCOUNT",  0.30))
+        delivery_neutral     = float(_cfg("FEE_CONF_NEUTRAL",      0.5))
+        delivery_max_discount    = float(_cfg("FEE_CONF_MAX_DISCOUNT",  0.30))
 
         p = max(0.02, min(0.98, atr_percentile))
 
@@ -258,15 +263,19 @@ class ProfitFloorModel:
         else:
             spread_penalty = 1.0
 
-        # Signal confidence discount
-        conf_norm = max(0.0, min(1.0, signal_confidence))
-        if conf_norm > conf_neutral and (1.0 - conf_neutral) > 1e-10:
-            conf_excess = (conf_norm - conf_neutral) / (1.0 - conf_neutral)
-            confidence_discount = 1.0 - conf_excess * conf_max_disc
+        # Probability adjustment is permitted only when a calibrated model is
+        # explicitly supplied. Structural evidence scores never discount fees.
+        if delivery_probability is not None:
+            delivery_norm = max(0.0, min(1.0, float(delivery_probability)))
+            if delivery_norm > delivery_neutral and (1.0 - delivery_neutral) > 1e-10:
+                delivery_excess = (delivery_norm - delivery_neutral) / (1.0 - delivery_neutral)
+                delivery_adjustment = 1.0 - delivery_excess * delivery_max_discount
+            else:
+                delivery_adjustment = 1.0
         else:
-            confidence_discount = 1.0
+            delivery_adjustment = 1.0
 
-        mult = base_mult * spread_penalty * confidence_discount
+        mult = base_mult * spread_penalty * delivery_adjustment
         return max(abs_min, mult)
 
     def min_gross_move(
@@ -276,11 +285,11 @@ class ProfitFloorModel:
         atr_percentile: float,
         total_rt_cost_bps: float,
         spread_bps: float,
-        signal_confidence: float = 0.5,
+        delivery_probability: Optional[float] = None,
     ) -> float:
         """
         Returns the minimum gross price move (always positive) required
-        for a trade to clear all execution costs with the regime-adaptive buffer.
+        for a trade to clear all execution costs with the measured execution-cost buffer.
 
         ATR CAP: result is capped at FEE_FLOOR_MAX_ATR_MULT × ATR.
         Without this cap, at very low ATR percentiles the mult can demand
@@ -289,7 +298,7 @@ class ProfitFloorModel:
         Default cap: 2.0×ATR (a generous but achievable TP distance).
         """
         if price <= 0:
-            return float("inf")     # genuine bad data — hard-block always correct
+            return float("inf")     # genuine bad data — mechanical guard always correct
         if atr <= 0:
             # FE-4 FIX: during ATR warmup (first ~14 candles after boot), return
             # a conservative floor of 2 × rt_cost_price rather than 0.0. A zero
@@ -302,11 +311,11 @@ class ProfitFloorModel:
             _warmup_floor    = 2.0 * _rt_price_warmup
             logger.debug(
                 f"ProfitFloor: ATR=0 (engine warming up) — using conservative "
-                f"2×rt_cost floor = ${_warmup_floor:.2f}")
+                f"2×rt_cost floor = {_warmup_floor:.2f}")
             return _warmup_floor
 
         mult = self.compute_multiplier(
-            atr_percentile, spread_bps, atr, price, signal_confidence
+            atr_percentile, spread_bps, atr, price, delivery_probability
         )
         rt_cost_price = total_rt_cost_bps / 10_000.0 * price
         result = rt_cost_price * mult
@@ -317,11 +326,12 @@ class ProfitFloorModel:
         atr_cap      = max_atr_mult * atr
         result       = min(result, atr_cap)
 
+        calibrated_p_txt = f"{delivery_probability:.2f}" if delivery_probability is not None else "N/A"
         logger.debug(
             f"ProfitFloor: rt_cost={rt_cost_price:.2f} × mult={mult:.2f} "
             f"(pctile={atr_percentile:.2f}, spread={spread_bps:.1f}bps, "
-            f"conf={signal_confidence:.2f}) → min_move=${result:.2f} "
-            f"(atr_cap=${atr_cap:.2f})"
+            f"calibrated_p={calibrated_p_txt}) → min_move={result:.2f} "
+            f"(atr_cap={atr_cap:.2f})"
         )
         return result
 
@@ -355,7 +365,16 @@ class MakerTakerDecision:
 
     @property
     def MAKER_RATE(self) -> float:
-        return float(_cfg("COMMISSION_RATE_MAKER", self.TAKER_RATE * 0.40))
+        # Bug #26 fix: Delta maker orders receive a REBATE — the exchange pays
+        # YOU for providing liquidity.  The canonical Delta rate is −0.00020
+        # (negative means income, not cost).  Using TAKER_RATE * 0.40 = +0.00022
+        # treats the rebate as a positive fee, understating the cost advantage of
+        # maker entries by 2× and making the fee-saving calculation incorrect.
+        #
+        # Config convention: set COMMISSION_RATE_MAKER to a negative value for
+        # rebate exchanges (Delta), or a positive fraction for fee exchanges.
+        # Default −0.00020 matches Delta's documented maker rebate tier.
+        return float(_cfg("COMMISSION_RATE_MAKER", -0.00020))
 
     @property
     def TICK_SIZE(self) -> float:
@@ -444,28 +463,31 @@ class MakerTakerDecision:
                 )
 
             # ── 5. Compute limit price — guarded against tight spreads ──────
-            # For LONG maker: post at bid+tick, clamped below ask so we never
-            # cross the spread and take immediately. Fallback: bid (guaranteed maker).
-            # For SHORT maker: post at ask-tick, clamped above bid. Fallback MUST be
-            # ask+tick (not ask), because ask itself is the taker-fill price for a
-            # SHORT sell — posting AT ask crosses the spread on many venues.
+            # For LONG maker: post at bid (guaranteed maker position in book).
+            # A tick above bid risks crossing to taker if spread is 1 tick.
+            # For SHORT maker: post at ask (the resting ask is always maker for
+            # a sell order on most venues). Bug #29 fix: the old fallback posted
+            # ask+tick which places the order ABOVE all current asks — it would
+            # sit unexecuted above the market, never filling.
             if side == "long":
                 candidate   = round(bid + tick, 1)
                 limit_price = min(candidate, round(ask - tick, 1))
                 if limit_price <= bid or limit_price >= ask:
-                    limit_price = bid   # guaranteed maker fallback (post at bid)
+                    limit_price = bid   # guaranteed maker fallback
             else:
                 candidate   = round(ask - tick, 1)
                 limit_price = max(candidate, round(bid + tick, 1))
                 if limit_price <= bid or limit_price >= ask:
-                    # ask itself is the taker-fill price for a SHORT — must post
-                    # strictly ABOVE the current ask so it rests in the book.
-                    limit_price = round(ask + tick, 1)   # guaranteed maker fallback
+                    # Bug #29 fix: post AT ask (not ask+tick).
+                    # ask is the best resting sell in the book — our order
+                    # joins it as a maker. ask+tick was ABOVE the market and
+                    # would never fill.
+                    limit_price = ask   # join the best ask as a maker
 
             return (
                 True, limit_price,
                 f"maker: save={risk_adjusted_saving:.2f}bps, fill_p={fill_probability:.2f}, "
-                f"lim=${limit_price:.2f}"
+                f"lim={limit_price:.2f}"
             )
 
         except Exception as e:
@@ -485,7 +507,7 @@ class ExecutionCostEngine:
     be changed in config.py and take effect on the next evaluation cycle
     without restarting the bot.
 
-    Usage in quant_strategy.py:
+    Usage in institutional_strategy.py:
         self._fee_engine = ExecutionCostEngine()
 
         # In on_tick / data update:
@@ -496,11 +518,11 @@ class ExecutionCostEngine:
             side, qty, price, orderbook, signal_urgency)
 
         # After fill confirmed:
-        self._fee_engine.record_fill(expected_price, fill_price)
+        self._fee_engine.record_fill(expected_price, fill_price, leg="entry")
 
-        # In _compute_sl_tp to gate TP viability:
+        # In entry validation to assess TP viability:
         min_move = self._fee_engine.min_required_tp_move(
-            price, atr, atr_pctile, use_maker, composite_score)
+            price, atr, atr_pctile, use_maker, delivery_probability)
 
         if abs(tp_price - price) < min_move:
             return None, None   # reject — not enough edge after fees
@@ -508,15 +530,22 @@ class ExecutionCostEngine:
 
     @property
     def TAKER_RATE(self) -> float:
+        if _is_delta_execution():
+            return float(_cfg("DELTA_COMMISSION_RATE", _cfg("COMMISSION_RATE", 0.00055)))
         return float(_cfg("COMMISSION_RATE", 0.00055))
 
     @property
     def MAKER_RATE(self) -> float:
-        return float(_cfg("COMMISSION_RATE_MAKER", self.TAKER_RATE * 0.40))
+        # Bug #26 fix: Delta maker rebate is negative (see MakerTakerDecision above).
+        if _is_delta_execution():
+            return float(_cfg("DELTA_COMMISSION_RATE_MAKER", -0.00020))
+        return float(_cfg("COMMISSION_RATE_MAKER", -0.00020))
 
     def __init__(self):
         self._spread  = SpreadTracker()
-        self._slip    = SlippageTracker()
+        self._entry_slip = SlippageTracker()
+        self._exit_slip  = SlippageTracker()
+        self._slip       = self._exit_slip  # backward-compatible read alias
         self._floor   = ProfitFloorModel()
         self._mtd     = MakerTakerDecision()
 
@@ -531,7 +560,7 @@ class ExecutionCostEngine:
 
         Warmup threshold: 5 spread samples (~5-10 seconds of live data).
 
-        Note: the _spread_atr_gate in quant_strategy.py does NOT use median_bps()
+        Note: the live spread gate in institutional_strategy.py does not use median_bps()
         — it computes the live bid-ask directly from the current orderbook so it
         is unaffected by the warmup sentinel entirely.
         """
@@ -543,9 +572,17 @@ class ExecutionCostEngine:
         """Call on every orderbook snapshot (already called in data_manager tick)."""
         self._spread.update(orderbook, price)
 
-    def record_fill(self, expected_price: float, fill_price: float) -> None:
-        """Call after every fill to feed back realized slippage."""
-        self._slip.record(expected_price, fill_price)
+    def record_fill(self, expected_price: float, fill_price: float,
+                    leg: str = "entry") -> None:
+        """
+        Feed back realized slippage for one execution leg.
+
+        Entry and exit slippage are tracked separately so maker-entry queue
+        risk is not charged on top of a blended all-fill EWMA.
+        """
+        leg_key = str(leg or "entry").lower()
+        tracker = self._exit_slip if leg_key == "exit" else self._entry_slip
+        tracker.record(expected_price, fill_price)
 
     # ── Query ─────────────────────────────────────────────────────────────────
 
@@ -553,33 +590,41 @@ class ExecutionCostEngine:
         """
         Total estimated round-trip cost in basis points.
 
+        Bug #26 fix: MAKER_RATE on Delta is a REBATE (negative value, e.g. −0.00020).
+        A negative entry_fee_bps means the exchange pays us — it reduces the total cost.
+        The old code treated it as an additive positive cost, overstating round-trip
+        cost for maker entries and causing fee-floor over-rejection.
+
+        Bug #31 fix: maker entries are NOT zero-slippage in all market conditions.
+        Queue slippage (price moves while our limit rests) is small but non-zero.
+        We model it as FEE_MAKER_SLIP_FRAC × expected_taker_slippage (default 20%).
+        This prevents the engine from treating maker entries as perfectly costless,
+        which was causing it to prefer maker entry even when the market was moving
+        fast enough to make queue-slippage material.
+
         Taker entry (market):
           entry_fee(taker) + exit_fee(taker) + half_spread×2 + slippage×2
-          Both legs cross the spread; both legs have market-order slippage.
 
         Maker entry (limit):
-          entry_fee(maker) + exit_fee(taker) + half_spread×1 + slippage×1
-          Entry does NOT cross the spread (we post, we don't take).
-          Entry has zero slippage (fills at exactly the posted price).
-          Only the SL/TP exit (always market) incurs spread-cross + slippage.
-
-        BUG FIX: original code charged half_spread*2 + slip*2 unconditionally,
-        which over-stated round-trip cost for maker entries by one full spread
-        and one full slippage, producing a min_tp floor that was too high for
-        maker-routed trades and causing legitimate setups to be rejected.
+          entry_fee(maker, may be negative rebate) + exit_fee(taker)
+          + half_spread×1 (exit only crosses spread)
+          + maker_queue_slip (fraction of taker slippage — queue risk)
+          + taker_slip (exit market slippage)
         """
-        entry_fee   = (self.MAKER_RATE if use_maker_entry else self.TAKER_RATE) * 10_000
-        exit_fee    = self.TAKER_RATE * 10_000      # SL/TP always market = taker
-        half_spread = self._spread.median_bps() / 2.0
-        slip        = self._slip.expected_bps()
+        entry_fee_bps = self.MAKER_RATE * 10_000 if use_maker_entry else self.TAKER_RATE * 10_000
+        exit_fee_bps  = self.TAKER_RATE * 10_000   # SL/TP always market = taker
+        half_spread   = self._spread.median_bps() / 2.0
+        entry_slip    = self._entry_slip.expected_bps()
+        exit_slip     = self._exit_slip.expected_bps()
 
         if use_maker_entry:
-            # Entry: maker fee only — no spread cross, no slippage
-            # Exit:  taker spread cross + slippage
-            return entry_fee + exit_fee + half_spread + slip
+            # entry_fee_bps may be negative (rebate) — math is correct either way.
+            # Maker queue slippage: fraction of taker slippage (Bug #31 fix).
+            maker_slip_frac = float(_cfg("FEE_MAKER_SLIP_FRAC", 0.20))
+            maker_queue_slip = entry_slip * maker_slip_frac
+            return entry_fee_bps + exit_fee_bps + half_spread + maker_queue_slip + exit_slip
         else:
-            # Both legs are market: entry + exit each cross half spread and have slippage
-            return entry_fee + exit_fee + half_spread * 2 + slip * 2
+            return entry_fee_bps + exit_fee_bps + half_spread * 2 + entry_slip + exit_slip
 
     def min_required_tp_move(
         self,
@@ -587,7 +632,7 @@ class ExecutionCostEngine:
         atr: float,
         atr_percentile: float,
         use_maker_entry: bool,
-        signal_confidence: float = 0.5,
+        delivery_probability: Optional[float] = None,
     ) -> float:
         """
         Minimum gross TP distance (in price units) for the trade to be
@@ -597,10 +642,13 @@ class ExecutionCostEngine:
         """
         spread_bps   = self._spread.median_bps()
         rt_cost_bps  = self.effective_roundtrip_cost_bps(use_maker_entry)
-        return self._floor.min_gross_move(
+        # In stress/wide-spread regimes a trade must clear more gross distance;
+        # in compressed markets the floor relaxes only slightly.
+        gross_floor = self._floor.min_gross_move(
             price, atr, atr_percentile, rt_cost_bps,
-            spread_bps, signal_confidence
+            spread_bps, delivery_probability
         )
+        return gross_floor
 
     def decide_entry_type(
         self,
@@ -626,13 +674,18 @@ class ExecutionCostEngine:
         taker_cost = self.effective_roundtrip_cost_bps(use_maker_entry=False)
         maker_cost = self.effective_roundtrip_cost_bps(use_maker_entry=True)
         spread_samples = self._spread.sample_count
-        slip_warmed    = self._slip._ewma is not None
+        entry_slip_warmed = self._entry_slip._ewma is not None
+        exit_slip_warmed  = self._exit_slip._ewma is not None
         return {
             "spread_median_bps":    round(self._spread.median_bps(), 2),
             "spread_p90_bps":       round(self._spread.percentile_bps(0.90), 2),
             "spread_samples":       spread_samples,
-            "slippage_ewma_bps":    round(self._slip.expected_bps(), 2),
-            "slip_warmed":          slip_warmed,
+            "slippage_ewma_bps":    round(self._exit_slip.expected_bps(), 2),
+            "entry_slippage_ewma_bps": round(self._entry_slip.expected_bps(), 2),
+            "exit_slippage_ewma_bps":  round(self._exit_slip.expected_bps(), 2),
+            "slip_warmed":          entry_slip_warmed or exit_slip_warmed,
+            "entry_slip_warmed":    entry_slip_warmed,
+            "exit_slip_warmed":     exit_slip_warmed,
             "rt_cost_taker_bps":    round(taker_cost, 2),
             "rt_cost_maker_bps":    round(maker_cost, 2),
             "maker_saving_bps":     round(taker_cost - maker_cost, 2),

@@ -1,43 +1,7 @@
-"""
-telegram/notifier.py — Liquidity-First Telegram Notifier  v2.0
-==============================================================
-Report architecture mirrors the decision hierarchy:
-  DirectionEngine hunt → Pool target → Flow confirmation → ICT context → Entry → Exit
+"""Telegram notifications for the Institutional market_state execution system.
 
-Public API (imported by strategy layer):
-  send_telegram_message()            — async fire-and-forget delivery
-  format_periodic_report()           — 15-min institutional dashboard
-  format_direction_hunt_alert()      — DirectionEngine high-confidence prediction
-  format_post_sweep_verdict()        — post-sweep reversal/continuation decision
-  format_conviction_block_alert()    — conviction gate rejection with factor breakdown
-  format_pool_gate_alert()           — pool-hit gate action (exit/reverse/continue)
-  format_liquidity_trail_update()    — Fibonacci-trail SL advance (v5.0 engine)
-  install_global_telegram_log_handler()
-  TelegramLogHandler
-
-Internal helpers (used by controller.py):
-  _sanitize_html(), _esc()
-
-v2.0 CHANGES
-------------
-1.  _sanitize_html rewritten as a proper state-machine parser. It now:
-      • Normalises stray ampersands to &amp; (was missing — leading cause of
-        byte-offset 2010-2035 parse errors).
-      • Uses a single-pass tokenizer that splits the input into text runs
-        and tag runs, escaping only the text runs.
-      • Emits perfectly balanced tags: unmatched closes are dropped, unclosed
-        opens are auto-closed at end.
-      • Tolerates truncation: a tag fragment with no > at end-of-string is
-        escaped as literal.
-      • Does NOT apply inside <code>/<pre> contents — those are treated as
-        raw text and fully escaped (as Telegram HTML requires).
-
-2.  New _tag(text, name) helper guarantees that the wrapping is correct —
-    all fresh format_* functions use it instead of hand-crafted markup.
-
-3.  format_liquidity_trail_update rewritten for the v5.0 Fibonacci engine:
-    shows fib_ratio, swing context, momentum gate, HTF alignment, buffer
-    details, pool-between-expansion tag, and cluster info.
+Only structural thesis geometry, venue protection, exact-fill reconciliation
+and instrument-correct P&L are displayed.
 """
 
 from __future__ import annotations
@@ -59,32 +23,166 @@ import telegram.config as telegram_config
 
 logger = logging.getLogger(__name__)
 
-# REQUIRED_SCORE from authoritative source
-try:
-    from strategy.conviction_filter import REQUIRED_SCORE as _REQUIRED_CONVICTION_SCORE
-except ImportError:
-    try:
-        from conviction_filter import REQUIRED_SCORE as _REQUIRED_CONVICTION_SCORE
-    except ImportError:
-        _REQUIRED_CONVICTION_SCORE = 0.45
+_MOJIBAKE_SENTINELS = ("ð", "â", "Ã", "Â", "Î", "Ï")
+_MOJIBAKE_RUN = re.compile(
+    r"[\u0080-\u009f\u00a0-\u00ff\u0100-\u017f\u02c0-\u02ff"
+    r"\u2010-\u201f\u2020-\u2026\u2030\u2039\u203a\u20ac\u2122]+"
+)
+_MOJIBAKE_DIRECT = {
+    "🎯": "🎯", "🧭": "🧭", "📊": "📊", "💰": "💰",
+    "🔒": "🔒", "🔄": "🔄", "🔱": "🔱", "🚨": "🚨",
+    "💀": "💀", "💥": "💥", "✅": "✅", "❌": "❌",
+    "❌": "❌", "⚠️": "⚠️", "⚠️": "⚠️", "⏱️": "⏱️",
+    "⏱️": "⏱️", "⏱️": "⏱️", "⏱️": "⏱️", "⏳": "⏳",
+    "≈": "≈", "±": "±", "×": "×", "σ": "σ",
+    "⬜": "⬜", "░": "░", "█": "█",
+}
 
-_HUNT_ON_THRESHOLD  = 0.10
-_HUNT_OFF_THRESHOLD = 0.05
+
+def _repair_mojibake(text: str) -> str:
+    """Repair UTF-8 text that was accidentally decoded as cp1252."""
+    if not any(s in text for s in _MOJIBAKE_SENTINELS):
+        return text
+    for bad, good in _MOJIBAKE_DIRECT.items():
+        text = text.replace(bad, good)
+
+    def _as_original_utf8_bytes(frag: str) -> bytes:
+        out = bytearray()
+        for ch in frag:
+            try:
+                out.extend(ch.encode("cp1252"))
+            except UnicodeEncodeError:
+                code = ord(ch)
+                if code <= 0xFF:
+                    out.append(code)
+                else:
+                    raise
+        return bytes(out)
+
+    def _fix(match: re.Match) -> str:
+        frag = match.group(0)
+        if not any(s in frag for s in _MOJIBAKE_SENTINELS):
+            return frag
+        try:
+            repaired = _as_original_utf8_bytes(frag).decode("utf-8")
+        except UnicodeError:
+            return frag
+        old_bad = sum(frag.count(s) for s in _MOJIBAKE_SENTINELS)
+        new_bad = sum(repaired.count(s) for s in _MOJIBAKE_SENTINELS)
+        return repaired if new_bad < old_bad else frag
+
+    for _ in range(3):
+        repaired = _MOJIBAKE_RUN.sub(_fix, text)
+        if repaired == text or not any(s in repaired for s in _MOJIBAKE_SENTINELS):
+            return repaired
+        text = repaired
+        for bad, good in _MOJIBAKE_DIRECT.items():
+            text = text.replace(bad, good)
+    return text
+
 
 
 # ======================================================================
 # ASYNC SEND WORKER
 # ======================================================================
 
-_send_queue:    _queue_mod.Queue = _queue_mod.Queue(maxsize=200)
-_worker_started: bool            = False
-_worker_lock:   threading.Lock   = threading.Lock()
+# ──────────────────────────────────────────────────────────────────────────
+# v2.1 QUEUE: tiered priority queue with load-aware shedding
+#
+# The old design had three problems:
+#   1. maxsize=25 saturates in <30s during heartbeat bursts
+#      (200 items × 1.2s/msg = 4-min backlog)
+#   2. CRITICAL messages were promoted to a separate thread, but everything
+#      else went through a single FIFO — so a routine status report would
+#      delay an exit notification for a full minute.
+#   3. When the queue filled, ALL non-critical messages dropped — including
+#      operator command responses to Telegram /position, /trades, etc.
+#
+# v2.1 design:
+#   - PriorityQueue with 3 tiers:
+#       0=CRITICAL (errors, exits, exchange events) — never dropped
+#       1=IMPORTANT (entries, gate alerts, /command replies) — dropped LAST
+#       2=ROUTINE (periodic reports, status, log mirror) — dropped FIRST
+#   - maxsize=200 (4-min buffer at 1.2s/msg)
+#   - When full, ROUTINE messages are evicted to make room for higher tiers.
+#   - CRITICAL still also has a fast-path bypass thread for true emergencies.
+# ──────────────────────────────────────────────────────────────────────────
+
+PRIO_CRITICAL  = 0
+PRIO_IMPORTANT = 1
+PRIO_ROUTINE   = 2
+
+_send_queue: _queue_mod.PriorityQueue = _queue_mod.PriorityQueue(maxsize=200)
+_queue_seq: int = 0          # monotonic tiebreaker for PriorityQueue ordering
+_queue_seq_lock = threading.Lock()
+_worker_started: bool        = False
+_worker_lock: threading.Lock = threading.Lock()
 _MIN_INTERVAL = 1.2
 _MAX_RETRIES  = 4
 
+# Watchdog uses these counters via /watchdog_status and notifier_queue_depth check
+_dropped_routine: int   = 0
+_dropped_important: int = 0
+
+
+def _next_seq() -> int:
+    global _queue_seq
+    with _queue_seq_lock:
+        _queue_seq += 1
+        return _queue_seq
+
+
+def _classify_priority(message: str) -> int:
+    """Triage by content. Operator-controllable via add_telegram_suppress_pattern."""
+    upper = message.upper()
+    if any(kw in message for kw in _CRITICAL_KEYWORDS) or "🚨" in message or "💀" in message:
+        return PRIO_CRITICAL
+    if any(tag in upper for tag in (
+        "ENTRY", "EXIT", "TRADE OPEN", "TRADE CLOSED",
+        "POSITION ADOPTED", "WATCHDOG HEAL", "WATCHDOG CIRCUIT",
+        "market_state_DECISION", "INSTITUTIONAL_ORDER_THESIS", "INSTITUTIONAL_market_state",
+        "STRUCTURAL SL", "LIQUIDITY TARGET", "EXACT-FILL",
+    )):
+        return PRIO_IMPORTANT
+    return PRIO_ROUTINE
+
+
+def _shed_routine_for_room() -> bool:
+    """When the queue is full, drop one ROUTINE item to free a slot.
+    Returns True if a slot was freed."""
+    global _dropped_routine
+    # PriorityQueue doesn't expose internals safely; we approximate by
+    # iterating its internal heap under its mutex. This is best-effort:
+    # we accept that we may not always find a routine to evInstitutional.
+    try:
+        with _send_queue.mutex:  # type: ignore[attr-defined]
+            heap = _send_queue.queue  # type: ignore[attr-defined]
+            for i, item in enumerate(heap):
+                if item[0] >= PRIO_ROUTINE:
+                    heap.pop(i)
+                    _dropped_routine += 1
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+# Bug #36 fix: critical message keywords that bypass the async queue and
+# send synchronously.  This guarantees that UNPROTECTED position alerts,
+# crash reports, and killswitch confirmations are never dropped even when
+# the queue is full during a burst of routine heartbeat messages.
+_CRITICAL_KEYWORDS = frozenset((
+    "💀", "🚨",
+    "UNPROTECTED", "CRASH", "KILLSWITCH", "CIRCUIT_BREAKER",
+    "EMERGENCY", "emergency_flatten", "BOT CRASH",
+    "ORPHAN POSITION", "SIDE MISMATCH", "EXIT UNCONFIRMED",
+    "ORDER ERROR", "ORDER REJECTED", "BRACKET ORDER FAILED",
+    "TP HIT", "SL HIT", "EXIT FILL",
+))
+
 
 def _send_worker() -> None:
-    """Background daemon — drains the queue and sends to Telegram."""
+    """Background daemon — drains the priority queue and sends to Telegram."""
     import random
     import requests as _req
 
@@ -98,7 +196,17 @@ def _send_worker() -> None:
         if item is None:
             break
 
-        message, parse_mode = item
+        # PriorityQueue items: (priority, seq, message, parse_mode)
+        # Compatibility callers may still push (message, parse_mode); handle both.
+        if len(item) == 4:
+            _prio, _seq, message, parse_mode = item
+        elif len(item) == 2:
+            message, parse_mode = item
+        else:
+            logger.error("notifier: unexpected queue item shape: %d", len(item))
+            _send_queue.task_done()
+            continue
+        message = _repair_mojibake(str(message))
 
         for attempt in range(_MAX_RETRIES):
             gap = _MIN_INTERVAL - (time.time() - last_send_ts)
@@ -191,17 +299,391 @@ def _ensure_worker_started() -> None:
         _worker_started = True
 
 
-def send_telegram_message(message: str, parse_mode: str = "HTML") -> bool:
-    """Enqueue a Telegram message for async delivery.  Never blocks the caller."""
+
+
+# ======================================================================
+# MULTI-ASSET TELEGRAM CONTEXT ENRICHMENT
+# ======================================================================
+
+def _tg_current_instrument():
+    try:
+        from core.instruments import current_instrument
+        return current_instrument()
+    except Exception:
+        return None
+
+
+def _tg_asset_policy(inst):
+    try:
+        from core.market_policy import active_policy
+        return active_policy(inst)
+    except Exception:
+        return None
+
+
+def _tg_asset_header(inst=None, event_type: str = "", context: Optional[Dict[str, Any]] = None) -> str:
+    """Build an institutional asset-specific Telegram header.
+
+    Centralised formatting ensures Telegram always receives the correct
+    contract, venue, currency, protected-state and portfolio context.
+    """
+    inst = inst or _tg_current_instrument()
+    if inst is None:
+        return ""
+    context = context or {}
+    try:
+        asset = _esc(getattr(inst, "asset_id", "ASSET"))
+        name = _esc(getattr(inst, "display_name", asset))
+        primary = getattr(inst, "primary_exchange", None)
+        primary_name = _esc(getattr(primary, "value", str(primary or "-")).upper())
+        symbol = _esc(getattr(inst, "display_symbol", getattr(inst, "execution_symbol", "-")))
+        asset_class = _esc(getattr(getattr(inst, "asset_class", ""), "value", str(getattr(inst, "asset_class", ""))).upper())
+        venues = []
+        for ex, ei in getattr(inst, "by_exchange", {}).items():
+            try:
+                venues.append(f"{getattr(ex,'value',str(ex)).upper()}:{getattr(ei,'display_symbol',getattr(ei,'symbol','-'))}")
+            except Exception:
+                continue
+        venue_txt = _esc(", ".join(venues) if venues else f"{primary_name}:{symbol}")
+        pol = _tg_asset_policy(inst)
+        # Prefer actual runtime/entry leverage over policy/config leverage.
+        # Policy leverage is a venue cap; executed leverage is selected from
+        # structural-risk funding and liquidation-safety geometry.
+        lev = (context.get("entry_leverage") or context.get("actual_leverage")
+               or context.get("leverage") or getattr(pol, "leverage", None)
+               or getattr(inst, "max_leverage", 0) or "-")
+        margin = getattr(pol, "margin_pct", None)
+        risk_mult = getattr(pol, "risk_multiplier", None)
+        cadence = getattr(pol, "evaluation_interval_sec", None)
+        state = _esc(str(context.get("state") or context.get("phase") or "-").upper())
+        price = context.get("price")
+        slots = context.get("slots") or context.get("portfolio_slots") or ""
+        event = _esc(str(event_type or context.get("event_type") or "STRATEGY").upper().replace("_", " "))
+        line1 = f"🏛 <b>{event}</b>  <code>{asset}</code> <i>{name}</i>"
+        line2 = f"<code>{primary_name}:{symbol}</code> · {asset_class} · venues <code>{venue_txt}</code>"
+        bits = []
+        if lev != "-":
+            try: bits.append(f"lev {float(lev):g}x")
+            except Exception: bits.append(f"lev {lev}")
+        if margin is not None:
+            try: bits.append(f"margin {float(margin):.0%}")
+            except Exception: pass
+        if risk_mult is not None:
+            try: bits.append(f"risk×{float(risk_mult):.2f}")
+            except Exception: pass
+        if cadence is not None:
+            try: bits.append(f"cadence {float(cadence):.2f}s")
+            except Exception: pass
+        if state and state != "-": bits.append(f"state {state}")
+        if price is not None:
+            try: bits.append(f"px {_tg_price(float(price), venue=primary_name)}")
+            except Exception: pass
+        if slots: bits.append(f"slots {slots}")
+        line3 = "<code>" + _esc(" | ".join(bits)) + "</code>" if bits else ""
+        return "\n".join([x for x in (line1, line2, line3, _TG_RULE) if x])
+    except Exception:
+        return ""
+
+
+def _tg_message_already_asset_scoped(message: str) -> bool:
+    m = str(message or "")[:240]
+    return ("<b>ASSET" in m or "🏛 <b>" in m or "MULTI-ASSET" in m or "EXECUTION UNIVERSE" in m)
+
+
+def _tg_infer_event_type(message: str) -> str:
+    m = str(message or "").upper()
+    if "BRACKET" in m or "ENTRY" in m or "POSITION OPEN" in m:
+        return "EXECUTION"
+    if "SL" in m or "STOP" in m or "PROTECTION" in m:
+        return "PROTECTED RISK"
+    if "EXIT" in m or "PNL" in m or "TP HIT" in m:
+        return "EXIT"
+    if "market_state_DECISION" in m or "INSTITUTIONAL_ORDER_THESIS" in m or "INSTITUTIONAL_market_state" in m:
+        return "INSTITUTIONAL market_state DECISION"
+    if "LIQUIDITY" in m or "liquidity_event" in m or "POOL" in m:
+        return "LIQUIDITY"
+    if "STATUS" in m or "THINK" in m:
+        return "STATUS"
+    return "ASSET EVENT"
+
+
+def _tg_enrich_asset_message(message: str, *, instrument=None, event_type: Optional[str] = None, context: Optional[Dict[str, Any]] = None) -> str:
+    inst = instrument or _tg_current_instrument()
+    if inst is None:
+        return message
+    if _tg_message_already_asset_scoped(message):
+        return message
+    header = _tg_asset_header(inst, event_type or _tg_infer_event_type(message), context=context)
+    if not header:
+        return message
+    return f"{header}\n{message}"
+
+def send_telegram_message(message: str, parse_mode: str = "HTML", *, instrument=None, event_type: Optional[str] = None, context: Optional[Dict[str, Any]] = None, enrich: bool = True) -> bool:
+    """Enqueue a Telegram message for async delivery.  Never blocks the caller.
+
+    Bug #36 fix: critical messages (UNPROTECTED, CRASH, KILLSWITCH, etc.) are
+    sent via a dedicated daemon thread that bypasses the queue entirely.  This
+    guarantees delivery even when the queue is full due to a burst of routine
+    heartbeat/status messages.  The dedicated thread is fire-and-forget — the
+    caller is not blocked.
+    """
     if not telegram_config.TELEGRAM_ENABLED:
         return False
+    message = _repair_mojibake(str(message))
+    if enrich:
+        try:
+            message = _tg_enrich_asset_message(message, instrument=instrument, event_type=event_type, context=context)
+        except Exception:
+            pass
     _ensure_worker_started()
-    try:
-        _send_queue.put_nowait((message, parse_mode))
+
+    # Check if this message is critical and should bypass the queue
+    is_critical = any(kw in message for kw in _CRITICAL_KEYWORDS)
+    if is_critical:
+        def _send_critical_now():
+            import requests as _req
+            try:
+                url = (f"https://api.telegram.org/bot"
+                       f"{telegram_config.TELEGRAM_BOT_TOKEN}/sendMessage")
+                send_text = message[:4000]
+                if parse_mode == "HTML":
+                    send_text = _sanitize_html(send_text)
+                _req.post(url, json={
+                    "chat_id":                  telegram_config.TELEGRAM_CHAT_ID,
+                    "text":                     send_text,
+                    "parse_mode":               parse_mode,
+                    "disable_web_page_preview": True,
+                }, timeout=10)
+            except Exception as _ce:
+                logger.error("Critical Telegram send failed: %s", _ce)
+        t = threading.Thread(target=_send_critical_now, daemon=True,
+                             name="telegram-critical")
+        t.start()
         return True
-    except _queue_mod.Full:
-        logger.warning("Telegram queue full — dropping message")
+
+    try:
+        prio = _classify_priority(message)
+
+        if not _content_dedup_should_pass(prio, message):
+            return False
+
+        # SPAM-FIX 2026-04-26: rate governor.  Drops non-CRITICAL messages
+        # silently when the rolling 60s window exceeds TG_RATE_LIMIT_PER_MIN.
+        # A periodic summary log is emitted so the operator sees it happened.
+        if not _rate_governor_should_pass(prio):
+            return False
+
+        item = (prio, _next_seq(), message, parse_mode)
+        try:
+            _send_queue.put_nowait(item)
+            return True
+        except _queue_mod.Full:
+            # Try shedding a ROUTINE message to make room for higher tiers
+            global _dropped_important
+            if prio < PRIO_ROUTINE and _shed_routine_for_room():
+                try:
+                    _send_queue.put_nowait(item)
+                    return True
+                except _queue_mod.Full:
+                    pass
+            if prio == PRIO_ROUTINE:
+                # Routine — drop silently with a single rate-limited log
+                global _dropped_routine
+                _dropped_routine += 1
+                return False
+            _dropped_important += 1
+            logger.warning(
+                "Telegram queue full — DROPPING priority=%d message (dropped: routine=%d important=%d)",
+                prio, _dropped_routine, _dropped_important,
+            )
+            return False
+    except Exception as _qe:
+        logger.error("notifier: enqueue failed: %s", _qe)
         return False
+
+
+def get_queue_stats() -> Dict[str, Any]:
+    """Watchdog and /diagnostics introspection."""
+    try:
+        depth = _send_queue.qsize()
+    except Exception:
+        depth = -1
+    return {
+        "depth":            depth,
+        "maxsize":          _send_queue.maxsize,
+        "dropped_routine":  _dropped_routine,
+        "dropped_important": _dropped_important,
+        "dedup_hits":       _dedup_hits,
+        "content_dedup_hits": _content_dedup_hits,
+        "rate_governed":    _rate_governed,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SPAM-FIX 2026-04-26 — generic dedup helper + global rate governor
+# ══════════════════════════════════════════════════════════════════════
+#
+# The post-liquidity_event verdict (institutional_strategy.py:4263) and other repeating
+# alerts each implement their own ad-hoc dedup. This helper centralises
+# the pattern so any caller can opt in:
+#
+#     from telegram.notifier import send_telegram_dedup
+#     send_telegram_dedup("post_liquidity_event:long:0.55", ttl=60.0,
+
+#
+# The (key, ttl) pair gates the send: if the same key was sent within
+# TTL seconds, the new send is dropped silently and a counter is bumped.
+# Keys should be coarse enough that real state changes produce a NEW key
+# (e.g. round confidence to 15% buckets, not 5%).
+#
+# In addition, we enforce a global RATE GOVERNOR: no more than
+# TG_RATE_LIMIT_PER_MIN messages of priority >= 1 (IMPORTANT/ROUTINE)
+# in any rolling 60-second window. CRITICAL messages bypass the
+# governor entirely. When the governor trips, ROUTINE drops first, then
+# IMPORTANT, with a single periodic "[N suppressed]" summary so the
+# operator knows it happened.
+
+_dedup_lock = threading.Lock()
+_dedup_state: Dict[str, float] = {}     # key -> next_allowed_ts
+_dedup_hits: int = 0                    # observability counter
+
+_rate_lock = threading.Lock()
+_rate_window: deque = deque(maxlen=512)  # ts of recent non-CRITICAL sends
+_rate_governed: int = 0
+_rate_suppressed_summary_ts: float = 0.0
+_rate_suppressed_since_summary: int = 0
+_content_dedup_lock = threading.Lock()
+_content_dedup_state: Dict[str, float] = {}
+_content_dedup_hits: int = 0
+
+# Tunables — overridable via add_telegram_suppress_pattern's neighbour API
+TG_RATE_LIMIT_PER_MIN: int = 30          # rolling 60s budget for non-CRITICAL
+TG_RATE_SUMMARY_INTERVAL: float = 300.0  # how often to emit "[N suppressed]"
+TG_CONTENT_DEDUP_TTL: float = 20.0       # same alert shape within this window
+
+
+def _dedup_should_send(key: str, ttl: float) -> bool:
+    """Return True if (key, ttl) permits a send right now; False if dedup'd."""
+    if not key or ttl <= 0:
+        return True
+    global _dedup_hits
+    now = time.time()
+    with _dedup_lock:
+        next_ok = _dedup_state.get(key, 0.0)
+        if now < next_ok:
+            _dedup_hits += 1
+            return False
+        _dedup_state[key] = now + ttl
+        # Opportunistic GC: keep state small.
+        if len(_dedup_state) > 500:
+            cutoff = now - 60.0
+            for k in [k for k, v in _dedup_state.items() if v < cutoff]:
+                _dedup_state.pop(k, None)
+        return True
+
+
+def _rate_governor_should_pass(prio: int) -> bool:
+    """Rolling 60s rate limit. CRITICAL bypasses; others budgeted."""
+    if prio == PRIO_CRITICAL:
+        return True
+    global _rate_governed, _rate_suppressed_since_summary, _rate_suppressed_summary_ts
+    now = time.time()
+    cutoff = now - 60.0
+    with _rate_lock:
+        while _rate_window and _rate_window[0] < cutoff:
+            _rate_window.popleft()
+        if len(_rate_window) >= TG_RATE_LIMIT_PER_MIN:
+            _rate_governed += 1
+            _rate_suppressed_since_summary += 1
+            # Periodic summary so the operator sees it happened.
+            if now - _rate_suppressed_summary_ts >= TG_RATE_SUMMARY_INTERVAL:
+                _rate_suppressed_summary_ts = now
+                n = _rate_suppressed_since_summary
+                _rate_suppressed_since_summary = 0
+                # Use the worker queue path for the summary itself —
+                # priority IMPORTANT, never CRITICAL (don't bypass the queue
+                # for a meta-message).
+                logger.warning(
+                    "Telegram rate governor: %d non-critical messages suppressed "
+                    "in last ~%.0fs (limit=%d/min). Check for spam loop.",
+                    n, TG_RATE_SUMMARY_INTERVAL, TG_RATE_LIMIT_PER_MIN,
+                )
+            return False
+        _rate_window.append(now)
+        return True
+
+
+_CONTENT_NUMBER_RE = re.compile(r"(?<![A-Za-z])[-+]?\$?\d[\d,]*(?:\.\d+)?%?")
+_CONTENT_WS_RE = re.compile(r"\s+")
+
+
+def _content_fingerprint(message: str) -> str:
+    text = re.sub(r"<[^>]*>", " ", str(message))
+    text = _html_lib.unescape(text)
+    text = _CONTENT_NUMBER_RE.sub("#", text)
+    text = _CONTENT_WS_RE.sub(" ", text).strip().upper()
+    return text[:280]
+
+
+def _content_dedup_should_pass(prio: int, message: str) -> bool:
+    if prio == PRIO_CRITICAL or TG_CONTENT_DEDUP_TTL <= 0:
+        return True
+    key = _content_fingerprint(message)
+    if not key:
+        return True
+    global _content_dedup_hits
+    now = time.time()
+    with _content_dedup_lock:
+        next_ok = _content_dedup_state.get(key, 0.0)
+        if now < next_ok:
+            _content_dedup_hits += 1
+            return False
+        _content_dedup_state[key] = now + TG_CONTENT_DEDUP_TTL
+        if len(_content_dedup_state) > 800:
+            for k, v in list(_content_dedup_state.items()):
+                if v < now:
+                    _content_dedup_state.pop(k, None)
+        return True
+
+
+def send_telegram_dedup(
+    key: str,
+    ttl: float,
+    message: str,
+    parse_mode: str = "HTML",
+) -> bool:
+    """
+    Send a Telegram message, deduplicated by (key, ttl).
+
+    Returns True if the message was enqueued, False if it was dropped
+    by the dedup window or rate governor.
+
+    Use coarse keys: round confidence to 15% buckets, not 5%. Round prices
+    to 0.5-ATR bins, not exact dollars. The point of dedup is to drop
+    "same alert again because state wiggled" — make the key change only
+    on real state changes.
+
+    Examples:
+        # post-liquidity_event verdict
+        send_telegram_dedup(f"ps:{action}:{direction}:{round(conf*7)/7:.2f}",
+                             ttl=60.0, message=...)
+        # pool-gate near-touch
+        send_telegram_dedup(f"pool:{side}:{int(price/atr/0.5)}",
+                             ttl=120.0, message=...)
+    """
+    if not _dedup_should_send(key, ttl):
+        return False
+    return send_telegram_message(message, parse_mode=parse_mode)
+
+
+def reset_dedup_state() -> None:
+    """For tests + operator /reset_dedup. Wipes all dedup keys."""
+    with _dedup_lock:
+        _dedup_state.clear()
+    with _rate_lock:
+        _rate_window.clear()
+    with _content_dedup_lock:
+        _content_dedup_state.clear()
 
 
 # ======================================================================
@@ -298,11 +780,26 @@ def _sanitize_html(text: str) -> str:
     out: List[str] = []
     stack: List[str] = []
 
+    def _escape_naked_angles(s: str) -> str:
+        """
+        v2.1 BUG-FIX: any < or > surviving in a text run is provably NOT a
+        well-formed HTML tag (the tokenizer regex already extracted all
+        well-formed tags). They must be escaped or Telegram parses them.
+
+        Root-cause example: trail labels emit '(<1.0R)' — the '<' matches
+        no tag (the regex requires [A-Za-z] after '<'), so it survives as
+        text. Telegram then tries to parse '<1.0r)' as an HTML tag and
+        returns 400 'Unsupported start tag'.
+        """
+        return s.replace("<", "&lt;").replace(">", "&gt;")
+
     for tok in tokens:
         if tok[0] == "text":
-            # Normalise naked ampersands; leave < and > alone (none should
-            # exist here — tokenizer consumed all tag-shaped <...>)
-            out.append(_normalise_ampersands(tok[1]))
+            # First normalise &, then escape any leftover < or > that
+            # weren't consumed by the tag tokenizer (provably invalid HTML)
+            txt = _normalise_ampersands(tok[1])
+            txt = _escape_naked_angles(txt)
+            out.append(txt)
             continue
 
         _, closing, name, attrs = tok
@@ -378,682 +875,147 @@ def _tag(text: Any, name: str) -> str:
     return f"<{name}>{_esc(text)}</{name}>"
 
 
+def _tg_currency_symbol(venue: str = "", inst: Any = None) -> str:
+    text = str(venue or "").lower()
+    if inst is not None:
+        try:
+            text += " " + str(getattr(getattr(inst, "primary_exchange", ""), "value", getattr(inst, "primary_exchange", ""))).lower()
+            text += " " + str(getattr(getattr(inst, "primary", None), "quote_asset", "")).lower()
+        except Exception:
+            pass
+    if "groww" in text or "inr" in text:
+        return "\u20b9"
+    return "$"
+
+
+def _tg_current_venue() -> str:
+    inst = _tg_current_instrument()
+    try:
+        return str(getattr(getattr(inst, "primary_exchange", ""), "value", getattr(inst, "primary_exchange", ""))).upper()
+    except Exception:
+        return ""
+
+
 # ======================================================================
 # UTILITY HELPERS
 # ======================================================================
 
-def _fmt_price(p: Optional[float]) -> str:
+def _fmt_price(p: Optional[float], venue: str = "") -> str:
     if p is None:
         return "—"
-    return f"${p:,.1f}"
-
-
-def _fmt_pct(v: float) -> str:
-    return f"{v:.2f}%"
-
-
-def _session_icon(session: str) -> str:
-    s = (session or "").upper()
-    if "LONDON" in s: return "🇬🇧"
-    if "NY" in s or "NEW_YORK" in s: return "🇺🇸"
-    if "ASIA" in s: return "🌏"
-    return "🌐"
-
-
-def _score_bar(score: float, width: int = 10) -> str:
-    filled = min(max(int(score * width + 0.5), 0), width)
-    return "█" * filled + "░" * (width - filled)
-
-
-def _fmt_tf(tf: str) -> str:
-    return _esc(tf or "?")
+    cur = _tg_currency_symbol(venue or _tg_current_venue(), _tg_current_instrument())
+    digits = 2 if cur == "\u20b9" else 1
+    return f"{cur}{p:,.{digits}f}"
 
 
 # ======================================================================
-# GATE DIAGNOSTIC PANEL (internal)
-# ======================================================================
-
-def _build_gate_diagnostic(
-    direction_hunt=None,
-    amd_phase: str = "",
-    dealing_range_pd: float = 0.5,
-    session: str = "",
-    flow_conviction: float = 0.0,
-    flow_direction: str = "",
-    htf_bias: str = "",
-) -> List[str]:
-    """Render a 6-gate entry diagnostic panel for the periodic report."""
-    gates: List[str] = ["🚦 <b>ENTRY GATE STATUS</b>"]
-
-    # Gate 1: session
-    s = (session or "").upper()
-    sess_ok = s in ("LONDON", "NY", "LONDON_NY")
-    gates.append(f"  {'✅' if sess_ok else '⚪'} Session: {_esc(s or 'off')}")
-
-    # Gate 2: hunt prediction
-    pred = getattr(direction_hunt, "predicted", None) if direction_hunt else None
-    conf = float(getattr(direction_hunt, "confidence", 0.0)) if direction_hunt else 0.0
-    hunt_ok = pred in ("BSL", "SSL") and conf >= _HUNT_ON_THRESHOLD
-    gates.append(
-        f"  {'✅' if hunt_ok else '⚪'} Hunt: "
-        f"{_esc(pred or 'NEUTRAL')} ({conf:.0%})"
-    )
-
-    # Gate 3: flow direction
-    flow_ok = abs(flow_conviction) >= 0.20 and flow_direction in ("long", "short")
-    gates.append(
-        f"  {'✅' if flow_ok else '⚪'} Flow: "
-        f"{_esc(flow_direction or 'neutral')} ({flow_conviction:+.2f})"
-    )
-
-    # Gate 4: AMD phase
-    amd_ok = "MANIPULATION" in (amd_phase or "").upper() or \
-             "DISTRIBUTION" in (amd_phase or "").upper()
-    gates.append(
-        f"  {'✅' if amd_ok else '⚪'} AMD: {_esc(amd_phase or 'UNKNOWN')}"
-    )
-
-    # Gate 5: dealing range P/D
-    pd_ok = dealing_range_pd < 0.40 or dealing_range_pd > 0.60
-    pd_label = (
-        "DISC" if dealing_range_pd < 0.40 else
-        "EQ"   if dealing_range_pd < 0.60 else
-        "PREM"
-    )
-    gates.append(
-        f"  {'✅' if pd_ok else '⚪'} P/D: {pd_label} ({dealing_range_pd:.0%})"
-    )
-
-    # Gate 6: HTF bias
-    htf_ok = bool(htf_bias) and htf_bias.lower() != "mixed"
-    gates.append(
-        f"  {'✅' if htf_ok else '⚪'} HTF: {_esc(htf_bias or 'mixed')}"
-    )
-
-    return gates
-
-
-# ======================================================================
-# 1. PERIODIC REPORT
-# ======================================================================
-
-def format_periodic_report(
-    current_price:       float = 0.0,
-    balance:             float = 0.0,
-    total_trades:        int   = 0,
-    win_rate:            float = 0.0,
-    daily_pnl:           float = 0.0,
-    total_pnl:           float = 0.0,
-    consecutive_losses:  int   = 0,
-    bot_state:           str   = "SCANNING",
-    n_bsl_pools:         int   = 0,
-    n_ssl_pools:         int   = 0,
-    primary_target_str:  str   = "—",
-    flow_conviction:     float = 0.0,
-    flow_direction:      str   = "",
-    amd_phase:           str   = "UNKNOWN",
-    session:             str   = "REGULAR",
-    in_killzone:         bool  = False,
-    regime:              str   = "UNKNOWN",
-    position:            Optional[Dict] = None,
-    current_sl:          Optional[float] = None,
-    current_tp:          Optional[float] = None,
-    entry_price:         Optional[float] = None,
-    breakeven_moved:     bool  = False,
-    profit_locked_pct:   float = 0.0,
-    extra_lines:         Optional[List[str]] = None,
-    atr:                 float = 0.0,
-    htf_bias:            str   = "",
-    dealing_range_pd:    float = 0.5,
-    structure_15m:       str   = "",
-    structure_4h:        str   = "",
-    amd_bias:            str   = "",
-    nearest_bsl:         Optional[Dict] = None,
-    nearest_ssl:         Optional[Dict] = None,
-    sweep_analysis:      Optional[Dict] = None,
-    direction_hunt:        Optional[Any] = None,
-    direction_ps_analysis: Optional[Any] = None,
-    **_kwargs: Any,
-) -> str:
-    """15-minute institutional Telegram dashboard."""
-    ist_tz  = timezone(timedelta(hours=5, minutes=30))
-    now_ist = datetime.now(ist_tz).strftime("%H:%M IST")
-    now_utc = datetime.now(timezone.utc).strftime("%H:%M UTC")
-
-    sess_icon = _session_icon(session)
-    kz_str    = " 🔥KZ" if in_killzone else ""
-    pnl_icon  = "🟢" if daily_pnl >= 0 else "🔴"
-
-    _STATE_ICONS = {
-        "SCANNING":    "🔍",
-        "TRACKING":    "📡",
-        "READY":       "🎯",
-        "ENTERING":    "⚡",
-        "IN_POSITION": "📊",
-        "POST_SWEEP":  "🌊",
-    }
-    state_icon = _STATE_ICONS.get((bot_state or "").upper(), "⚪")
-
-    _PD_LABEL = (
-        "DEEP DISC"  if dealing_range_pd < 0.25 else
-        "DISCOUNT"   if dealing_range_pd < 0.40 else
-        "EQ"         if dealing_range_pd < 0.60 else
-        "PREMIUM"    if dealing_range_pd < 0.75 else
-        "DEEP PREM"
-    )
-
-    lines: List[str] = [
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"📊 <b>STATUS</b>  {_esc(now_ist)} / {_esc(now_utc)}",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "",
-    ]
-
-    lines.append(f"💰 BTC: <b>{_fmt_price(current_price)}</b>")
-    atr_part = f"  ATR: {_fmt_price(atr)}" if atr > 0 else ""
-    lines.append(f"  💵 Bal: {_fmt_price(balance)}{atr_part}")
-    lines.append(
-        f"  {pnl_icon} Day: <b>{_fmt_price(daily_pnl)}</b>  |  "
-        f"Total: {_fmt_price(total_pnl)}"
-    )
-
-    lines.append("")
-    lines.append(f"{state_icon} <b>{_esc(bot_state)}</b>  "
-                 f"{sess_icon} {_esc(session)}{kz_str}")
-
-    lines.append("")
-    lines.append("🏛️ <b>MARKET STRUCTURE</b>")
-    lines.append(f"  AMD: {_esc(amd_phase)} ({_esc(amd_bias)})")
-
-    htf_parts: List[str] = []
-    if structure_4h:  htf_parts.append(f"4H:{_esc(structure_4h)}")
-    if structure_15m: htf_parts.append(f"15m:{_esc(structure_15m)}")
-    if htf_bias:      htf_parts.append(f"HTF:{_esc(htf_bias)}")
-    if htf_parts:
-        lines.append(f"  {' | '.join(htf_parts)}")
-
-    lines.append(f"  Dealing range: {_PD_LABEL} ({dealing_range_pd:.0%})")
-    lines.append(f"  Regime: {_esc(regime)}")
-
-    lines.append("")
-    lines.append("🎯 <b>LIQUIDITY</b>")
-    lines.append(f"  BSL ▲ {int(n_bsl_pools)} pools  |  "
-                 f"SSL ▼ {int(n_ssl_pools)} pools")
-
-    if nearest_bsl:
-        lines.append(
-            f"  ▲ Nearest BSL: {_fmt_price(nearest_bsl.get('price', 0))} "
-            f"({nearest_bsl.get('dist_atr', 0):.1f}ATR "
-            f"sig={nearest_bsl.get('significance', 0):.0f} "
-            f"{_esc(nearest_bsl.get('timeframe', ''))})"
-        )
-    if nearest_ssl:
-        lines.append(
-            f"  ▼ Nearest SSL: {_fmt_price(nearest_ssl.get('price', 0))} "
-            f"({nearest_ssl.get('dist_atr', 0):.1f}ATR "
-            f"sig={nearest_ssl.get('significance', 0):.0f} "
-            f"{_esc(nearest_ssl.get('timeframe', ''))})"
-        )
-
-    if primary_target_str and primary_target_str != "—":
-        lines.append(f"  🎯 Target: {_esc(primary_target_str)}")
-
-    if sweep_analysis:
-        rs = float(sweep_analysis.get("reversal_score", 0))
-        cs = float(sweep_analysis.get("continuation_score", 0))
-        rr = sweep_analysis.get("reversal_reasons", []) or []
-        cr = sweep_analysis.get("continuation_reasons", []) or []
-        sw_side = sweep_analysis.get("sweep_side", "?")
-        sw_price = sweep_analysis.get("sweep_price", 0)
-        winner = ("REVERSAL"     if rs > cs + 15 else
-                  "CONTINUATION" if cs > rs + 15 else
-                  "UNDECIDED")
-        lines.append("")
-        lines.append(
-            f"🌊 <b>SWEEP ANALYSIS</b> ({_esc(sw_side)} @ {_fmt_price(sw_price)})"
-        )
-        lines.append(f"  REV: {rs:.0f}  |  CONT: {cs:.0f}  →  <b>{_esc(winner)}</b>")
-        if rr:
-            lines.append(f"  Rev:  {_esc(', '.join(str(r) for r in rr[:3]))}")
-        if cr:
-            lines.append(f"  Cont: {_esc(', '.join(str(r) for r in cr[:3]))}")
-
-    if direction_hunt is not None:
-        dh_pred  = getattr(direction_hunt, "predicted", None)
-        dh_conf  = float(getattr(direction_hunt, "confidence", 0.0))
-        dh_deliv = getattr(direction_hunt, "delivery_direction", "")
-        dh_bsl   = float(getattr(direction_hunt, "bsl_score", 0.0))
-        dh_ssl   = float(getattr(direction_hunt, "ssl_score", 0.0))
-        dh_raw   = float(getattr(direction_hunt, "raw_score",  0.0))
-
-        hunt_icon  = "🔵" if dh_pred == "BSL" else ("🟠" if dh_pred == "SSL" else "⚪")
-        deliv_icon = "🟢" if dh_deliv == "bullish" else ("🔴" if dh_deliv == "bearish" else "⚪")
-
-        lines.append("")
-        lines.append(f"{hunt_icon} <b>HUNT PREDICTION</b>: {_esc(dh_pred or 'NEUTRAL')}")
-        lines.append(
-            f"  [{_score_bar(dh_conf)}] {dh_conf:.0%}  "
-            f"{deliv_icon} {_esc(dh_deliv or '—')}"
-        )
-        lines.append(f"  BSL={dh_bsl:.3f}  SSL={dh_ssl:.3f}  raw={dh_raw:+.3f}")
-
-    if direction_ps_analysis is not None:
-        ps_action = getattr(direction_ps_analysis, "action", "?")
-        ps_dir    = getattr(direction_ps_analysis, "direction", "")
-        ps_conf   = float(getattr(direction_ps_analysis, "confidence", 0.0))
-        ps_phase  = getattr(direction_ps_analysis, "phase", "")
-        ps_rev    = float(getattr(direction_ps_analysis, "rev_score",  0.0))
-        ps_cont   = float(getattr(direction_ps_analysis, "cont_score", 0.0))
-        ps_cisd   = getattr(direction_ps_analysis, "cisd_active", False)
-        ps_ote    = getattr(direction_ps_analysis, "ote_active",  False)
-        ps_disp   = float(getattr(direction_ps_analysis, "displacement_atr", 0.0))
-
-        ps_winner = ("REVERSAL"     if ps_rev  > ps_cont + 15 else
-                     "CONTINUATION" if ps_cont > ps_rev  + 15 else
-                     "CONTESTED")
-        ps_ai = {"reverse": "🔄", "continue": "➡️", "wait": "⏳"}.get(
-            ps_action.lower(), "❓"
-        )
-        ps_di = "🟢" if ps_dir == "long" else ("🔴" if ps_dir == "short" else "⚪")
-
-        lines.append("")
-        lines.append(
-            f"{ps_ai} <b>POST-SWEEP VERDICT</b>: {_esc(ps_action.upper())}  "
-            f"{ps_di} {_esc(ps_dir.upper() or '—')}"
-        )
-        lines.append(f"  conf={ps_conf:.0%}  phase={_esc(ps_phase)}")
-        lines.append(f"  REV={ps_rev:.1f}  CONT={ps_cont:.1f}  → {_esc(ps_winner)}")
-
-        ps_flags: List[str] = []
-        if ps_cisd: ps_flags.append("CISD✓")
-        if ps_ote:  ps_flags.append("OTE✓")
-        if ps_disp > 0: ps_flags.append(f"disp={ps_disp:.2f}ATR")
-        if ps_flags:
-            lines.append("  " + "  ".join(_esc(x) for x in ps_flags))
-
-    lines.append("")
-    gate_lines = _build_gate_diagnostic(
-        direction_hunt   = direction_hunt,
-        amd_phase        = amd_phase,
-        dealing_range_pd = dealing_range_pd,
-        session          = session,
-        flow_conviction  = flow_conviction,
-        flow_direction   = flow_direction,
-        htf_bias         = htf_bias,
-    )
-    lines.extend(gate_lines)
-
-    if position:
-        side    = (position.get("side") or "?").upper()
-        p_entry = entry_price or position.get("entry_price", 0)
-        qty     = float(position.get("quantity", 0) or 0)
-
-        side_icon = "🟢" if side == "LONG" else "🔴"
-        lines.append("")
-        lines.append(f"{side_icon} <b>POSITION: {_esc(side)}</b>")
-        lines.append(f"  Entry: {_fmt_price(p_entry)}")
-
-        if current_sl:
-            sl_dist = abs(current_price - current_sl) / max(atr, 1) if atr > 0 else 0
-            lines.append(f"  SL: {_fmt_price(current_sl)} ({sl_dist:.1f}ATR)")
-        if current_tp:
-            tp_dist = abs(current_tp - current_price) / max(atr, 1) if atr > 0 else 0
-            lines.append(f"  TP: {_fmt_price(current_tp)} ({tp_dist:.1f}ATR)")
-
-        if p_entry and current_price:
-            move = ((current_price - p_entry) if side == "LONG"
-                    else (p_entry - current_price))
-            risk_d = abs(p_entry - current_sl) if current_sl else 0
-            ur_r   = move / risk_d if risk_d > 0 else 0
-            upnl   = move * qty if qty > 0 else move
-            icon   = "🟢" if move >= 0 else "🔴"
-
-            bar = "░" * 16
-            prog = 0.0
-            if current_tp:
-                total = abs(current_tp - p_entry)
-                if total > 0:
-                    prog = min(1.0, max(0.0, abs(current_price - p_entry) / total))
-                    if move < 0:
-                        prog = 0.0
-                    filled = int(prog * 16)
-                    bar = "█" * filled + "░" * (16 - filled)
-
-            if qty > 0:
-                lines.append(f"  {icon} <b>${upnl:+.2f}</b> ({ur_r:+.2f}R)")
-            else:
-                lines.append(f"  {icon} {move:+.1f}pts ({ur_r:+.2f}R)")
-            lines.append(f"  [{bar}] {prog*100:.0f}%→TP")
-
-        if breakeven_moved:
-            lines.append(f"  🔒 BE locked | {profit_locked_pct:.1f}R secured")
-
-    lines.append("")
-    lines.append("📈 <b>PERFORMANCE</b>")
-    lines.append(f"  Trades: {int(total_trades)}  |  WR: {win_rate:.1f}%")
-    if consecutive_losses > 0:
-        lines.append(f"  ⚠️ Consecutive losses: {int(consecutive_losses)}")
-
-    if extra_lines:
-        lines.append("")
-        for el in extra_lines:
-            if el and el.strip():
-                # extra_lines can contain HTML — let _sanitize_html handle it
-                lines.append(el)
-
-    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    return "\n".join(lines)
-
-
-# ======================================================================
-# 2. HUNT PREDICTION
-# ======================================================================
-
-def format_direction_hunt_alert(
-    predicted:           Optional[str],
-    confidence:          float,
-    delivery_direction:  str,
-    bsl_score:           float,
-    ssl_score:           float,
-    nearest_bsl:         Optional[Dict] = None,
-    nearest_ssl:         Optional[Dict] = None,
-    raw_score:           float = 0.0,
-    current_price:       float = 0.0,
-    atr:                 float = 0.0,
-) -> str:
-    hunt_icon = "🔵" if predicted == "BSL" else ("🟠" if predicted == "SSL" else "⚪")
-    deliv_icon = "🟢" if delivery_direction == "bullish" else \
-                 ("🔴" if delivery_direction == "bearish" else "⚪")
-    lines = [
-        f"{hunt_icon} <b>HUNT PREDICTION</b>: {_esc(predicted or 'NEUTRAL')}",
-        f"  Confidence: [{_score_bar(confidence)}] {confidence:.0%}",
-        f"  Delivery:   {deliv_icon} {_esc(delivery_direction or '—')}",
-        f"  BSL score:  {bsl_score:+.3f}",
-        f"  SSL score:  {ssl_score:+.3f}",
-        f"  Raw:        {raw_score:+.3f}",
-    ]
-    if current_price > 0:
-        lines.append(f"  Price:      {_fmt_price(current_price)}")
-    if atr > 0:
-        lines.append(f"  ATR:        {_fmt_price(atr)}")
-    if nearest_bsl:
-        lines.append(
-            f"  ▲ BSL target: {_fmt_price(nearest_bsl.get('price', 0))} "
-            f"({nearest_bsl.get('dist_atr', 0):.1f}ATR)"
-        )
-    if nearest_ssl:
-        lines.append(
-            f"  ▼ SSL target: {_fmt_price(nearest_ssl.get('price', 0))} "
-            f"({nearest_ssl.get('dist_atr', 0):.1f}ATR)"
-        )
-    return "\n".join(lines)
-
-
-# ======================================================================
-# 3. POST-SWEEP VERDICT
-# ======================================================================
-
-def format_post_sweep_verdict(
-    action:           str,
-    direction:        str,
-    confidence:       float,
-    phase:            str,
-    rev_score:        float,
-    cont_score:       float,
-    cisd_active:      bool = False,
-    ote_active:       bool = False,
-    displacement_atr: float = 0.0,
-    sweep_side:       str   = "",
-    sweep_price:      float = 0.0,
-    current_price:    float = 0.0,
-    atr:              float = 0.0,
-    **_kwargs: Any,
-) -> str:
-    ai = {"reverse": "🔄", "continue": "➡️", "wait": "⏳"}.get(
-        action.lower(), "❓"
-    )
-    di = "🟢" if direction == "long" else ("🔴" if direction == "short" else "⚪")
-    winner = ("REVERSAL"     if rev_score  > cont_score + 15 else
-              "CONTINUATION" if cont_score > rev_score  + 15 else
-              "CONTESTED")
-
-    lines = [
-        f"{ai} <b>POST-SWEEP VERDICT</b>: {_esc(action.upper())}  "
-        f"{di} {_esc(direction.upper() or '—')}",
-        f"  Confidence: [{_score_bar(confidence)}] {confidence:.0%}",
-        f"  Phase:      {_esc(phase)}",
-        f"  Sweep:      {_esc(sweep_side)} @ {_fmt_price(sweep_price)}",
-        f"  REV={rev_score:.1f}  CONT={cont_score:.1f}  → {_esc(winner)}",
-    ]
-    flags: List[str] = []
-    if cisd_active: flags.append("CISD✓")
-    if ote_active:  flags.append("OTE✓")
-    if displacement_atr > 0: flags.append(f"disp={displacement_atr:.2f}ATR")
-    if flags:
-        lines.append("  " + "  ".join(_esc(f) for f in flags))
-    if current_price > 0:
-        lines.append(f"  Price={_fmt_price(current_price)}  ATR={_fmt_price(atr)}")
-    return "\n".join(lines)
-
-
-# ======================================================================
-# 4. POOL GATE ALERT
-# ======================================================================
-
-def format_pool_gate_alert(
-    action:          str,                # "exit" | "reverse" | "continue"
-    side:            str,                # position side
-    pool_side:       str,                # "BSL" | "SSL"
-    pool_price:      float,
-    current_price:   float,
-    reason:          str = "",
-    rev_score:       float = 0.0,
-    cont_score:      float = 0.0,
-    **_kwargs: Any,
-) -> str:
-    act_icon = {"exit": "🚪", "reverse": "🔄", "continue": "➡️"}.get(
-        action.lower(), "❓"
-    )
-    lines = [
-        f"{act_icon} <b>POOL-GATE {_esc(action.upper())}</b>",
-        f"  Position:  {_esc(side.upper())}",
-        f"  Pool hit:  {_esc(pool_side)} @ {_fmt_price(pool_price)}",
-        f"  Price:     {_fmt_price(current_price)}",
-        f"  REV={rev_score:.1f}  CONT={cont_score:.1f}",
-    ]
-    if reason:
-        lines.append(f"  Reason: {_esc(reason)}")
-    return "\n".join(lines)
-
-
-# ======================================================================
-# 5. CONVICTION BLOCK ALERT
-# ======================================================================
-
-def format_conviction_block_alert(
-    side:               str,
-    factor_scores:      Dict[str, float],
-    weighted_total:     float,
-    reasons:            Optional[List[str]] = None,
-    required_score:     float = _REQUIRED_CONVICTION_SCORE,
-    **_kwargs: Any,
-) -> str:
-    deficit = max(0.0, required_score - weighted_total)
-    lines = [
-        f"🚫 <b>CONVICTION BLOCKED</b> {_esc(side.upper())}",
-        f"  Total: <b>{weighted_total:.2f}</b> / {required_score:.2f}  "
-        f"(need +{deficit:.2f})",
-        "",
-        "  <b>Factor scores</b>",
-    ]
-    for factor, score in factor_scores.items():
-        bar = _score_bar(min(1.0, max(0.0, score)), width=10)
-        lines.append(f"    {_esc(factor):<12} [{bar}] {score:+.2f}")
-    if reasons:
-        lines.append("")
-        lines.append("  <b>Rejection reasons</b>")
-        for r in reasons[:5]:
-            lines.append(f"    • {_esc(r)}")
-    return "\n".join(lines)
-
-
-# ======================================================================
-# 6. LIQUIDITY TRAIL UPDATE (v5.0 FIB ENGINE)
-# ======================================================================
-
-def format_liquidity_trail_update(
-    side:          str,
-    new_sl:        float,
-    anchor_price:  float,
-    anchor_tf:     str,
-    anchor_sig:    float,
-    phase:         str,
-    is_swept:      bool,
-    entry_price:   float,
-    current_price: float,
-    atr:           float,
-    session:       str = "",
-    # v5.0 extras (all optional so v4.0 callers still work)
-    fib_ratio:     Optional[float]   = None,
-    r_multiple:    float             = 0.0,
-    swing_low:     Optional[float]   = None,
-    swing_high:    Optional[float]   = None,
-    momentum_gate: str               = "",
-    htf_aligned:   Optional[bool]    = None,
-    is_cluster:    bool              = False,
-    n_cluster_tfs: int               = 1,
-    pool_boost:    bool              = False,
-    pool_between_expand: bool        = False,
-    buffer_atr:    float             = 0.0,
-) -> str:
-    """
-    Fibonacci SL trail advance alert (v5.0 engine).
-
-    Shows the full anchor reasoning: Fib ratio + swing context + momentum
-    source + HTF alignment + liquidity confluence tags.
-    Throttled in quant_strategy to one per 120s.
-    """
-    side_icon = "🟢" if (side or "").lower() == "long" else "🔴"
-    phase_icons = {
-        "STRUCTURAL":   "🏛️",
-        "AGGRESSIVE":   "🎯",
-        "BE_LOCK":      "🔒",
-        "COUNTER_BOS":  "🚨",
-        "HANDS_OFF":    "⏸",
-        "HOLD":         "⏸",
-    }
-    phase_icon = phase_icons.get(phase, "📍")
-
-    # Fib ratio display
-    fib_str = f"{fib_ratio:.3f}" if fib_ratio is not None else "?"
-    golden = fib_ratio in (0.382, 0.500, 0.618) if fib_ratio is not None else False
-    ratio_tag = f"✨ <b>{fib_str}</b>" if golden else f"<b>{fib_str}</b>"
-
-    # Cluster tag
-    cluster_tag = ""
-    if is_cluster:
-        cluster_tag = f" ×{int(n_cluster_tfs)}TF"
-
-    # Pool confluence
-    pool_tag = ""
-    if pool_boost:
-        pool_tag = " +pool"
-    if pool_between_expand:
-        pool_tag += " +expand"
-
-    # Momentum source
-    gate_emoji = {"DISP": "💥", "CVD": "📈", "BOS": "🏗️", "NONE": "⚪"}.get(
-        momentum_gate, "⚪"
-    )
-
-    # HTF alignment
-    htf_str = (
-        "🟢 aligned" if htf_aligned is True else
-        "🔴 counter" if htf_aligned is False else
-        "⚪ n/a"
-    )
-
-    sess_icons = {"LONDON": "🇬🇧", "NY": "🇺🇸", "ASIA": "🌏", "": "🌐"}
-    sess_icon  = sess_icons.get((session or "").upper(), "🌐")
-
-    # Profit locked in R from entry
-    r_locked = 0.0
-    if atr > 1e-10 and entry_price > 0:
-        if (side or "").lower() == "long":
-            r_locked_pts = new_sl - entry_price
-        else:
-            r_locked_pts = entry_price - new_sl
-        r_locked = r_locked_pts / atr
-
-    dist_to_sl_atr = abs(current_price - new_sl) / atr if atr > 1e-10 else 0.0
-
-    lines: List[str] = [
-        f"{side_icon} <b>FIBONACCI TRAIL</b>  {phase_icon} {_esc(phase)}  "
-        f"({r_multiple:.2f}R)",
-        "",
-        f"  🎯 SL → <b>{_fmt_price(new_sl)}</b>  "
-        f"({r_locked:+.2f}R from entry)",
-        f"  📐 Fib: {ratio_tag}{_esc(cluster_tag)}{_esc(pool_tag)}  "
-        f"{_fmt_price(anchor_price)} ({_fmt_tf(anchor_tf)})",
-    ]
-
-    if swing_low is not None and swing_high is not None:
-        swing_rng = abs(swing_high - swing_low)
-        lines.append(
-            f"  📊 Swing: {_fmt_price(swing_low)} → {_fmt_price(swing_high)}  "
-            f"({swing_rng:.0f}pts)"
-        )
-
-    if buffer_atr > 0:
-        lines.append(f"  🪶 Buffer: {buffer_atr:.2f} ATR")
-
-    if phase in ("STRUCTURAL", "AGGRESSIVE"):
-        lines.append(
-            f"  {gate_emoji} Momentum: {_esc(momentum_gate or 'n/a')}  "
-            f"HTF: {htf_str}"
-        )
-
-    lines.append(
-        f"  📏 Distance: {dist_to_sl_atr:.2f} ATR  |  Q: {anchor_sig:.1f}"
-    )
-
-    lines.append("")
-    lines.append(
-        f"  Entry: {_fmt_price(entry_price)}  |  "
-        f"Price: {_fmt_price(current_price)}  "
-        f"{sess_icon} {_esc(session or 'unknown')}"
-    )
-
-    if phase == "COUNTER_BOS":
-        lines.append(
-            "  <i>🚨 Counter-BOS broke entry — thesis invalidated, locked to BE</i>"
-        )
-    elif phase == "BE_LOCK":
-        lines.append(
-            "  <i>🔒 BE + exact fees + slippage locked; trade is now risk-free</i>"
-        )
-    elif is_cluster:
-        lines.append(
-            "  <i>Multi-TF Fib confluence — strongest possible anchor</i>"
-        )
-    elif pool_boost:
-        lines.append(
-            "  <i>Fibonacci + liquidity pool confluence</i>"
-        )
-    else:
-        lines.append(
-            "  <i>SL anchored to institutional Fib retracement</i>"
-        )
-
-    return "\n".join(lines)
-
-
-# ======================================================================
+# LOGGING HANDLER# ======================================================================
 # LOGGING HANDLER — forward WARNING+ logs to Telegram
 # ======================================================================
 
+# ──────────────────────────────────────────────────────────────────────
+# Telegram suppression patterns
+#
+# Certain WARNING-level log records are routine/diagnostic noise that
+# should never page the user on Telegram (but should still appear in
+# the local institutional_bot.log file). Any record whose formatted message
+# contains ANY of these substrings is dropped by TelegramLogHandler
+# before the send.
+#
+# Matching is substring-against-the-formatted-message (case-sensitive
+# to avoid accidental over-match). Formatter is
+# "%(name)s: %(message)s" so logger-name prefixes are also searchable
+# (e.g. "exchanges.delta.data_manager:").
+#
+# Maintained here so new noisy warnings can be muted centrally without
+# editing every call site. Extend via `add_telegram_suppress_pattern`.
+# ──────────────────────────────────────────────────────────────────────
+_TELEGRAM_SUPPRESS_PATTERNS: List[str] = [
+    # Delta data-manager routine self-heal (main cause of historic spam —
+    # now also downgraded to INFO at source, but kept here as
+    # belt-and-braces in case another path logs these at WARNING).
+    "Delta REST refresh ",
+    "candles stale age=",
+    "starting REST self-heal",
+    # Watchdog daily-counter consistency check — a known false-positive
+    # comparison (gate counts ENTRIES; risk_manager counts COMPLETED
+    # trades, or may not even track the same field). Fires every 5 min
+    # while a position is open. Diagnostic only, no auto-heal path.
+    "daily_counter_consistency",
+    "daily counter drift",
+    # Structural liquidity_event-quality deferrals are INFO-level decision context and
+    # should never be duplicated as Telegram WARNING notifications.
+    "liquidity_event QUALITY IMPAIRED [tf_quality]:",
+    "liquidity_event DEFERRED [tf_quality]:",
+    # 2. Telegram API HTTP errors on getUpdates: when Telegram itself
+    #    rate-limits the bot, the WARN was being routed BACK into the
+    #    Telegram queue, amplifying the burst. Source-downgraded to
+    #    throttled WARN/INFO; this is belt-and-braces.
+    "Telegram API HTTP",
+    "getUpdates skipped",
+    "Telegram connection error",
+    # 3. Watchdog stuck-flag self-heal: routine maintenance, not actionable
+    "watchdog[stuck_exit_completed]",
+    "watchdog[no_trades_after_first]",
+    # 4. Notifier internal retry chatter — the queue/retry mechanism is
+    #    its own observability layer; don't notify Telegram about Telegram
+    #    being slow.
+    "Telegram 429",
+    "Telegram 502",
+    "Telegram 503",
+    "Telegram queue full",
+    # 5. WebSocket reconnect warnings — handled by reconnect logic; they
+    #    fire briefly during normal network blips and would otherwise
+    #    cluster as a 3-message Telegram burst per blip.
+    "DeltaWebSocket closed",
+    "DeltaWebSocket reconnecting",
+    # 6. FibTrail dispatch block (rare but bursts when it does) — already
+    #    surfaced via the throttled trail Telegram update, no need for
+    #    duplicate via log handler.
+    "FibTrail dispatch blocked:",
+    # 7. Circuit-breaker steady state. The breaker trip/clear messages are
+    #    actionable; the per-entry "still frozen" state is local telemetry.
+    "Entries paused: watchdog circuit breaker is engaged",
+    "Entries still paused by watchdog circuit breaker",
+]
+_TELEGRAM_SUPPRESS_LOCK = threading.Lock()
+
+
+def add_telegram_suppress_pattern(pattern: str) -> None:
+    """Register an additional substring pattern to suppress from Telegram."""
+    if not pattern:
+        return
+    with _TELEGRAM_SUPPRESS_LOCK:
+        if pattern not in _TELEGRAM_SUPPRESS_PATTERNS:
+            _TELEGRAM_SUPPRESS_PATTERNS.append(pattern)
+
+
+def clear_telegram_suppress_patterns() -> None:
+    """Remove all suppression patterns (primarily for tests)."""
+    with _TELEGRAM_SUPPRESS_LOCK:
+        _TELEGRAM_SUPPRESS_PATTERNS.clear()
+
+
+def _is_suppressed_for_telegram(formatted_msg: str) -> bool:
+    if not formatted_msg:
+        return False
+    with _TELEGRAM_SUPPRESS_LOCK:
+        patterns = tuple(_TELEGRAM_SUPPRESS_PATTERNS)
+    for pat in patterns:
+        if pat and pat in formatted_msg:
+            return True
+    return False
+
+
 class TelegramLogHandler(logging.Handler):
-    """Forward WARNING+ log records to Telegram with throttling and buffering."""
+    """Forward WARNING+ log records to Telegram with throttling and buffering.
+
+    Suppression: records whose formatted message matches any substring in
+    `_TELEGRAM_SUPPRESS_PATTERNS` are dropped silently and do NOT consume
+    the throttle/buffer slots. This prevents a recurring noisy WARNING
+    from crowding out a genuinely important one that happens to arrive
+    during the same throttle window.
+    """
 
     def __init__(self, level: int = logging.WARNING, throttle_seconds: float = 5.0):
         super().__init__(level)
@@ -1064,6 +1026,14 @@ class TelegramLogHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            # Format once, so suppression and send use the same text.
+            msg = self.format(record)
+
+            # Early exit for suppressed patterns — don't advance throttle
+            # state, don't occupy a buffer slot.
+            if _is_suppressed_for_telegram(msg):
+                return
+
             with self._lock:
                 now = time.time()
                 if now - self._last_ts < self._throttle:
@@ -1071,13 +1041,19 @@ class TelegramLogHandler(logging.Handler):
                     return
                 self._last_ts = now
 
-            msg = self.format(record)
             if self._buffer:
-                buffered = [self.format(r) for r in list(self._buffer)]
+                buffered_records = list(self._buffer)
                 self._buffer.clear()
-                msg = "\n".join(buffered) + "\n" + msg
+                # Filter buffered records through suppression too — a pattern
+                # may have been added since they were buffered.
+                buffered_msgs = [
+                    self.format(r) for r in buffered_records
+                    if not _is_suppressed_for_telegram(self.format(r))
+                ]
+                if buffered_msgs:
+                    msg = "\n".join(buffered_msgs) + "\n" + msg
 
-            send_telegram_message(f"⚠️ <code>{_esc(msg[:1500])}</code>")
+            send_telegram_message(format_log_alert(record.levelname, record.name, msg))
         except Exception:
             pass
 
@@ -1090,3 +1066,216 @@ def install_global_telegram_log_handler(
     handler = TelegramLogHandler(level=level, throttle_seconds=throttle_seconds)
     handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
     logging.getLogger().addHandler(handler)
+
+
+def _venue_currency(venue: str = "", inst: Any = None) -> str:
+    return _tg_currency_symbol(venue, inst)
+
+
+def _side_arrow(side: str) -> str:
+    return "▲ LONG" if str(side or "").lower() == "long" else "▼ SHORT"
+
+
+def format_entry_alert(*, side: str, price: float = 0.0, entry: float = 0.0, sl: float = 0.0, tp: float = 0.0,
+                       qty: float = 0.0, leverage: float = 1.0, venue: str = "",
+                       context_4h: Any = "-", context_15m: Any = "-",
+                       liquidity_event_quality: float = 0.0, displacement_atr: float = 0.0,
+                       delivery_score: float = 0.0, delivery_probability: Optional[float] = None,
+                       delivery_utility_r: float = 0.0, probability_calibrated: bool = False,
+                       decision_path: str = "INSTITUTIONAL_PROTECTED_FLOW", rr: float = 0.0,
+                       instrument: Any = None, **kwargs) -> str:
+    inst = instrument or _tg_current_instrument()
+    sym = _venue_currency(venue, inst)
+    price = float(price or entry or 0.0)
+    risk_usd = float(kwargs.get("risk_usd", kwargs.get("structural_risk", 0.0)) or 0.0)
+    margin_used = float(kwargs.get("margin_used", 0.0) or 0.0)
+    fee_status = str(kwargs.get("fee_status", kwargs.get("fee_line", "")) or "")
+    liquidity_event_label = str(kwargs.get("liquidity_event_label", "-") or "-")
+    liquidity_event_price = float(kwargs.get("liquidity_event_price", 0.0) or 0.0)
+    target_label = str(kwargs.get("target_label", "validated liquidity target") or "validated liquidity target")
+    vehicle = ""
+    try:
+        primary = getattr(inst, "primary", None)
+        raw = getattr(primary, "raw", {}) if primary is not None else {}
+        selected = raw.get("selected_option_contract", {}) if isinstance(raw, dict) else {}
+        row = selected.get("raw", selected) if isinstance(selected, dict) else {}
+        contract = row.get("TradingSymbol") or row.get("trading_symbol") or ""
+        right = str(row.get("right") or "").lower()
+        action = "BUY CALL" if right.startswith("c") else ("BUY PUT" if right.startswith("p") else "BUY OPTION")
+        if contract:
+            vehicle = f"\nOption Vehicle: {action} <code>{_html_lib.escape(str(contract))}</code>"
+    except Exception:
+        vehicle = ""
+    calibration = (f"Calibrated delivery P={float(delivery_probability):.3f} | utility={float(delivery_utility_r):+.3f}R"
+                   if probability_calibrated and delivery_probability is not None
+                   else "Calibrated delivery P=N/A | sizing=structural risk + measured execution cost")
+    price_block = (
+        f"ENTRY  {sym}{float(price):,.4f}\n"
+        f"SL     {sym}{float(sl):,.4f}\n"
+        f"TP     {sym}{float(tp):,.4f}\n"
+        f"R:R    1:{float(rr):.2f}"
+    )
+    size_block = (
+        f"QTY    {float(qty):.8g}\n"
+        f"LEV    {float(leverage):.1f}x\n"
+        f"RISK   {sym}{risk_usd:,.2f}"
+    )
+    if margin_used > 0:
+        size_block += f"\nMARGIN {sym}{margin_used:,.2f}"
+    context_block = (
+        f"4H     {_esc(context_4h)}\n"
+        f"15m    {_esc(context_15m)}\n"
+        f"EVENT  {_esc(liquidity_event_label)}" + (f" @ {sym}{liquidity_event_price:,.4f}" if liquidity_event_price > 0 else "") + "\n"
+        f"DISP   {float(displacement_atr):.2f} ATR\n"
+        f"SCORE  delivery {float(delivery_score):+.2f} | liquidity {float(liquidity_event_quality):.2f}"
+    )
+    lines = [
+        f"<b>ENTRY TICKET | {_side_arrow(side)}</b>",
+        f"<code>{_esc(decision_path)}</code>",
+        "<b>Price Map</b>",
+        f"<pre>{_esc(price_block)}</pre>",
+        "<b>Size / Risk</b>",
+        f"<pre>{_esc(size_block)}</pre>",
+        "<b>Decision Context</b>",
+        f"<pre>{context_block}</pre>",
+        f"<b>Model</b>\n<code>{_esc(calibration)}</code>",
+        f"<b>Protection</b>\n<code>Stop + target managed at venue; target={_esc(target_label)}</code>",
+    ]
+    if fee_status:
+        lines.append(f"<b>Fees</b>\n<code>{_esc(fee_status)}</code>")
+    if vehicle:
+        lines.append(vehicle.lstrip())
+    return "\n".join(lines)
+
+
+def format_exit_alert(*, side: str = "", entry_price: float = 0.0, exit_price: float = 0.0,
+                      pnl: float = 0.0, reason: str = "", venue: str = "", quantity: float = 0.0,
+                      exact_fill: bool = True, provisional: bool = False, **kwargs) -> str:
+    sym = _venue_currency(venue, _tg_current_instrument())
+    entry_price = float(kwargs.get("entry", entry_price) or 0.0)
+    quantity = float(kwargs.get("qty", quantity) or 0.0)
+    residual_qty = float(kwargs.get("residual_qty", 0.0) or 0.0)
+    partial_qty = float(kwargs.get("partial_qty", 0.0) or 0.0)
+    gross = float(kwargs.get("gross", pnl) or 0.0)
+    fees = float(kwargs.get("fees", 0.0) or 0.0)
+    r_realised = float(kwargs.get("r_realised", 0.0) or 0.0)
+    mfe_r = float(kwargs.get("mfe_r", 0.0) or 0.0)
+    planned_rr = float(kwargs.get("planned_rr", 0.0) or 0.0)
+    margin_pct = float(kwargs.get("margin_pct", 0.0) or 0.0)
+    margin_used = float(kwargs.get("margin_used", 0.0) or 0.0)
+    fee_source = str(kwargs.get("fee_source", "") or "")
+    tp_ladder_net = float(kwargs.get("tp_ladder_net", 0.0) or 0.0)
+    residual_net = float(kwargs.get("residual_net", pnl) or 0.0)
+    exact_fill = bool(kwargs.get("exact_fees", exact_fill))
+    provisional = bool(kwargs.get("pnl_provisional", provisional))
+    state = "EXACT BROKER FILL" if exact_fill and not provisional else "PENDING FEE/FILL RECONCILIATION"
+    price_block = (
+        f"ENTRY  {sym}{entry_price:,.4f}\n"
+        f"EXIT   {sym}{float(exit_price):,.4f}\n"
+        f"R      {r_realised:+.2f}R / plan {planned_rr:.2f}R\n"
+        f"MFE    {mfe_r:+.2f}R"
+    )
+    pnl_block = (
+        f"GROSS  {sym}{gross:+,.4f}\n"
+        f"FEES   {sym}{fees:,.4f}\n"
+        f"NET    {sym}{float(pnl):+,.4f}\n"
+        f"ROE    {margin_pct:+.2f}%"
+    )
+    if margin_used > 0:
+        pnl_block += f"\nMARGIN {sym}{margin_used:,.2f}"
+    qty_block = (
+        f"START  {quantity:.8g}\n"
+        f"PART   {partial_qty:.8g}\n"
+        f"FINAL  {residual_qty:.8g}"
+    )
+    lines = [
+        f"<b>EXIT REPORT | {_side_arrow(side)}</b>",
+        f"<code>{_esc(reason or '-')} | {state}</code>",
+        "<b>Price / R</b>",
+        f"<pre>{_esc(price_block)}</pre>",
+        "<b>P&amp;L</b>",
+        f"<pre>{_esc(pnl_block)}</pre>",
+        "<b>Quantity</b>",
+        f"<pre>{_esc(qty_block)}</pre>",
+    ]
+    if abs(tp_ladder_net) > 1e-12 or abs(residual_net - pnl) > 1e-12:
+        ladder_block = (
+            f"LADDER    {sym}{tp_ladder_net:+,.4f}\n"
+            f"RESIDUAL  {sym}{residual_net:+,.4f}"
+        )
+        lines.extend(["<b>Lifecycle Split</b>", f"<pre>{_esc(ladder_block)}</pre>"])
+    if fee_source:
+        lines.extend(["<b>Fee Source</b>", f"<code>{_esc(fee_source)}</code>"])
+    return "\n".join(lines)
+
+
+def format_partial_exit_alert(*, side: str = "", price: float = 0.0, qty: float = 0.0,
+                              pnl: float = 0.0, venue: str = "", target: str = "TP", **kwargs) -> str:
+    sym = _venue_currency(venue, _tg_current_instrument())
+    target = str(kwargs.get("role", target) or target)
+    price = float(kwargs.get("fill_price", price) or 0.0)
+    qty = float(kwargs.get("qty_closed", qty) or 0.0)
+    remaining = float(kwargs.get("qty_remaining", 0.0) or 0.0)
+    gross = float(kwargs.get("gross", pnl) or 0.0)
+    fees = float(kwargs.get("fees", 0.0) or 0.0)
+    pnl = float(kwargs.get("net", pnl) or 0.0)
+    cumulative = float(kwargs.get("cumulative_net", pnl) or 0.0)
+    sl = float(kwargs.get("sl", 0.0) or 0.0)
+    final_tp = float(kwargs.get("final_tp", 0.0) or 0.0)
+    status = str(kwargs.get("status", "FILLED") or "FILLED")
+    exact = bool(kwargs.get("exact_fees", True))
+    fill_block = (
+        f"FILL   {sym}{price:,.4f}\n"
+        f"CLOSED {qty:.8g}\n"
+        f"LEFT   {remaining:.8g}\n"
+        f"STATE  {status}"
+    )
+    pnl_block = (
+        f"GROSS  {sym}{gross:+,.4f}\n"
+        f"FEES   {sym}{fees:,.4f}\n"
+        f"NET    {sym}{pnl:+,.4f}\n"
+        f"TOTAL  {sym}{cumulative:+,.4f}"
+    )
+    lines = [
+        f"<b>PARTIAL EXIT | {_esc(target)} | {_side_arrow(side)}</b>",
+        f"<code>{'exact broker fill' if exact else 'fee pending'}</code>",
+        "<b>Fill</b>",
+        f"<pre>{_esc(fill_block)}</pre>",
+        "<b>P&amp;L</b>",
+        f"<pre>{_esc(pnl_block)}</pre>",
+    ]
+    if sl > 0 or final_tp > 0:
+        structure_block = f"SL     {sym}{sl:,.4f}\nFINAL  {sym}{final_tp:,.4f}"
+        lines.extend(["<b>Remaining Structure</b>", f"<pre>{_esc(structure_block)}</pre>"])
+    return "\n".join(lines)
+
+
+def format_periodic_report(*, asset: str = "", symbol: str = "", state: str = "SCANNING",
+                           side: str = "", entry_price: float = 0.0, current_price: float = 0.0,
+                           sl_price: float = 0.0, tp_price: float = 0.0, pnl: float = 0.0,
+                           venue: str = "", context_4h: Any = "-", context_15m: Any = "-",
+                           trigger: Any = "WAIT", instrument: Any = None, position: Optional[Dict[str, Any]] = None, balance: float = 0.0, daily_pnl: float = 0.0, total_pnl: float = 0.0, total_trades: int = 0, win_rate: float = 0.0, **kwargs) -> str:
+    inst = instrument or _tg_current_instrument()
+    sym = _venue_currency(venue, inst)
+    position = position or {}
+    side = side or str(position.get("side", "") or "")
+    entry_price = float(entry_price or position.get("entry_price", 0.0) or 0.0)
+    sl_price = float(sl_price or position.get("sl_price", 0.0) or 0.0)
+    tp_price = float(tp_price or position.get("tp_price", 0.0) or 0.0)
+    pnl = float(pnl or position.get("unrealized_pnl", 0.0) or 0.0)
+    lines = [f"🏛️ <b>INSTITUTIONAL market_state | {_html_lib.escape(str(asset or symbol or 'DESK'))}</b>",
+             f"Price: {sym}{float(current_price):,.2f} | Balance: {sym}{float(balance):,.2f}",
+             f"Today: {'+' if float(daily_pnl) >= 0 else '-'}{sym}{abs(float(daily_pnl)):,.2f} | Total: {'+' if float(total_pnl) >= 0 else '-'}{sym}{abs(float(total_pnl)):,.2f}",
+             f"State: {_html_lib.escape(str(state))}",
+             f"4H: {_html_lib.escape(str(context_4h))} | 15m: {_html_lib.escape(str(context_15m))}",
+             f"5m: {_html_lib.escape(str(trigger))}"]
+    if side:
+        lines += [f"Position: {_side_arrow(side)} | {sym}{float(entry_price):,.2f} → {sym}{float(current_price):,.2f}",
+                  f"SL {sym}{float(sl_price):,.2f} | TP {sym}{float(tp_price):,.2f} | P&amp;L {sym}{float(pnl):+,.2f}"]
+    return "\n".join(lines)
+
+
+def format_log_alert(level: str, logger_name: str, message: str) -> str:
+    label = "market_state/LIQUIDITY" if any(x in str(logger_name).lower() for x in ("strategy", "entry_engine", "liquidity")) else "RUNTIME"
+    return f"{_html_lib.escape(str(level))} | <b>{label}</b>\n<code>{_html_lib.escape(str(message))}</code>"
+

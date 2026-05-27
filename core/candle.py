@@ -1,7 +1,7 @@
 """
 core/candle.py — Canonical Candle dataclass
 ============================================
-Single definition shared by every data manager, strategy, and ICT engine.
+Single definition shared by every data manager, strategy, and institutional engine.
 Both exchange adapters produce this type; the aggregator consumes it.
 """
 

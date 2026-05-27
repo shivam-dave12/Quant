@@ -17,7 +17,11 @@ from typing import Dict, List, Optional
 
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import config
+from core.instruments import ExchangeName
 from core.candle import Candle
+from market_data.feed_health import score_feed_health
+from market_data.normalizer import InstrumentMapping, build_venue_microstate
+from market_data.microstructure import LatencyBaseline, MicrostructureTracker
 from exchanges.delta.api    import DeltaAPI
 from exchanges.delta.websocket import DeltaWebSocket
 
@@ -44,6 +48,7 @@ class StreamStats:
 
 
 class DeltaDataManager:
+    venue = "delta"
     """
     Delta Exchange data manager.
     Same public interface as CoinSwitchDataManager.
@@ -60,7 +65,14 @@ class DeltaDataManager:
 
     _WARMUP_SLEEP = float(getattr(config, "DELTA_API_MIN_INTERVAL", 0.25))
 
-    def __init__(self) -> None:
+    def __init__(self, instrument=None) -> None:
+        self.instrument = instrument
+        self.exchange_instrument = (instrument.by_exchange.get(ExchangeName.DELTA)
+                                    if instrument is not None and hasattr(instrument, "by_exchange") else None)
+        self.symbol = (self.exchange_instrument.symbol if self.exchange_instrument is not None
+                       else getattr(config, "DELTA_SYMBOL", "BTCUSD"))
+        self.ws_symbol = (self.exchange_instrument.ws_symbol if self.exchange_instrument is not None
+                          else self.symbol)
         self.api = DeltaAPI(
             api_key    = config.DELTA_API_KEY,
             secret_key = config.DELTA_SECRET_KEY,
@@ -78,26 +90,108 @@ class DeltaDataManager:
 
         self._last_price:             float = 0.0
         self._last_price_update_time: float = 0.0
+        self._last_orderbook_update_time: float = 0.0
         self._orderbook:              Dict  = {"bids": [], "asks": []}
         self._recent_trades:          deque = deque(maxlen=500)
+        # Queue-flow and trade-flow are stored separately in comparable USD notional.
+        self._microstructure = MicrostructureTracker(self._instrument_mapping())
+        self._latency_baseline = LatencyBaseline()
+        self._latest_latency_ms: float | None = None
+        self._latest_latency_z: float | None = None
+        self._sequence_valid = True
+        self._snapshot_ready = False
+        self._funding_rate: float | None = None
+        self._last_market_meta_refresh_s: float = 0.0
+        self._metadata_stop = threading.Event()
+        self._metadata_thread: threading.Thread | None = None
 
         self._lock            = threading.RLock()
         self._forming_ts:     Dict[str, int] = {}
         self._warmup_complete = False
+        self._last_candle_rest_refresh: Dict[str, float] = {}
+        self._candle_refresh_inflight: set[str] = set()
 
         self._strategy_ref = None
         self.is_ready      = False
         self.is_streaming  = False
         self._product_id:  Optional[int] = None
 
-        logger.info("DeltaDataManager initialised")
+        logger.info(f"DeltaDataManager initialised ({self.symbol})")
+
+    def _instrument_mapping(self) -> InstrumentMapping:
+        raw = getattr(self.exchange_instrument, "raw", {}) or {}
+        inverse = self.symbol.upper() == "BTCUSD"
+        multiplier = float(raw.get("contract_multiplier") or raw.get("contract_value") or 1.0)
+        return InstrumentMapping(
+            venue="delta", venue_symbol=self.symbol, canonical_underlying=str(getattr(self.instrument, "asset_id", "BTC")),
+            product_class=str(raw.get("contract_type") or "inverse_perp" if inverse else "linear_perp"),
+            quote_currency=str(raw.get("quote_asset") or "USD"), contract_multiplier=max(multiplier, 1e-12),
+            settlement_currency=str(raw.get("settlement_currency") or ("BTC" if inverse else "USD")),
+            price_tick=float(raw.get("tick_size") or getattr(config, "TICK_SIZE_DELTA", 0.5)),
+            qty_step=float(raw.get("lot_step") or raw.get("qty_step") or 1.0), execution_enabled=True,
+            notional_model="inverse_usd_contract" if inverse else "linear",
+        )
+
+    @staticmethod
+    def _payload_ts_ns(data: Dict) -> int | None:
+        for key in ("timestamp", "time", "ts", "t"):
+            try:
+                value = float(data.get(key) or 0.0)
+            except Exception:
+                value = 0.0
+            if value <= 0:
+                continue
+            if value > 1e17:
+                return int(value)
+            if value > 1e14:
+                return int(value * 1_000)
+            if value > 1e11:
+                return int(value * 1_000_000)
+            return int(value * 1_000_000_000)
+        return None
+
+    def _record_latency(self, data: Dict, receive_ts_ns: int) -> None:
+        exchange_ts_ns = self._payload_ts_ns(data)
+        if exchange_ts_ns is None:
+            return
+        latency_ms = max(0.0, (receive_ts_ns - exchange_ts_ns) / 1_000_000.0)
+        self._latest_latency_ms = latency_ms
+        self._latest_latency_z = self._latency_baseline.observe(latency_ms)
+
+    def _refresh_market_metadata(self) -> None:
+        now = time.time()
+        if now - self._last_market_meta_refresh_s < float(getattr(config, "VENUE_MARKET_META_REFRESH_SEC", 30.0)):
+            return
+        self._last_market_meta_refresh_s = now
+        try:
+            resp = self.api.get_ticker(self.symbol)
+            row = resp.get("result", {}) if isinstance(resp, dict) else {}
+            for key in ("funding_rate", "fundingRate", "current_funding_rate"):
+                if isinstance(row, dict) and row.get(key) is not None:
+                    self._funding_rate = float(row.get(key))
+                    break
+        except Exception as exc:
+            logger.debug("Delta funding metadata refresh failed for %s: %s", self.symbol, exc)
+
+    def _start_metadata_refresh_worker(self) -> None:
+        if self._metadata_thread is not None and self._metadata_thread.is_alive():
+            return
+        self._metadata_stop.clear()
+        self._metadata_thread = threading.Thread(target=self._metadata_refresh_loop, name=f"metadata-{self.venue}-{self.symbol}", daemon=True)
+        self._metadata_thread.start()
+
+    def _metadata_refresh_loop(self) -> None:
+        interval = max(5.0, float(getattr(config, "VENUE_MARKET_META_REFRESH_SEC", 30.0)))
+        while not self._metadata_stop.is_set():
+            self._refresh_market_metadata()
+            self._metadata_stop.wait(interval)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self) -> bool:
         try:
             self.is_ready = self.is_streaming = False
-            symbol = getattr(config, "DELTA_SYMBOL", "BTCUSD")
+            symbol = self.symbol
 
             # Prefetch product ID
             self._product_id = self.api.get_product_id(symbol)
@@ -106,7 +200,7 @@ class DeltaDataManager:
             else:
                 logger.warning(f"Delta product_id not resolved for {symbol}")
 
-            logger.info("Delta DM: starting WebSocket...")
+            logger.info(f"Delta DM[{symbol}]: starting WebSocket...")
             self.ws = DeltaWebSocket(
                 api_key    = config.DELTA_API_KEY,
                 secret_key = config.DELTA_SECRET_KEY,
@@ -127,14 +221,15 @@ class DeltaDataManager:
                 self.ws.subscribe_account(          callback=self._on_account_update)
 
             if not self.ws.connect(timeout=30):
-                logger.error("❌ Delta WS connection failed")
+                logger.error(f"❌ Delta WS connection failed for {symbol}")
                 return False
 
             self.is_streaming = True
-            logger.info("✅ Delta WS streams started")
+            logger.info(f"✅ Delta WS streams started for {symbol}")
+            self._start_metadata_refresh_worker()
 
             # REST warmup
-            logger.info("Delta DM: starting REST warmup...")
+            logger.info(f"Delta DM[{symbol}]: starting REST warmup...")
             for tf in ("1m", "5m", "15m", "1h", "4h", "1d"):
                 self._warmup_klines(tf)
                 time.sleep(self._WARMUP_SLEEP)
@@ -162,11 +257,11 @@ class DeltaDataManager:
                         self._forming_ts[tf_key] = int(last_c.timestamp * 1000)
 
             self._warmup_complete = True
-            logger.info("✅ Delta REST warmup complete")
+            logger.info(f"✅ Delta REST warmup complete for {symbol}")
 
             self.is_ready = self._check_minimum_data()
             logger.info(
-                f"Delta DM ready={self.is_ready} "
+                f"Delta DM[{self.symbol}] ready={self.is_ready} "
                 f"(1m={len(self._candles_1m)} 5m={len(self._candles_5m)} "
                 f"15m={len(self._candles_15m)} 4h={len(self._candles_4h)})"
             )
@@ -180,6 +275,7 @@ class DeltaDataManager:
     def stop(self) -> None:
         try:
             self.is_ready = self.is_streaming = False
+            self._metadata_stop.set()
             if self.ws:
                 self.ws.disconnect()
             logger.info("Delta DM stopped")
@@ -195,7 +291,7 @@ class DeltaDataManager:
             time.sleep(1.0)
             # Clear candle deques before warmup — without this, warmup appends to
             # existing data producing duplicate candles (same timestamps) that cause
-            # the ICT engine to create duplicate OBs and distort structure detection.
+            # the institutional engine to create duplicate OBs and distort structure detection.
             with self._lock:
                 self._candles_1m.clear()
                 self._candles_5m.clear()
@@ -235,7 +331,7 @@ class DeltaDataManager:
         interval_min, default_limit, deque_attr = cfg
         limit  = limit or default_limit
         target: deque = getattr(self, deque_attr)
-        symbol = getattr(config, "DELTA_SYMBOL", "BTCUSD")
+        symbol = self.symbol
 
         for attempt in range(1, retries + 2):
             try:
@@ -251,7 +347,7 @@ class DeltaDataManager:
                 )
 
                 if not resp.get("success"):
-                    logger.warning(f"Delta warmup {label} attempt {attempt}: "
+                    logger.warning(f"Delta warmup {symbol} {label} attempt {attempt}: "
                                    f"{resp.get('error')}")
                     if attempt <= retries:
                         time.sleep(2.0)
@@ -282,18 +378,172 @@ class DeltaDataManager:
                         continue
 
                 if seeded > 0:
-                    logger.info(f"Delta warmup {label}: {seeded} candles")
+                    logger.info(f"Delta warmup {symbol} {label}: {seeded} candles")
                     return
                 else:
                     if attempt <= retries:
                         time.sleep(2.0)
 
             except Exception as e:
-                logger.error(f"Delta warmup {label} attempt {attempt}: {e}")
+                logger.error(f"Delta warmup {symbol} {label} attempt {attempt}: {e}")
                 if attempt <= retries:
                     time.sleep(2.0)
 
     # ── Candle deque helper ───────────────────────────────────────────────────
+
+    def _tf_seconds(self, label: str) -> float:
+        cfg = self._WARMUP_CONFIG.get(label)
+        if not cfg:
+            return 300.0
+        return float(cfg[0]) * 60.0
+
+    def _candle_stale_threshold(self, label: str) -> float:
+        grace = float(getattr(config, "DELTA_CANDLE_STALE_GRACE_SEC", 45.0))
+        tf_sec = self._tf_seconds(label)
+        # REST often returns the latest CLOSED candle. Its start timestamp is
+        # normally up to ~2 bars old just before the next close arrives, so a
+        # tf+grace threshold creates false stale alarms on healthy feeds.
+        return max(120.0, (2.0 * tf_sec) + grace)
+
+    def _schedule_stale_candle_refresh(self, label: str, age_sec: float) -> None:
+        if label not in self._WARMUP_CONFIG or not self._warmup_complete:
+            return
+
+        throttle = float(getattr(config, "DELTA_CANDLE_REFRESH_THROTTLE_SEC", 45.0))
+        now = time.time()
+        with self._lock:
+            if label in self._candle_refresh_inflight:
+                return
+            last = self._last_candle_rest_refresh.get(label, 0.0)
+            if now - last < throttle:
+                return
+            self._last_candle_rest_refresh[label] = now
+            self._candle_refresh_inflight.add(label)
+
+        # BUG-DM-SPAM-FIX: Downgraded WARNING → INFO (was flooding Telegram).
+        # This is a ROUTINE recovery event, not a warning. WS delivery for
+        # low-activity bars (especially 5m/15m/1h/4h/1d where a bar can go
+        # minutes without a tick) naturally makes `get_candles()` see an
+        # ageing last-bar — the self-heal REST refresh is expected
+        # maintenance, triggered O(once per timeframe per minute) at most
+        # (throttled via DELTA_CANDLE_REFRESH_THROTTLE_SEC). Real failure
+        # modes remain at WARNING / ERROR:
+        #   - `_refresh_klines_replace` attempt errors → logger.warning
+        #   - `_refresh_klines_replace` no-data return → logger.error
+        # The warning level is preserved for the institutional_bot.log file (full
+        # fidelity) but INFO-level here means it no longer trips the
+        # TelegramLogHandler (WARNING+ only) in notifier.py.
+        logger.debug(
+            f"Delta {label} candles stale age={age_sec:.1f}s "
+            f"(threshold={self._candle_stale_threshold(label):.1f}s); "
+            "starting REST self-heal"
+        )
+        threading.Thread(
+            target=self._refresh_klines_replace,
+            args=(label,),
+            name=f"delta-candle-refresh-{label}",
+            daemon=True,
+        ).start()
+
+    def _refresh_klines_replace(self, label: str, limit: int = 0, retries: int = 1) -> None:
+        cfg = self._WARMUP_CONFIG.get(label)
+        if not cfg:
+            with self._lock:
+                self._candle_refresh_inflight.discard(label)
+            return
+
+        interval_min, default_limit, deque_attr = cfg
+        limit = limit or min(default_limit, 300)
+        symbol = self.symbol
+        candles: List[Candle] = []
+        latest_age = -1.0
+
+        try:
+            for attempt in range(1, retries + 2):
+                try:
+                    end_ms = int(time.time() * 1000)
+                    start_ms = end_ms - limit * interval_min * 60 * 1000
+                    resp = self.api.get_candles(
+                        symbol=symbol,
+                        resolution=interval_min,
+                        start_time=start_ms,
+                        end_time=end_ms,
+                        limit=limit,
+                    )
+                    if not resp.get("success"):
+                        logger.warning(
+                            f"Delta REST refresh {label} attempt {attempt}: "
+                            f"{resp.get('error')}"
+                        )
+                        if attempt <= retries:
+                            time.sleep(1.0)
+                        continue
+
+                    raw = sorted(
+                        [c for c in (resp.get("result") or []) if c.get("t") and c.get("c")],
+                        key=lambda c: c["t"],
+                    )
+                    for c in raw:
+                        try:
+                            candle = Candle(
+                                timestamp=c["t"] / 1000.0,
+                                open=float(c["o"]),
+                                high=float(c["h"]),
+                                low=float(c["l"]),
+                                close=float(c["c"]),
+                                volume=float(c["v"]),
+                            )
+                            if candle.close > 0:
+                                candles.append(candle)
+                        except Exception:
+                            continue
+                    break
+                except Exception as e:
+                    logger.warning(f"Delta REST refresh {label} attempt {attempt}: {e}")
+                    if attempt <= retries:
+                        time.sleep(1.0)
+
+            if not candles:
+                logger.error(f"Delta REST refresh {label}: no usable candles returned")
+                return
+
+            with self._lock:
+                target: deque = getattr(self, deque_attr)
+                merged = {int(c.timestamp * 1000): c for c in target}
+                for candle in candles:
+                    merged[int(candle.timestamp * 1000)] = candle
+                maxlen = target.maxlen or default_limit
+                ordered = [merged[k] for k in sorted(merged)][-maxlen:]
+                target.clear()
+                target.extend(ordered)
+
+                if target:
+                    tf_key = {
+                        "1m": "1", "5m": "5", "15m": "15",
+                        "1h": "60", "4h": "240", "1d": "1440",
+                    }.get(label)
+                    if tf_key:
+                        self._forming_ts[tf_key] = int(target[-1].timestamp * 1000)
+                    if label == "1m":
+                        self._last_price = target[-1].close
+                        self._last_price_update_time = time.time()
+                    latest_age = time.time() - target[-1].timestamp
+                stored = len(target)
+
+            self.stats.record_candle()
+            # BUG-DM-SPAM-FIX: Downgraded WARNING → INFO (paired with the
+            # stale-detection downgrade above). This is the success-completion
+            # log of a routine self-heal; it carries diagnostic metrics
+            # (merged/stored/latest_age) worth keeping locally but does not
+            # warrant a Telegram alert. Real failures earlier in this method
+            # stay at WARNING / ERROR.
+            logger.debug(
+                f"Delta REST refresh {label}: merged={len(candles)} "
+                f"stored={stored} latest_age={latest_age:.1f}s"
+            )
+        finally:
+            with self._lock:
+                self._candle_refresh_inflight.discard(label)
 
     def _process_ws_candle(self, data: Dict, candle: Candle,
                            target: deque, tf_key: str, tf_label: str) -> None:
@@ -306,7 +556,7 @@ class DeltaDataManager:
               tracked in self._forming_ts[tf_key].
           I3. A late/stale tick (start_ts < latest known bar) is DROPPED.
               Never appends out-of-order bars — downstream indicators
-              (ATR, swing detection, ICT structure) assume monotonic order.
+              (ATR, return, volatility, and market-state calculations) assume monotonic order.
           I4. On a closed tick for a bar already closed in the deque
               (duplicate close after forming_ts was popped), the existing
               bar is overwritten (last-write-wins on identical start_ts),
@@ -456,56 +706,62 @@ class DeltaDataManager:
 
     def _on_orderbook(self, data: Dict) -> None:
         try:
+            callback = None
+            quote_price = 0.0
             with self._lock:
-                # Delta WS uses "buy"/"sell" keys, NOT "bids"/"asks"
+                # Delta WS uses "buy"/"sell" keys, NOT "bids"/"asks".
                 raw_bids = data.get("buy") or data.get("bids", [])
                 raw_asks = data.get("sell") or data.get("asks", [])
+                receive_ts_ns = time.time_ns()
                 self._orderbook = {
                     "bids": self._normalise_ob_side(raw_bids),
                     "asks": self._normalise_ob_side(raw_asks),
                 }
+                self._last_orderbook_update_time = receive_ts_ns / 1_000_000_000.0
+                self._snapshot_ready = bool(self._orderbook["bids"] and self._orderbook["asks"])
+                self._microstructure.update_book(self._orderbook["bids"], self._orderbook["asks"], self._last_orderbook_update_time)
+                self._record_latency(data, receive_ts_ns)
                 bids, asks = self._orderbook["bids"], self._orderbook["asks"]
                 if bids and asks:
-                    try:
-                        self._last_price = (bids[0][0] + asks[0][0]) / 2.0
-                        self._last_price_update_time = time.time()
-                    except Exception:
-                        pass
+                    quote_price = (bids[0][0] + asks[0][0]) / 2.0
+                    self._last_price = quote_price
+                    self._last_price_update_time = self._last_orderbook_update_time
+                    if self._strategy_ref is not None:
+                        callback = getattr(self._strategy_ref, "_on_realtime_quote", None)
                 self.stats.record_orderbook()
+            if callback is not None and quote_price > 0.0:
+                callback(quote_price)
         except Exception as e:
-            logger.debug(f"Delta OB callback: {e}")
+            logger.debug(f"Delta orderbook callback: {e}")
 
     def _on_trade(self, data: Dict) -> None:
         try:
+            callback = None
+            price = qty = 0.0
+            side = "buy"
             with self._lock:
                 # Delta public trades channel uses "price"/"size"/"side" fields.
                 # "p"/"q"/"m" is the aggregated ticker format — different channel.
-                # Support both formats defensively.
                 price = float(data.get("price") or data.get("p") or 0)
                 qty   = float(data.get("size")  or data.get("q") or 0)
                 side_raw = data.get("side", "")
                 if side_raw:
                     side = "buy" if str(side_raw).lower() == "buy" else "sell"
                 else:
-                    # Fallback: "m" = True means buyer was maker = sell aggressor
                     side = "sell" if bool(data.get("m")) else "buy"
                 if price > 0:
                     self._last_price = price
                     self._last_price_update_time = time.time()
+                    trade_ts = time.time()
                     self._recent_trades.append({
-                        "price":     price,
-                        "quantity":  qty,
-                        "side":      side,
-                        "timestamp": time.time(),
+                        "price": price, "quantity": qty, "side": side, "timestamp": trade_ts,
                     })
+                    self._microstructure.record_trade(price=price, quantity=qty, buyer_aggressor=(side == "buy"), timestamp_s=trade_ts)
                     if self._strategy_ref is not None:
-                        try:
-                            on_rt = getattr(self._strategy_ref, "_on_realtime_trade", None)
-                            if on_rt:
-                                on_rt(price, qty, side)
-                        except Exception:
-                            pass
+                        callback = getattr(self._strategy_ref, "_on_realtime_trade", None)
                 self.stats.record_trade()
+            if callback is not None and price > 0.0:
+                callback(price, qty, side)
         except Exception as e:
             logger.debug(f"Delta trade callback: {e}")
 
@@ -542,6 +798,11 @@ class DeltaDataManager:
 
     # ── Public interface ──────────────────────────────────────────────────────
 
+    def get_last_update(self) -> float:
+        """Timestamp of the latest executable quote/mark update for lineage auditing."""
+        with self._lock:
+            return float(self._last_price_update_time or 0.0)
+
     def get_last_price(self) -> float:
         with self._lock: return self._last_price
 
@@ -550,8 +811,62 @@ class DeltaDataManager:
             return {
                 "bids": list(self._orderbook.get("bids", [])),
                 "asks": list(self._orderbook.get("asks", [])),
-                "timestamp": time.time(),
+                "timestamp": float(self._last_orderbook_update_time or 0.0),
             }
+
+    def get_microstructure_flow(self) -> Dict[str, float]:
+        with self._lock:
+            return self._microstructure.snapshot(time.time()).asdict()
+
+    def get_microstructure_research_state(self) -> Dict[str, List[Dict[str, float]]]:
+        """Raw USD-normalised event stream for dynamic protection calibration."""
+        with self._lock:
+            return self._microstructure.research_state(time.time())
+
+    def get_feed_reliability(self) -> Dict:
+        with self._lock:
+            snapshot_ready = bool(self._snapshot_ready)
+            connected = bool(self.is_streaming)
+            return {
+                "connected": connected,
+                "heartbeat_ok": connected,
+                "sequence_valid": bool(self._sequence_valid),
+                "snapshot_ready": snapshot_ready,
+                "exchange_timestamp_available": self._latest_latency_ms is not None,
+                "latency_ms": self._latest_latency_ms,
+                "latency_vs_baseline_z": self._latest_latency_z,
+                "no_change_heartbeat_valid": connected and snapshot_ready,
+                "latency_baseline_samples": self._latency_baseline.sample_count,
+            }
+
+    def _execution_cost_metadata(self) -> Dict[str, object]:
+        """Use live-catalog fee fields when Delta exposes them; otherwise fallback config applies."""
+        raw = getattr(self.exchange_instrument, "raw", {}) or {}
+        for key in ("taker_fee_rate", "taker_commission_rate", "taker_fee"): 
+            try:
+                taker = float(raw.get(key) or 0.0)
+            except (TypeError, ValueError):
+                taker = 0.0
+            if taker > 0:
+                return {"round_trip_fee_bps": 2.0 * taker * 10_000.0, "fee_basis": f"catalog_{key}_taker_taker"}
+        return {}
+
+    def get_venue_microstate(self):
+        # Live decision path consumes the asynchronously refreshed funding cache only.
+        with self._lock:
+            bids = list(self._orderbook.get("bids", []))
+            asks = list(self._orderbook.get("asks", []))
+            recv_ts_ns = int((self._last_orderbook_update_time or time.time()) * 1_000_000_000)
+            flows = self._microstructure.snapshot(time.time()).asdict()
+            reliability = self.get_feed_reliability()
+        if not bids or not asks:
+            return None
+        health = score_feed_health(**{k: reliability[k] for k in ("connected", "heartbeat_ok", "sequence_valid", "snapshot_ready", "exchange_timestamp_available", "latency_vs_baseline_z", "no_change_heartbeat_valid")})
+        return build_venue_microstate(
+            mapping=self._instrument_mapping(), bids=bids, asks=asks, feed_health=health,
+            receive_ts_ns=recv_ts_ns, funding_rate=self._funding_rate,
+            metadata=self._execution_cost_metadata(), **flows,
+        )
 
     def get_recent_trades_raw(self) -> List[Dict]:
         with self._lock: return list(self._recent_trades)[-200:]
@@ -567,9 +882,16 @@ class DeltaDataManager:
             "15m": self._candles_15m, "1h": self._candles_1h,
             "4h": self._candles_4h,  "1d": self._candles_1d,
         }
-        src = tf_map.get(timeframe, self._candles_5m)
+        label = timeframe if timeframe in tf_map else "5m"
+        src = tf_map.get(label, self._candles_5m)
         with self._lock:
             candles = list(src)
+
+        if candles:
+            latest_age = time.time() - float(candles[-1].timestamp)
+            if latest_age > self._candle_stale_threshold(label):
+                self._schedule_stale_candle_refresh(label, latest_age)
+
         return [
             {"t": int(c.timestamp * 1000), "o": c.open, "h": c.high,
              "l": c.low, "c": c.close, "v": c.volume}

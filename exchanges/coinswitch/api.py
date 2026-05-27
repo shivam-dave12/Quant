@@ -31,76 +31,31 @@ class FuturesAPI:
             api_key: CoinSwitch API key
             secret_key: CoinSwitch secret key
         """
-        self.api_key = api_key or os.getenv('COINSWITCH_API_KEY')
-        self.secret_key = secret_key or os.getenv('COINSWITCH_SECRET_KEY')
+        self.api_key = api_key or getattr(config, 'COINSWITCH_API_KEY', '')
+        self.secret_key = secret_key or getattr(config, 'COINSWITCH_SECRET_KEY', '')
         self.base_url = "https://coinswitch.co"
         
         if not self.api_key or not self.secret_key:
             raise ValueError("API key and secret key required")
     
-    def _generate_signature(self, method: str, endpoint: str, params: Dict = None, payload: Dict = None) -> str:
-        """
-        Generate ED25519 signature
+    def _generate_signature(self, method: str, endpoint: str, params: Dict = None, payload: Dict = None, *, epoch: str) -> str:
+        """Generate the documented CoinSwitch Ed25519 signature.
 
-        IMPORTANT — VERIFY AGAINST COINSWITCH OFFICIAL DOCS BEFORE RELYING ON THIS:
-        The historical codebase always signed with the literal string "{}" as
-        the body, regardless of method. If CoinSwitch actually requires the
-        JSON body of POST/DELETE requests to be signed, this is WRONG and
-        will produce signatures that pass validation only because the server
-        ignores body-signing. That has security implications. Check:
-        https://docs.coinswitch.co/ for the current spec.
-
-        Current behaviour (preserved from original):
-          - Canonicalised path: `endpoint` (plus `?query=string` for GET).
-            The canonicalised string is UNQUOTED via urllib.parse.unquote_plus.
-          - Signed string:     METHOD + canonicalised_path + "{}"
-
-        Args:
-            method: HTTP method
-            endpoint: API endpoint
-            params: Query parameters (GET only)
-            payload: Body payload (POST/DELETE) — NOT included in signature
-                     under the current spec.
-
-        Returns:
-            Hex-encoded Ed25519 signature.
+        Current futures authentication signs ``METHOD + decoded_path_with_query
+        + epoch`` and sends the same millisecond epoch in ``X-AUTH-EPOCH``.  The
+        JSON body is not included in the signed message.
         """
         params = params or {}
-
-        # Build endpoint-with-query for GET
         signature_endpoint = endpoint
-        if method == "GET" and params:
+        if method.upper() == "GET" and params:
             signature_endpoint = f"{endpoint}?{urlencode(params)}"
-
-        # AUDIT NOTE (BUG-CS-API-1):
-        # The original code unquote_plus'd the signing path but sent the
-        # URL in its ENCODED form. Any query-parameter value containing
-        # reserved characters ('+', '/', '=', '%', ' ', '&') would cause
-        # the signature to be computed over a DIFFERENT string than the
-        # server reconstructs from the URL → signature mismatch → 401.
-        # Fix: sign the EXACT string we send on the wire.
-        #
-        # If CoinSwitch's reference impl requires the unquoted form (their
-        # Python example uses unquote_plus), set _COINSWITCH_SIGN_UNQUOTED
-        # in config to True. Default is to sign the wire form because
-        # that eliminates the encoding-mismatch class of bugs.
-        _sign_unquoted = bool(getattr(config, 'COINSWITCH_SIGN_UNQUOTED', True))
-        if _sign_unquoted:
-            canonical = urllib.parse.unquote_plus(signature_endpoint)
-        else:
-            canonical = signature_endpoint
-
-        payload_json = "{}"
-        signature_msg = method + canonical + payload_json
-
-        logger.debug(f"Signature message: {signature_msg}")
-
-        request_string  = bytes(signature_msg, 'utf-8')
+        canonical = urllib.parse.unquote_plus(signature_endpoint)
+        signature_msg = method.upper() + canonical + str(epoch)
+        logger.debug("CoinSwitch signature path=%s epoch=%s", canonical, epoch)
+        request_string = signature_msg.encode("utf-8")
         secret_key_bytes = bytes.fromhex(self.secret_key)
-        secret_key_obj   = ed25519.Ed25519PrivateKey.from_private_bytes(secret_key_bytes)
-        signature_bytes  = secret_key_obj.sign(request_string)
-
-        return signature_bytes.hex()
+        secret_key_obj = ed25519.Ed25519PrivateKey.from_private_bytes(secret_key_bytes)
+        return secret_key_obj.sign(request_string).hex()
 
     def _make_request(self, method: str, endpoint: str, params: Dict = None, payload: Dict = None) -> Dict:
         """
@@ -110,7 +65,8 @@ class FuturesAPI:
         JSON response body) returns {"error": "...", "status_code": <int|None>}.
         Never raises — callers rely on dict semantics everywhere.
         """
-        signature = self._generate_signature(method, endpoint, params, payload)
+        epoch = str(int(time.time() * 1000))
+        signature = self._generate_signature(method, endpoint, params, payload, epoch=epoch)
 
         url = self.base_url + endpoint
         if method == "GET" and params:
@@ -120,6 +76,7 @@ class FuturesAPI:
             'Content-Type':    'application/json',
             'X-AUTH-SIGNATURE': signature,
             'X-AUTH-APIKEY':    self.api_key,
+            'X-AUTH-EPOCH':     epoch,
         }
 
         req_timeout = getattr(config, 'REQUEST_TIMEOUT', 30)
@@ -211,38 +168,18 @@ class FuturesAPI:
         return self._make_request("POST", endpoint, payload=payload)
     
     def get_order(self, order_id: str, exchange: str = "EXCHANGE_2") -> Dict:
-        """
-        Get specific order details by order_id.
-        
-        Args:
-            order_id: Unique order identifier
-            exchange: Exchange identifier
-            
-        Returns:
-            Order details or error dict
-        """
+        """Get order status using the documented required ``order_id`` query only."""
+        _ = exchange  # retained for adapter compatibility; not part of the official query contract
         endpoint = "/trade/api/v2/futures/order"
-        params = {"order_id": order_id, "exchange": exchange}
-        
-        return self._make_request("GET", endpoint, params=params)
-    
+        return self._make_request("GET", endpoint, params={"order_id": order_id})
+
     def get_open_orders(self, exchange: str = "EXCHANGE_2", symbol: str = None) -> Dict:
-        """
-        Get all open orders.
-        
-        Args:
-            exchange: Exchange identifier
-            symbol: Optional filter by symbol
-            
-        Returns:
-            List of open orders or error dict
-        """
-        endpoint = "/trade/api/v2/futures/open_orders"
-        params = {"exchange": exchange}
+        """Get active orders using CoinSwitch's documented POST body contract."""
+        endpoint = "/trade/api/v2/futures/orders/open"
+        payload = {"exchange": exchange}
         if symbol:
-            params["symbol"] = symbol
-        
-        return self._make_request("GET", endpoint, params=params)
+            payload["symbol"] = str(symbol).lower()
+        return self._make_request("POST", endpoint, payload=payload)
     
     def cancel_order(self, order_id: str, exchange: str = "EXCHANGE_2") -> Dict:
         """
@@ -370,6 +307,25 @@ class FuturesAPI:
         
         params = {"exchange": exchange}
         return self._make_request("GET", endpoint, params=params, payload=None)
+
+    def get_futures_ticker(self, symbol: str, exchange: str = "EXCHANGE_2") -> Dict:
+        """Get current top-of-book, mark and funding state for one futures symbol.
+
+        Documented CoinSwitch futures endpoint. The instrument registry uses
+        this as an exact live-symbol fallback when instrument_info is sparse.
+        """
+        endpoint = "/trade/api/v2/futures/ticker"
+        params = {"symbol": str(symbol).upper(), "exchange": exchange}
+        return self._make_request("GET", endpoint, params=params, payload=None)
+
+    # Compatibility name used by older registry/data-manager builds.
+    get_ticker = get_futures_ticker
+
+    def get_orderbook(self, symbol: str, exchange: str = "EXCHANGE_2") -> Dict:
+        """Get the current CoinSwitch futures order book for a symbol."""
+        endpoint = "/trade/api/v2/futures/order_book"
+        params = {"symbol": str(symbol).upper(), "exchange": exchange}
+        return self._make_request("GET", endpoint, params=params, payload=None)
     
     # ------------------------- REST klines / candles API -----------------
     
@@ -426,11 +382,24 @@ class FuturesAPI:
                     available = float(total_avail_str)
                     locked = float(total_blocked_str)
                     
-                    return {
+                    total = float(balances.get("total_balance", available + locked) or 0.0)
+                    position_margin = float(balances.get("total_position_margin", 0.0) or 0.0)
+                    open_order_margin = float(balances.get("total_open_order_margin", 0.0) or 0.0)
+                    out = {
                         "available": available,
                         "locked": locked,
+                        "total": total,
+                        "position_margin": position_margin,
+                        "open_order_margin": open_order_margin,
                         "currency": currency,
+                        "source": "coinswitch_futures_wallet_balance.total_available_balance",
+                        "wallet_type": "USDT_FUTURES",
                     }
+                    logger.info(
+                        "CoinSwitch futures wallet balance source=%s available=$%.4f locked=$%.4f total=$%.4f position_margin=$%.4f open_order_margin=$%.4f",
+                        out["source"], available, locked, total, position_margin, open_order_margin,
+                    )
+                    return out
             
             # If we reach here, USDT was not found
             return {
@@ -446,19 +415,38 @@ class FuturesAPI:
             }
 
 
-if __name__ == "__main__":
-    # Quick test
-    try:
-        api = FuturesAPI()
-        print("✓ Futures API initialized successfully")
-        
-        # Test getting positions
-        positions = api.get_positions()
-        print(f"✓ Positions retrieved: {positions}")
-        
-        # Test getting wallet balance
-        balance = api.get_wallet_balance()
-        print(f"✓ Wallet balance retrieved")
-    
-    except Exception as e:
-        print(f"✗ Error: {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-asset discovery helpers (live endpoints only; no synthetic symbols)
+# ─────────────────────────────────────────────────────────────────────────────
+def _futures_api_get_futures_ticker(self, symbol: str, exchange: str = "EXCHANGE_2") -> Dict:
+    """Return one confirmed futures ticker from CoinSwitch.
+
+    CoinSwitch's documented ticker endpoint is per-symbol.  The multi-asset
+    registry uses this as a live validation probe before enabling CoinSwitch as
+    a secondary/execution venue for a contract.
+    """
+    endpoint = "/trade/api/v2/futures/ticker"
+    return self._make_request("GET", endpoint, params={"exchange": exchange, "symbol": symbol}, payload=None)
+
+
+def _futures_api_get_futures_tickers(self, exchange: str = "EXCHANGE_2", symbol: str = None) -> Dict:
+    """Return futures ticker(s) when available; symbol is preferred by docs."""
+    endpoint = "/trade/api/v2/futures/ticker"
+    params = {"exchange": exchange}
+    if symbol:
+        params["symbol"] = symbol
+    return self._make_request("GET", endpoint, params=params, payload=None)
+
+
+def _futures_api_get_futures_instruments(self, exchange: str = "EXCHANGE_2") -> Dict:
+    """Alias around instrument_info for the instrument registry."""
+    return self.get_instrument_info(exchange=exchange)
+
+
+try:
+    FuturesAPI.get_futures_ticker = _futures_api_get_futures_ticker
+    FuturesAPI.get_futures_tickers = _futures_api_get_futures_tickers
+    FuturesAPI.get_futures_instruments = _futures_api_get_futures_instruments
+except NameError:
+    pass

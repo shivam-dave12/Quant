@@ -35,6 +35,8 @@ import requests
 from dotenv import load_dotenv
 import sys, os as _os; sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
 
+import config
+
 load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -127,8 +129,8 @@ class DeltaAPI:
         testnet:    bool          = False,
         timeout:    int           = 10,  # was 30s — 30s × retries = multi-min main-thread freeze
     ):
-        self.api_key    = api_key    or os.getenv("DELTA_API_KEY",    "")
-        self.secret_key = secret_key or os.getenv("DELTA_SECRET_KEY", "")
+        self.api_key    = api_key    or getattr(config, "DELTA_API_KEY", "")
+        self.secret_key = secret_key or getattr(config, "DELTA_SECRET_KEY", "")
         self.base_url   = DELTA_TESTNET_URL if testnet else DELTA_LIVE_URL
         self.timeout    = timeout
         self._session   = requests.Session()
@@ -883,6 +885,14 @@ class DeltaAPI:
         # Delta Exchange uses it to distinguish SL vs TP conditional orders
         # that share the same base order_type (market_order + stop_price).
         stop_order_type: Optional[str]    = None,
+        # ── Delta native bracket child fields ─────────────────────────────────
+        # The public CreateOrderRequest schema supports both trigger and limit
+        # prices for native bracket children.  Supplying only trigger prices can
+        # be accepted on some contracts but rejected on others, especially
+        # non-BTC tokenised commodity/equity products.
+        bracket_stop_loss_limit_price: Optional[float] = None,
+        bracket_take_profit_limit_price: Optional[float] = None,
+        bracket_stop_trigger_method: Optional[str] = None,
         # isomorphic_slippage_check is passed through if provided (advanced)
         isomorphic_slippage_check: Optional[bool] = None,
     ) -> Dict:
@@ -947,8 +957,14 @@ class DeltaAPI:
             body["client_order_id"] = client_order_id
         if bracket_stop_loss_price is not None:
             body["bracket_stop_loss_price"] = str(bracket_stop_loss_price)
+        if bracket_stop_loss_limit_price is not None:
+            body["bracket_stop_loss_limit_price"] = str(bracket_stop_loss_limit_price)
         if bracket_take_profit_price is not None:
             body["bracket_take_profit_price"] = str(bracket_take_profit_price)
+        if bracket_take_profit_limit_price is not None:
+            body["bracket_take_profit_limit_price"] = str(bracket_take_profit_limit_price)
+        if bracket_stop_trigger_method:
+            body["bracket_stop_trigger_method"] = str(bracket_stop_trigger_method)
         if trailing_stop_delta is not None:
             body["trailing_stop_delta"] = str(trailing_stop_delta)
         if mmp:
@@ -1215,6 +1231,22 @@ class DeltaAPI:
                 _stop_otype_map.get(stop_otype)
                 or otype_map.get(otype_raw, otype_raw.upper())
             )
+            # Preserve product identity.  This is mandatory in a multi-asset
+            # bot: Delta can return all open orders even when a product filter is
+            # requested, and bracket child IDs must never be adopted from another
+            # product.  The order manager performs a second defensive filter.
+            _pid = (
+                o.get("product_id")
+                or ((o.get("product") or {}) if isinstance(o.get("product"), dict) else {}).get("id")
+                or product_id
+            )
+            _psym = (
+                o.get("product_symbol")
+                or o.get("symbol")
+                or ((o.get("product") or {}) if isinstance(o.get("product"), dict) else {}).get("symbol")
+                or symbol
+                or ""
+            )
             normalised.append({
                 "order_id":      str(o.get("id", "")),
                 "type":          mapped_type,
@@ -1223,6 +1255,8 @@ class DeltaAPI:
                 "size":          _safe_float(o.get("size", 0)),
                 "side":          str(o.get("side", "")),
                 "status":        str(o.get("state", "")),
+                "product_id":    int(_pid) if str(_pid or "").isdigit() else _pid,
+                "product_symbol": str(_psym or "").upper(),
                 "_raw":          o,
             })
         resp["result"] = normalised
@@ -1555,15 +1589,3 @@ class DeltaAPI:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# QUICK TEST
-# ─────────────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import traceback
-    logging.basicConfig(level=logging.INFO)
-    try:
-        api = DeltaAPI()
-        api.self_test("BTCUSD")
-    except Exception as e:
-        print(f"\n❌ CRASH: {e}")
-        traceback.print_exc()

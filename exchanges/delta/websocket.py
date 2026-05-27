@@ -41,11 +41,13 @@ import threading
 import time
 from collections import deque
 from datetime import datetime
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import websocket          # pip install websocket-client
 from dotenv import load_dotenv
 import sys, os as _os; sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
+
+import config
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -135,8 +137,8 @@ class DeltaWebSocket:
         secret_key: Optional[str] = None,
         testnet:    bool          = False,
     ):
-        self.api_key    = api_key    or os.getenv("DELTA_API_KEY",    "")
-        self.secret_key = secret_key or os.getenv("DELTA_SECRET_KEY", "")
+        self.api_key    = api_key    or getattr(config, "DELTA_API_KEY", "")
+        self.secret_key = secret_key or getattr(config, "DELTA_SECRET_KEY", "")
         self.ws_url     = DELTA_WS_TESTNET if testnet else DELTA_WS_LIVE
 
         # Connection state
@@ -1026,62 +1028,3 @@ from typing import Any
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# QUICK TEST
-# ─────────────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-
-    ob_count = [0]
-    trade_count = [0]
-    candle_count = [0]
-
-    def on_ob(data):
-        ob_count[0] += 1
-        bids = data.get("bids", [])
-        asks = data.get("asks", [])
-        if ob_count[0] <= 3:
-            if bids and asks:
-                bb = bids[0][0]; ba = asks[0][0]
-                warn = " ⚠️ ZERO PRICE - check raw log above" if float(bb) == 0 else ""
-                print(f"  📊 OB  best_bid={bb} best_ask={ba}  "
-                      f"(depth: {len(bids)}×{len(asks)}){warn}")
-            else:
-                print(f"  📊 OB received but bids/asks empty — raw keys: {list(data.keys())}")
-
-    def on_trade(data):
-        trade_count[0] += 1
-        if trade_count[0] <= 5:
-            side = "SELL" if data.get("m") else "BUY"
-            print(f"  💹 Trade  {side}  price={data.get('p')}  qty={data.get('q')}")
-
-    def on_candle(data):
-        candle_count[0] += 1
-        if candle_count[0] <= 3:
-            print(f"  🕯️  Candle[{data.get('i')}m]  "
-                  f"o={data.get('o')}  h={data.get('h')}  "
-                  f"l={data.get('l')}  c={data.get('c')}  v={data.get('v')}")
-
-    symbol = "BTCUSD"
-    ws = DeltaWebSocket()
-    ws.subscribe_orderbook(symbol, callback=on_ob, depth=5)
-    ws.subscribe_trades(symbol, callback=on_trade)
-    ws.subscribe_candlestick(symbol, interval=1, callback=on_candle)
-
-    print(f"Connecting to {ws.ws_url}...")
-    connected = ws.connect(timeout=15)
-    if connected:
-        print("✅ Connected! Listening for 60s...")
-        for i in range(60):
-            time.sleep(1)
-            if i % 10 == 9:
-                print(f"  [{i+1}s] OB updates: {ob_count[0]}  Trades: {trade_count[0]}  Candles: {candle_count[0]}")
-        print(f"\n=== FINAL COUNTS ===")
-        print(f"  Orderbook updates: {ob_count[0]}")
-        print(f"  Trades:            {trade_count[0]}")
-        print(f"  Candle updates:    {candle_count[0]}")
-        print(f"  Total WS messages: {ws.message_count}")
-    else:
-        print("❌ Connection failed")
-
-    ws.disconnect()

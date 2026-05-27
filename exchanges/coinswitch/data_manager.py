@@ -19,7 +19,11 @@ from typing import Dict, List, Optional
 
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import config
+from core.instruments import ExchangeName
 from core.candle import Candle, wrap_candles
+from market_data.feed_health import score_feed_health
+from market_data.normalizer import InstrumentMapping, build_venue_microstate
+from market_data.microstructure import LatencyBaseline, MicrostructureTracker
 from exchanges.coinswitch.api import FuturesAPI
 from exchanges.coinswitch.websocket import CoinSwitchWebSocket
 
@@ -53,6 +57,7 @@ class StreamStats:
 
 
 class CoinSwitchDataManager:
+    venue = "coinswitch"
     """
     CoinSwitch data manager.
     Provides: candles (6 TFs), orderbook, recent trades, price.
@@ -71,7 +76,14 @@ class CoinSwitchDataManager:
     # CoinSwitch hard rate limit between REST calls
     _WARMUP_SLEEP = 3.5
 
-    def __init__(self) -> None:
+    def __init__(self, instrument=None) -> None:
+        self.instrument = instrument
+        self.exchange_instrument = (instrument.by_exchange.get(ExchangeName.COINSWITCH)
+                                    if instrument is not None and hasattr(instrument, "by_exchange") else None)
+        self.symbol = (self.exchange_instrument.symbol if self.exchange_instrument is not None
+                       else config.COINSWITCH_SYMBOL)
+        self.ws_symbol = (self.exchange_instrument.ws_symbol if self.exchange_instrument is not None
+                          else self.symbol)
         self.api = FuturesAPI(
             api_key    = config.COINSWITCH_API_KEY,
             secret_key = config.COINSWITCH_SECRET_KEY,
@@ -88,8 +100,20 @@ class CoinSwitchDataManager:
 
         self._last_price:             float = 0.0
         self._last_price_update_time: float = 0.0
+        self._last_orderbook_update_time: float = 0.0
         self._orderbook:              Dict  = {"bids": [], "asks": []}
         self._recent_trades:          deque = deque(maxlen=500)
+        # Queue-flow and trade-flow are stored separately in comparable USD notional.
+        self._microstructure = MicrostructureTracker(self._instrument_mapping())
+        self._latency_baseline = LatencyBaseline()
+        self._latest_latency_ms: float | None = None
+        self._latest_latency_z: float | None = None
+        self._sequence_valid = True
+        self._snapshot_ready = False
+        self._funding_rate: float | None = None
+        self._last_market_meta_refresh_s: float = 0.0
+        self._metadata_stop = threading.Event()
+        self._metadata_thread: threading.Thread | None = None
 
         self._lock         = threading.RLock()
         self._forming_ts:  Dict[str, int] = {}
@@ -99,20 +123,105 @@ class CoinSwitchDataManager:
         self.is_ready      = False
         self.is_streaming  = False
 
-        logger.info("CoinSwitchDataManager initialised")
+        logger.info(f"CoinSwitchDataManager initialised ({self.symbol})")
+
+    def _instrument_mapping(self) -> InstrumentMapping:
+        raw = getattr(self.exchange_instrument, "raw", {}) or {}
+        return InstrumentMapping(
+            venue="coinswitch", venue_symbol=self.symbol, canonical_underlying=str(getattr(self.instrument, "asset_id", "BTC")),
+            product_class=str(raw.get("contract_type") or "linear_perp"),
+            quote_currency=str(raw.get("quote_asset") or "USDT"),
+            contract_multiplier=float(raw.get("contract_multiplier") or raw.get("contract_value") or 1.0),
+            settlement_currency=str(raw.get("settlement_currency") or "USDT"),
+            price_tick=float(raw.get("tick_size") or getattr(config, "TICK_SIZE_COINSWITCH", 0.1)),
+            qty_step=float(raw.get("lot_step") or raw.get("qty_step") or 0.001), execution_enabled=True,
+            notional_model="linear",
+        )
+
+    @staticmethod
+    def _payload_ts_ns(data: Dict) -> int | None:
+        for key in ("timestamp", "time", "ts", "t"):
+            try:
+                value = float(data.get(key) or 0.0)
+            except Exception:
+                value = 0.0
+            if value <= 0:
+                continue
+            if value > 1e17:
+                return int(value)
+            if value > 1e14:
+                return int(value * 1_000)
+            if value > 1e11:
+                return int(value * 1_000_000)
+            return int(value * 1_000_000_000)
+        return None
+
+    def _record_latency(self, data: Dict, receive_ts_ns: int) -> None:
+        exchange_ts_ns = self._payload_ts_ns(data)
+        if exchange_ts_ns is None:
+            return
+        latency_ms = max(0.0, (receive_ts_ns - exchange_ts_ns) / 1_000_000.0)
+        self._latest_latency_ms = latency_ms
+        self._latest_latency_z = self._latency_baseline.observe(latency_ms)
+
+    def _execution_cost_metadata(self) -> Dict[str, object]:
+        """Fee metadata confirmed by the live instrument catalog when supplied.
+
+        The protected lifecycle can execute an entry and an exit aggressively;
+        therefore the route selector uses taker+taker as the fail-safe estimate,
+        rather than presuming a maker fill on a limit entry.
+        """
+        raw = getattr(self.exchange_instrument, "raw", {}) or {}
+        try:
+            taker = float(raw.get("taker_fee_rate") or 0.0)
+        except (TypeError, ValueError):
+            taker = 0.0
+        if taker > 0:
+            return {"round_trip_fee_bps": 2.0 * taker * 10_000.0, "fee_basis": "instrument_info_taker_taker"}
+        return {}
+
+    def _refresh_market_metadata(self) -> None:
+        """Refresh documented CoinSwitch funding state without REST flooding."""
+        now = time.time()
+        if now - self._last_market_meta_refresh_s < float(getattr(config, "VENUE_MARKET_META_REFRESH_SEC", 30.0)):
+            return
+        self._last_market_meta_refresh_s = now
+        try:
+            resp = self.api.get_futures_ticker(symbol=self.symbol, exchange=config.COINSWITCH_EXCHANGE)
+            data = resp.get("data", {}) if isinstance(resp, dict) else {}
+            row = data.get(config.COINSWITCH_EXCHANGE, data) if isinstance(data, dict) else {}
+            if isinstance(row, dict) and row.get("funding_rate") is not None:
+                self._funding_rate = float(row.get("funding_rate"))
+        except Exception as exc:
+            logger.debug("CoinSwitch funding metadata refresh failed for %s: %s", self.symbol, exc)
+
+    def _start_metadata_refresh_worker(self) -> None:
+        if self._metadata_thread is not None and self._metadata_thread.is_alive():
+            return
+        self._metadata_stop.clear()
+        self._metadata_thread = threading.Thread(target=self._metadata_refresh_loop, name=f"metadata-{self.venue}-{self.symbol}", daemon=True)
+        self._metadata_thread.start()
+
+    def _metadata_refresh_loop(self) -> None:
+        interval = max(5.0, float(getattr(config, "VENUE_MARKET_META_REFRESH_SEC", 30.0)))
+        while not self._metadata_stop.is_set():
+            self._refresh_market_metadata()
+            self._metadata_stop.wait(interval)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self) -> bool:
         try:
             self.is_ready = self.is_streaming = False
-            symbol = config.COINSWITCH_SYMBOL
+            # Official Futures WebSocket pair format is BASEUSDT (for example
+            # XAGUSDT), never the UI display label XAG/USDT.
+            symbol = str(self.symbol).upper().replace("/", "").replace("-", "")
 
-            logger.info("CoinSwitch DM: starting WebSocket...")
+            logger.info(f"CoinSwitch DM[{symbol}]: starting WebSocket...")
             self.ws = CoinSwitchWebSocket()
 
             if not self.ws.connect(timeout=30):
-                logger.error("❌ CoinSwitch WS failed to connect")
+                logger.error(f"❌ CoinSwitch WS failed to connect for {symbol}")
                 return False
 
             # Subscribe all streams
@@ -126,20 +235,21 @@ class CoinSwitchDataManager:
                 self.ws.subscribe_candlestick(symbol, interval=iv_int, callback=cb)
 
             self.is_streaming = True
-            logger.info("✅ CoinSwitch WS streams subscribed")
+            logger.info(f"✅ CoinSwitch WS streams subscribed for {symbol}")
+            self._start_metadata_refresh_worker()
 
             # REST warmup (rate-limited)
-            logger.info("CoinSwitch DM: REST warmup starting (3.5s between calls)...")
+            logger.info(f"CoinSwitch DM[{self.symbol}]: REST warmup starting (3.5s between calls)...")
             for tf in ("1m", "5m", "15m", "1h", "4h", "1d"):
                 self._warmup_klines(tf)
                 time.sleep(self._WARMUP_SLEEP)
 
             self._warmup_complete = True
-            logger.info("✅ CoinSwitch REST warmup complete")
+            logger.info(f"✅ CoinSwitch REST warmup complete for {self.symbol}")
 
             self.is_ready = self._check_minimum_data()
             logger.info(
-                f"CoinSwitch DM ready={self.is_ready} "
+                f"CoinSwitch DM[{self.symbol}] ready={self.is_ready} "
                 f"(1m={len(self._candles_1m)} 5m={len(self._candles_5m)} "
                 f"15m={len(self._candles_15m)} 4h={len(self._candles_4h)})"
             )
@@ -153,6 +263,7 @@ class CoinSwitchDataManager:
     def stop(self) -> None:
         try:
             self.is_ready = self.is_streaming = False
+            self._metadata_stop.set()
             if self.ws:
                 self.ws.disconnect()
             logger.info("CoinSwitch DM stopped")
@@ -207,7 +318,7 @@ class CoinSwitchDataManager:
                     method   = "GET",
                     endpoint = "/trade/api/v2/futures/klines",
                     params   = {
-                        "symbol":     config.COINSWITCH_SYMBOL,
+                        "symbol":     self.symbol,
                         "exchange":   config.COINSWITCH_EXCHANGE,
                         "interval":   interval_str,
                         "start_time": start_ms,
@@ -217,7 +328,7 @@ class CoinSwitchDataManager:
                 )
 
                 if not isinstance(resp, dict) or resp.get("error"):
-                    logger.warning(f"CoinSwitch warmup {label} attempt {attempt}: "
+                    logger.warning(f"CoinSwitch warmup {self.symbol} {label} attempt {attempt}: "
                                    f"{resp.get('error', 'unexpected response')}")
                     if attempt <= retries:
                         time.sleep(self._WARMUP_SLEEP)
@@ -225,7 +336,7 @@ class CoinSwitchDataManager:
 
                 data = resp.get("data", [])
                 if not data:
-                    logger.warning(f"CoinSwitch warmup {label}: no data")
+                    logger.warning(f"CoinSwitch warmup {self.symbol} {label}: no data")
                     if attempt <= retries:
                         time.sleep(self._WARMUP_SLEEP)
                     continue
@@ -252,14 +363,14 @@ class CoinSwitchDataManager:
                         continue
 
                 if seeded > 0:
-                    logger.info(f"CoinSwitch warmup {label}: {seeded} candles")
+                    logger.info(f"CoinSwitch warmup {self.symbol} {label}: {seeded} candles")
                     return
                 else:
                     if attempt <= retries:
                         time.sleep(self._WARMUP_SLEEP)
 
             except Exception as e:
-                logger.error(f"CoinSwitch warmup {label} attempt {attempt}: {e}")
+                logger.error(f"CoinSwitch warmup {self.symbol} {label} attempt {attempt}: {e}")
                 if attempt <= retries:
                     time.sleep(self._WARMUP_SLEEP)
 
@@ -336,21 +447,31 @@ class CoinSwitchDataManager:
 
     def _on_orderbook(self, data: Dict) -> None:
         try:
+            callback = None
+            quote_price = 0.0
             with self._lock:
+                receive_ts_ns = time.time_ns()
                 self._orderbook = {
                     "bids": data.get("bids", []),
                     "asks": data.get("asks", []),
                 }
+                self._last_orderbook_update_time = receive_ts_ns / 1_000_000_000.0
+                self._snapshot_ready = bool(self._orderbook["bids"] and self._orderbook["asks"])
+                self._microstructure.update_book(self._orderbook["bids"], self._orderbook["asks"], self._last_orderbook_update_time)
+                self._record_latency(data, receive_ts_ns)
                 bids = self._orderbook["bids"]
                 asks = self._orderbook["asks"]
                 if bids and asks:
-                    try:
-                        self._last_price = (float(bids[0][0]) + float(asks[0][0])) / 2.0
-                    except Exception:
-                        pass
+                    quote_price = (float(bids[0][0]) + float(asks[0][0])) / 2.0
+                    self._last_price = quote_price
+                    self._last_price_update_time = self._last_orderbook_update_time
+                    if self._strategy_ref is not None:
+                        callback = getattr(self._strategy_ref, "_on_realtime_quote", None)
                 self.stats.record_orderbook()
+            if callback is not None and quote_price > 0.0:
+                callback(quote_price)
         except Exception as e:
-            logger.debug(f"CoinSwitch OB callback: {e}")
+            logger.debug(f"CoinSwitch orderbook callback: {e}")
 
     def _on_trade(self, data: Dict) -> None:
         # BUG-DDM-1 FIX: snapshot state and release self._lock BEFORE firing the
@@ -373,12 +494,14 @@ class CoinSwitchDataManager:
                 if price > 0:
                     self._last_price = price
                     self._last_price_update_time = time.time()
+                    trade_ts = time.time()
                     self._recent_trades.append({
                         "price":     price,
                         "quantity":  qty,
                         "side":      side,
-                        "timestamp": time.time(),
+                        "timestamp": trade_ts,
                     })
+                    self._microstructure.record_trade(price=price, quantity=qty, buyer_aggressor=(str(side).lower() == "buy"), timestamp_s=trade_ts)
                     if self._strategy_ref is not None:
                         _callback = getattr(self._strategy_ref, "_on_realtime_trade", None)
                 self.stats.record_trade()
@@ -415,9 +538,17 @@ class CoinSwitchDataManager:
         if missing:
             logger.debug(f"CoinSwitch DM not ready: {', '.join(missing)}")
             return False
+        if bool(getattr(config, "COINSWITCH_REQUIRE_LIVE_ORDERBOOK_FOR_EXECUTION", True)) and not self._snapshot_ready:
+            logger.warning("CoinSwitch DM[%s] fail-closed: candles warm but no official live orderbook snapshot received", self.symbol)
+            return False
         return True
 
     # ── Public interface (identical to DeltaDataManager) ──────────────────────
+
+    def get_last_update(self) -> float:
+        """Timestamp of the latest executable quote/mark update for lineage auditing."""
+        with self._lock:
+            return float(self._last_price_update_time or 0.0)
 
     def get_last_price(self) -> float:
         with self._lock:
@@ -428,16 +559,58 @@ class CoinSwitchDataManager:
             return {
                 "bids": list(self._orderbook.get("bids", [])),
                 "asks": list(self._orderbook.get("asks", [])),
-                "timestamp": time.time(),
+                "timestamp": float(self._last_orderbook_update_time or 0.0),
             }
+
+    def get_microstructure_flow(self) -> Dict[str, float]:
+        with self._lock:
+            return self._microstructure.snapshot(time.time()).asdict()
+
+    def get_microstructure_research_state(self) -> Dict[str, List[Dict[str, float]]]:
+        """Raw USD-normalised event stream for dynamic protection calibration."""
+        with self._lock:
+            return self._microstructure.research_state(time.time())
+
+    def get_feed_reliability(self) -> Dict:
+        with self._lock:
+            snapshot_ready = bool(self._snapshot_ready)
+            connected = bool(self.is_streaming)
+            return {
+                "connected": connected,
+                "heartbeat_ok": connected,
+                "sequence_valid": bool(self._sequence_valid),
+                "snapshot_ready": snapshot_ready,
+                "exchange_timestamp_available": self._latest_latency_ms is not None,
+                "latency_ms": self._latest_latency_ms,
+                "latency_vs_baseline_z": self._latest_latency_z,
+                "no_change_heartbeat_valid": connected and snapshot_ready,
+                "latency_baseline_samples": self._latency_baseline.sample_count,
+            }
+
+    def get_venue_microstate(self):
+        # Live decision path consumes the asynchronously refreshed funding cache only.
+        with self._lock:
+            bids = list(self._orderbook.get("bids", []))
+            asks = list(self._orderbook.get("asks", []))
+            recv_ts_ns = int((self._last_orderbook_update_time or time.time()) * 1_000_000_000)
+            flows = self._microstructure.snapshot(time.time()).asdict()
+            reliability = self.get_feed_reliability()
+        if not bids or not asks:
+            return None
+        health = score_feed_health(**{k: reliability[k] for k in ("connected", "heartbeat_ok", "sequence_valid", "snapshot_ready", "exchange_timestamp_available", "latency_vs_baseline_z", "no_change_heartbeat_valid")})
+        return build_venue_microstate(
+            mapping=self._instrument_mapping(), bids=bids, asks=asks, feed_health=health,
+            receive_ts_ns=recv_ts_ns, funding_rate=self._funding_rate,
+            metadata=self._execution_cost_metadata(), **flows,
+        )
 
     def get_recent_trades_raw(self) -> List[Dict]:
         with self._lock:
             return list(self._recent_trades)[-200:]
 
     def is_price_fresh(self, max_stale_seconds: float = 90.0) -> bool:
-        if self._last_price_update_time == 0:
-            return True
+        if self._last_price_update_time <= 0:
+            return False
         return (time.time() - self._last_price_update_time) < max_stale_seconds
 
     def get_candles(self, timeframe: str = "5m", limit: int = 100) -> List[Dict]:
