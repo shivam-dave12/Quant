@@ -255,7 +255,7 @@ def test_groww_lifecycle_oco_failure_blocks_new_entries_and_emergency_exits(monk
     assert result.blocked_new_entries is True
     assert result.emergency_order_id == "GROWWORDER2"
     assert fake.place_orders[1]["transaction_type"] == "SELL"
-    assert fake.place_orders[1]["order_type"] == "LIMIT"
+    assert fake.place_orders[1]["order_type"] == "MARKET"
 
 
 def _candidate() -> LongOptionCandidateScore:

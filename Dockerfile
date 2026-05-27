@@ -25,6 +25,23 @@ PY
 
 RUN useradd --home-dir /app/.runtime-home --create-home --shell /usr/sbin/nologin botuser
 
+# GrowwFeed(groww) in the official SDK refreshes its instruments.csv cache at
+# runtime. Grant the non-root process write access only to that SDK cache file;
+# do not make the Python package/code directory writable.
+RUN python - <<'PY'
+from pathlib import Path
+from pwd import getpwnam
+import os
+import growwapi
+
+user = getpwnam("botuser")
+cache = Path(growwapi.__file__).resolve().parent / "instruments.csv"
+cache.touch(exist_ok=True)
+os.chown(cache, user.pw_uid, user.pw_gid)
+os.chmod(cache, 0o600)
+print(f"Groww SDK feed cache prepared for non-root runtime: {cache}")
+PY
+
 COPY . .
 
 RUN mkdir -p /app/data /app/logs /app/.runtime-home \

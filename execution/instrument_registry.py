@@ -560,8 +560,10 @@ class InstrumentRegistry:
                 continue
             primary = self.execution_preference if self.execution_preference in by_ex else next(iter(by_ex.keys()))
             if require_primary and self.execution_preference not in by_ex:
-                # still activate on fallback if explicit config allows; default false is handled by caller
-                pass
+                self.report.unavailable[intent.asset_id] = (
+                    f"required primary exchange {self.execution_preference.value} unavailable; not traded"
+                )
+                continue
             matched.append(TradableInstrument(
                 asset_id=intent.asset_id,
                 display_name=intent.display_name,

@@ -167,57 +167,23 @@ class GrowwUnderlyingDataManager:
                 logger.debug("GROWW underlying historical warmup %s failed for %s: %s", tf, self._underlying_code(), exc)
 
     def _load_historical(self, timeframe: str) -> None:
-        source = {
-            "1m": ("minute", 1),
-            "5m": ("5minute", 5),
-            "15m": ("5minute", 15),
-            "1h": ("30minute", 60),
-            "4h": ("30minute", 240),
-            "1d": ("day", 1440),
-        }.get(timeframe, ("minute", 1))
-        interval, target_minutes = source
+        interval = {"1m": "1minute", "5m": "5minute", "15m": "15minute", "1h": "1hour", "4h": "4hour", "1d": "1day"}.get(timeframe, "1minute")
         to_dt = datetime.now(timezone.utc)
         from_dt = to_dt - timedelta(days=7 if timeframe in {"1m", "5m", "15m"} else 45 if timeframe in {"1h", "4h"} else 180)
-        base_req = {
+        req = {
             "interval": interval,
-            "from_date": from_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-            "to_date": to_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "from_date": from_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "to_date": to_dt.strftime("%Y-%m-%d %H:%M:%S"),
             "stock_code": self._underlying_code(),
+            "trading_symbol": self._underlying_code(),
             "exchange_code": self._underlying_exchange(),
-            "product_type": "cash",
+            "segment": "CASH",
+            "groww_symbol": f"{self._underlying_exchange()}-{self._underlying_code()}",
         }
-        rows = []
-        # Try the documented signed v1 route first, then v2.  Keep attempts
-        # bounded and non-synthetic: if Groww has no underlying chart, no fake
-        # candles are generated.
-        for req in (base_req, {**base_req, "product_type": "Cash"}):
-            try:
-                groww_throttle(f"underlying_historical:{timeframe}:{self._underlying_code()}")
-                resp = self.api.get_historical_charts(**{k: v for k, v in req.items() if v})
-                rows = self._rows(resp)
-                if rows:
-                    break
-            except Exception:
-                continue
-        if not rows and bool(_cfg("GROWW_HISTORICAL_V2_FALLBACK", True)):
-            v2_req = dict(base_req)
-            v2_req["exch_code"] = v2_req.pop("exchange_code")
-            # Groww v2 interval vocabulary differs from the v1 signed route.
-            v2_req["interval"] = {
-                "minute": "1minute", "5minute": "5minute",
-                "30minute": "30minute", "day": "1day",
-            }.get(str(v2_req.get("interval") or ""), str(v2_req.get("interval") or ""))
-            v2_req["product_type"] = "Cash"
-            v2_req["from_date"] = from_dt.strftime("%Y-%m-%d %H:%M:%S")
-            v2_req["to_date"] = to_dt.strftime("%Y-%m-%d %H:%M:%S")
-            try:
-                groww_throttle(f"underlying_historical_v2:{timeframe}:{self._underlying_code()}")
-                resp = self.api.get_historical_charts_v2(**v2_req)
-                rows = self._rows(resp)
-            except Exception:
-                rows = []
+        groww_throttle(f"underlying_historical_candles:{timeframe}:{self._underlying_code()}")
+        resp = self.api.get_historical_candles_canonical(**req)
+        rows = self._rows(resp)
         parsed = self._parse_rows(rows)
-        parsed = self._resample(parsed, target_minutes) if target_minutes not in (1, 5, 1440) else parsed
         if parsed:
             with self._lock:
                 self._candles[timeframe].clear(); self._candles[timeframe].extend(parsed[-800:])
@@ -350,7 +316,7 @@ class GrowwUnderlyingDataManager:
                 self._sio = None
                 logger.error("GROWW underlying websocket subscribed but delivered no live tick within %.1fs for %s", timeout, self._display_underlying())
                 return False
-            logger.info("GROWW underlying websocket LIVE for %s via official Groww quote feed; 1m/5m/15m/1h/4h bars are streamed/aggregated locally", self._display_underlying())
+            logger.info("GROWW underlying websocket LIVE for %s via official Groww index-value feed; live ticks maintain current bars", self._display_underlying())
             return True
         except Exception as exc:
             logger.error("GROWW mandatory underlying websocket unavailable for %s: %s", self._display_underlying(), exc)
@@ -369,7 +335,7 @@ class GrowwUnderlyingDataManager:
     def _on_stream_candle(self, data: Any) -> None:
         """Consume official Groww live underlying quotes/OHLC without synthetic prices.
 
-        NIFTY is documented by Groww as a real-time quote subscription.  The
+        NIFTY is documented by Groww as an index-value feed subscription.  The
         tick price therefore updates the current one-minute candle, from which
         the institutional 5m/15m/1h/4h structural frames are aggregated.
         """

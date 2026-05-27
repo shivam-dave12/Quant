@@ -116,7 +116,8 @@ class MultiAssetInstitutionalBot:
         wants_groww_runtime = bool(getattr(config, "GROWW_OPTIONS_RUNTIME_ENABLED", False))
         has_groww_runtime_keys = bool(
             getattr(config, "GROWW_ACCESS_TOKEN", "")
-            or (getattr(config, "GROWW_API_KEY", "") and (getattr(config, "GROWW_API_SECRET", "") or getattr(config, "GROWW_TOTP_SECRET", "")))
+            or (getattr(config, "GROWW_TOTP_TOKEN", "") and getattr(config, "GROWW_TOTP_SECRET", ""))
+            or (getattr(config, "GROWW_API_KEY", "") and getattr(config, "GROWW_API_SECRET", ""))
         )
         has_groww = bool(
             GrowwRestClient is not None

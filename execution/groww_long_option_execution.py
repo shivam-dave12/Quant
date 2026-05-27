@@ -282,13 +282,12 @@ class GrowwLongOptionExecutor:
         fill = self._wait_for_fill(
             order_id=entry_id,
             requested_qty=int(quantity),
-            fallback_price=limit_price,
             timeout_sec=fill_timeout_sec,
             poll_interval_sec=poll_interval_sec,
         )
         status = str(fill.get("status") or "").upper()
         filled_qty = int(_num(fill.get("filled_quantity"), 0.0))
-        avg_price = _num(fill.get("average_price"), limit_price)
+        avg_price = _num(fill.get("average_price"), 0.0)
 
         if status not in self.FILL_STATUSES | self.PARTIAL_STATUSES or filled_qty <= 0:
             reason = f"GROWW_ENTRY_NOT_FILLED: status={status or 'UNKNOWN'}"
@@ -317,16 +316,24 @@ class GrowwLongOptionExecutor:
         )
 
         oco_payload = self._oco_body(candidate, filled_qty, protection)
-        oco_resp = self._create_smart_order(oco_payload)
-        smart_id = _extract_id(oco_resp, "smart_order_id", "id", "order_id")
-        step(
-            GrowwLongOptionExecutionState.PROTECTION_SUBMITTED_FOR_FILLED_QTY,
-            smart_order_id=smart_id,
-            payload=oco_payload,
-            raw=oco_resp,
-        )
+        oco_resp: dict[str, Any] = {}
+        smart_id = ""
+        try:
+            oco_resp = self._create_smart_order(oco_payload)
+            smart_id = _extract_id(oco_resp, "smart_order_id", "id", "order_id")
+            step(
+                GrowwLongOptionExecutionState.PROTECTION_SUBMITTED_FOR_FILLED_QTY,
+                smart_order_id=smart_id,
+                payload=oco_payload,
+                raw=oco_resp,
+            )
+            oco_confirmed = bool(smart_id) and self._confirm_oco(smart_id, candidate, filled_qty)
+        except Exception as exc:
+            logger.exception("Groww OCO submission/status verification failed after filled entry")
+            reasons.append(f"GROWW_OCO_API_ERROR: {exc}")
+            oco_confirmed = False
 
-        if not smart_id or not self._confirm_oco(smart_id, candidate, filled_qty, fallback_row=oco_resp):
+        if not oco_confirmed:
             return self._emergency_result(
                 candidate=candidate,
                 entry_order_id=entry_id,
@@ -476,7 +483,6 @@ class GrowwLongOptionExecutor:
         *,
         order_id: str,
         requested_qty: int,
-        fallback_price: float,
         timeout_sec: float,
         poll_interval_sec: float,
     ) -> dict[str, Any]:
@@ -488,7 +494,7 @@ class GrowwLongOptionExecutor:
             filled = int(_num(row.get("filled_quantity") or row.get("executed_quantity"), 0.0))
             if filled <= 0 and status in self.FILL_STATUSES:
                 filled = requested_qty
-            avg = self._average_fill_price(row, fallback_price=fallback_price)
+            avg = self._average_fill_price(row)
             if status in self.FILL_STATUSES | self.PARTIAL_STATUSES | self.DEAD_STATUSES:
                 row["status"] = status
                 row["filled_quantity"] = filled
@@ -503,31 +509,28 @@ class GrowwLongOptionExecutor:
             self.sleep(max(float(poll_interval_sec or 0.0), 0.0))
 
     def _get_order(self, order_id: str) -> dict[str, Any]:
-        getter = getattr(self.api, "get_order_detail", None) or getattr(self.api, "get_order", None)
-        if callable(getter):
-            try:
-                resp = getter(groww_order_id=order_id, segment=_const(self.api, "SEGMENT_FNO", "FNO"))
-            except TypeError:
-                try:
-                    resp = getter(order_id=order_id, segment=_const(self.api, "SEGMENT_FNO", "FNO"))
-                except TypeError:
-                    resp = getter(order_id)
-            row = _first_mapping(resp)
-            if row:
-                return row
-        return {"order_id": order_id, "status": "UNKNOWN"}
+        """Read the order through Groww's documented get_order_detail endpoint only."""
+        getter = getattr(self.api, "get_order_detail", None)
+        if not callable(getter):
+            raise RuntimeError("Groww SDK get_order_detail is mandatory for live FNO execution.")
+        resp = getter(
+            groww_order_id=order_id,
+            segment=_const(self.api, "SEGMENT_FNO", "FNO"),
+        )
+        row = _first_mapping(resp)
+        if not row:
+            raise RuntimeError(f"Groww get_order_detail returned no order row for {order_id}.")
+        return row
 
     def _cancel_order(self, order_id: str) -> dict[str, Any]:
+        """Cancel through Groww's documented cancel_order endpoint only."""
         canceller = getattr(self.api, "cancel_order", None)
         if not callable(canceller):
-            return {}
-        try:
-            resp = canceller(groww_order_id=order_id, segment=_const(self.api, "SEGMENT_FNO", "FNO"))
-        except TypeError:
-            try:
-                resp = canceller(order_id=order_id, segment=_const(self.api, "SEGMENT_FNO", "FNO"))
-            except TypeError:
-                resp = canceller(order_id)
+            raise RuntimeError("Groww SDK cancel_order is mandatory for live FNO execution.")
+        resp = canceller(
+            groww_order_id=order_id,
+            segment=_const(self.api, "SEGMENT_FNO", "FNO"),
+        )
         return dict(resp or {}) if isinstance(resp, Mapping) else {}
 
     def _confirm_oco(
@@ -535,23 +538,19 @@ class GrowwLongOptionExecutor:
         smart_order_id: str,
         candidate: LongOptionCandidateScore,
         quantity: int,
-        *,
-        fallback_row: Any,
     ) -> bool:
+        """Confirm OCO state from Groww's documented smart-order status call only."""
         getter = getattr(self.api, "get_smart_order", None)
-        row: dict[str, Any] = {}
-        if callable(getter):
-            try:
-                resp = getter(
-                    smart_order_id=smart_order_id,
-                    segment=_const(self.api, "SEGMENT_FNO", "FNO"),
-                    smart_order_type=_const(self.api, "SMART_ORDER_TYPE_OCO", "OCO"),
-                )
-            except TypeError:
-                resp = getter(smart_order_id)
-            row = _first_mapping(resp)
+        if not callable(getter):
+            raise RuntimeError("Groww SDK get_smart_order is mandatory for OCO verification.")
+        resp = getter(
+            smart_order_id=smart_order_id,
+            segment=_const(self.api, "SEGMENT_FNO", "FNO"),
+            smart_order_type=_const(self.api, "SMART_ORDER_TYPE_OCO", "OCO"),
+        )
+        row = _first_mapping(resp)
         if not row:
-            row = _first_mapping(fallback_row)
+            return False
         status = str(row.get("status") or row.get("smart_order_status") or "").upper()
         if status not in self.ACTIVE_SMART_STATUSES:
             return False
@@ -620,8 +619,13 @@ class GrowwLongOptionExecutor:
         )
 
     def _emergency_exit(self, candidate: LongOptionCandidateScore, quantity: int, average_price: float) -> str:
-        buffer_pct = float(_cfg("GROWW_EMERGENCY_EXIT_LIMIT_BUFFER_PCT", 0.10) or 0.10)
-        limit_price = self._round_price(max(self.tick_size, average_price * max(0.01, 1.0 - buffer_pct)), mode="floor")
+        """Flatten an already-filled unprotected long option using Groww MARKET SELL.
+
+        This is not a substitute entry route. It is mandatory loss containment after an
+        entry fill exists but the required OCO protection cannot be verified.
+        It intentionally does not fabricate a LIMIT price from a requested entry.
+        """
+        _ = average_price
         body = {
             "trading_symbol": candidate.trading_symbol,
             "quantity": int(quantity),
@@ -629,9 +633,8 @@ class GrowwLongOptionExecutor:
             "exchange": _const(self.api, "EXCHANGE_NSE", "NSE"),
             "segment": _const(self.api, "SEGMENT_FNO", "FNO"),
             "product": str(_cfg("GROWW_OPTION_PRODUCT_TYPE", "NRML") or "NRML").upper(),
-            "order_type": _const(self.api, "ORDER_TYPE_LIMIT", "LIMIT"),
+            "order_type": _const(self.api, "ORDER_TYPE_MARKET", "MARKET"),
             "transaction_type": _const(self.api, "TRANSACTION_TYPE_SELL", "SELL"),
-            "price": f"{limit_price:.2f}",
             "order_reference_id": _reference_id(self.api, "emg"),
         }
         resp = self._place_order(body)
@@ -657,7 +660,7 @@ class GrowwLongOptionExecutor:
         return raw or "UNKNOWN"
 
     @staticmethod
-    def _average_fill_price(row: Mapping[str, Any], *, fallback_price: float) -> float:
+    def _average_fill_price(row: Mapping[str, Any]) -> float:
         for key in ("average_fill_price", "average_price", "avg_price", "execution_price", "price"):
             px = _num(row.get(key), 0.0)
             if px > 0:
@@ -675,7 +678,7 @@ class GrowwLongOptionExecutor:
                     den += qty
             if den > 0:
                 return num / den
-        return float(fallback_price)
+        return 0.0
 
     def _round_price(self, value: float, *, mode: str = "nearest") -> float:
         raw = float(value or 0.0)

@@ -12,7 +12,6 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
 try:
     from zoneinfo import ZoneInfo
 except Exception:  # pragma: no cover
@@ -83,8 +82,6 @@ class GrowwOptionDataManager:
         self._first_stream_tick = threading.Event()
         self._last_stream_repair_attempt = 0.0
         self._stream_repair_inflight = False
-        self._last_execution_preflight_ts = 0.0
-        self._last_execution_preflight_key: tuple[str, str, float] | None = None
         self._last_execution_quote_source = "NONE"
         # Stream-route telemetry is execution critical: the underlying quote may
         # be live while CE/PE packets are missing or cannot be unambiguously
@@ -102,15 +99,12 @@ class GrowwOptionDataManager:
         return is_chain_instrument(self.instrument)
 
     def _hydrate_chain_candidates(self, *, force_refresh: bool = False, underlying_spot: float = 0.0) -> bool:
-        """Populate the session option universe from verified NFO definitions.
+        """Populate the session option universe from official Groww data only.
 
-        Groww OptionChain does not support a blind entire-chain call: the
-        official contract requires at least two filters among expiry/right/strike.
-        We therefore obtain exact contract definitions and lot sizes from the
-        daily Security Master, then request filtered CE/PE quotes for eligible
-        expiries only.  Some Groww accounts do not have the OptionChain facility
-        enabled; those accounts fall back to exact-contract /quotes probes around
-        the live underlying spot.
+        Contract identity, exchange token and lot size come from Groww's official
+        instrument CSV; live option metrics and Greeks come from the documented
+        ``get_option_chain`` endpoint.  If either source is unavailable, the
+        option desk is fail-closed rather than substituting quote probes.
         """
         raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
         if not isinstance(raw, dict):
@@ -139,30 +133,20 @@ class GrowwOptionDataManager:
         verified = [row for row in verified if contract_key(row)[0] in set(expiries)]
         quote_rows: list[dict[str, Any]] = []
         for expiry in expiries:
-            for right in ("call", "put"):
-                try:
-                    groww_throttle(f"option_chain:{stock_code}:{expiry}:{right}")
-                    resp = self.api.get_option_chain_quotes(
-                        stock_code=stock_code, exchange_code="NFO", product_type="options",
-                        expiry_date=self.api._normalise_expiry(expiry), right=right,
-                    )
-                    quote_rows.extend(dict(row) for row in self._chain_rows(resp) if isinstance(row, dict))
-                except Exception as exc:
-                    logger.warning("GROWW filtered option-chain fetch failed %s %s %s: %s", stock_code, expiry, right, exc)
+            try:
+                groww_throttle(f"option_chain:{stock_code}:{expiry}")
+                resp = self.api.get_option_chain_quotes(
+                    stock_code=stock_code, exchange_code="NFO", product_type="options",
+                    expiry_date=self.api._normalise_expiry(expiry),
+                )
+                quote_rows.extend(dict(row) for row in self._chain_rows(resp) if isinstance(row, dict))
+            except Exception as exc:
+                logger.error("GROWW official option-chain fetch failed %s %s: %s", stock_code, expiry, exc)
+                return False
         candidates = merge_verified_chain_quotes(verified, quote_rows)
-        chain_source = "daily_security_master_plus_filtered_option_chain"
+        chain_source = "official_instrument_csv_plus_get_option_chain"
         if not candidates:
-            fallback_rows = self._quote_verified_contracts_fallback(
-                verified,
-                stock_code=stock_code,
-                expiries=expiries,
-                underlying_spot=float(underlying_spot or raw.get("underlying_spot_price") or raw.get("spot_price") or 0.0),
-            )
-            candidates = merge_verified_chain_quotes(verified, fallback_rows)
-            if candidates:
-                chain_source = "daily_security_master_plus_quotes_fallback"
-        if not candidates:
-            logger.error("GROWW session contract book failed: filtered OptionChain and quotes fallback returned no verified executable quotes for %s", stock_code)
+            logger.error("GROWW session contract book failed: official get_option_chain returned no executable contracts matching instrument CSV for %s", stock_code)
             return False
         raw["chain_candidates"] = candidates
         raw["chain_candidates_deferred"] = False
@@ -173,99 +157,6 @@ class GrowwOptionDataManager:
             stock_code, len(candidates), ",".join(expiries), chain_source,
         )
         return True
-
-    def _quote_verified_contracts_fallback(
-        self,
-        verified: list[dict[str, Any]],
-        *,
-        stock_code: str,
-        expiries: list[str],
-        underlying_spot: float,
-    ) -> list[dict[str, Any]]:
-        """Hydrate exact master contracts with /quotes when /OptionChain is unavailable."""
-        if not bool(_cfg("GROWW_SESSION_BOOK_QUOTES_FALLBACK_ENABLED", True)):
-            return []
-        spot = float(underlying_spot or 0.0)
-        per_side = max(1, int(_cfg("GROWW_SESSION_BOOK_QUOTE_FALLBACK_STRIKES_PER_SIDE", 10)))
-        max_contracts = max(4, int(_cfg("GROWW_SESSION_BOOK_QUOTE_FALLBACK_MAX_CONTRACTS", 60)))
-        expiry_rank = {exp: i for i, exp in enumerate(expiries)}
-
-        def right_of(row: dict[str, Any]) -> str:
-            return str(contract_key(row)[1] or "").lower()
-
-        def strike_of(row: dict[str, Any]) -> float:
-            try:
-                return float(contract_key(row)[2] or 0.0)
-            except Exception:
-                return 0.0
-
-        def sort_key(row: dict[str, Any]) -> tuple[float, float, float]:
-            exp = contract_key(row)[0]
-            right = right_of(row)
-            strike = strike_of(row)
-            dist = abs(strike - spot) if spot > 0 and strike > 0 else 0.0
-            # Target-delta index options are usually near-ATM/slightly OTM.
-            # Penalize ITM contracts a little so fallback probes do not waste
-            # quote calls on expensive vehicles when spot sits between strikes.
-            itm_penalty = 0.0
-            if spot > 0:
-                if right == "call" and strike < spot:
-                    itm_penalty = 0.15 * abs(strike - spot)
-                elif right == "put" and strike > spot:
-                    itm_penalty = 0.15 * abs(strike - spot)
-            return (float(expiry_rank.get(exp, 999)), dist + itm_penalty, strike)
-
-        selected: list[dict[str, Any]] = []
-        for exp in expiries:
-            exp_rows = [dict(row) for row in verified if contract_key(row)[0] == exp]
-            for right in ("call", "put"):
-                side_rows = [row for row in exp_rows if right_of(row) == right and strike_of(row) > 0]
-                side_rows.sort(key=sort_key)
-                selected.extend(side_rows[:per_side])
-        selected.sort(key=sort_key)
-        selected = selected[:max_contracts]
-        if not selected:
-            return []
-
-        quote_rows: list[dict[str, Any]] = []
-        failures = 0
-        for row in selected:
-            exp, right, strike = contract_key(row)
-            route = dict(row)
-            route["stock_code"] = stock_code
-            route["exchange_code"] = "NFO"
-            route["product_type"] = "Options"
-            route["expiry_date"] = row.get("expiry_date") or row.get("ExpiryDate") or exp
-            route["right"] = "Call" if right == "call" else "Put"
-            route["strike_price"] = strike
-            try:
-                groww_throttle(f"quote_fallback:{stock_code}:{exp}:{right}:{strike:g}")
-                resp = self.api.get_quote_for_instrument(SimpleNamespace(raw=route, asset_id=stock_code))
-                quote = self._first_response_row(resp)
-                if not quote:
-                    continue
-                out = dict(route)
-                out.update(quote)
-                out["stock_code"] = stock_code
-                out["exchange_code"] = "NFO"
-                out["product_type"] = "Options"
-                out["expiry_date"] = route["expiry_date"]
-                out["right"] = route["right"]
-                out["strike_price"] = strike
-                out["runtime_lot_size"] = route.get("runtime_lot_size") or route.get("LotSize")
-                out["quote_source"] = "groww_quotes_contract_fallback"
-                quote_rows.append(out)
-            except Exception as exc:
-                failures += 1
-                logger.debug(
-                    "GROWW exact-contract quote fallback failed %s %s %.0f %s: %s",
-                    stock_code, exp, strike, right, exc,
-                )
-        logger.info(
-            "GROWW exact-contract quote fallback for %s: probed=%d quotes=%d failures=%d spot=%.2f",
-            stock_code, len(selected), len(quote_rows), failures, spot,
-        )
-        return quote_rows
 
     @staticmethod
     def _chain_rows(resp: Dict[str, Any]) -> list[Any]:
@@ -433,7 +324,7 @@ class GrowwOptionDataManager:
                     "last_tick_keys": (),
                 }
                 callback = lambda data, stream_key=key, stream_identity=identity: self._on_session_book_option_tick(stream_key, stream_identity, data)
-                ids = hub.subscribe_option_quotes_and_ohlcv(stock_code=identity["stock_code"], expiry_date=identity["expiry"], strike_price=str(identity["strike"]), right=identity["right"], callback=callback)
+                ids = hub.subscribe_option_market_data(stock_code=identity["stock_code"], expiry_date=identity["expiry"], strike_price=str(identity["strike"]), right=identity["right"], callback=callback)
                 self._book_stream_subscription_ids[key] = list(ids)
                 self._stream_subscription_ids.extend(ids)
             if bool(_cfg("GROWW_OPTION_WEBSOCKET_REQUIRED", True)) and timeout > 0:
@@ -452,7 +343,7 @@ class GrowwOptionDataManager:
                         msg,
                     )
                     return True
-            logger.info("GROWW CE/PE session vehicles websocket LIVE before signal execution; streamed_contracts=%d", len(self._book_stream_state))
+            logger.info("GROWW CE/PE session vehicles live through official LTP+market-depth feeds before signal execution; streamed_contracts=%d", len(self._book_stream_state))
             return True
         except Exception as exc:
             self._stop_option_stream()
@@ -555,14 +446,14 @@ class GrowwOptionDataManager:
             self._live_hub = hub
             self._active_stream_contract = {"stock_code": stock_code, "expiry": expiry, "right": right, "strike": float(strike)}
             self._stream_armed_at = time.time()
-            self._stream_subscription_ids = hub.subscribe_option_quotes_and_ohlcv(
+            self._stream_subscription_ids = hub.subscribe_option_market_data(
                 stock_code=stock_code, expiry_date=expiry, strike_price=strike, right=right, callback=self._on_option_stream_tick)
             timeout = max(0.0, float(_cfg("GROWW_OPTION_STREAM_FIRST_TICK_TIMEOUT_SEC", 12.0)))
             if bool(_cfg("GROWW_OPTION_WEBSOCKET_REQUIRED", True)) and timeout > 0 and not self._first_stream_tick.wait(timeout):
                 self._stop_option_stream()
                 logger.error("GROWW option websocket subscribed but produced no first tick within %.1fs for %s %s %s %s", timeout, stock_code, expiry, strike, right)
                 return False
-            logger.info("GROWW option websocket LIVE for %s %s %s %s; live quotes/OHLCV are primary execution data", stock_code, expiry, strike, right)
+            logger.info("GROWW option websocket LIVE for %s %s %s %s; official LTP+market-depth are primary execution data", stock_code, expiry, strike, right)
             return True
         except Exception as exc:
             self._stop_option_stream()
@@ -573,10 +464,9 @@ class GrowwOptionDataManager:
         """Repair only a failed shared transport; never block the strategy loop.
 
         A quiet CE/PE contract is not evidence that the Groww socket is broken.
-        If the shared NIFTY transport is still receiving ticks, reconnecting it in
-        the execution path destroys good analysis data and creates 8-12 second
-        on_tick stalls.  An exact-contract REST preflight is used only at order
-        commitment when the chosen option has no recent streamed quote.
+        If the shared Groww transport is still receiving ticks, reconnecting it in
+        the execution path destroys good analysis data and creates latency. The
+        mandatory selected-contract LTP/depth stream remains fail-closed until fresh.
         """
         if not bool(_cfg("GROWW_OPTION_STREAM_ENABLED", True)) or not bool(_cfg("GROWW_OPTION_WEBSOCKET_REQUIRED", True)):
             return False
@@ -603,7 +493,7 @@ class GrowwOptionDataManager:
                 self._stream_last_route_warning_ts = now
                 logger.info(
                     "GROWW selected option has no recent routed tick but shared Groww transport is live "
-                    "(shared_age=%.2fs); no socket recycle on strategy path; exact-contract preflight remains available at commitment",
+                    "(shared_age=%.2fs); no socket recycle on strategy path; execution remains blocked until documented option feed is fresh",
                     shared_age,
                 )
             return False
@@ -833,7 +723,7 @@ class GrowwOptionDataManager:
         try:
             apply_contract_choice(self.instrument, choice)
             self._clear_option_execution_state()
-            self._warmup(historical_only=False)
+            self._warmup(historical_only=True)
             with self._lock:
                 if self._last_price <= 0 or len(self._candles.get("1m", ())) < int(_cfg("GROWW_OPTION_MIN_READY_1M_BARS", 20)):
                     return False
@@ -899,14 +789,13 @@ class GrowwOptionDataManager:
         """Expose the day-start option vehicle book and its actual websocket health.
 
         Underlying NIFTY ticks are analysis data only. Option execution is ready
-        only from a direction-specific NFO route: either a fresh identity-routed
-        websocket quote/depth pair, or an immediate exact-contract REST preflight
-        executed at order commitment. Historical/session-book premiums cannot clear it.
+        only from a direction-specific NFO route with a fresh identity-routed
+        websocket LTP plus market-depth pair. Historical/session-book prices cannot clear it.
         """
         raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
         book = raw.get("session_contract_book") if isinstance(raw, dict) else None
         if not isinstance(book, dict):
-            return {"status": "MISSING", "execution_freshness_gate": "WEBSOCKET_OR_EXACT_CONTRACT_COMMIT_PREFLIGHT_REQUIRED"}
+            return {"status": "MISSING", "execution_freshness_gate": "DOCUMENTED_OPTION_LTP_AND_DEPTH_STREAM_REQUIRED"}
         now = time.time()
         max_stale = max(0.1, float(_cfg("GROWW_OPTION_STREAM_MAX_STALE_SEC", 15.0)))
 
@@ -952,7 +841,7 @@ class GrowwOptionDataManager:
             "status": dynamic_status,
             "configured_status": str(raw.get("session_contract_book_status") or "READY"),
             "execution_feed_status": str(feed_status.get("status") or "UNKNOWN"),
-            "execution_freshness_gate": "WEBSOCKET_OR_EXACT_CONTRACT_COMMIT_PREFLIGHT_REQUIRED",
+            "execution_freshness_gate": "DOCUMENTED_OPTION_LTP_AND_DEPTH_STREAM_REQUIRED",
             "max_stream_stale_sec": max_stale,
             "trade_date_ist": str(book.get("trade_date_ist") or ""),
             "built_at": float(book.get("built_at", 0.0) or 0.0),
@@ -987,19 +876,9 @@ class GrowwOptionDataManager:
         executable = [row for row in state_rows if row["book_executable"]]
         active_row = next((row for row in state_rows if row["key"] == self._active_stream_key), None)
         streamed_active_ready = bool(active_row and active_row["book_executable"])
-        with self._lock:
-            preflight_ts = float(self._last_execution_preflight_ts or 0.0)
-            preflight_key = self._last_execution_preflight_key
-        preflight_ready = bool(
-            self._active_stream_key is not None and preflight_key == self._active_stream_key and preflight_ts > 0
-            and now - preflight_ts <= float(_cfg("GROWW_EXECUTION_PREFLIGHT_QUOTE_TTL_SEC", 2.0))
-            and self._last_price > 0 and self._best_bid > 0 and self._best_ask >= self._best_bid
-        )
-        active_ready = bool(streamed_active_ready or preflight_ready)
+        active_ready = streamed_active_ready
         if streamed_active_ready:
             status = "ACTIVE_OPTION_VEHICLE_LIVE"
-        elif preflight_ready:
-            status = "ACTIVE_OPTION_VEHICLE_EXACT_REST_PREFLIGHT_FRESH"
         elif len(executable) == len(state_rows) and state_rows:
             status = "CE_PE_PRESELECTED_LIVE_PENDING_DIRECTION"
         elif self._stream_unroutable_tick_count > 0 and not live:
@@ -1013,8 +892,7 @@ class GrowwOptionDataManager:
             "session_vehicle_stream_ready": bool(active_ready or (state_rows and len(executable) == len(state_rows))),
             "active_vehicle_ready": active_ready,
             "active_vehicle_stream_ready": streamed_active_ready,
-            "active_vehicle_preflight_ready": preflight_ready,
-            "active_execution_quote_source": "EXACT_CONTRACT_REST_PREFLIGHT" if preflight_ready and not streamed_active_ready else "GROWW_WEBSOCKET" if streamed_active_ready else "NONE",
+            "active_execution_quote_source": "GROWW_OPTION_LTP_AND_DEPTH_FEED" if streamed_active_ready else "NONE",
             "active_vehicle": self._active_stream_key,
             "preselected_vehicle_count": len(state_rows),
             "fresh_vehicle_count": len(live),
@@ -1037,12 +915,11 @@ class GrowwOptionDataManager:
                 self._best_ask_qty = float(snapshot.get("best_ask_qty", 0.0) or 0.0)
                 self._candles = {tf: deque(rows, maxlen=600) for tf, rows in (snapshot.get("candles") or {}).items()}
         else:
-            self._warmup(historical_only=False)
+            self._warmup(historical_only=True)
         # Both session vehicles are websocket-armed before signal execution.
         # Activation routes the direction-specific vehicle without subscribing on
-        # the latency-sensitive entry path. Websocket is primary; if the selected
-        # option has not emitted a current tick, an exact-contract REST quote is
-        # accepted only as a short-lived commit-time execution preflight.
+        # the latency-sensitive entry path. A fresh Groww LTP plus market-depth
+        # stream for the exact selected option is mandatory; there is no REST substitute.
         key = self._snapshot_key(choice)
         stream_state = self._book_stream_state.get(key)
         self._active_stream_key = key
@@ -1066,14 +943,9 @@ class GrowwOptionDataManager:
             if not self._start_selected_contract_stream():
                 return False
         max_quote_age = float(_cfg("GROWW_OPTION_MAX_QUOTE_STALE_SEC", 10.0))
-        if not self._execution_price_fresh(max_quote_age) and bool(_cfg("GROWW_EXECUTION_PREFLIGHT_EXACT_QUOTE_ENABLED", True)):
-            try:
-                self._refresh_quote(source="EXACT_CONTRACT_REST_PREFLIGHT")
-            except Exception as exc:
-                logger.warning("GROWW exact-contract REST preflight failed for %s: %s", getattr(choice, "selected_symbol", key), exc)
         if self._last_price <= 0 or not self._execution_price_fresh(max_quote_age):
             logger.error(
-                "GROWW selected session vehicle has no current executable quote from websocket or exact-contract preflight: %s | execution_feed=%s",
+                "GROWW selected session vehicle has no fresh documented LTP+market-depth websocket state: %s | execution_feed=%s",
                 getattr(choice, "selected_symbol", key), self.execution_feed_status(),
             )
             return False
@@ -1086,13 +958,6 @@ class GrowwOptionDataManager:
             selected.setdefault("raw", {})["selected_entry_premium"] = float(self._last_price)
             selected["raw"]["ltp"] = float(self._last_price)
             raw["selected_entry_premium"] = float(self._last_price)
-        if not self._running:
-            with self._lock:
-                self._poll_generation += 1
-                generation = self._poll_generation
-                self._running = True
-            self._thread = threading.Thread(target=self._poll_loop, args=(generation,), name=f"groww-option-dm-{getattr(self.instrument,'asset_id','')}", daemon=True)
-            self._thread.start()
         return True
 
     def select_contract_for_thesis(self, thesis_side: str, underlying_spot: float = 0.0, available_funds: float = 0.0):
@@ -1118,7 +983,7 @@ class GrowwOptionDataManager:
                 logger.warning("GROWW preselected session vehicle unavailable for %s thesis=%s reason=%s", getattr(self.instrument, "asset_id", "?"), thesis_side, status)
                 return None
         if not self._activate_session_vehicle(choice):
-            logger.error("GROWW preselected vehicle failed mandatory executable quote activation (fresh WS or exact-contract commit preflight): %s", choice.selected_symbol)
+            logger.error("GROWW preselected vehicle failed mandatory documented LTP+market-depth websocket activation: %s", choice.selected_symbol)
             self.release_execution_vehicle()
             return None
         # The session book was built earlier, but the final affordability and
@@ -1210,17 +1075,11 @@ class GrowwOptionDataManager:
                     )
                     return False
             self.api.preflight_session()
-            self._warmup(historical_only=False)
+            self._warmup(historical_only=True)
             if self._last_price <= 0 or len(self._candles.get("1m", ())) < int(_cfg("GROWW_OPTION_MIN_READY_1M_BARS", 30)):
                 logger.error("GROWW option DM not ready: missing real quote/historical candles for %s", getattr(self.instrument, "asset_id", "?"))
                 return False
-            with self._lock:
-                self._poll_generation += 1
-                generation = self._poll_generation
-                self._running = True
             self.is_ready = True
-            self._thread = threading.Thread(target=self._poll_loop, args=(generation,), name=f"groww-option-dm-{getattr(self.instrument,'asset_id','')}", daemon=True)
-            self._thread.start()
             return True
         except Exception as exc:
             logger.error("GROWW option data start failed for %s: %s", getattr(self.instrument, "asset_id", "?"), exc)
@@ -1230,7 +1089,7 @@ class GrowwOptionDataManager:
         """Fetch historical candles outside live trading hours without enabling trading."""
         try:
             self.api.preflight_session()
-            self._warmup(historical_only=not bool(_cfg("GROWW_CLOSED_MARKET_QUOTE_PROBE", False)))
+            self._warmup(historical_only=True)
             logger.info(
                 "GROWW closed-market historical warmup for %s complete: %s; reason=%s",
                 getattr(self.instrument, "asset_id", "?"),
@@ -1258,27 +1117,12 @@ class GrowwOptionDataManager:
             time.sleep(0.25)
         return bool(self.is_ready)
 
-    def _poll_loop(self, generation: int | None = None) -> None:
-        interval = float(_cfg("GROWW_OPTION_QUOTE_POLL_SEC", 2.0))
-        owned_generation = int(self._poll_generation if generation is None else generation)
-        while True:
-            with self._lock:
-                if not self._running or owned_generation != self._poll_generation:
-                    return
-            try:
-                self._refresh_quote()
-            except Exception as exc:
-                logger.debug("GROWW quote poll failed: %s", exc)
-            time.sleep(max(0.5, interval))
-
     def _warmup(self, historical_only: bool = False) -> None:
         for tf in ("1m", "5m", "15m", "1h"):
             try:
                 self._load_historical(tf)
             except Exception as exc:
                 logger.warning("GROWW historical warmup %s failed for %s: %s", tf, getattr(self.instrument, "asset_id", "?"), exc)
-        if not historical_only:
-            self._refresh_quote()
 
     def _historical_count_summary(self) -> str:
         with self._lock:
@@ -1289,54 +1133,26 @@ class GrowwOptionDataManager:
         selected = raw.get("selected_option_contract") if isinstance(raw, dict) else None
         if isinstance(selected, dict) and isinstance(selected.get("raw"), dict):
             raw = selected.get("raw") or raw
-        # Groww historicalcharts accepts: minute, 5minute, 30minute, day.
-        # There is no native 15m/1h interval; use 5m/30m source bars
-        # rather than sending unsupported values and getting empty historicals.
-        interval = {"1m": "minute", "5m": "5minute", "15m": "5minute", "1h": "30minute", "4h": "day", "1d": "day"}.get(timeframe, "minute")
+        # Groww documents native candle intervals through get_historical_candles.
+        interval = {"1m": "1minute", "5m": "5minute", "15m": "15minute", "1h": "1hour", "4h": "4hour", "1d": "1day"}.get(timeframe, "1minute")
         to_dt = datetime.now(timezone.utc)
         from_dt = to_dt - timedelta(days=5 if timeframe in {"1m", "5m", "15m"} else 45)
         body = {
             "interval": interval,
-            "from_date": from_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-            "to_date": to_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "from_date": from_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "to_date": to_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "trading_symbol": str(raw.get("trading_symbol") or raw.get("TradingSymbol") or "").strip(),
+            "groww_symbol": str(raw.get("groww_symbol") or "").strip(),
             "stock_code": str(raw.get("stock_code") or raw.get("ShortName") or "").upper(),
             "exchange_code": str(raw.get("exchange_code") or "NFO").upper(),
-            "product_type": "options",
+            "segment": "FNO",
             "expiry_date": self.api._normalise_expiry(raw.get("expiry_date") or raw.get("ExpiryDate") or ""),
             "right": self.api._normalise_right(raw.get("right") or raw.get("OptionType") or ""),
             "strike_price": str(raw.get("strike_price") or raw.get("StrikePrice") or ""),
         }
-        req = {k: v for k, v in body.items() if v}
-        groww_throttle(f"historical:{timeframe}:{getattr(self.instrument, 'asset_id', '?')}")
-        resp = self.api.get_historical_charts(**req)
-        rows = resp.get("Success") or resp.get("data") or resp.get("result") or []
-        if not rows and bool(_cfg("GROWW_HISTORICAL_V2_FALLBACK", True)):
-            v2_req = dict(req)
-            v2_req["exch_code"] = v2_req.pop("exchange_code", "NFO")
-            # Groww v2 uses 1minute/5minute/30minute/1day; v1 uses
-            # minute/5minute/30minute/day. Never send v1 units to v2.
-            v2_req["interval"] = {
-                "minute": "1minute", "5minute": "5minute",
-                "30minute": "30minute", "day": "1day",
-            }.get(str(v2_req.get("interval") or ""), str(v2_req.get("interval") or ""))
-            # v2 examples accept human-cased values.
-            if str(v2_req.get("product_type", "")).lower() == "options":
-                v2_req["product_type"] = "Options"
-            if str(v2_req.get("right", "")).lower() == "call":
-                v2_req["right"] = "Call"
-            elif str(v2_req.get("right", "")).lower() == "put":
-                v2_req["right"] = "Put"
-            # v2 sample URL uses a space-separated timestamp.
-            try:
-                v2_req["from_date"] = from_dt.strftime("%Y-%m-%d %H:%M:%S")
-                v2_req["to_date"] = to_dt.strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                pass
-            groww_throttle(f"historical_v2:{timeframe}:{getattr(self.instrument, 'asset_id', '?')}")
-            resp = self.api.get_historical_charts_v2(**v2_req)
-            rows = resp.get("Success") or resp.get("data") or resp.get("result") or []
-        if isinstance(rows, dict):
-            rows = rows.get("data") or rows.get("candles") or []
+        groww_throttle(f"historical_candles:{timeframe}:{getattr(self.instrument, 'asset_id', '?')}")
+        resp = self.api.get_historical_candles_canonical(**{k: v for k, v in body.items() if v})
+        rows = resp.get("Success") or []
         parsed = []
         for r in rows if isinstance(rows, list) else []:
             if not isinstance(r, dict):
@@ -1349,18 +1165,8 @@ class GrowwOptionDataManager:
             high = max(float(h or c), float(o or c), float(c))
             low = min(float(l or c), float(o or c), float(c))
             parsed.append({
-                "t": ts_ms,
-                "o": float(o or c),
-                "h": high,
-                "l": low,
-                "c": float(c),
-                "v": float(v or 0.0),
-                "timestamp": ts_ms / 1000.0,
-                "open": float(o or c),
-                "high": high,
-                "low": low,
-                "close": float(c),
-                "volume": float(v or 0.0),
+                "t": ts_ms, "o": float(o or c), "h": high, "l": low, "c": float(c), "v": float(v or 0.0),
+                "timestamp": ts_ms / 1000.0, "open": float(o or c), "high": high, "low": low, "close": float(c), "volume": float(v or 0.0),
             })
         if parsed:
             with self._lock:
@@ -1402,53 +1208,15 @@ class GrowwOptionDataManager:
                 pass
         return int(time.time() * 1000)
 
-    def _refresh_quote(self, *, source: str = "REST_RECONCILIATION") -> bool:
-        raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
-        if self._is_chain_mode() and not raw.get("selected_option_contract"):
-            return False
-        groww_throttle(f"quote:{getattr(self.instrument, 'asset_id', '?')}")
-        q = self.api.get_quote_for_instrument(getattr(self.instrument, "primary", None))
-        row = q.get("Success") if isinstance(q, dict) else {}
-        if isinstance(row, list) and row:
-            row = row[0]
-        if not isinstance(row, dict):
-            row = q if isinstance(q, dict) else {}
-        px = self._float_first(row, ("ltp", "last_price", "lastPrice", "close", "price"))
-        if px <= 0:
-            return False
-        bid = self._float_first(row, ("best_bid_price", "best_bid", "bid", "bPrice", "bid_price"))
-        ask = self._float_first(row, ("best_offer_price", "best_ask_price", "best_ask", "ask", "sPrice", "ask_price", "offer_price"))
-        bid_qty = self._float_first(row, ("best_bid_quantity", "bid_quantity", "bid_qty", "bQty"))
-        ask_qty = self._float_first(row, ("best_offer_quantity", "best_ask_quantity", "ask_quantity", "ask_qty", "sQty"))
-        now = time.time()
-        with self._lock:
-            self._last_price = px
-            self._best_bid = bid
-            self._best_ask = ask
-            self._best_bid_qty = bid_qty
-            self._best_ask_qty = ask_qty
-            self._last_quote_ts = now
-            self._trades.append({"price": px, "quantity": self._float_first(row, ("quantity", "volume", "total_quantity_traded")), "side": "buy", "timestamp": now, "source": str(source).lower()})
-            if source == "EXACT_CONTRACT_REST_PREFLIGHT":
-                self._last_execution_preflight_ts = now
-                self._last_execution_preflight_key = self._active_stream_key
-                self._last_execution_quote_source = source
-        return True
-
     def _execution_price_fresh(self, max_stale_seconds: float) -> bool:
+        """Require fresh Groww option LTP and market depth from the documented feed."""
         now = time.time()
         with self._lock:
             stream_ts = float(self._last_stream_tick_ts or 0.0)
-            preflight_ts = float(self._last_execution_preflight_ts or 0.0)
-            preflight_key = self._last_execution_preflight_key
-            active_key = self._active_stream_key
             has_book = self._best_bid > 0 and self._best_ask > 0 and self._best_ask >= self._best_bid
             has_price = self._last_price > 0
         max_stream = min(float(max_stale_seconds), float(_cfg("GROWW_OPTION_STREAM_MAX_STALE_SEC", 15.0)))
-        stream_ok = stream_ts > 0 and now - stream_ts <= max_stream and has_price and has_book
-        preflight_ttl = min(float(max_stale_seconds), float(_cfg("GROWW_EXECUTION_PREFLIGHT_QUOTE_TTL_SEC", 2.0)))
-        preflight_ok = bool(active_key is not None and preflight_key == active_key and preflight_ts > 0 and now - preflight_ts <= preflight_ttl and has_price and has_book)
-        return stream_ok or preflight_ok
+        return bool(stream_ts > 0 and now - stream_ts <= max_stream and has_price and has_book)
 
     def get_last_update(self) -> float:
         with self._lock:
@@ -1480,12 +1248,7 @@ class GrowwOptionDataManager:
         # only executable size Groww actually returned.
         stream_age = time.time() - stream_ts if stream_ts > 0 else 999999.0
         stream_fresh = bool(self._stream_subscription_ids) and stream_ts > 0 and stream_age <= float(_cfg("GROWW_OPTION_STREAM_MAX_STALE_SEC", 15.0))
-        with self._lock:
-            preflight_ts = float(self._last_execution_preflight_ts or 0.0)
-            preflight_key = self._last_execution_preflight_key
-            active_key = self._active_stream_key
-        preflight_fresh = bool(active_key is not None and preflight_key == active_key and preflight_ts > 0 and time.time() - preflight_ts <= float(_cfg("GROWW_EXECUTION_PREFLIGHT_QUOTE_TTL_SEC", 2.0)))
-        source = "groww_groww_websocket" if stream_fresh else "groww_exact_contract_rest_preflight" if preflight_fresh else "groww_groww_websocket_stale" if self._stream_subscription_ids else "groww_rest_quote_reconcile"
+        source = "groww_option_ltp_and_depth_feed" if stream_fresh else "groww_option_feed_stale" if self._stream_subscription_ids else "groww_option_feed_not_armed"
         return {"bids": [[bid, bid_qty]] if bid > 0 and bid_qty > 0 else [], "asks": [[ask, ask_qty]] if ask > 0 and ask_qty > 0 else [], "timestamp": ts, "_sources": 1, "_executable_source": source, "_stream_age_sec": stream_age}
 
     def get_recent_trades(self, limit: int = 100) -> List[Dict]:

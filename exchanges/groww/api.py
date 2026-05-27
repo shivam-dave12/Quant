@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 import os
 import re
 import time
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Mapping, Optional
 
@@ -20,6 +22,8 @@ try:
     import config
 except Exception:  # pragma: no cover
     config = None  # type: ignore
+
+logger = logging.getLogger(__name__)
 
 
 def _cfg(name: str, default: Any) -> Any:
@@ -45,7 +49,7 @@ class GrowwRestClient:
     Official SDK contracts used here:
     - ``GrowwAPI(access_token)`` for client construction.
     - ``place_order(...)`` with Groww order fields.
-    - ``get_quote(...)``, ``get_historical_candle_data(...)``.
+    - ``get_quote(...)`` and the documented replacement ``get_historical_candles(...)``.
     - ``get_available_margin_details()`` and ``get_positions_for_user(...)``.
     - ``create_smart_order(...)`` for OCO protection orders.
     """
@@ -56,17 +60,41 @@ class GrowwRestClient:
         self,
         *,
         access_token: str | None = None,
+        totp_token: str | None = None,
+        totp_secret: str | None = None,
         api_key: str | None = None,
         api_secret: str | None = None,
-        totp_secret: str | None = None,
     ) -> None:
+        # Groww documents three distinct credential modes.  Keep the TOTP token
+        # separate from an API-key/secret credential and from a generated access
+        # token so a long-lived TOTP token can never be sent as a bearer token.
         self.access_token = (access_token or _cfg("GROWW_ACCESS_TOKEN", "") or os.getenv("GROWW_ACCESS_TOKEN", "")).strip()
+        self.totp_token = (totp_token or _cfg("GROWW_TOTP_TOKEN", "") or os.getenv("GROWW_TOTP_TOKEN", "")).strip()
+        self.totp_secret = (totp_secret or _cfg("GROWW_TOTP_SECRET", "") or os.getenv("GROWW_TOTP_SECRET", "")).strip()
         self.api_key = (api_key or _cfg("GROWW_API_KEY", "") or os.getenv("GROWW_API_KEY", "")).strip()
         self.api_secret = (api_secret or _cfg("GROWW_API_SECRET", "") or os.getenv("GROWW_API_SECRET", "")).strip()
-        self.totp_secret = (totp_secret or _cfg("GROWW_TOTP_SECRET", "") or os.getenv("GROWW_TOTP_SECRET", "")).strip()
         self._client = None
         self._instrument_rows: list[dict[str, Any]] = []
         self._instrument_loaded_ts = 0.0
+        self._auth_mode = ""
+
+    def _configured_auth_mode(self) -> str:
+        modes = []
+        if self.access_token:
+            modes.append("access_token")
+        if self.totp_token or self.totp_secret:
+            if not (self.totp_token and self.totp_secret):
+                raise RuntimeError("Groww TOTP mode requires both GROWW_TOTP_TOKEN and GROWW_TOTP_SECRET.")
+            modes.append("totp")
+        if self.api_key or self.api_secret:
+            if not (self.api_key and self.api_secret):
+                raise RuntimeError("Groww API-key mode requires both GROWW_API_KEY and GROWW_API_SECRET.")
+            modes.append("api_key_secret")
+        if len(modes) != 1:
+            if not modes:
+                raise RuntimeError("Groww credentials missing. Configure exactly one mode: GROWW_TOTP_TOKEN+GROWW_TOTP_SECRET, GROWW_API_KEY+GROWW_API_SECRET, or GROWW_ACCESS_TOKEN.")
+            raise RuntimeError(f"Groww credentials are ambiguous: configured modes={','.join(modes)}. Configure exactly one mode.")
+        return modes[0]
 
     @property
     def client(self):
@@ -76,51 +104,45 @@ class GrowwRestClient:
             from growwapi import GrowwAPI
         except Exception as exc:  # pragma: no cover - dependency is optional in tests
             raise RuntimeError("Groww official SDK is not installed. Install growwapi before live trading.") from exc
-        token = self.access_token or self._mint_access_token(GrowwAPI)
+        mode = self._configured_auth_mode()
+        token = self.access_token if mode == "access_token" else self._mint_access_token(GrowwAPI, mode)
         if not token:
-            raise RuntimeError("Groww access token missing. Set GROWW_ACCESS_TOKEN or API key credentials.")
+            raise RuntimeError(f"Groww access-token generation returned an empty token for mode={mode}.")
         self.access_token = token
+        self._auth_mode = mode
         self._client = GrowwAPI(token)
+        logger.info("Groww SDK authenticated client initialised via official %s flow", mode)
         return self._client
 
-    def _mint_access_token(self, GrowwAPI) -> str:
-        if not self.api_key:
-            return ""
-        attempts: list[dict[str, Any]] = []
-        if self.totp_secret:
-            try:
-                import pyotp
-
-                attempts.extend([
-                    {"api_key": self.api_key, "totp": pyotp.TOTP(self.totp_secret).now()},
-                ])
-            except Exception:
-                pass
-        if self.api_secret:
-            attempts.extend([
-                {"api_key": self.api_key, "secret": self.api_secret},
-            ])
+    def _mint_access_token(self, GrowwAPI, mode: str) -> str:
         getter = getattr(GrowwAPI, "get_access_token", None)
         if not callable(getter):
-            return ""
-        last_exc: Exception | None = None
-        for kwargs in attempts:
-            try:
-                token = getter(**kwargs)
-                if isinstance(token, Mapping):
-                    token = token.get("access_token") or token.get("token") or token.get("auth_token")
-                if str(token or "").strip():
-                    return str(token).strip()
-            except Exception as exc:
-                last_exc = exc
-        if last_exc is not None:
-            raise RuntimeError(f"Groww access-token generation failed: {last_exc}") from last_exc
-        return ""
+            raise RuntimeError("Groww SDK does not expose GrowwAPI.get_access_token(); upgrade growwapi.")
+        try:
+            if mode == "totp":
+                import pyotp
+                # Official Groww SDK naming: its api_key argument receives the
+                # TOTP token created in the Groww console.
+                token = getter(api_key=self.totp_token, totp=pyotp.TOTP(self.totp_secret).now())
+            elif mode == "api_key_secret":
+                token = getter(api_key=self.api_key, secret=self.api_secret)
+            else:
+                raise RuntimeError(f"Unsupported generated-token mode: {mode}")
+        except Exception as exc:
+            raise RuntimeError(f"Groww access-token generation failed for mode={mode}: {exc}") from exc
+        if isinstance(token, Mapping):
+            token = token.get("access_token") or token.get("token") or token.get("auth_token")
+        return str(token or "").strip()
 
     def preflight_session(self, *, force_refresh: bool = False) -> dict[str, Any]:
         _ = force_refresh
         client = self.client
-        return {"broker": "groww", "ready": True, "sdk": type(client).__name__}
+        profile = client.get_user_profile()
+        segments = profile.get("active_segments", []) if isinstance(profile, Mapping) else []
+        segments = [str(x).upper() for x in segments] if isinstance(segments, (list, tuple, set)) else []
+        if "FNO" not in segments:
+            raise RuntimeError(f"Groww FNO segment is not active for this account; active_segments={segments}")
+        return {"broker": "groww", "ready": True, "sdk": type(client).__name__, "auth_mode": self._auth_mode, "active_segments": segments}
 
     def validate_static_ip(self) -> dict[str, Any]:
         """Validate outbound IP for live Groww order routing.
@@ -276,39 +298,50 @@ class GrowwRestClient:
         return []
 
     def get_all_instruments(self, *, force_refresh: bool = False) -> list[dict[str, Any]]:
+        """Load the official Groww instrument CSV into application-owned memory.
+
+        The SDK's ``get_all_instruments`` helper may persist ``instruments.csv``
+        under its installed package directory.  Containers generally make that
+        directory read-only.  Groww documents direct download of
+        ``GrowwAPI.INSTRUMENT_CSV_URL``; use that official route and never write
+        inside site-packages.
+        """
         ttl = float(_cfg("GROWW_INSTRUMENT_CACHE_TTL_SEC", 1800.0))
         if self._instrument_rows and not force_refresh and time.time() - self._instrument_loaded_ts < ttl:
             return list(self._instrument_rows)
-        rows: list[dict[str, Any]] = []
-        getter = getattr(self.client, "get_all_instruments", None)
-        if callable(getter):
-            data = getter()
-            if hasattr(data, "to_dict"):
-                rows = [dict(x) for x in data.to_dict(orient="records")]
-            elif isinstance(data, list):
-                rows = [dict(x) for x in data if isinstance(x, Mapping)]
-            elif isinstance(data, Mapping):
-                rows = self._response_list(data, "instruments", "instrument_list", "data")
+        rows = self._download_instruments_csv()
         if not rows:
-            rows = self._download_instruments_csv()
+            raise RuntimeError("Groww official instrument CSV returned no rows; desk is fail-closed.")
         self._instrument_rows = rows
         self._instrument_loaded_ts = time.time()
         return list(rows)
 
     def _download_instruments_csv(self) -> list[dict[str, Any]]:
-        try:
-            import requests
+        import requests
 
-            url = str(_cfg("GROWW_INSTRUMENTS_CSV_URL", self.INSTRUMENTS_CSV_URL))
-            resp = requests.get(url, timeout=20.0)
-            resp.raise_for_status()
-            text = resp.text
-            return [dict(row) for row in csv.DictReader(io.StringIO(text))]
-        except Exception:
-            return []
+        url = str(_cfg("GROWW_INSTRUMENTS_CSV_URL", self.INSTRUMENTS_CSV_URL))
+        resp = requests.get(url, timeout=20.0)
+        resp.raise_for_status()
+        text = resp.text
+        rows = [dict(row) for row in csv.DictReader(io.StringIO(text))]
+        required = {"exchange", "exchange_token", "trading_symbol", "groww_symbol", "segment", "instrument_type"}
+        if not rows or not required.issubset(set(rows[0].keys())):
+            raise RuntimeError("Groww instrument CSV schema is incomplete; refusing to select contracts.")
+        cache_path = Path(str(_cfg("GROWW_SECURITY_MASTER_CACHE_PATH", "data/groww_instruments.csv")))
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+            tmp_path.write_text(text, encoding="utf-8")
+            tmp_path.replace(cache_path)
+        except OSError as exc:
+            raise RuntimeError(f"Groww official instrument CSV cannot be persisted in writable application cache {cache_path}: {exc}") from exc
+        logger.info("Groww official instrument CSV loaded: rows=%d cache=%s", len(rows), cache_path)
+        return rows
 
     def _option_symbol_from_route(self, route: Mapping[str, Any]) -> str:
-        for key in ("trading_symbol", "TradingSymbol", "symbol", "groww_symbol"):
+        # Groww quote/order methods require trading_symbol. Do not send a
+        # groww_symbol or an unverified generic symbol in that field.
+        for key in ("trading_symbol", "TradingSymbol"):
             value = str(route.get(key) or "").strip()
             if value:
                 return value
@@ -381,8 +414,6 @@ class GrowwRestClient:
         return out
 
     def get_option_chain_quotes(self, **kwargs) -> dict[str, Any]:
-        if not bool(_cfg("GROWW_USE_OPTION_CHAIN_FOR_SELECTION", False)):
-            return {"Success": [], "Status": 200, "Error": None, "_empty_chain": True}
         underlying = str(kwargs.get("underlying") or kwargs.get("stock_code") or "").strip().upper()
         expiry = self._normalise_expiry(kwargs.get("expiry_date") or kwargs.get("expiry"))
         if not underlying or not expiry:
@@ -464,24 +495,63 @@ class GrowwRestClient:
         row["best_offer_quantity"] = _num(row.get("offer_quantity") or row.get("best_offer_quantity"), 0.0)
         return {"Success": [row], "Status": 200, "Error": None, "_raw": resp}
 
-    def get_historical_charts(self, **kwargs) -> Dict[str, Any]:
-        interval = self._interval_minutes(kwargs.get("interval"))
+    def _groww_symbol_for_route(self, route: Mapping[str, Any], *, exchange: str, segment: str, trading_symbol: str) -> str:
+        direct = str(route.get("groww_symbol") or "").strip()
+        if direct:
+            return direct
+        if str(segment).upper() == "CASH":
+            return f"{str(exchange).upper()}-{str(trading_symbol).upper()}"
+        for row in self.get_all_instruments():
+            if str(row.get("exchange") or "").upper() != str(exchange).upper():
+                continue
+            if str(row.get("segment") or "").upper() != str(segment).upper():
+                continue
+            if str(row.get("trading_symbol") or "").upper() == str(trading_symbol).upper():
+                symbol = str(row.get("groww_symbol") or "").strip()
+                if symbol:
+                    return symbol
+        raise RuntimeError(f"Groww FNO groww_symbol not found in official instrument CSV for {trading_symbol}")
+
+    def _candle_interval(self, interval: Any) -> str:
+        minutes = self._interval_minutes(interval)
+        const_names = {
+            1: "CANDLE_INTERVAL_MIN_1", 2: "CANDLE_INTERVAL_MIN_2", 3: "CANDLE_INTERVAL_MIN_3",
+            5: "CANDLE_INTERVAL_MIN_5", 10: "CANDLE_INTERVAL_MIN_10", 15: "CANDLE_INTERVAL_MIN_15",
+            30: "CANDLE_INTERVAL_MIN_30", 60: "CANDLE_INTERVAL_HOUR_1", 240: "CANDLE_INTERVAL_HOUR_4",
+            1440: "CANDLE_INTERVAL_DAY", 10080: "CANDLE_INTERVAL_WEEK",
+        }
+        constant = const_names.get(minutes)
+        if not constant or not hasattr(self.client, constant):
+            raise RuntimeError(f"Groww SDK has no documented candle interval constant for {minutes} minutes; upgrade growwapi.")
+        return str(getattr(self.client, constant))
+
+    def get_historical_candles_canonical(self, **kwargs) -> Dict[str, Any]:
+        """Fetch candles only through Groww's documented ``get_historical_candles`` API.
+
+        The adapter canonicalises Groww's documented response for the strategy
+        without calling the deprecated historical-candle method.
+        """
         exchange = str(kwargs.get("exchange") or kwargs.get("exchange_code") or kwargs.get("exch_code") or "NSE").upper()
-        if exchange == "NFO":
+        if exchange in {"NFO", "FNO"}:
             exchange = "NSE"
         segment = str(kwargs.get("segment") or ("FNO" if str(kwargs.get("exchange_code") or "").upper() == "NFO" else "CASH")).upper()
-        trading_symbol = str(kwargs.get("trading_symbol") or "").strip()
+        route = dict(kwargs)
+        trading_symbol = str(route.get("trading_symbol") or "").strip()
         if not trading_symbol:
-            trading_symbol = self._option_symbol_from_route(kwargs) if segment == "FNO" else str(kwargs.get("stock_code") or "").strip().upper()
+            trading_symbol = self._option_symbol_from_route(route) if segment == "FNO" else str(route.get("stock_code") or "").strip().upper()
         if not trading_symbol:
             raise RuntimeError("Groww historical route missing trading_symbol")
-        resp = self.client.get_historical_candle_data(
-            trading_symbol=trading_symbol,
+        groww_symbol = self._groww_symbol_for_route(route, exchange=exchange, segment=segment, trading_symbol=trading_symbol)
+        getter = getattr(self.client, "get_historical_candles", None)
+        if not callable(getter):
+            raise RuntimeError("Groww SDK lacks documented get_historical_candles(); upgrade growwapi before running live.")
+        resp = getter(
             exchange=exchange,
             segment=segment,
+            groww_symbol=groww_symbol,
             start_time=self._to_groww_time(kwargs.get("start_time") or kwargs.get("from_date")),
             end_time=self._to_groww_time(kwargs.get("end_time") or kwargs.get("to_date")),
-            interval_in_minutes=interval,
+            candle_interval=self._candle_interval(kwargs.get("interval")),
         )
         rows = []
         candles = resp.get("candles") if isinstance(resp, Mapping) else []
@@ -489,20 +559,10 @@ class GrowwRestClient:
             if isinstance(item, (list, tuple)) and len(item) >= 5:
                 ts, o, h, l, c = item[:5]
                 v = item[5] if len(item) > 5 else 0
-                rows.append({
-                    "datetime": datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                    "open": _num(o),
-                    "high": _num(h),
-                    "low": _num(l),
-                    "close": _num(c),
-                    "volume": _num(v),
-                })
+                rows.append({"datetime": ts, "open": _num(o), "high": _num(h), "low": _num(l), "close": _num(c), "volume": _num(v)})
             elif isinstance(item, Mapping):
                 rows.append(dict(item))
-        return {"Success": rows, "Status": 200, "Error": None, "_raw": resp}
-
-    def get_historical_charts_v2(self, **kwargs) -> Dict[str, Any]:
-        return self.get_historical_charts(**kwargs)
+        return {"Success": rows, "Status": 200, "Error": None, "_raw": resp, "_source": "groww.get_historical_candles"}
 
     def get_funds(self) -> Dict[str, Any]:
         return self.get_margin()
@@ -602,15 +662,15 @@ class GrowwRestClient:
         return self.client.create_smart_order(**body)
 
     def get_smart_order(self, smart_order_id: str, **kwargs) -> Dict[str, Any]:
-        getter = getattr(self.client, "get_smart_order", None) or getattr(self.client, "get_smart_order_detail", None)
+        getter = getattr(self.client, "get_smart_order", None)
         if not callable(getter):
-            return {"smart_order_id": smart_order_id, "status": "ACTIVE"}
+            raise RuntimeError("Groww SDK get_smart_order method unavailable; upgrade growwapi.")
         return getter(smart_order_id=smart_order_id, **kwargs)
 
     def get_smart_order_list(self, **kwargs) -> Dict[str, Any]:
-        getter = getattr(self.client, "get_smart_order_list", None) or getattr(self.client, "get_smart_orders", None)
+        getter = getattr(self.client, "get_smart_order_list", None)
         if not callable(getter):
-            return {"smart_order_list": []}
+            raise RuntimeError("Groww SDK get_smart_order_list method unavailable; upgrade growwapi.")
         return getter(**kwargs)
 
     def cancel_smart_order(self, smart_order_id: str, **kwargs) -> Dict[str, Any]:
@@ -628,6 +688,4 @@ class GrowwRestClient:
                 continue
             if str(row.get("trading_symbol") or "").upper() == symbol.upper():
                 return str(row.get("exchange_token") or "").strip()
-        if segment.upper() == "CASH" and symbol.upper() in {"NIFTY", "BANKNIFTY", "FINNIFTY"}:
-            return symbol.upper()
         return ""

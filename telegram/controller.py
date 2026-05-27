@@ -408,26 +408,29 @@ class TelegramBotController:
 
     def _cmd_groww_status(self) -> str:
         access = bool(getattr(config, "GROWW_ACCESS_TOKEN", ""))
+        totp_token = bool(getattr(config, "GROWW_TOTP_TOKEN", ""))
+        totp_secret = bool(getattr(config, "GROWW_TOTP_SECRET", ""))
         api_key = bool(getattr(config, "GROWW_API_KEY", ""))
-        totp = bool(getattr(config, "GROWW_TOTP_SECRET", ""))
-        ready = access or (api_key and totp)
-        mode = "access-token" if access else "api-key+totp" if api_key and totp else "missing"
+        api_secret = bool(getattr(config, "GROWW_API_SECRET", ""))
+        ready = access or (totp_token and totp_secret) or (api_key and api_secret)
+        mode = "access-token" if access else "totp-token+secret" if totp_token and totp_secret else "api-key+secret" if api_key and api_secret else "missing"
         icon = "??" if ready else "??"
         return (
             f"{icon} <b>Groww Desk</b>\n"
             "????????????????????\n"
             f"Mode: <code>{mode}</code>\n"
             f"Access token: <code>{access}</code>\n"
-            f"API key: <code>{api_key}</code>\n"
-            f"TOTP secret: <code>{totp}</code>\n"
+            f"TOTP token: <code>{totp_token}</code>\n"
+            f"TOTP secret: <code>{totp_secret}</code>\n"
+            f"API key/secret: <code>{api_key and api_secret}</code>\n"
             "The 6-digit TOTP is generated locally at login time from the .env secret."
         )
 
     def _cmd_groww_token(self) -> str:
         return (
             "Groww does not use the old Telegram OTP browser flow.\n"
-            "Set <code>GROWW_API_KEY</code> and <code>GROWW_TOTP_SECRET</code> in .env, "
-            "or set <code>GROWW_ACCESS_TOKEN</code>."
+            "For the official TOTP flow set <code>GROWW_TOTP_TOKEN</code> and <code>GROWW_TOTP_SECRET</code> in .env. "
+            "Do not put the TOTP token in <code>GROWW_ACCESS_TOKEN</code>."
         )
 
     def _cmd_groww_otp(self, args: str) -> str:
@@ -1235,10 +1238,12 @@ class TelegramBotController:
 
     def _ensure_groww_session_before_bot_start(self) -> None:
         access = bool(getattr(config, "GROWW_ACCESS_TOKEN", ""))
+        totp_token = bool(getattr(config, "GROWW_TOTP_TOKEN", ""))
+        totp_secret = bool(getattr(config, "GROWW_TOTP_SECRET", ""))
         api_key = bool(getattr(config, "GROWW_API_KEY", ""))
-        totp = bool(getattr(config, "GROWW_TOTP_SECRET", ""))
-        if bool(getattr(config, "GROWW_OPTIONS_RUNTIME_ENABLED", False)) and not (access or (api_key and totp)):
-            raise RuntimeError("Groww credentials missing: set GROWW_ACCESS_TOKEN or GROWW_API_KEY plus GROWW_TOTP_SECRET.")
+        api_secret = bool(getattr(config, "GROWW_API_SECRET", ""))
+        if bool(getattr(config, "GROWW_OPTIONS_RUNTIME_ENABLED", False)) and not (access or (totp_token and totp_secret) or (api_key and api_secret)):
+            raise RuntimeError("Groww credentials missing: set GROWW_TOTP_TOKEN plus GROWW_TOTP_SECRET for TOTP flow.")
         return
 
     # ================================================================
@@ -1364,7 +1369,7 @@ class TelegramBotController:
             "⚡ <b>Institutional Controller Ready</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "🏦 Execution: <code>" + getattr(config, "EXECUTION_EXCHANGE", "?").upper() + "</code>\n"
-            "?? Groww credentials: <code>" + ("ready" if (getattr(config, "GROWW_ACCESS_TOKEN", "") or (getattr(config, "GROWW_API_KEY", "") and getattr(config, "GROWW_TOTP_SECRET", ""))) else "missing") + "</code>\n\n"
+            "?? Groww credentials: <code>" + ("ready" if (getattr(config, "GROWW_ACCESS_TOKEN", "") or (getattr(config, "GROWW_TOTP_TOKEN", "") and getattr(config, "GROWW_TOTP_SECRET", "")) or (getattr(config, "GROWW_API_KEY", "") and getattr(config, "GROWW_API_SECRET", ""))) else "missing") + "</code>\n\n"
             + self._cmd_help())
         logger.info("Telegram controller started")
         self._maybe_run_groww_premarket_refresh()
