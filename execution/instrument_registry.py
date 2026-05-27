@@ -153,17 +153,32 @@ def _unwrap_list(resp) -> List[dict]:
             v = data.get(key)
             if isinstance(v, list):
                 return [x for x in v if isinstance(x, dict)]
-        # Some CoinSwitch endpoints return {exchange: {symbol: specs}}.
-        # Guard this strictly: ticker payloads also contain dicts with fields such
-        # as lowPrice24h/highPrice24h. Those field names are NOT symbols.
+        # CoinSwitch documented instrument_info response is directly keyed by
+        # symbol: {"data": {"BTCUSDT": {spec...}}}. Parse that shape first.
         rows: List[dict] = []
+        for sym, spec in data.items():
+            if _market_key_like(sym) and isinstance(spec, dict):
+                row = dict(spec)
+                # The response key is the executable market (for example BTCUSDT).
+                # Retain any abbreviated payload symbol for audit only; never let
+                # it replace the routeable contract identity.
+                if row.get("symbol") and normalise_symbol(str(row.get("symbol"))) != normalise_symbol(str(sym)):
+                    row["underlying_symbol"] = row.get("symbol")
+                row["symbol"] = sym
+                rows.append(row)
+        if rows:
+            return rows
+        # Also accept nested venue-key response shapes where they are returned.
+        # Guard strictly: fields such as low_price_24h are not symbols.
         for ex_val in data.values():
             if isinstance(ex_val, dict):
                 for sym, spec in ex_val.items():
                     if not _market_key_like(sym):
                         continue
                     row = dict(spec) if isinstance(spec, dict) else {}
-                    row.setdefault("symbol", sym)
+                    if row.get("symbol") and normalise_symbol(str(row.get("symbol"))) != normalise_symbol(str(sym)):
+                        row["underlying_symbol"] = row.get("symbol")
+                    row["symbol"] = sym
                     rows.append(row)
         return rows
     return []
@@ -177,7 +192,13 @@ def _unwrap_one(resp) -> Optional[dict]:
     if isinstance(resp, dict):
         data = resp.get("result", resp.get("data"))
         if isinstance(data, dict):
-            return data
+            market_fields = {"symbol", "last_price", "lastPrice", "mark_price", "markPrice", "best_bid_price", "best_ask_price", "funding_rate", "open_interest"}
+            if market_fields.intersection(data):
+                return data
+            # CoinSwitch ticker response: {"data": {"EXCHANGE_2": {ticker...}}}
+            for value in data.values():
+                if isinstance(value, dict) and market_fields.intersection(value):
+                    return value
     return None
 
 
@@ -376,10 +397,15 @@ class InstrumentRegistry:
                 base_asset=base,
                 contract_type=str(r.get("contract_type") or r.get("type") or "perpetual_futures"),
                 status=str(r.get("status") or r.get("state") or "active"),
-                tick_size=first_positive(_safe_float(r.get("tick_size")), _safe_float(r.get("quote_precision"))),
-                lot_step=first_positive(_safe_float(r.get("lot_size")), _safe_float(r.get("quantity_precision"))),
-                min_qty=first_positive(_safe_float(r.get("min_qty")), _safe_float(r.get("minQuantity")), _safe_float(r.get("min_size"))),
-                max_qty=first_positive(_safe_float(r.get("max_qty")), _safe_float(r.get("maxQuantity"))),
+                # CoinSwitch represents tick_size in price_precision units:
+                # tick_size=1 and price_precision=2 means an executable tick of 0.01.
+                tick_size=first_positive(
+                    _safe_float(r.get("tick_size")) * (10 ** (-_safe_int(r.get("price_precision"), 0))),
+                    _safe_float(r.get("price_increment")),
+                ),
+                lot_step=first_positive(_safe_float(r.get("base_quantity_step_size")), _safe_float(r.get("lot_size"))),
+                min_qty=first_positive(_safe_float(r.get("min_base_quantity")), _safe_float(r.get("min_qty")), _safe_float(r.get("minQuantity")), _safe_float(r.get("min_size"))),
+                max_qty=first_positive(_safe_float(r.get("max_base_quantity")), _safe_float(r.get("max_qty")), _safe_float(r.get("maxQuantity"))),
                 max_leverage=first_positive(_safe_float(r.get("max_leverage")), _safe_float(r.get("leverage")), _safe_float(r.get("maxLeverage"))),
                 raw=r,
             )

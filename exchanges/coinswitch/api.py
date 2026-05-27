@@ -38,69 +38,24 @@ class FuturesAPI:
         if not self.api_key or not self.secret_key:
             raise ValueError("API key and secret key required")
     
-    def _generate_signature(self, method: str, endpoint: str, params: Dict = None, payload: Dict = None) -> str:
-        """
-        Generate ED25519 signature
+    def _generate_signature(self, method: str, endpoint: str, params: Dict = None, payload: Dict = None, *, epoch: str) -> str:
+        """Generate the documented CoinSwitch Ed25519 signature.
 
-        IMPORTANT — VERIFY AGAINST COINSWITCH OFFICIAL DOCS BEFORE RELYING ON THIS:
-        The historical codebase always signed with the literal string "{}" as
-        the body, regardless of method. If CoinSwitch actually requires the
-        JSON body of POST/DELETE requests to be signed, this is WRONG and
-        will produce signatures that pass validation only because the server
-        ignores body-signing. That has security implications. Check:
-        https://docs.coinswitch.co/ for the current spec.
-
-        Current behaviour (preserved from original):
-          - Canonicalised path: `endpoint` (plus `?query=string` for GET).
-            The canonicalised string is UNQUOTED via urllib.parse.unquote_plus.
-          - Signed string:     METHOD + canonicalised_path + "{}"
-
-        Args:
-            method: HTTP method
-            endpoint: API endpoint
-            params: Query parameters (GET only)
-            payload: Body payload (POST/DELETE) — NOT included in signature
-                     under the current spec.
-
-        Returns:
-            Hex-encoded Ed25519 signature.
+        Current futures authentication signs ``METHOD + decoded_path_with_query
+        + epoch`` and sends the same millisecond epoch in ``X-AUTH-EPOCH``.  The
+        JSON body is not included in the signed message.
         """
         params = params or {}
-
-        # Build endpoint-with-query for GET
         signature_endpoint = endpoint
-        if method == "GET" and params:
+        if method.upper() == "GET" and params:
             signature_endpoint = f"{endpoint}?{urlencode(params)}"
-
-        # AUDIT NOTE (BUG-CS-API-1):
-        # The original code unquote_plus'd the signing path but sent the
-        # URL in its ENCODED form. Any query-parameter value containing
-        # reserved characters ('+', '/', '=', '%', ' ', '&') would cause
-        # the signature to be computed over a DIFFERENT string than the
-        # server reconstructs from the URL → signature mismatch → 401.
-        # Fix: sign the EXACT string we send on the wire.
-        #
-        # If CoinSwitch's reference impl requires the unquoted form (their
-        # Python example uses unquote_plus), set _COINSWITCH_SIGN_UNQUOTED
-        # in config to True. Default is to sign the wire form because
-        # that eliminates the encoding-mismatch class of bugs.
-        _sign_unquoted = bool(getattr(config, 'COINSWITCH_SIGN_UNQUOTED', True))
-        if _sign_unquoted:
-            canonical = urllib.parse.unquote_plus(signature_endpoint)
-        else:
-            canonical = signature_endpoint
-
-        payload_json = "{}"
-        signature_msg = method + canonical + payload_json
-
-        logger.debug(f"Signature message: {signature_msg}")
-
-        request_string  = bytes(signature_msg, 'utf-8')
+        canonical = urllib.parse.unquote_plus(signature_endpoint)
+        signature_msg = method.upper() + canonical + str(epoch)
+        logger.debug("CoinSwitch signature path=%s epoch=%s", canonical, epoch)
+        request_string = signature_msg.encode("utf-8")
         secret_key_bytes = bytes.fromhex(self.secret_key)
-        secret_key_obj   = ed25519.Ed25519PrivateKey.from_private_bytes(secret_key_bytes)
-        signature_bytes  = secret_key_obj.sign(request_string)
-
-        return signature_bytes.hex()
+        secret_key_obj = ed25519.Ed25519PrivateKey.from_private_bytes(secret_key_bytes)
+        return secret_key_obj.sign(request_string).hex()
 
     def _make_request(self, method: str, endpoint: str, params: Dict = None, payload: Dict = None) -> Dict:
         """
@@ -110,7 +65,8 @@ class FuturesAPI:
         JSON response body) returns {"error": "...", "status_code": <int|None>}.
         Never raises — callers rely on dict semantics everywhere.
         """
-        signature = self._generate_signature(method, endpoint, params, payload)
+        epoch = str(int(time.time() * 1000))
+        signature = self._generate_signature(method, endpoint, params, payload, epoch=epoch)
 
         url = self.base_url + endpoint
         if method == "GET" and params:
@@ -120,6 +76,7 @@ class FuturesAPI:
             'Content-Type':    'application/json',
             'X-AUTH-SIGNATURE': signature,
             'X-AUTH-APIKEY':    self.api_key,
+            'X-AUTH-EPOCH':     epoch,
         }
 
         req_timeout = getattr(config, 'REQUEST_TIMEOUT', 30)
@@ -369,6 +326,25 @@ class FuturesAPI:
         endpoint = "/trade/api/v2/futures/instrument_info"
         
         params = {"exchange": exchange}
+        return self._make_request("GET", endpoint, params=params, payload=None)
+
+    def get_futures_ticker(self, symbol: str, exchange: str = "EXCHANGE_2") -> Dict:
+        """Get current top-of-book, mark and funding state for one futures symbol.
+
+        Documented CoinSwitch futures endpoint. The instrument registry uses
+        this as an exact live-symbol fallback when instrument_info is sparse.
+        """
+        endpoint = "/trade/api/v2/futures/ticker"
+        params = {"symbol": str(symbol).upper(), "exchange": exchange}
+        return self._make_request("GET", endpoint, params=params, payload=None)
+
+    # Compatibility name used by older registry/data-manager builds.
+    get_ticker = get_futures_ticker
+
+    def get_orderbook(self, symbol: str, exchange: str = "EXCHANGE_2") -> Dict:
+        """Get the current CoinSwitch futures order book for a symbol."""
+        endpoint = "/trade/api/v2/futures/order_book"
+        params = {"symbol": str(symbol).upper(), "exchange": exchange}
         return self._make_request("GET", endpoint, params=params, payload=None)
     
     # ------------------------- REST klines / candles API -----------------

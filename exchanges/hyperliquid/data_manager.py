@@ -47,8 +47,10 @@ class HyperliquidReferenceDataManager:
         canonical_underlying: str | None = None,
         price_tick: float = 0.01,
         qty_step: float = 0.00001,
+        api=None,
     ) -> None:
         self.instrument = instrument
+        self.api = api
         raw_coin = str(coin or "BTC").strip()
         if ":" in raw_coin:
             dex, name = raw_coin.split(":", 1)
@@ -74,6 +76,8 @@ class HyperliquidReferenceDataManager:
         self._last_update_s = 0.0
         self._latest_latency_ms: float | None = None
         self._latest_latency_z: float | None = None
+        self._funding_rate: float | None = None
+        self._last_market_meta_refresh_s: float = 0.0
         self._ws: websocket.WebSocketApp | None = None
         self._thread: threading.Thread | None = None
         self._running = False
@@ -206,6 +210,18 @@ class HyperliquidReferenceDataManager:
         except Exception as exc:
             logger.debug("Hyperliquid reference message parse failed: %s", exc)
 
+    def _refresh_market_metadata(self) -> None:
+        now = time.time()
+        if now - self._last_market_meta_refresh_s < float(_cfg("VENUE_MARKET_META_REFRESH_SEC", 30.0)):
+            return
+        self._last_market_meta_refresh_s = now
+        try:
+            context = self.api.current_asset_context(self.coin) if self.api is not None else {}
+            if isinstance(context, dict) and context.get("funding") is not None:
+                self._funding_rate = float(context.get("funding"))
+        except Exception as exc:
+            logger.debug("Hyperliquid funding metadata refresh failed for %s: %s", self.coin, exc)
+
     def get_feed_reliability(self) -> dict[str, Any]:
         with self._lock:
             ready = bool(self.is_ready and self._book["bids"] and self._book["asks"])
@@ -218,6 +234,7 @@ class HyperliquidReferenceDataManager:
             }
 
     def get_venue_microstate(self):
+        self._refresh_market_metadata()
         with self._lock:
             bids, asks = list(self._book["bids"]), list(self._book["asks"])
             flows = self._tracker.snapshot(time.time()).asdict()
@@ -226,7 +243,7 @@ class HyperliquidReferenceDataManager:
             return None
         rel = self.get_feed_reliability()
         health = score_feed_health(**rel)
-        return build_venue_microstate(mapping=self._mapping, bids=bids, asks=asks, feed_health=health, receive_ts_ns=ts_ns, **flows)
+        return build_venue_microstate(mapping=self._mapping, bids=bids, asks=asks, feed_health=health, receive_ts_ns=ts_ns, funding_rate=self._funding_rate, **flows)
 
     def register_strategy(self, strategy) -> None:
         self._strategy_ref = strategy

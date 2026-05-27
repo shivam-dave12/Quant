@@ -16,15 +16,16 @@ except ImportError:  # production image may not ship python-dotenv
 load_dotenv()
 
 # ── OPERATOR CONTROL PANEL — change policy only here, never in .env ───────────
-# LIVE TRADING MASTER SWITCH. Keep False for shadow validation. Change only this
-# line to True once the live venues below are explicitly approved.
-LIVE_TRADING_ENABLED = False
+# LIVE TRADING MASTER SWITCH. This build authorises protected crypto execution
+# only on the three cross-venue routes below. It still fails closed at import if
+# a listed venue has no credentials or lacks a protected-order lifecycle.
+LIVE_TRADING_ENABLED = True
 
-# Analysis may run across all configured feeds. Orders may route ONLY to venues
-# explicitly listed in LIVE_EXECUTION_VENUES when LIVE_TRADING_ENABLED=True.
-# Safe first-live default: Groww/NIFTY only; add "delta" deliberately later.
+# Data is collected from all three crypto venues plus the Groww/NIFTY analysis
+# feed. Groww remains available for NIFTY analysis but is NOT live-authorised in
+# this three-crypto-venue release until its separate compliance prerequisites are enabled.
 ANALYSIS_DATA_VENUES = ("delta", "coinswitch", "hyperliquid", "groww")
-LIVE_EXECUTION_VENUES = ("groww", "delta", "coinswitch", "hyperliquid")
+LIVE_EXECUTION_VENUES = ("delta", "coinswitch", "hyperliquid")
 EXECUTION_EXCHANGE = "delta"  # legacy discovery preference; not live-order permission
 
 # Venue activation / environments are runtime policy, not secrets.
@@ -32,6 +33,7 @@ DELTA_TESTNET = False
 GROWW_ENABLED = True
 HYPERLIQUID_REFERENCE_ENABLED = True
 HYPERLIQUID_EXECUTION_ENABLED = True
+COINSWITCH_EXECUTION_ENABLED = True
 HYPERLIQUID_TESTNET = False
 HYPERLIQUID_RECONNECT_SEC = 3.0
 HYPERLIQUID_PERP_DEXS = ("", "xyz", "km")
@@ -40,9 +42,9 @@ HYPERLIQUID_REFERENCE_COIN_BY_ASSET = {
     "GOLD": "PAXG",
     "SILVER": "xyz:SILVER",
 }
-PREFERRED_EXECUTION_VENUE_BY_ASSET = {
-    "SILVER": "hyperliquid",
-}
+# No permanent venue preference: route from live executable economics,
+# collateral and protection feasibility on each approved candidate.
+PREFERRED_EXECUTION_VENUE_BY_ASSET = {}
 
 # ── Credentials — .env may contain ONLY values in this section ────────────────
 DELTA_API_KEY             = os.getenv("DELTA_API_KEY",    "")
@@ -276,21 +278,48 @@ INSTITUTIONAL_MAX_SELECTED_LEVERAGE = 15.0
 INSTITUTIONAL_CORRELATED_EXPOSURE_CAP_FRACTION = 0.35
 RESEARCH_STORE_PATH = "research_output"
 
-# Cross-venue execution venue selection. The selector prices spread, depth
-# impact, taker fee assumptions and same-asset basis before choosing the venue.
+# Cross-venue execution venue selection. Books remain isolated per exchange;
+# selection prices actual side/touch, depth impact, round-trip fees, funding,
+# latency, available collateral and confirmed hard-protection capability.
 VENUE_SELECTION_ENABLED = True
 VENUE_SELECTION_MIN_IMPROVEMENT_BPS = 0.50
 VENUE_SELECTION_NOTIONAL_FRACTION = 0.25
+VENUE_SELECTION_MIN_FREE_MARGIN_USD = 1.00
+VENUE_BALANCE_CACHE_TTL_SEC = 8.0
 VENUE_SELECTION_MAX_COST_BPS = 100.0
-VENUE_FEE_BPS = {
-    "delta": 1.50,
-    "coinswitch": 2.00,
-    "hyperliquid": 4.50,
+# Expected round-trip cost: maker entry plus protected-market exit. Replace
+# these approved-account assumptions when a venue/account fee tier changes.
+VENUE_ROUND_TRIP_FEE_BPS = {
+    "delta": 3.00,
+    # CoinSwitch instrument_info fee fields override this value live; 13 bps is
+    # the conservative taker+taker fallback from the documented BTCUSDT sample.
+    "coinswitch": 13.00,  # CoinSwitch instrument_info default 2.4bp maker + 6.5bp taker
+    "hyperliquid": 7.00,
 }
+# Backwards-compatible alias for telemetry/readers still expecting this name.
+VENUE_FEE_BPS = VENUE_ROUND_TRIP_FEE_BPS
 VENUE_SLIPPAGE_IMPACT_MULTIPLIER = 35.0
-SILVER_HYPERLIQUID_PREFERENCE_BPS = 8.0
+VENUE_FUNDING_INTERVAL_HOURS = 8.0
+VENUE_EXPECTED_HOLDING_HOURS = 8.0
+VENUE_ALLOW_FUNDING_CREDIT = False
+VENUE_MAX_FUNDING_CREDIT_BPS = 5.0
+VENUE_LATENCY_TOLERANCE_MS = 250.0
+VENUE_LATENCY_PENALTY_BPS_PER_SEC = 2.0
+VENUE_MARKET_META_REFRESH_SEC = 30.0
+# CoinSwitch documents position-level TP/SL after a filled position, not an
+# atomic attached-entry bracket. This reserve prices the protection activation
+# window into venue selection without altering signal quality or direction.
+VENUE_NON_ATOMIC_PROTECTION_RISK_RESERVE_BPS = {"coinswitch": 5.0}
+# Hard venue preference is disabled; a venue is penalised only when its live
+# displayed depth cannot cover the intended execution notional.
+SILVER_HYPERLIQUID_PREFERENCE_BPS = 0.0
 SILVER_DELTA_ILLIQUIDITY_PENALTY_BPS = 15.0
 SILVER_DELTA_MIN_NEAR_DEPTH_USD = 50000.0
+# CoinSwitch protected entry lifecycle: limit entry -> confirmed fill ->
+# documented position-level STOP_MARKET + TAKE_PROFIT_MARKET reduce-only arms.
+COINSWITCH_ENTRY_FILL_TIMEOUT_SEC = 45.0
+COINSWITCH_ENTRY_POLL_SEC = 1.0
+COINSWITCH_EMERGENCY_CLOSE_ON_PROTECTION_FAILURE = True
 
 # ── Dynamic state-dependent TP/SL and exit model ─────────────────────────────
 # One protection authority for BTC, Delta commodities and Groww long options.
@@ -305,10 +334,12 @@ DYNAMIC_PROTECTION_MAX_HALF_LIFE_SEC = 3600.0
 DYNAMIC_PROTECTION_MAX_OPTIMAL_HOLD_SEC = 3600.0
 DYNAMIC_PROTECTION_REQUIRE_SIGNAL_DECAY_READY = True
 DYNAMIC_PROTECTION_MIN_KYLE_OBSERVATIONS = 20
-DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_FOR_DELTA = True
+DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_FOR_DELTA = True  # legacy alias
+DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_VENUES = ("delta",)
 DYNAMIC_PROTECTION_MIN_VPIN_BUCKETS = 5
 DYNAMIC_PROTECTION_VPIN_WINDOW_BUCKETS = 20
-DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_FOR_DELTA = True
+DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_FOR_DELTA = True  # legacy alias
+DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_VENUES = ("delta",)
 DYNAMIC_PROTECTION_VPIN_STOP_MULT_MIN = 0.80
 DYNAMIC_PROTECTION_VPIN_STOP_MULT_MAX = 1.80
 DYNAMIC_PROTECTION_VOL_STOP_MULT = 1.25
@@ -877,14 +908,26 @@ def validate_live_control_plane() -> None:
         errors.append(f"unknown LIVE_EXECUTION_VENUES={sorted(unknown)}")
     if LIVE_TRADING_ENABLED and not live_venues:
         errors.append("LIVE_TRADING_ENABLED=True requires at least one LIVE_EXECUTION_VENUE")
+    if LIVE_TRADING_ENABLED and "delta" in live_venues:
+        if not DELTA_API_KEY or not DELTA_SECRET_KEY:
+            errors.append("Delta live requires DELTA_API_KEY and DELTA_SECRET_KEY in .env")
+    if LIVE_TRADING_ENABLED and "coinswitch" in live_venues:
+        if not COINSWITCH_EXECUTION_ENABLED:
+            errors.append("CoinSwitch live requires COINSWITCH_EXECUTION_ENABLED=True in config.py")
+        if not COINSWITCH_API_KEY or not COINSWITCH_SECRET_KEY:
+            errors.append("CoinSwitch live requires COINSWITCH_API_KEY and COINSWITCH_SECRET_KEY in .env")
     if LIVE_TRADING_ENABLED and "groww" in live_venues:
         if GROWW_REQUIRE_STATIC_IP_FOR_LIVE_ORDERS and not GROWW_APPROVED_STATIC_IPS:
             errors.append("Groww live requires GROWW_APPROVED_STATIC_IPS configured in config.py")
         if GROWW_REQUIRE_SEBI_ALGO_CONFIRMATION_FOR_LIVE_ORDERS and not GROWW_SEBI_ALGO_REGISTRATION_CONFIRMED:
             errors.append("Groww live requires GROWW_SEBI_ALGO_REGISTRATION_CONFIRMED=True after broker confirmation")
     if LIVE_TRADING_ENABLED and "hyperliquid" in live_venues:
-        if HYPERLIQUID_EXECUTION_ENABLED and not HYPERLIQUID_PRIVATE_KEY:
+        if not HYPERLIQUID_EXECUTION_ENABLED:
+            errors.append("Hyperliquid live requires HYPERLIQUID_EXECUTION_ENABLED=True in config.py")
+        if not HYPERLIQUID_PRIVATE_KEY:
             errors.append("Hyperliquid live requires HYPERLIQUID_PRIVATE_KEY in .env")
+        if not HYPERLIQUID_MAIN_API_KEY:
+            errors.append("Hyperliquid live requires HYPERLIQUID_MAIN_API_KEY/account address in .env")
     if errors:
         raise ValueError("Invalid live control plane: " + "; ".join(errors))
 

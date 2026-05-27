@@ -13,8 +13,9 @@ def test_env_cannot_override_non_secret_runtime_policy(monkeypatch):
     monkeypatch.setenv("UNIVERSE_INCLUDE_EXCHANGES", "groww")
     monkeypatch.setenv("GROWW_SESSION_MODEL_AUDIT_FULL_INFO", "true")
     reloaded = importlib.reload(config)
-    assert reloaded.LIVE_TRADING_ENABLED is False
-    assert reloaded.INSTITUTIONAL_ENABLE_LIVE_ENTRIES is False
+    assert reloaded.LIVE_TRADING_ENABLED is True
+    assert reloaded.INSTITUTIONAL_ENABLE_LIVE_ENTRIES is True
+    assert reloaded.LIVE_EXECUTION_VENUES == ("delta", "coinswitch", "hyperliquid")
     assert reloaded.EXECUTION_EXCHANGE == "delta"
     assert reloaded.UNIVERSE_INCLUDE_EXCHANGES == "delta,coinswitch,hyperliquid,groww"
     assert reloaded.GROWW_SESSION_MODEL_AUDIT_FULL_INFO is False
@@ -59,4 +60,25 @@ def test_delta_only_live_policy_does_not_require_groww_prerequisites(monkeypatch
     monkeypatch.setattr(config, "LIVE_EXECUTION_VENUES", ("delta",))
     monkeypatch.setattr(config, "GROWW_APPROVED_STATIC_IPS", ())
     monkeypatch.setattr(config, "GROWW_SEBI_ALGO_REGISTRATION_CONFIRMED", False)
+    monkeypatch.setattr(config, "DELTA_API_KEY", "test")
+    monkeypatch.setattr(config, "DELTA_SECRET_KEY", "test")
     config.validate_live_control_plane()
+
+
+def test_three_venue_live_policy_fails_closed_without_coinswitch_credentials(monkeypatch):
+    monkeypatch.setattr(config, "LIVE_TRADING_ENABLED", True)
+    monkeypatch.setattr(config, "LIVE_EXECUTION_VENUES", ("delta", "coinswitch", "hyperliquid"))
+    monkeypatch.setattr(config, "DELTA_API_KEY", "test")
+    monkeypatch.setattr(config, "DELTA_SECRET_KEY", "test")
+    monkeypatch.setattr(config, "COINSWITCH_EXECUTION_ENABLED", True)
+    monkeypatch.setattr(config, "COINSWITCH_API_KEY", "")
+    monkeypatch.setattr(config, "COINSWITCH_SECRET_KEY", "")
+    monkeypatch.setattr(config, "HYPERLIQUID_EXECUTION_ENABLED", True)
+    monkeypatch.setattr(config, "HYPERLIQUID_PRIVATE_KEY", "test")
+    monkeypatch.setattr(config, "HYPERLIQUID_MAIN_API_KEY", "test")
+    try:
+        config.validate_live_control_plane()
+    except ValueError as exc:
+        assert "COINSWITCH_API_KEY" in str(exc)
+    else:
+        raise AssertionError("Three-venue live policy must fail closed without CoinSwitch credentials")

@@ -204,6 +204,9 @@ class InstitutionalStrategy:
         # every market event without emitting an INFO-scale JSON payload per tick.
         self._telemetry_last_signature: tuple[Any, ...] | None = None
         self._telemetry_last_emit_ts: float = 0.0
+        # Per-venue collateral snapshots prevent the route model selecting a
+        # cheaper-looking exchange that cannot actually fund the approved trade.
+        self._venue_cash_cache: dict[str, tuple[float, float]] = {}
 
     def bind_market_wakeup(self, callback: Callable[[], Any]) -> None:
         self._market_wakeup = callback
@@ -494,6 +497,9 @@ class InstitutionalStrategy:
             desk, price, liquidity_score, execution_state=execution_state, btc_composite=btc_composite
         )
         venue_selection = None
+        venue_available_cash: dict[str, float] = {}
+        venue_candidate_notional: dict[str, float] = {}
+        venue_required_margin: dict[str, float] = {}
         if (
             bool(_cfg("VENUE_SELECTION_ENABLED", True))
             and direction is not Direction.NO_TRADE
@@ -501,15 +507,30 @@ class InstitutionalStrategy:
         ):
             try:
                 routeable = self._routeable_venues(order_manager)
+                venue_available_cash = self._venue_available_cash(order_manager, routeable)
+                venue_candidate_notional, venue_required_margin = self._venue_selection_budgets(venue_available_cash)
                 venue_selection = select_execution_venue(
                     states=states,
                     direction=direction,
                     asset_id=self._asset_id,
                     current_venue=venue,
                     routeable_venues=routeable,
-                    notional_usd=self._venue_selection_notional(risk_manager),
+                    notional_usd=0.0,
+                    available_cash_by_venue=venue_available_cash,
+                    required_margin_usd=0.0,
+                    protection_capable_venues=self._protection_capable_venues(order_manager, routeable),
+                    gross_edge_bps=directional_edge_bps,
+                    notional_by_venue=venue_candidate_notional,
+                    required_margin_by_venue=venue_required_margin,
                 )
-                selected_state = states.get(str(venue_selection.selected_venue).lower())
+                if venue_selection.reason == "no_funded_protected_route_candidate":
+                    direction = Direction.NO_TRADE
+                    directional_edge_bps = 0.0
+                    direction_reason = "no_funded_protected_route_candidate"
+                selected_state = (
+                    None if venue_selection.reason == "no_funded_protected_route_candidate"
+                    else states.get(str(venue_selection.selected_venue).lower())
+                )
                 if selected_state is not None and venue_selection.selected_venue:
                     venue = str(venue_selection.selected_venue).lower()
                     instrument = self._symbol_for_venue(venue, instrument)
@@ -591,6 +612,10 @@ class InstitutionalStrategy:
         model_values.update(signal_breakdown)
         if venue_selection is not None:
             model_values["venue_selection"] = venue_selection.as_dict()
+            model_values["venue_available_cash_usd"] = dict(venue_available_cash)
+            model_values["venue_candidate_notional_usd"] = dict(venue_candidate_notional)
+            model_values["venue_required_margin_usd"] = dict(venue_required_margin)
+            model_values["selected_venue_available_cash_usd"] = float(venue_available_cash.get(str(venue).lower(), 0.0))
         if execution_state is not None:
             model_values.update({
                 "ofi_usd_1s": execution_state.ofi_usd_1s,
@@ -1802,16 +1827,42 @@ class InstitutionalStrategy:
         self, desk: str, instrument: str, direction: Direction, price: float, net_edge: float, liquidity_score: float, protection: ProtectionPlan, risk_manager, venue: str | None = None, balance_source=None,
     ) -> PositionSizingDecision:
         _ = direction
+        capital_venue = str(venue or "").strip().lower()
+        bal: Mapping[str, Any] = {}
+        balance_label = ""
         try:
             if balance_source is not None and hasattr(balance_source, "get_balance"):
-                bal = balance_source.get_balance() or {}
+                raw_balance = balance_source.get_balance() or {}
+                bal = raw_balance if isinstance(raw_balance, Mapping) else {}
+                balance_label = str(bal.get("source") or f"{capital_venue or 'selected'}_live_balance")
+            elif capital_venue and bool(_cfg("VENUE_SELECTION_ENABLED", True)):
+                # A selected multi-venue route may never silently borrow the
+                # primary/default broker balance merely because its adapter is
+                # unavailable. Fail closed and surface the wiring defect.
+                return PositionSizingDecision(
+                    desk, instrument, False, 0.0, 0.0, 0.0, None, 0.0, net_edge, 0.0, 0.0, 0.0,
+                    [f"selected_venue_balance_source_unavailable:{capital_venue}"], capital_venue=capital_venue,
+                )
             else:
-                bal = risk_manager.get_available_balance() or {}
+                raw_balance = risk_manager.get_available_balance() or {}
+                bal = raw_balance if isinstance(raw_balance, Mapping) else {}
+                balance_label = str(bal.get("source") or "single_venue_risk_manager_balance")
             cash = _num(bal.get("available"), 0.0)
-        except Exception:
+        except Exception as exc:
+            if capital_venue:
+                return PositionSizingDecision(
+                    desk, instrument, False, 0.0, 0.0, 0.0, None, 0.0, net_edge, 0.0, 0.0, 0.0,
+                    [f"selected_venue_balance_fetch_failed:{capital_venue}"], capital_venue=capital_venue,
+                    balance_source=str(exc)[:120],
+                )
             cash = _num(_cfg("INITIAL_BALANCE", 0.0), 0.0)
+            balance_label = "configured_initial_balance_fallback"
         if cash <= 0:
-            return PositionSizingDecision(desk, instrument, False, 0.0, 0.0, 0.0, None, 0.0, net_edge, 0.0, 0.0, 0.0, ["cash_unavailable"])
+            return PositionSizingDecision(
+                desk, instrument, False, 0.0, 0.0, 0.0, None, 0.0, net_edge, 0.0, 0.0, 0.0,
+                [f"cash_unavailable:{capital_venue}" if capital_venue else "cash_unavailable"],
+                capital_venue=capital_venue, available_cash_used=cash, balance_source=balance_label,
+            )
         mapping = self._instrument_mapping(instrument, venue=venue)
         stop_distance_pct = abs(price - protection.stop_price) / max(price, 1e-9)
         if stop_distance_pct <= 0:
@@ -1856,7 +1907,8 @@ class InstitutionalStrategy:
         margin = notional if leverage is None else notional / max(leverage, 1.0)
         risk_after = qty * risk_per_unit
         approved = qty > 0 and margin <= cash and net_edge > 0 and risk_after <= risk_budget + 1e-9
-        reasons = ["quarter_kelly_vol_scaled_risk_approved"] if approved else ["kelly_vol_liquidity_or_margin_rejected"]
+        reasons = ([f"broker_local_cash_sizing_approved:{capital_venue or 'single_venue'}"] if approved
+                   else [f"broker_local_cash_sizing_rejected:{capital_venue or 'single_venue'}"])
         exposure_check = getattr(risk_manager, "can_add_exposure", None)
         if approved and callable(exposure_check):
             signed_delta = notional if direction in {Direction.LONG, Direction.BULLISH} else -notional
@@ -1871,6 +1923,7 @@ class InstitutionalStrategy:
         return PositionSizingDecision(
             desk=desk, instrument=instrument, approved=approved, quantity=qty, notional=notional, margin_required=margin, leverage_selected=leverage,
             risk_to_invalidation=risk_after, expected_net_edge=net_edge, liquidity_capacity_cap=liquidity_cap, portfolio_risk_before=0.0, portfolio_risk_after=risk_after, reasons=reasons,
+            capital_venue=capital_venue, available_cash_used=cash, balance_source=balance_label,
         )
 
     def _realized_vol_log(self, window: int = 60) -> float:
@@ -1982,13 +2035,70 @@ class InstitutionalStrategy:
                 pass
         return order_manager
 
-    def _venue_selection_notional(self, risk_manager) -> float:
-        try:
-            bal = risk_manager.get_available_balance() or {}
-            cash = _num(bal.get("available"), 0.0)
-        except Exception:
-            cash = _num(_cfg("INITIAL_BALANCE", 0.0), 0.0)
-        return max(0.0, cash * float(_cfg("VENUE_SELECTION_NOTIONAL_FRACTION", 0.25)))
+    def _venue_available_cash(self, order_manager, venues: set[str] | None = None) -> dict[str, float]:
+        """Return executable free collateral by venue with a short cache TTL.
+
+        Routing on book price alone is invalid when collateral is fragmented
+        across exchanges. A venue with zero free margin is data-only for this
+        candidate even when it has the tightest spread.
+        """
+        now = time.monotonic()
+        ttl = max(0.5, float(_cfg("VENUE_BALANCE_CACHE_TTL_SEC", 8.0)))
+        out: dict[str, float] = {}
+        for venue in sorted(venues or self._routeable_venues(order_manager)):
+            key = str(venue).lower()
+            cached = self._venue_cash_cache.get(key)
+            if cached is not None and now - cached[0] <= ttl:
+                out[key] = cached[1]
+                continue
+            manager = self._execution_manager_for(order_manager, key)
+            cash = 0.0
+            try:
+                bal = manager.get_balance() if manager is not None and hasattr(manager, "get_balance") else {}
+                cash = max(0.0, _num((bal or {}).get("available"), 0.0))
+            except Exception as exc:
+                logger.debug("venue collateral snapshot unavailable venue=%s: %s", key, exc)
+            self._venue_cash_cache[key] = (now, cash)
+            out[key] = cash
+        return out
+
+    def _protection_capable_venues(self, order_manager, venues: set[str] | None = None) -> set[str]:
+        protected: set[str] = set()
+        for venue in (venues or self._routeable_venues(order_manager)):
+            manager = self._execution_manager_for(order_manager, venue)
+            adapter = getattr(manager, "_adapter", None)
+            # Production OrderManager delegates to its adapter; light-weight
+            # simulation managers may implement the protected lifecycle directly.
+            if callable(getattr(manager, "place_bracket_limit_entry", None)) or callable(getattr(adapter, "place_bracket_limit_entry", None)):
+                protected.add(str(venue).lower())
+        return protected
+
+    def _venue_selection_budgets(self, available_cash_by_venue: Mapping[str, float]) -> tuple[dict[str, float], dict[str, float]]:
+        """Build cost-comparison sizes from each venue's own free collateral.
+
+        Price/fee/depth comparison is invalid when every candidate is costed at
+        a notional funded by Delta. Each executable venue is therefore assessed
+        only at the provisional notional its own live available balance can
+        support; final size is recomputed after selection using full SL geometry.
+        """
+        fraction = max(0.0, float(_cfg("VENUE_SELECTION_NOTIONAL_FRACTION", 0.25)))
+        min_margin = max(0.0, float(_cfg("VENUE_SELECTION_MIN_FREE_MARGIN_USD", 1.0)))
+        configured_lev = max(1.0, float(_cfg("LEVERAGE", 1.0) or 1.0))
+        code_cap = max(1.0, float(_cfg("INSTITUTIONAL_MAX_SELECTED_LEVERAGE", configured_lev) or configured_lev))
+        notionals: dict[str, float] = {}
+        margins: dict[str, float] = {}
+        for venue, raw_cash in available_cash_by_venue.items():
+            key = str(venue).lower()
+            cash = max(0.0, _num(raw_cash, 0.0))
+            venue_cap = self._venue_max_leverage(key)
+            caps = [configured_lev, code_cap]
+            if venue_cap > 0:
+                caps.append(venue_cap)
+            leverage = max(1.0, min(caps))
+            notional = cash * fraction
+            notionals[key] = notional
+            margins[key] = max(min_margin, notional / leverage) if notional > 0 else min_margin
+        return notionals, margins
 
     def _entry_risk_gate(self, risk_manager, *, balance_source=None) -> tuple[bool, str]:
         """Gate live entries through the same risk controls that record entries."""

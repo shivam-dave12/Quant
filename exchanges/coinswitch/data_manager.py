@@ -109,6 +109,8 @@ class CoinSwitchDataManager:
         self._latest_latency_z: float | None = None
         self._sequence_valid = True
         self._snapshot_ready = False
+        self._funding_rate: float | None = None
+        self._last_market_meta_refresh_s: float = 0.0
 
         self._lock         = threading.RLock()
         self._forming_ts:  Dict[str, int] = {}
@@ -158,6 +160,37 @@ class CoinSwitchDataManager:
         latency_ms = max(0.0, (receive_ts_ns - exchange_ts_ns) / 1_000_000.0)
         self._latest_latency_ms = latency_ms
         self._latest_latency_z = self._latency_baseline.observe(latency_ms)
+
+    def _execution_cost_metadata(self) -> Dict[str, object]:
+        """Fee metadata confirmed by the live instrument catalog when supplied.
+
+        The protected lifecycle can execute an entry and an exit aggressively;
+        therefore the route selector uses taker+taker as the fail-safe estimate,
+        rather than presuming a maker fill on a limit entry.
+        """
+        raw = getattr(self.exchange_instrument, "raw", {}) or {}
+        try:
+            taker = float(raw.get("taker_fee_rate") or 0.0)
+        except (TypeError, ValueError):
+            taker = 0.0
+        if taker > 0:
+            return {"round_trip_fee_bps": 2.0 * taker * 10_000.0, "fee_basis": "instrument_info_taker_taker"}
+        return {}
+
+    def _refresh_market_metadata(self) -> None:
+        """Refresh documented CoinSwitch funding state without REST flooding."""
+        now = time.time()
+        if now - self._last_market_meta_refresh_s < float(getattr(config, "VENUE_MARKET_META_REFRESH_SEC", 30.0)):
+            return
+        self._last_market_meta_refresh_s = now
+        try:
+            resp = self.api.get_futures_ticker(symbol=self.symbol, exchange=config.COINSWITCH_EXCHANGE)
+            data = resp.get("data", {}) if isinstance(resp, dict) else {}
+            row = data.get(config.COINSWITCH_EXCHANGE, data) if isinstance(data, dict) else {}
+            if isinstance(row, dict) and row.get("funding_rate") is not None:
+                self._funding_rate = float(row.get("funding_rate"))
+        except Exception as exc:
+            logger.debug("CoinSwitch funding metadata refresh failed for %s: %s", self.symbol, exc)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -532,6 +565,7 @@ class CoinSwitchDataManager:
             }
 
     def get_venue_microstate(self):
+        self._refresh_market_metadata()
         with self._lock:
             bids = list(self._orderbook.get("bids", []))
             asks = list(self._orderbook.get("asks", []))
@@ -543,7 +577,8 @@ class CoinSwitchDataManager:
         health = score_feed_health(**{k: reliability[k] for k in ("connected", "heartbeat_ok", "sequence_valid", "snapshot_ready", "exchange_timestamp_available", "latency_vs_baseline_z", "no_change_heartbeat_valid")})
         return build_venue_microstate(
             mapping=self._instrument_mapping(), bids=bids, asks=asks, feed_health=health,
-            receive_ts_ns=recv_ts_ns, **flows,
+            receive_ts_ns=recv_ts_ns, funding_rate=self._funding_rate,
+            metadata=self._execution_cost_metadata(), **flows,
         )
 
     def get_recent_trades_raw(self) -> List[Dict]:

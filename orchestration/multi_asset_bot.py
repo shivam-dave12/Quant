@@ -987,7 +987,10 @@ class MultiAssetInstitutionalBot:
         delta_om = None
         groww_om = None
         hl_om = None
-        if ExchangeName.COINSWITCH in inst.by_exchange and cs_api is not None:
+        if (
+            ExchangeName.COINSWITCH in inst.by_exchange and cs_api is not None
+            and bool(getattr(config, "COINSWITCH_EXECUTION_ENABLED", False))
+        ):
             cs_om = OrderManager(cs_api, exchange_name="coinswitch", instrument=inst)
         if ExchangeName.DELTA in inst.by_exchange and delta_api is not None:
             delta_om = OrderManager(delta_api, exchange_name="delta", instrument=inst)
@@ -1014,6 +1017,7 @@ class MultiAssetInstitutionalBot:
             reference_dms.append(HyperliquidDataManager(
                 instrument=inst,
                 execution_enabled=hl_om is not None,
+                api=hl_api,
             ))
 
         if primary_ex == ExchangeName.DELTA:
@@ -1033,13 +1037,21 @@ class MultiAssetInstitutionalBot:
             if HyperliquidDataManager is None:
                 logger.warning("%s skipped: Hyperliquid data manager unavailable", inst.asset_id)
                 return None
-            primary_dm = HyperliquidDataManager(instrument=inst, execution_enabled=hl_om is not None)
+            primary_dm = HyperliquidDataManager(instrument=inst, execution_enabled=hl_om is not None, api=hl_api)
             if ExchangeName.DELTA in inst.by_exchange and delta_api is not None:
                 secondary_dm = DeltaDataManager(instrument=inst)
             elif ExchangeName.COINSWITCH in inst.by_exchange and cs_api is not None:
                 secondary_dm = CoinSwitchDataManager(instrument=inst)
             else:
                 secondary_dm = None
+            # Primary + secondary is not enough when a third executable venue
+            # exists. Preserve all independent books for venue scoring; never
+            # merge quantities or drop CoinSwitch merely because Delta exists.
+            if (
+                ExchangeName.DELTA in inst.by_exchange and delta_api is not None
+                and ExchangeName.COINSWITCH in inst.by_exchange and cs_api is not None
+            ):
+                reference_dms.append(CoinSwitchDataManager(instrument=inst))
             analysis_dm = None
         else:
             primary_dm = CoinSwitchDataManager(instrument=inst)

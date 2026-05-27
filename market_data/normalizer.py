@@ -238,6 +238,7 @@ def build_venue_microstate(
     tfi_usd_10s: float = 0.0,
     tfi_usd_60s: float = 0.0,
     funding_rate: float | None = None,
+    metadata: Mapping[str, object] | None = None,
     bands_bps: tuple[tuple[float, float], ...] = DEFAULT_BANDS_BPS,
 ) -> VenueMicrostate:
     bid_levels = sorted(parse_levels(bids), key=lambda x: x.price, reverse=True)

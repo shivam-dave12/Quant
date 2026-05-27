@@ -1,24 +1,22 @@
-# Quant bot v2 — live runtime dependencies
-# This file is suitable for the current Docker runtime and all enabled venues.
-# Do NOT install python-telegram-bot: the repository has a local telegram/ package
-# and uses requests for the Telegram Bot API.
+# Quant bot — consolidated dependencies
+# Do not install python-telegram-bot: the repo contains its own telegram/
+# package and calls the Bot API through requests.
 
-# Core runtime / configuration
+# Live execution runtime
 requests>=2.31,<3
 python-dotenv>=1.0,<2
 pydantic>=2.7,<3
-
-# Streaming / transport / signing
 websocket-client>=1.7,<2
 python-socketio[client]>=5.11,<6
 cryptography>=42,<47
-
-# Groww live execution and TOTP-backed access-token flow
 growwapi
 pyotp>=2.9,<3
-
-# Hyperliquid official SDK and direct signing dependency used by
-# exchanges/hyperliquid/api.py (Info, Exchange, constants, Account).
-# SDK 0.23.0 includes the perp_dexs/timeout support used in this codebase.
 hyperliquid-python-sdk==0.23.0
 eth-account>=0.10,<0.14
+
+# Optional local dashboard / browser-auth utilities retained from full package
+fastapi>=0.111,<1
+uvicorn>=0.30,<1
+playwright>=1.44,<2
+# Install the Playwright browser binary during image build when browser auth is enabled:
+# python -m playwright install chromium

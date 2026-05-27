@@ -14,6 +14,8 @@ def _relax_warmup(monkeypatch):
     monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_VPIN_WINDOW_BUCKETS", 5, raising=False)
     monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_REQUIRE_SIGNAL_DECAY_READY", True, raising=False)
     monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_FOR_DELTA", True, raising=False)
+    monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_VENUES", ("delta",), raising=False)
+    monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_VENUES", ("delta",), raising=False)
 
 
 def test_ar1_signal_decay_produces_finite_cost_crossing_horizon(monkeypatch):
@@ -91,6 +93,8 @@ def test_dynamic_plan_uses_spread_tick_and_policy_floors_for_silver(monkeypatch)
     monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_REQUIRE_SIGNAL_DECAY_READY", False, raising=False)
     monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_FOR_DELTA", False, raising=False)
     monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_FOR_DELTA", False, raising=False)
+    monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_VENUES", (), raising=False)
+    monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_VENUES", (), raising=False)
     monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_ASSET_MIN_STOP_BPS", {"SILVER": 45.0}, raising=False)
     monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_VENUE_ASSET_MIN_STOP_BPS", {"hyperliquid:SILVER": 60.0}, raising=False)
     monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_ASSET_MIN_TARGET_BPS", {"SILVER": 100.0}, raising=False)
@@ -144,6 +148,7 @@ def test_option_greek_exit_diagnostics_fires_on_delta_iv_and_theta(monkeypatch):
 def test_delta_plan_fails_closed_until_kyle_and_vpin_are_observed(monkeypatch):
     _relax_warmup(monkeypatch)
     monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_FOR_DELTA", True, raising=False)
+    monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_VENUES", ("delta",), raising=False)
     engine = DynamicProtectionPlanBuilder("GOLD")
     for i in range(12):
         engine.observe(signal_bps=8.0 * (0.92 ** i), timestamp_s=100.0 + i)
@@ -157,6 +162,24 @@ def test_delta_plan_fails_closed_until_kyle_and_vpin_are_observed(monkeypatch):
         asset_class="commodity",
         position_notional=10000.0,
         quantity=2.0,
+        market_state={"asset_id": "GOLD", "venue": "delta"},
     )
     assert plan.protection_feasible is False
     assert any("kyle_lambda_warmup" in reason for reason in plan.reasons)
+
+
+def test_hyperliquid_plan_is_not_blocked_by_delta_only_kyle_and_vpin_warmup(monkeypatch):
+    monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_REQUIRE_SIGNAL_DECAY_READY", False, raising=False)
+    monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_VENUES", ("delta",), raising=False)
+    monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_VENUES", ("delta",), raising=False)
+    engine = DynamicProtectionPlanBuilder("SILVER")
+    plan = engine.build_plan(
+        direction=Direction.SHORT, entry_price=73.82, volatility_price=0.12,
+        gross_edge_bps=28.0, execution_cost_bps=2.7,
+        protection_type="VENUE_NATIVE_BRACKET", asset_class="commodity",
+        position_notional=1000.0, quantity=10.0,
+        market_state={"asset_id": "SILVER", "venue": "hyperliquid", "spread_bps": 0.2, "price_tick": 0.001, "near_touch_depth_usd": 1000000.0},
+    )
+    assert plan.protection_feasible is True
+    assert not any("kyle_lambda_warmup" in reason for reason in plan.reasons)
+    assert not any("vpin_trade_tape_warmup" in reason for reason in plan.reasons)

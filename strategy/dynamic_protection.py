@@ -308,11 +308,20 @@ class DynamicProtectionPlanBuilder:
         if require_decay and not decay.ready:
             diagnostics = {"signal_decay": asdict(decay), "kyle_impact": asdict(impact), "vpin": asdict(toxicity)}
             return ProtectionPlan(price, price, price, protection_type, False, [decay.reason], diagnostics=diagnostics)
-        if asset_class != "option" and bool(_cfg("DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_FOR_DELTA", True)) and not impact.ready:
-            diagnostics = {"signal_decay": asdict(decay), "kyle_impact": asdict(impact), "vpin": asdict(toxicity)}
+        # Kyle and VPIN readiness are venue-specific. The previous implementation
+        # named these policies *_FOR_DELTA but accidentally blocked Hyperliquid and
+        # CoinSwitch forever when their selected feed had no Delta-style event tape.
+        kyle_venues_raw = _cfg("DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_VENUES", ("delta",))
+        toxic_venues_raw = _cfg("DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_VENUES", ("delta",))
+        kyle_venues = {str(v).strip().lower() for v in (kyle_venues_raw if isinstance(kyle_venues_raw, (tuple, list, set)) else str(kyle_venues_raw).split(",")) if str(v).strip()}
+        toxic_venues = {str(v).strip().lower() for v in (toxic_venues_raw if isinstance(toxic_venues_raw, (tuple, list, set)) else str(toxic_venues_raw).split(",")) if str(v).strip()}
+        require_kyle_here = asset_class != "option" and venue_key in kyle_venues
+        require_toxicity_here = asset_class != "option" and venue_key in toxic_venues
+        if require_kyle_here and not impact.ready:
+            diagnostics = {"signal_decay": asdict(decay), "kyle_impact": asdict(impact), "vpin": asdict(toxicity), "required_kyle_venues": sorted(kyle_venues)}
             return ProtectionPlan(price, price, price, protection_type, False, [impact.reason], diagnostics=diagnostics)
-        if asset_class != "option" and bool(_cfg("DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_FOR_DELTA", True)) and not toxicity.ready:
-            diagnostics = {"signal_decay": asdict(decay), "kyle_impact": asdict(impact), "vpin": asdict(toxicity)}
+        if require_toxicity_here and not toxicity.ready:
+            diagnostics = {"signal_decay": asdict(decay), "kyle_impact": asdict(impact), "vpin": asdict(toxicity), "required_toxicity_venues": sorted(toxic_venues)}
             return ProtectionPlan(price, price, price, protection_type, False, [toxicity.reason], diagnostics=diagnostics)
         stop_mult = toxicity.stop_multiplier if toxicity.ready else 1.0
         geometry_enabled = bool(_cfg("DYNAMIC_PROTECTION_MARKET_AWARE_GEOMETRY_ENABLED", True))

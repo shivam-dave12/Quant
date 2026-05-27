@@ -80,6 +80,11 @@ class PositionSizingDecision:
     portfolio_risk_before: float
     portfolio_risk_after: float
     reasons: list[str]
+    # Capital attribution is mandatory in multi-venue execution: the approved
+    # quantity must be traceable to the same broker that receives the order.
+    capital_venue: str = ""
+    available_cash_used: float = 0.0
+    balance_source: str = ""
 
 
 @dataclass(frozen=True)

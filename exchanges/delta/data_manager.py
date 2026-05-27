@@ -99,6 +99,8 @@ class DeltaDataManager:
         self._latest_latency_z: float | None = None
         self._sequence_valid = True
         self._snapshot_ready = False
+        self._funding_rate: float | None = None
+        self._last_market_meta_refresh_s: float = 0.0
 
         self._lock            = threading.RLock()
         self._forming_ts:     Dict[str, int] = {}
@@ -152,6 +154,21 @@ class DeltaDataManager:
         latency_ms = max(0.0, (receive_ts_ns - exchange_ts_ns) / 1_000_000.0)
         self._latest_latency_ms = latency_ms
         self._latest_latency_z = self._latency_baseline.observe(latency_ms)
+
+    def _refresh_market_metadata(self) -> None:
+        now = time.time()
+        if now - self._last_market_meta_refresh_s < float(getattr(config, "VENUE_MARKET_META_REFRESH_SEC", 30.0)):
+            return
+        self._last_market_meta_refresh_s = now
+        try:
+            resp = self.api.get_ticker(self.symbol)
+            row = resp.get("result", {}) if isinstance(resp, dict) else {}
+            for key in ("funding_rate", "fundingRate", "current_funding_rate"):
+                if isinstance(row, dict) and row.get(key) is not None:
+                    self._funding_rate = float(row.get(key))
+                    break
+        except Exception as exc:
+            logger.debug("Delta funding metadata refresh failed for %s: %s", self.symbol, exc)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -804,7 +821,20 @@ class DeltaDataManager:
                 "latency_baseline_samples": self._latency_baseline.sample_count,
             }
 
+    def _execution_cost_metadata(self) -> Dict[str, object]:
+        """Use live-catalog fee fields when Delta exposes them; otherwise fallback config applies."""
+        raw = getattr(self.exchange_instrument, "raw", {}) or {}
+        for key in ("taker_fee_rate", "taker_commission_rate", "taker_fee"): 
+            try:
+                taker = float(raw.get(key) or 0.0)
+            except (TypeError, ValueError):
+                taker = 0.0
+            if taker > 0:
+                return {"round_trip_fee_bps": 2.0 * taker * 10_000.0, "fee_basis": f"catalog_{key}_taker_taker"}
+        return {}
+
     def get_venue_microstate(self):
+        self._refresh_market_metadata()
         with self._lock:
             bids = list(self._orderbook.get("bids", []))
             asks = list(self._orderbook.get("asks", []))
@@ -816,7 +846,8 @@ class DeltaDataManager:
         health = score_feed_health(**{k: reliability[k] for k in ("connected", "heartbeat_ok", "sequence_valid", "snapshot_ready", "exchange_timestamp_available", "latency_vs_baseline_z", "no_change_heartbeat_valid")})
         return build_venue_microstate(
             mapping=self._instrument_mapping(), bids=bids, asks=asks, feed_health=health,
-            receive_ts_ns=recv_ts_ns, **flows,
+            receive_ts_ns=recv_ts_ns, funding_rate=self._funding_rate,
+            metadata=self._execution_cost_metadata(), **flows,
         )
 
     def get_recent_trades_raw(self) -> List[Dict]:

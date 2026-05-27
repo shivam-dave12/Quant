@@ -138,6 +138,24 @@ class HyperliquidAPI:
         except Exception:
             return {}
 
+    def current_asset_context(self, coin: str) -> Dict[str, Any]:
+        """Return live mark/funding/OI context from official metaAndAssetCtxs."""
+        target = str(coin or "").upper()
+        for dex in self.perp_dexs:
+            try:
+                raw = self.info.post("/info", {"type": "metaAndAssetCtxs", "dex": dex})
+                if not isinstance(raw, (list, tuple)) or len(raw) < 2:
+                    continue
+                meta, ctxs = raw[0], raw[1]
+                universe = meta.get("universe", []) if isinstance(meta, dict) else []
+                for i, item in enumerate(universe):
+                    name = str((item or {}).get("name") or "").upper() if isinstance(item, dict) else ""
+                    if name == target or (dex and f"{dex.upper()}:{name}" == target):
+                        return dict(ctxs[i]) if isinstance(ctxs, list) and i < len(ctxs) and isinstance(ctxs[i], dict) else {}
+            except Exception as exc:
+                logger.debug("Hyperliquid asset context fetch failed dex=%r coin=%s: %s", dex, coin, exc)
+        return {}
+
     def size_decimals(self, coin: str) -> int:
         try:
             asset = self.info.name_to_asset(str(coin))

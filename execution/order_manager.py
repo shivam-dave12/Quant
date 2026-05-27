@@ -277,6 +277,86 @@ class _CoinSwitchAdapter:
             leverage = leverage,
         )
 
+    def place_bracket_limit_entry(
+        self, side: str, quantity: float, limit_price: float, sl_price: float, tp_price: float,
+        timeout_sec: float = 45.0, on_order_placed=None,
+    ) -> Optional[Dict]:
+        """CoinSwitch protected lifecycle using its documented futures contract.
+
+        CoinSwitch TP/SL orders are position-level.  A LIMIT entry is allowed to
+        fill first, then both STOP_MARKET and TAKE_PROFIT_MARKET reduce-only
+        orders are armed with quantity=0 as required by the API.  No naked
+        fallback entry is ever submitted.
+        """
+        qty = float(quantity or 0.0)
+        if qty <= 0:
+            return {"_error": True, "_sc": 0, "_raw": {"error": "coinswitch_qty_invalid"}}
+        entry_side = "BUY" if str(side or "").upper() in {"BUY", "LONG"} else "SELL"
+        entry = self.place_order(entry_side, "LIMIT", qty, price=float(limit_price), reduce_only=False)
+        if not isinstance(entry, dict) or entry.get("_error"):
+            return entry or {"_error": True, "_sc": 0, "_raw": {"error": "coinswitch_entry_rejected"}}
+        oid = str(entry.get("order_id") or "")
+        if not oid:
+            return {"_error": True, "_sc": 200, "_raw": entry, "_err_msg": "missing_entry_order_id"}
+        if on_order_placed is not None:
+            try:
+                on_order_placed(oid)
+            except Exception:
+                pass
+
+        deadline = time.time() + max(1.0, float(timeout_sec or _cfg("COINSWITCH_ENTRY_FILL_TIMEOUT_SEC", 45.0)))
+        poll = max(0.25, float(_cfg("COINSWITCH_ENTRY_POLL_SEC", 1.0)))
+        fill_price = float(self.extract_fill_price(entry) or limit_price)
+        filled_qty = float(self.extract_filled_qty(entry) or 0.0)
+        status = self.extract_status(entry)
+        while status == "PENDING" and time.time() < deadline:
+            time.sleep(poll)
+            state = self.get_order(oid) or {}
+            status = self.extract_status(state)
+            fill_price = float(self.extract_fill_price(state) or fill_price)
+            filled_qty = float(self.extract_filled_qty(state) or filled_qty)
+        # Official CoinSwitch futures lifecycle documents PARTIALLY_EXECUTED as
+        # terminal: protect the actual filled position, never the requested size.
+        if status not in {"FILLED", "PARTIAL_FILL"} or filled_qty <= 0:
+            try:
+                self.cancel_order(oid)
+            except Exception:
+                pass
+            return {"_error": True, "_sc": 0, "_raw": {"error": "coinswitch_entry_not_filled_before_timeout", "order_id": oid, "status": status}}
+
+        exit_side = "SELL" if entry_side == "BUY" else "BUY"
+        # API contract: TP/SL quantity is exactly zero because protection applies
+        # to the complete open symbol position; reduce_only must be true.
+        sl = self.place_order(exit_side, "STOP_MARKET", 0.0, trigger_price=float(sl_price), reduce_only=True)
+        tp = self.place_order(exit_side, "TAKE_PROFIT_MARKET", 0.0, trigger_price=float(tp_price), reduce_only=True)
+        sl_oid = str((sl or {}).get("order_id") or "") if isinstance(sl, dict) else ""
+        tp_oid = str((tp or {}).get("order_id") or "") if isinstance(tp, dict) else ""
+        if not sl_oid or not tp_oid:
+            for child in (sl_oid, tp_oid):
+                if child:
+                    try:
+                        self.cancel_order(child)
+                    except Exception:
+                        pass
+            emergency = None
+            if bool(_cfg("COINSWITCH_EMERGENCY_CLOSE_ON_PROTECTION_FAILURE", True)):
+                emergency = self.place_order(exit_side, "MARKET", filled_qty, reduce_only=False)
+            return {
+                "_error": True, "_sc": 200,
+                "_raw": {"entry_order_id": oid, "stop_response": sl, "target_response": tp, "emergency_close": emergency},
+                "_err_msg": "coinswitch_protection_arm_failed_after_fill",
+            }
+        return {
+            "order_id": oid, "status": "FILLED", "quantity": filled_qty,
+            "fill_type": "limit", "fill_price": fill_price, "price": fill_price,
+            "bracket_order": True, "bracket_child_verified": True,
+            "bracket_sl_order_id": sl_oid, "bracket_tp_order_id": tp_oid,
+            "bracket_sl_price": float(sl_price), "bracket_tp_price": float(tp_price),
+            "protection_model": "COINSWITCH_POSITION_TPSL_AFTER_FILL",
+            "protection_confirmed": True,
+            "paid_commission": 0.0, "paid_commission_exact": False,
+        }
+
     def normalise_position(self, raw) -> Optional[Dict]:
         """Turn CoinSwitch position response into a canonical dict."""
         positions = raw if isinstance(raw, list) else ([raw] if isinstance(raw, dict) else [])
@@ -2933,6 +3013,45 @@ class OrderManager:
             f"[PROTECTED_ENTRY] {side.upper()} {quantity}{qty_note} @ {cur}{limit_price:.2f} "
             f"SL={cur}{sl_price:.2f} TP={cur}{tp_price:.2f} (timeout={timeout_sec:.0f}s)"
         )
+
+        if self._exchange_name == "coinswitch":
+            try:
+                data = self._adapter.place_bracket_limit_entry(
+                    side=side, quantity=quantity, limit_price=limit_price,
+                    sl_price=sl_price, tp_price=tp_price, timeout_sec=timeout_sec,
+                    on_order_placed=on_order_placed,
+                )
+            except Exception as exc:
+                self.last_order_error = {
+                    "stage": "coinswitch_fill_first_position_tpsl_lifecycle",
+                    "status_code": 0, "reason": str(exc), "raw": {"error": str(exc)},
+                }
+                logger.error("CoinSwitch protected lifecycle failed before entry: %s", exc, exc_info=True)
+                return None
+            if not data or data.get("_error"):
+                raw = (data or {}).get("_raw", {})
+                self.last_order_error = {
+                    "stage": "coinswitch_fill_first_position_tpsl_lifecycle",
+                    "status_code": (data or {}).get("_sc", 0),
+                    "reason": (data or {}).get("_err_msg") or self._compact_error(raw),
+                    "raw": raw,
+                }
+                logger.error("CoinSwitch protected entry failed: %s raw=%s", self.last_order_error["reason"], raw)
+                return None
+            self._record_order(str(data.get("order_id", "")), {
+                "order_id": str(data.get("order_id", "")), "side": side,
+                "type": "COINSWITCH_POSITION_TPSL_AFTER_FILL",
+                "quantity": float(data.get("quantity", quantity) or quantity),
+                "price": float(limit_price), "status": "FILLED",
+                "timestamp": datetime.now().isoformat(),
+                "bracket_sl_order_id": data.get("bracket_sl_order_id"),
+                "bracket_tp_order_id": data.get("bracket_tp_order_id"),
+            })
+            logger.info(
+                "CoinSwitch protected entry filled order=%s SL=%s TP=%s",
+                data.get("order_id"), data.get("bracket_sl_order_id"), data.get("bracket_tp_order_id"),
+            )
+            return data
 
         if self._exchange_name == "hyperliquid":
             try:

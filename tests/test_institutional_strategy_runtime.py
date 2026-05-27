@@ -101,6 +101,9 @@ class _Orders:
     def get_open_position(self):
         return {"size": 1.0}
 
+    def get_balance(self):
+        return {"available": 100000.0}
+
 
 def _instrument():
     ei = ExchangeInstrument(
@@ -209,6 +212,8 @@ def test_shadow_mode_blocks_live_order_even_when_flow_edge_is_positive(tmp_path,
     monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_SIGNAL_DECAY_READY", False, raising=False)
     monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_FOR_DELTA", False, raising=False)
     monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_FOR_DELTA", False, raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_VENUES", (), raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_VENUES", (), raising=False)
     def cfg(name, default):
         values = {"RESEARCH_STORE_PATH": str(tmp_path), "INSTITUTIONAL_ENABLE_LIVE_ENTRIES": False,
                   "INSTITUTIONAL_MIN_NET_EDGE_BPS": 0.1, "INSTITUTIONAL_MIN_SIGNAL_BPS": 0.01}
@@ -245,6 +250,8 @@ def test_live_entry_requires_protection_confirmation(tmp_path, monkeypatch):
     monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_SIGNAL_DECAY_READY", False, raising=False)
     monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_FOR_DELTA", False, raising=False)
     monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_FOR_DELTA", False, raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_VENUES", (), raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_VENUES", (), raising=False)
     def cfg(name, default):
         values = {"RESEARCH_STORE_PATH": str(tmp_path), "INSTITUTIONAL_ENABLE_LIVE_ENTRIES": True,
                   "INSTITUTIONAL_MIN_NET_EDGE_BPS": 0.1, "INSTITUTIONAL_MIN_SIGNAL_BPS": 0.01,
@@ -269,6 +276,8 @@ def test_live_entry_is_blocked_by_risk_manager_trade_gate(tmp_path, monkeypatch)
     monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_SIGNAL_DECAY_READY", False, raising=False)
     monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_FOR_DELTA", False, raising=False)
     monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_FOR_DELTA", False, raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_VENUES", (), raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_VENUES", (), raising=False)
 
     def cfg(name, default):
         values = {
@@ -492,6 +501,8 @@ def test_groww_ready_context_activates_ce_and_reaches_shadow_decision(tmp_path, 
     monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_SIGNAL_DECAY_READY", False, raising=False)
     monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_FOR_DELTA", False, raising=False)
     monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_FOR_DELTA", False, raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_VENUES", (), raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_VENUES", (), raising=False)
     def cfg(name, default):
         values = {"RESEARCH_STORE_PATH": str(tmp_path), "INSTITUTIONAL_ENABLE_LIVE_ENTRIES": False, "INSTITUTIONAL_MIN_NET_EDGE_BPS": 0.0,
                   "INSTITUTIONAL_RISK_FRACTION_PER_TRADE": 1.0, "INSTITUTIONAL_QUARTER_KELLY": 1.0, "INSTITUTIONAL_TARGET_OBSERVATION_VOL_BPS": 100000.0}
@@ -511,6 +522,8 @@ def test_groww_live_decision_places_buy_with_oco_only_after_all_gates(tmp_path, 
     monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_SIGNAL_DECAY_READY", False, raising=False)
     monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_FOR_DELTA", False, raising=False)
     monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_FOR_DELTA", False, raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_VENUES", (), raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_VENUES", (), raising=False)
     def cfg(name, default):
         values = {"RESEARCH_STORE_PATH": str(tmp_path), "INSTITUTIONAL_ENABLE_LIVE_ENTRIES": True, "INSTITUTIONAL_MIN_NET_EDGE_BPS": 0.0,
                   "INSTITUTIONAL_RISK_FRACTION_PER_TRADE": 1.0, "INSTITUTIONAL_QUARTER_KELLY": 1.0, "INSTITUTIONAL_TARGET_OBSERVATION_VOL_BPS": 100000.0}
@@ -530,6 +543,8 @@ def test_groww_option_edge_deducts_hold_horizon_theta_carry(tmp_path, monkeypatc
     monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_SIGNAL_DECAY_READY", False, raising=False)
     monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_FOR_DELTA", False, raising=False)
     monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_FOR_DELTA", False, raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_VENUES", (), raising=False)
+    monkeypatch.setattr("strategy.dynamic_protection.config.DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_VENUES", (), raising=False)
     def cfg(name, default):
         values = {
             "RESEARCH_STORE_PATH": str(tmp_path), "INSTITUTIONAL_ENABLE_LIVE_ENTRIES": False,
@@ -707,3 +722,51 @@ def test_microstructure_telemetry_includes_weighted_edge_components(tmp_path, mo
         values["ofi_component_bps"] + values["tfi_component_bps"]
         + values["microprice_component_bps"] + values["dislocation_component_bps"]
     )) < 1e-9
+
+
+def test_selected_broker_balance_controls_final_position_size_not_delta_balance(tmp_path, monkeypatch):
+    from strategy.domain import Direction, ProtectionPlan
+
+    monkeypatch.setattr("strategy.institutional_strategy._cfg", lambda name, default: {
+        "RESEARCH_STORE_PATH": str(tmp_path),
+        "VENUE_SELECTION_ENABLED": True,
+        "INSTITUTIONAL_RISK_FRACTION_PER_TRADE": 1.0,
+        "INSTITUTIONAL_QUARTER_KELLY": 1.0,
+        "INSTITUTIONAL_TARGET_OBSERVATION_VOL_BPS": 100000.0,
+        "LEVERAGE": 5.0,
+        "INSTITUTIONAL_MAX_SELECTED_LEVERAGE": 5.0,
+    }.get(name, default))
+    strategy = InstitutionalStrategy(instrument=_silver_instrument())
+    delta_funded_risk = SimpleNamespace(get_available_balance=lambda: {"available": 180.31, "source": "delta"})
+    selected_hyperliquid = SimpleNamespace(get_balance=lambda: {"available": 20.0, "source": "hyperliquid.user_state"})
+    decision = strategy._size_position(
+        "DESK_A_METALS", "xyz:SILVER", Direction.LONG, 30.0, 100.0, 1.0,
+        ProtectionPlan(30.0, 29.0, 32.0, "VENUE_NATIVE_BRACKET", True), delta_funded_risk,
+        venue="hyperliquid", balance_source=selected_hyperliquid,
+    )
+    assert decision.available_cash_used == 20.0
+    assert decision.capital_venue == "hyperliquid"
+    assert decision.balance_source == "hyperliquid.user_state"
+    assert decision.margin_required <= 20.0
+    assert decision.notional <= 20.0 * 0.20 + 1e-9
+    assert decision.reasons[0] == "broker_local_cash_sizing_approved:hyperliquid"
+
+
+def test_selected_broker_balance_failure_never_falls_back_to_delta_cash(tmp_path, monkeypatch):
+    from strategy.domain import Direction, ProtectionPlan
+
+    monkeypatch.setattr("strategy.institutional_strategy._cfg", lambda name, default: {
+        "RESEARCH_STORE_PATH": str(tmp_path),
+        "VENUE_SELECTION_ENABLED": True,
+    }.get(name, default))
+    strategy = InstitutionalStrategy(instrument=_silver_instrument())
+    delta_funded_risk = SimpleNamespace(get_available_balance=lambda: {"available": 180.31, "source": "delta"})
+    failed_hyperliquid = SimpleNamespace(get_balance=lambda: {"available": 0.0, "source": "hyperliquid.user_state"})
+    decision = strategy._size_position(
+        "DESK_A_METALS", "xyz:SILVER", Direction.LONG, 30.0, 100.0, 1.0,
+        ProtectionPlan(30.0, 29.0, 32.0, "VENUE_NATIVE_BRACKET", True), delta_funded_risk,
+        venue="hyperliquid", balance_source=failed_hyperliquid,
+    )
+    assert decision.approved is False
+    assert decision.available_cash_used == 0.0
+    assert decision.reasons == ["cash_unavailable:hyperliquid"]
