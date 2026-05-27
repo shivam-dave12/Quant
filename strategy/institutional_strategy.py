@@ -2308,6 +2308,10 @@ class InstitutionalStrategy:
                 capital_venue=capital_venue, available_cash_used=cash, balance_source=balance_label,
             )
         mapping = self._instrument_mapping(instrument, venue=venue)
+        try:
+            policy = active_policy(self._instrument)
+        except Exception:
+            policy = None
         stop_distance_pct = abs(price - protection.stop_price) / max(price, 1e-9)
         if stop_distance_pct <= 0:
             return PositionSizingDecision(desk, instrument, False, 0.0, 0.0, 0.0, None, 0.0, net_edge, 0.0, 0.0, 0.0, ["invalid_stop_distance"])
@@ -2316,10 +2320,16 @@ class InstitutionalStrategy:
         # exposure quantity to integer contracts using contract_value.
         unit_notional = price
         risk_per_unit = unit_notional * stop_distance_pct
-        risk_budget = cash * float(_cfg("INSTITUTIONAL_RISK_FRACTION_PER_TRADE", 0.0025))
-        liquidity_cap = max(0.0, cash * min(1.0, liquidity_score) * 0.20)
+        risk_cash = _num(bal.get("risk_available"), cash)
+        if risk_cash <= 0:
+            risk_cash = cash
+        risk_multiplier = _num(getattr(policy, "risk_multiplier", None), 1.0)
+        risk_fraction = max(0.0, float(_cfg("INSTITUTIONAL_RISK_FRACTION_PER_TRADE", 0.0025))) * max(0.0, risk_multiplier)
+        risk_budget = risk_cash * risk_fraction
+        policy_margin_fraction = _num(getattr(policy, "margin_pct", None), float(_cfg("INSTITUTIONAL_MARGIN_PCT", 0.20)))
+        margin_fraction = max(0.0, min(1.0, policy_margin_fraction))
+        margin_budget = cash * margin_fraction
         edge_pct = max(0.0, net_edge) / 10_000.0
-        kelly_notional = cash * (edge_pct / max(stop_distance_pct, 1e-9)) * float(_cfg("INSTITUTIONAL_QUARTER_KELLY", 0.25))
         observation_vol_bps = (
             float(venue_market_state.robust_one_minute_vol_bps)
             if venue_market_state is not None and venue_market_state.ready
@@ -2327,11 +2337,20 @@ class InstitutionalStrategy:
         )
         vol_scalar = min(1.0, float(_cfg("INSTITUTIONAL_TARGET_OBSERVATION_VOL_BPS", 10.0)) / max(observation_vol_bps, 1e-6))
         risk_limited_notional = risk_budget / max(stop_distance_pct, 1e-9)
-        target_notional = min(liquidity_cap, risk_limited_notional, kelly_notional * vol_scalar)
+        kelly_fraction = float(_cfg("INSTITUTIONAL_FRACTIONAL_KELLY", _cfg("INSTITUTIONAL_QUARTER_KELLY", 0.25)))
+        edge_to_stop = edge_pct / max(stop_distance_pct, 1e-9)
+        min_kelly_scalar = max(0.0, float(_cfg("INSTITUTIONAL_MIN_KELLY_DEPLOYMENT_SCALAR", 0.0)))
+        max_kelly_scalar = max(min_kelly_scalar, float(_cfg("INSTITUTIONAL_MAX_KELLY_DEPLOYMENT_SCALAR", 1.0)))
+        kelly_scalar = min(max_kelly_scalar, max(min_kelly_scalar, edge_to_stop * max(0.0, kelly_fraction)))
         if desk == DeskId.INDIA_OPTIONS.value:
             # Never size NFO options from a configured/default lot.  The lot
             # must be the exact value joined from Groww's official instrument
             # master for the direction-specific session vehicle.
+            leverage = None
+            margin_cap_notional = margin_budget
+            liquidity_cap = max(0.0, margin_cap_notional * min(1.0, max(0.0, liquidity_score)))
+            kelly_notional = margin_cap_notional * kelly_scalar * vol_scalar
+            target_notional = min(liquidity_cap, risk_limited_notional, kelly_notional)
             raw = getattr(getattr(self._instrument, "primary", None), "raw", {}) if self._instrument is not None else {}
             selected = raw.get("selected_option_contract") if isinstance(raw, dict) else None
             selected_raw = selected.get("raw") if isinstance(selected, dict) and isinstance(selected.get("raw"), dict) else {}
@@ -2339,11 +2358,8 @@ class InstitutionalStrategy:
             if lot <= 0:
                 return PositionSizingDecision(desk, instrument, False, 0.0, 0.0, 0.0, None, 0.0, net_edge, liquidity_cap, 0.0, 0.0, ["verified_nfo_lot_size_unavailable"])
             qty = float(max(0, math.floor(target_notional / max(unit_notional * lot, 1e-9)) * lot))
-            leverage = None
         else:
             step = max(float(mapping.qty_step or 0.0), 1e-12)
-            raw_qty = target_notional / max(unit_notional, 1e-9)
-            qty = math.floor(raw_qty / step) * step
             configured_lev = float(_cfg("LEVERAGE", 1.0))
             code_cap = float(_cfg("INSTITUTIONAL_MAX_SELECTED_LEVERAGE", configured_lev))
             venue_cap = self._venue_max_leverage(venue)
@@ -2351,6 +2367,54 @@ class InstitutionalStrategy:
             if venue_cap > 0:
                 caps.append(venue_cap)
             leverage = max(1.0, min(caps))
+            margin_cap_notional = max(0.0, margin_budget * leverage)
+            liquidity_scalar = min(1.0, max(0.0, liquidity_score))
+            liquidity_cap = max(0.0, margin_cap_notional * liquidity_scalar)
+            kelly_notional = margin_cap_notional * kelly_scalar * vol_scalar
+            hard_cap_notional = min(margin_cap_notional, liquidity_cap, risk_limited_notional)
+            min_order_notional = self._venue_min_order_notional_usd(capital_venue)
+            exchange_instrument = self._exchange_instrument(venue)
+            raw = getattr(exchange_instrument, "raw", {}) if exchange_instrument is not None else {}
+            min_qty = max(0.0, _num(
+                raw.get("min_qty")
+                or raw.get("min_base_quantity")
+                or raw.get("minQuantity")
+                or raw.get("min_size")
+                or getattr(exchange_instrument, "min_qty", 0.0),
+                0.0,
+            ))
+            max_qty = max(0.0, _num(
+                raw.get("max_qty")
+                or raw.get("max_base_quantity")
+                or raw.get("maxQuantity")
+                or getattr(exchange_instrument, "max_qty", 0.0),
+                0.0,
+            ))
+            min_executable_notional = max(min_order_notional, min_qty * unit_notional)
+            target_notional = min(liquidity_cap, risk_limited_notional, kelly_notional)
+            if (
+                min_executable_notional > 0.0
+                and target_notional + 1e-9 < min_executable_notional
+                and min_executable_notional <= hard_cap_notional + 1e-9
+            ):
+                target_notional = min_executable_notional
+
+            def _floor_to_step(value: float) -> float:
+                return math.floor(max(0.0, value) / step) * step
+
+            def _ceil_to_step(value: float) -> float:
+                return math.ceil(max(0.0, value) / step) * step
+
+            raw_qty = target_notional / max(unit_notional, 1e-9)
+            qty = _floor_to_step(raw_qty)
+            if min_executable_notional > 0.0 and min_executable_notional <= hard_cap_notional + 1e-9:
+                min_exec_qty = max(min_qty, min_order_notional / max(unit_notional, 1e-9))
+                if qty * unit_notional + 1e-9 < min_executable_notional:
+                    raised_qty = _ceil_to_step(min_exec_qty)
+                    if raised_qty * unit_notional <= hard_cap_notional + 1e-9:
+                        qty = raised_qty
+            if max_qty > 0.0:
+                qty = min(qty, _floor_to_step(max_qty))
         notional = qty * unit_notional
         margin = notional if leverage is None else notional / max(leverage, 1.0)
         risk_after = qty * risk_per_unit
@@ -2364,9 +2428,28 @@ class InstitutionalStrategy:
                 reasons=[f"order_notional_below_venue_minimum:{capital_venue}:{notional:.4f}<{min_order_notional:.4f}"],
                 capital_venue=capital_venue, available_cash_used=cash, balance_source=balance_label,
             )
-        approved = qty > 0 and margin <= cash and net_edge > 0 and risk_after <= risk_budget + 1e-9
+        approved = (
+            qty > 0
+            and margin <= cash + 1e-9
+            and margin <= margin_budget + 1e-9
+            and net_edge > 0
+            and risk_after <= risk_budget + 1e-9
+        )
         reasons = ([f"broker_local_cash_sizing_approved:{capital_venue or 'single_venue'}"] if approved
-                   else [f"broker_local_cash_sizing_rejected:{capital_venue or 'single_venue'}"])
+                   else [])
+        if not approved:
+            if qty <= 0:
+                reasons.append("quantity_rounds_to_zero_after_venue_step")
+            if margin > cash + 1e-9:
+                reasons.append(f"free_cash_margin_exceeded:{margin:.4f}>{cash:.4f}")
+            if margin > margin_budget + 1e-9:
+                reasons.append(f"policy_margin_budget_exceeded:{margin:.4f}>{margin_budget:.4f}")
+            if net_edge <= 0:
+                reasons.append(f"nonpositive_net_edge:{net_edge:.3f}")
+            if risk_after > risk_budget + 1e-9:
+                reasons.append(f"stop_risk_budget_exceeded:{risk_after:.4f}>{risk_budget:.4f}")
+            if not reasons:
+                reasons.append(f"broker_local_cash_sizing_rejected:{capital_venue or 'single_venue'}")
         exposure_check = getattr(risk_manager, "can_add_exposure", None)
         if approved and callable(exposure_check):
             signed_delta = notional if direction in {Direction.LONG, Direction.BULLISH} else -notional
@@ -2550,7 +2633,10 @@ class InstitutionalStrategy:
         only at the provisional notional its own live available balance can
         support; final size is recomputed after selection using full SL geometry.
         """
-        fraction = max(0.0, float(_cfg("VENUE_SELECTION_NOTIONAL_FRACTION", 0.25)))
+        fraction = max(0.0, min(1.0, float(_cfg(
+            "VENUE_SELECTION_MARGIN_FRACTION",
+            _cfg("VENUE_SELECTION_NOTIONAL_FRACTION", 0.25),
+        ))))
         min_margin = max(0.0, float(_cfg("VENUE_SELECTION_MIN_FREE_MARGIN_USD", 1.0)))
         configured_lev = max(1.0, float(_cfg("LEVERAGE", 1.0) or 1.0))
         code_cap = max(1.0, float(_cfg("INSTITUTIONAL_MAX_SELECTED_LEVERAGE", configured_lev) or configured_lev))
@@ -2564,14 +2650,14 @@ class InstitutionalStrategy:
             if venue_cap > 0:
                 caps.append(venue_cap)
             leverage = max(1.0, min(caps))
-            notional = cash * fraction
+            margin_allocation = cash * fraction
+            notional = margin_allocation * leverage
             min_order_notional = self._venue_min_order_notional_usd(key)
             if min_order_notional > 0.0 and 0.0 < notional + 1e-9 < min_order_notional:
                 # Cost the venue at its smallest executable contract value only
                 # when that minimum can be funded within the same broker-local
                 # margin allocation.  This permits a genuinely feasible route
                 # to compete while final SL/risk sizing remains authoritative.
-                margin_allocation = cash * fraction
                 min_required_margin = min_order_notional / leverage
                 notional = min_order_notional if min_required_margin <= margin_allocation + 1e-9 else 0.0
             notionals[key] = notional

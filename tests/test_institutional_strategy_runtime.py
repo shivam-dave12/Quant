@@ -114,6 +114,16 @@ def _instrument():
     return TradableInstrument("BTC", "Bitcoin", AssetClass.CRYPTO, ExchangeName.DELTA, {ExchangeName.DELTA: ei})
 
 
+def _hyperliquid_btc_instrument():
+    ei = ExchangeInstrument(
+        exchange=ExchangeName.HYPERLIQUID, symbol="BTC", ws_symbol="BTC", display_symbol="BTC",
+        asset_id="BTC", asset_class=AssetClass.CRYPTO, quote_asset="USD", base_asset="BTC",
+        status="active", tick_size=1.0, lot_step=0.00001, min_qty=0.00001, max_leverage=50.0,
+        raw={"contract_type": "linear_perp", "tick_size": 1.0, "qty_step": 0.00001, "min_qty": 0.00001},
+    )
+    return TradableInstrument("BTC", "Bitcoin", AssetClass.CRYPTO, ExchangeName.HYPERLIQUID, {ExchangeName.HYPERLIQUID: ei})
+
+
 def _silver_instrument():
     delta = ExchangeInstrument(
         exchange=ExchangeName.DELTA, symbol="SLVONUSD", ws_symbol="SLVONUSD", display_symbol="SLVONUSD",
@@ -441,9 +451,9 @@ def test_delta_contract_value_sizes_exposure_units_not_raw_contracts(tmp_path, m
     )
 
     assert decision.approved is True
-    assert decision.quantity == 0.004
+    assert decision.quantity == 0.065
     assert abs(decision.notional - decision.quantity * 4484.55) < 1e-9
-    assert _DeltaAdapter(None, exchange_instrument=ei)._qty_to_contracts(decision.quantity) == 4
+    assert _DeltaAdapter(None, exchange_instrument=ei)._qty_to_contracts(decision.quantity) == 65
 
 
 
@@ -758,8 +768,38 @@ def test_selected_broker_balance_controls_final_position_size_not_delta_balance(
     assert decision.capital_venue == "hyperliquid"
     assert decision.balance_source == "hyperliquid.user_state"
     assert decision.margin_required <= 100.0
-    assert decision.notional <= 100.0 * 0.20 + 1e-9
+    assert decision.notional <= 100.0 * 0.65 * 5.0 + 1e-9
     assert decision.notional >= 10.0
+    assert decision.reasons[0] == "broker_local_cash_sizing_approved:hyperliquid"
+
+
+def test_small_hyperliquid_btc_balance_uses_leverage_to_clear_minimum_notional(tmp_path, monkeypatch):
+    from strategy.domain import Direction, ProtectionPlan
+
+    monkeypatch.setattr("strategy.institutional_strategy._cfg", lambda name, default: {
+        "RESEARCH_STORE_PATH": str(tmp_path),
+        "VENUE_SELECTION_ENABLED": True,
+        "INSTITUTIONAL_RISK_FRACTION_PER_TRADE": 0.025,
+        "INSTITUTIONAL_FRACTIONAL_KELLY": 0.60,
+        "INSTITUTIONAL_TARGET_OBSERVATION_VOL_BPS": 100000.0,
+        "LEVERAGE": 25.0,
+        "INSTITUTIONAL_MAX_SELECTED_LEVERAGE": 25.0,
+        "HYPERLIQUID_MIN_ORDER_NOTIONAL_USD": 10.0,
+    }.get(name, default))
+    strategy = InstitutionalStrategy(instrument=_hyperliquid_btc_instrument())
+    risk = SimpleNamespace(get_available_balance=lambda: {"available": 100000.0, "source": "delta"})
+    decision = strategy._size_position(
+        "DESK_A_BTC", "BTC", Direction.SHORT, 74838.5, 12.1437, 0.999,
+        ProtectionPlan(74838.5, 75078.7445409202, 74189.28816388892, "VENUE_NATIVE_BRACKET", True),
+        risk,
+        venue="hyperliquid",
+        available_cash_snapshot=6.72784,
+        balance_source_label="shared_verified_collateral_snapshot:hyperliquid",
+    )
+    assert decision.approved is True
+    assert decision.notional >= 10.0
+    assert decision.margin_required <= 6.72784 * 0.85 + 1e-9
+    assert decision.risk_to_invalidation <= 6.72784 * 0.025 + 1e-9
     assert decision.reasons[0] == "broker_local_cash_sizing_approved:hyperliquid"
 
 
@@ -828,7 +868,7 @@ def test_hyperliquid_subminimum_notional_is_rejected_before_submission(tmp_path,
     }.get(name, default))
     strategy = InstitutionalStrategy(instrument=_silver_instrument())
     risk = SimpleNamespace(get_available_balance=lambda: {"available": 180.31, "source": "delta"})
-    hyperliquid = SimpleNamespace(get_balance=lambda: {"available": 20.0, "source": "hyperliquid.user_state"})
+    hyperliquid = SimpleNamespace(get_balance=lambda: {"available": 0.5, "source": "hyperliquid.user_state"})
     decision = strategy._size_position(
         "DESK_A_METALS", "xyz:SILVER", Direction.LONG, 30.0, 100.0, 1.0,
         ProtectionPlan(30.0, 29.0, 32.0, "VENUE_NATIVE_BRACKET", True), risk,

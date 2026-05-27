@@ -82,16 +82,16 @@ def test_hyperliquid_minimum_order_notional_is_enforced_before_route_selection()
     strategy = InstitutionalStrategy(instrument=None)
     assert strategy._venue_min_order_notional_usd("hyperliquid") == 10.0
     notionals, margins = strategy._venue_selection_budgets({"hyperliquid": 6.7278})
-    # Comparison is performed at the smallest executable contract notional
-    # only because the broker-local allocated margin supports that minimum.
-    assert notionals["hyperliquid"] == 10.0
+    # Comparison is performed from broker-local margin allocation expanded by
+    # selected leverage, never by another venue's collateral.
+    assert notionals["hyperliquid"] >= 10.0
     assert margins["hyperliquid"] > 0.0
 
 
 def test_hyperliquid_minimum_route_is_excluded_when_venue_local_margin_allocation_cannot_support_it():
     from strategy.institutional_strategy import InstitutionalStrategy
     strategy = InstitutionalStrategy(instrument=None)
-    notionals, _ = strategy._venue_selection_budgets({"hyperliquid": 1.0})
+    notionals, _ = strategy._venue_selection_budgets({"hyperliquid": 0.4})
     assert notionals["hyperliquid"] == 0.0
 
 
