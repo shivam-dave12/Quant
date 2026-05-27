@@ -494,7 +494,6 @@ GROWW_SESSION_BOOK_REQUIRE_FIRST_OPTION_TICK_ON_STARTUP = False
 GROWW_OPTION_STREAM_FIRST_TICK_TIMEOUT_SEC = 12.0
 GROWW_OPTION_STREAM_MAX_STALE_SEC = 15.0
 GROWW_REQUIRE_STATIC_IP_FOR_LIVE_ORDERS = True
-GROWW_APPROVED_STATIC_IPS: tuple[str, ...] = ()  # SET TO ("<YOUR_EC2_ELASTIC_IP>",) BEFORE GROWW LIVE
 GROWW_OUTBOUND_IP_CHECK_URL = "https://api.ipify.org?format=json"
 GROWW_OUTBOUND_IP_OVERRIDE = ""  # testing only; leave empty in production
 # Groww SDK exposes order_reference_id (8-20 chars) for traceability. Broker-side
