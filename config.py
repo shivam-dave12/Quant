@@ -537,7 +537,7 @@ GROWW_OUTBOUND_IP_OVERRIDE = ""  # testing only; leave empty in production
 # Groww SDK exposes order_reference_id (8-20 chars) for traceability. Broker-side
 # algo registration/whitelisting must be confirmed before live India execution.
 GROWW_REQUIRE_SEBI_ALGO_CONFIRMATION_FOR_LIVE_ORDERS = True
-GROWW_SEBI_ALGO_REGISTRATION_CONFIRMED = False  # set True only after broker confirmation
+GROWW_SEBI_ALGO_REGISTRATION_CONFIRMED = True  # set True only after broker confirmation
 GROWW_SEBI_STRATEGY_PREFIX = "instv2"[:6]
 GROWW_OPTION_MIN_LIVE_IV_COVERAGE = 0.60
 GROWW_OPTION_LONG_MAX_VRP = -0.02
