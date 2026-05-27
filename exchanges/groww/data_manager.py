@@ -33,7 +33,9 @@ from agents.groww_chain_architect import (
     chain_quality, is_chain_instrument, apply_contract_choice,
     build_session_contract_book, select_contract_from_session_book,
     eligible_nfo_master_option_rows, merge_verified_chain_quotes, contract_key,
+    shortlist_contracts_for_quote_validation,
 )
+from core.instruments import normalise_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +80,10 @@ class GrowwOptionDataManager:
         self._active_stream_key: tuple[str, str, float] | None = None
         self._active_stream_contract: dict[str, Any] = {}
         self._last_stream_tick_ts = 0.0
+        # LTP and market depth are distinct official Groww feeds.  Track both
+        # independently so a fresh LTP cannot keep a stale order book executable.
+        self._last_ltp_stream_ts = 0.0
+        self._last_depth_stream_ts = 0.0
         self._stream_armed_at = 0.0
         self._first_stream_tick = threading.Event()
         self._last_stream_repair_attempt = 0.0
@@ -204,6 +210,8 @@ class GrowwOptionDataManager:
         with self._lock:
             self._last_price = 0.0; self._last_quote_ts = 0.0; self._best_bid = 0.0; self._best_ask = 0.0; self._best_bid_qty = 0.0; self._best_ask_qty = 0.0
             self._last_stream_tick_ts = 0.0
+            self._last_ltp_stream_ts = 0.0
+            self._last_depth_stream_ts = 0.0
             self._candles = {tf: deque(maxlen=600) for tf in ("1m", "5m", "15m", "1h", "4h", "1d")}
             self._trades.clear()
             self._first_stream_tick.clear()
@@ -343,7 +351,7 @@ class GrowwOptionDataManager:
                         msg,
                     )
                     return True
-            logger.info("GROWW CE/PE session vehicles live through official LTP+market-depth feeds before signal execution; streamed_contracts=%d", len(self._book_stream_state))
+            logger.info("GROWW CE/PE session vehicles subscribed through official LTP+market-depth feeds; entry activation requires fresh LTP and depth for the selected vehicle; streamed_contracts=%d", len(self._book_stream_state))
             return True
         except Exception as exc:
             self._stop_option_stream()
@@ -422,7 +430,15 @@ class GrowwOptionDataManager:
             with self._lock:
                 self._upsert_option_live_candle("1m", candle, store=state["candles"])
                 self._aggregate_option_live_frames(int(candle["t"]), store=state["candles"])
-        if px > 0 or (bid > 0 and ask > 0):
+        ltp_ready = bool(state.get("quote_tick_ts", 0.0) and float(state.get("last_price", 0.0) or 0.0) > 0)
+        depth_ready = bool(
+            state.get("depth_tick_ts", 0.0)
+            and float(state.get("best_bid", 0.0) or 0.0) > 0
+            and float(state.get("best_ask", 0.0) or 0.0) >= float(state.get("best_bid", 0.0) or 0.0)
+            and float(state.get("best_bid_qty", 0.0) or 0.0) > 0
+            and float(state.get("best_ask_qty", 0.0) or 0.0) > 0
+        )
+        if ltp_ready and depth_ready:
             state["event"].set()
         if self._active_stream_key == key:
             self._active_stream_contract = dict(identity)
@@ -613,7 +629,10 @@ class GrowwOptionDataManager:
                 self._last_quote_ts = now
                 self._last_stream_tick_ts = now
                 if px > 0:
+                    self._last_ltp_stream_ts = now
                     self._last_price = px
+                if bid > 0 and ask >= bid and bid_qty > 0 and ask_qty > 0:
+                    self._last_depth_stream_ts = now
                 if bid > 0: self._best_bid = bid
                 if ask > 0: self._best_ask = ask
                 if bid_qty > 0: self._best_bid_qty = bid_qty
@@ -718,7 +737,64 @@ class GrowwOptionDataManager:
             return False, {"spread_bps": spread_bps, "visible_depth": visible_depth, "premium_atr": premium_atr, "spread_to_atr": spread_to_atr}
         return True, {"spread_bps": spread_bps, "visible_depth": visible_depth, "premium_atr": premium_atr, "spread_to_atr": spread_to_atr}
 
+    def _fetch_executable_quote_shortlist(self, underlying_spot: float, available_funds: float) -> dict[str, dict[str, Any]]:
+        """Validate a bounded CE/PE shortlist with Groww's documented Quote API.
+
+        The official Option Chain endpoint deliberately does not publish bid/offer
+        depth.  It is therefore used for chain-wide screening only.  The official
+        Quote endpoint supplies bid/offer and quantities for a small ranked set;
+        these snapshots are used only to finalise the session vehicle book.  Live
+        execution later remains blocked until the documented LTP and market-depth
+        websocket streams are fresh for the activated option.
+        """
+        per_side = max(1, int(_cfg("GROWW_SESSION_BOOK_QUOTE_SHORTLIST_PER_SIDE", 4)))
+        routes: list[dict[str, Any]] = []
+        for thesis in ("long", "short"):
+            ranked = shortlist_contracts_for_quote_validation(
+                self.instrument, thesis, underlying_spot=underlying_spot,
+                available_funds=available_funds, limit=per_side,
+            )
+            if not ranked:
+                logger.error("GROWW session contract book failed: option-chain shortlist empty for thesis=%s", thesis)
+                return {}
+            routes.extend(ranked)
+        quotes: dict[str, dict[str, Any]] = {}
+        requested = 0
+        two_sided = 0
+        seen: set[str] = set()
+        for route in routes:
+            symbol = normalise_symbol(route.get("TradingSymbol") or route.get("trading_symbol") or "")
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            requested += 1
+            try:
+                groww_throttle(f"selection_quote:{symbol}")
+                response = self.api.get_quote_for_instrument(route)
+                row = self._first_response_row(response)
+                if not row:
+                    continue
+                row["selection_quote_source"] = "groww.get_quote"
+                quotes[symbol] = row
+                bid, ask, bid_qty, ask_qty = self._extract_top_of_book(row)
+                if bid > 0 and ask >= bid and bid_qty > 0 and ask_qty > 0:
+                    two_sided += 1
+            except Exception as exc:
+                logger.warning("GROWW documented executable quote snapshot failed symbol=%s: %s", symbol, exc)
+        logger.info(
+            "GROWW two-stage option selection quotes loaded: requested=%d returned=%d two_sided=%d "
+            "basis=option_chain_greeks_oi_volume_then_get_quote_depth",
+            requested, len(quotes), two_sided,
+        )
+        return quotes
+
     def _prewarm_session_vehicle(self, choice) -> bool:
+        """Load option-premium history after documented Quote validation.
+
+        Two-sided selection liquidity was already verified through get_quote.
+        Do not test websocket state before subscriptions exist; fresh LTP+depth
+        websocket state remains the non-negotiable entry activation gate.
+        """
         route = self._route_field_snapshot()
         try:
             apply_contract_choice(self.instrument, choice)
@@ -727,15 +803,12 @@ class GrowwOptionDataManager:
             with self._lock:
                 if self._last_price <= 0 or len(self._candles.get("1m", ())) < int(_cfg("GROWW_OPTION_MIN_READY_1M_BARS", 20)):
                     return False
-            acceptable, metrics = self._live_execution_liquidity_check(choice, phase="session-prewarm")
-            if not acceptable:
-                return False
-            with self._lock:
                 self._contract_snapshots[self._snapshot_key(choice)] = {
-                    "last_price": self._last_price, "last_quote_ts": self._last_quote_ts,
-                    "best_bid": self._best_bid, "best_ask": self._best_ask,
-                    "best_bid_qty": self._best_bid_qty, "best_ask_qty": self._best_ask_qty,
-                    "liquidity_metrics": dict(metrics),
+                    "last_price": self._last_price, "last_quote_ts": 0.0,
+                    "best_bid": 0.0, "best_ask": 0.0,
+                    "best_bid_qty": 0.0, "best_ask_qty": 0.0,
+                    "selection_liquidity_source": "groww.get_quote",
+                    "execution_liquidity_source": "DOCUMENTED_OPTION_LTP_AND_DEPTH_STREAM_REQUIRED",
                     "candles": {tf: list(rows) for tf, rows in self._candles.items()},
                 }
             return True
@@ -752,11 +825,19 @@ class GrowwOptionDataManager:
             return False
         if not self._hydrate_chain_candidates(force_refresh=force_refresh, underlying_spot=underlying_spot):
             return False
-        # Build provisionally: publish a session book only after both vehicles
-        # pass premium-history and executable-liquidity prewarm.
-        book = build_session_contract_book(self.instrument, underlying_spot=underlying_spot, available_funds=available_funds, commit=False)
+        # Groww's option-chain payload contains LTP/Greeks/OI/volume but no
+        # two-sided book.  First rank a small official-chain shortlist, then use
+        # documented get_quote snapshots to finalise executable CE/PE vehicles.
+        quote_by_symbol = self._fetch_executable_quote_shortlist(underlying_spot, available_funds)
+        if not quote_by_symbol:
+            logger.error("GROWW session contract book rejected: no documented executable quote snapshots for shortlisted CE/PE vehicles")
+            return False
+        book = build_session_contract_book(
+            self.instrument, underlying_spot=underlying_spot,
+            available_funds=available_funds, option_quote_by_symbol=quote_by_symbol, commit=False,
+        )
         if book is None:
-            logger.error("GROWW session contract book rejected: cannot select both executable CE and PE vehicles")
+            logger.error("GROWW session contract book rejected: no CE/PE pair passed documented get_quote spread/depth and sizing checks")
             return False
         if bool(_cfg("GROWW_SESSION_BOOK_PREWARM_EXECUTION_DATA", True)):
             if not self._prewarm_session_vehicle(book.call) or not self._prewarm_session_vehicle(book.put):
@@ -768,7 +849,11 @@ class GrowwOptionDataManager:
         if not isinstance(raw, dict):
             return False
         stream_ready = all(
-            float(state.get("last_stream_tick_ts", 0.0) or 0.0) > 0.0
+            float(state.get("quote_tick_ts", 0.0) or 0.0) > 0.0
+            and float(state.get("depth_tick_ts", 0.0) or 0.0) > 0.0
+            and float(state.get("last_price", 0.0) or 0.0) > 0.0
+            and float(state.get("best_bid", 0.0) or 0.0) > 0.0
+            and float(state.get("best_ask", 0.0) or 0.0) >= float(state.get("best_bid", 0.0) or 0.0)
             for state in self._book_stream_state.values()
         ) if self._book_stream_state else False
         raw["session_contract_book"] = book.as_dict()
@@ -806,8 +891,11 @@ class GrowwOptionDataManager:
             key = (str(choice.get("expiry", "") or ""), right, round(float(choice.get("strike", 0.0) or 0.0), 6))
             with self._lock:
                 stream = dict(self._book_stream_state.get(key, {}) or {})
-            stream_ts = float(stream.get("last_stream_tick_ts", 0.0) or 0.0)
-            stream_age = max(0.0, now - stream_ts) if stream_ts > 0 else None
+            quote_ts = float(stream.get("quote_tick_ts", 0.0) or 0.0)
+            depth_ts = float(stream.get("depth_tick_ts", 0.0) or 0.0)
+            quote_age = max(0.0, now - quote_ts) if quote_ts > 0 else None
+            depth_age = max(0.0, now - depth_ts) if depth_ts > 0 else None
+            stream_age = max(quote_age, depth_age) if quote_age is not None and depth_age is not None else None
             ws_fresh = bool(stream_age is not None and stream_age <= max_stale)
             return {
                 "symbol": choice.get("selected_symbol", ""),
@@ -859,18 +947,23 @@ class GrowwOptionDataManager:
         max_age = float(_cfg("GROWW_OPTION_STREAM_MAX_STALE_SEC", 15.0))
         state_rows = []
         for key, state in dict(self._book_stream_state).items():
-            ts = float(state.get("last_stream_tick_ts", 0.0) or 0.0)
-            age = (now - ts) if ts > 0 else None
+            quote_ts = float(state.get("quote_tick_ts", 0.0) or 0.0)
+            depth_ts = float(state.get("depth_tick_ts", 0.0) or 0.0)
+            quote_age = (now - quote_ts) if quote_ts > 0 else None
+            depth_age = (now - depth_ts) if depth_ts > 0 else None
+            age = max(quote_age, depth_age) if quote_age is not None and depth_age is not None else None
             px = float(state.get("last_price", 0.0) or 0.0)
             bid = float(state.get("best_bid", 0.0) or 0.0)
             ask = float(state.get("best_ask", 0.0) or 0.0)
-            fresh = bool(ts > 0 and age is not None and age <= max_age and px > 0)
-            executable = bool(fresh and bid > 0 and ask > 0 and ask >= bid)
+            bid_qty = float(state.get("best_bid_qty", 0.0) or 0.0)
+            ask_qty = float(state.get("best_ask_qty", 0.0) or 0.0)
+            quote_fresh = bool(quote_ts > 0 and quote_age is not None and quote_age <= max_age and px > 0)
+            depth_fresh = bool(depth_ts > 0 and depth_age is not None and depth_age <= max_age and bid > 0 and ask >= bid and bid_qty > 0 and ask_qty > 0)
+            executable = bool(quote_fresh and depth_fresh)
             state_rows.append({
-                "key": key, "age_sec": age, "price": px, "quote_fresh": fresh,
-                "book_executable": executable, "quote_tick_ts": float(state.get("quote_tick_ts", 0.0) or 0.0),
-                "depth_tick_ts": float(state.get("depth_tick_ts", 0.0) or 0.0),
-                "ohlcv_tick_ts": float(state.get("ohlcv_tick_ts", 0.0) or 0.0),
+                "key": key, "age_sec": age, "price": px, "quote_fresh": quote_fresh,
+                "depth_fresh": depth_fresh, "book_executable": executable, "quote_tick_ts": quote_ts,
+                "depth_tick_ts": depth_ts, "ohlcv_tick_ts": float(state.get("ohlcv_tick_ts", 0.0) or 0.0),
             })
         live = [row for row in state_rows if row["quote_fresh"]]
         executable = [row for row in state_rows if row["book_executable"]]
@@ -932,6 +1025,8 @@ class GrowwOptionDataManager:
                 stream_ts = float(stream_state.get("last_stream_tick_ts", 0.0) or 0.0)
                 self._last_quote_ts = float(stream_ts or stream_state.get("last_quote_ts", 0.0) or 0.0)
                 self._last_stream_tick_ts = stream_ts
+                self._last_ltp_stream_ts = float(stream_state.get("quote_tick_ts", 0.0) or 0.0)
+                self._last_depth_stream_ts = float(stream_state.get("depth_tick_ts", 0.0) or 0.0)
                 self._best_bid = float(stream_state.get("best_bid", 0.0) or 0.0)
                 self._best_ask = float(stream_state.get("best_ask", 0.0) or 0.0)
                 self._best_bid_qty = float(stream_state.get("best_bid_qty", 0.0) or 0.0)
@@ -1209,14 +1304,22 @@ class GrowwOptionDataManager:
         return int(time.time() * 1000)
 
     def _execution_price_fresh(self, max_stale_seconds: float) -> bool:
-        """Require fresh Groww option LTP and market depth from the documented feed."""
+        """Require independently fresh Groww option LTP and market-depth feeds."""
         now = time.time()
         with self._lock:
-            stream_ts = float(self._last_stream_tick_ts or 0.0)
-            has_book = self._best_bid > 0 and self._best_ask > 0 and self._best_ask >= self._best_bid
+            ltp_ts = float(self._last_ltp_stream_ts or 0.0)
+            depth_ts = float(self._last_depth_stream_ts or 0.0)
+            has_book = (
+                self._best_bid > 0 and self._best_ask >= self._best_bid
+                and self._best_bid_qty > 0 and self._best_ask_qty > 0
+            )
             has_price = self._last_price > 0
         max_stream = min(float(max_stale_seconds), float(_cfg("GROWW_OPTION_STREAM_MAX_STALE_SEC", 15.0)))
-        return bool(stream_ts > 0 and now - stream_ts <= max_stream and has_price and has_book)
+        return bool(
+            ltp_ts > 0 and depth_ts > 0
+            and now - ltp_ts <= max_stream and now - depth_ts <= max_stream
+            and has_price and has_book
+        )
 
     def get_last_update(self) -> float:
         with self._lock:

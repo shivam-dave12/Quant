@@ -189,3 +189,119 @@ def test_runtime_image_scopes_groww_sdk_state_boundary_for_botuser():
     assert "os.chown(instruments_cache, user.pw_uid, user.pw_gid)" in dockerfile
     assert "chown -R botuser:botuser /usr/local/lib/python3.11/site-packages" not in dockerfile
     assert "chmod -R" not in dockerfile
+
+
+def test_option_chain_normalisation_preserves_official_nested_greeks_without_inventing_depth():
+    wrapper = GrowwRestClient(access_token="test")
+    rows = wrapper._normalise_option_chain(
+        {
+            "underlying_ltp": 25000.0,
+            "strikes": {
+                "25000": {
+                    "CE": {
+                        "greeks": {"delta": 0.48, "gamma": 0.001, "theta": -8.2, "vega": 11.5, "rho": 1.2, "iv": 14.5},
+                        "trading_symbol": "NIFTY26J0225000CE",
+                        "ltp": 112.0,
+                        "open_interest": 500,
+                        "volume": 200,
+                    }
+                }
+            },
+        },
+        "NIFTY",
+        "2026-06-02",
+    )
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["delta"] == 0.48
+    assert row["iv"] == 14.5
+    assert row["official_greeks_source"] == "groww_option_chain"
+    assert "best_bid_price" not in row
+    assert "best_offer_price" not in row
+
+
+def test_two_stage_session_book_screens_chain_then_requires_documented_quote_depth(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+    from agents import groww_chain_architect as chain
+
+    expiry = (datetime.now(timezone.utc) + timedelta(days=7)).strftime("%Y-%m-%d")
+    ce_symbol = "NIFTY26J0225000CE"
+    pe_symbol = "NIFTY26J0225000PE"
+    instrument = SimpleNamespace(
+        asset_id="NIFTY",
+        primary=SimpleNamespace(
+            raw={
+                "desk_id": "GROWW_INDEX_OPTIONS",
+                "stock_code": "NIFTY",
+                "underlying": "NIFTY",
+                "chain_source": "official_instrument_csv_plus_get_option_chain",
+                "chain_candidates": [
+                    {
+                        "right": "Call", "option_type": "CE", "TradingSymbol": ce_symbol,
+                        "trading_symbol": ce_symbol, "strike_price": 25000, "expiry_date": expiry,
+                        "runtime_lot_size": 25, "ltp": 100.0, "delta": 0.46,
+                        "iv": 15.0, "open_interest": 1000, "volume": 1000,
+                    },
+                    {
+                        "right": "Put", "option_type": "PE", "TradingSymbol": pe_symbol,
+                        "trading_symbol": pe_symbol, "strike_price": 25000, "expiry_date": expiry,
+                        "runtime_lot_size": 25, "ltp": 105.0, "delta": -0.44,
+                        "iv": 15.0, "open_interest": 1200, "volume": 900,
+                    },
+                ],
+            }
+        ),
+    )
+    monkeypatch.setattr(chain.config, "GROWW_SESSION_BOOK_REQUIRE_TWO_SIDED_QUOTE", True, raising=False)
+    monkeypatch.setattr(chain.config, "GROWW_OPTION_MIN_DTE", 1.0, raising=False)
+    monkeypatch.setattr(chain.config, "GROWW_OPTION_MAX_DTE", 21.0, raising=False)
+
+    ce_shortlist = chain.shortlist_contracts_for_quote_validation(
+        instrument, "long", underlying_spot=25000.0, available_funds=25852.96, limit=4
+    )
+    pe_shortlist = chain.shortlist_contracts_for_quote_validation(
+        instrument, "short", underlying_spot=25000.0, available_funds=25852.96, limit=4
+    )
+    assert ce_shortlist[0]["TradingSymbol"] == ce_symbol
+    assert pe_shortlist[0]["TradingSymbol"] == pe_symbol
+    # An option-chain row alone is not executable because Groww documents no bid/offer depth there.
+    assert chain.build_session_contract_book(
+        instrument, underlying_spot=25000.0, available_funds=25852.96, commit=False
+    ) is None
+
+    quote_by_symbol = {
+        ce_symbol: {"bid_price": 99.5, "offer_price": 100.0, "bid_quantity": 100, "offer_quantity": 100},
+        pe_symbol: {"bid_price": 104.0, "offer_price": 104.5, "bid_quantity": 100, "offer_quantity": 100},
+    }
+    book = chain.build_session_contract_book(
+        instrument, underlying_spot=25000.0, available_funds=25852.96,
+        option_quote_by_symbol=quote_by_symbol, commit=False,
+    )
+    assert book is not None
+    assert book.call.selected_symbol == ce_symbol
+    assert book.put.selected_symbol == pe_symbol
+
+
+def test_execution_freshness_requires_independently_fresh_ltp_and_market_depth():
+    import time
+    from types import SimpleNamespace
+    from exchanges.groww.data_manager import GrowwOptionDataManager
+
+    manager = GrowwOptionDataManager(
+        instrument=SimpleNamespace(asset_id="NIFTY", primary=SimpleNamespace(raw={})),
+        api=SimpleNamespace(),
+    )
+    now = time.time()
+    manager._last_price = 100.0
+    manager._best_bid = 99.5
+    manager._best_ask = 100.0
+    manager._best_bid_qty = 100
+    manager._best_ask_qty = 100
+    manager._last_ltp_stream_ts = now
+    manager._last_depth_stream_ts = 0.0
+    assert manager._execution_price_fresh(10.0) is False
+    manager._last_depth_stream_ts = now
+    assert manager._execution_price_fresh(10.0) is True
+    manager._last_ltp_stream_ts = now - 60.0
+    assert manager._execution_price_fresh(10.0) is False

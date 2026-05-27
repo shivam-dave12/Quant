@@ -369,6 +369,78 @@ def merge_verified_chain_quotes(master_rows: Iterable[Mapping[str, Any]], quote_
     return merged
 
 
+
+def shortlist_contracts_for_quote_validation(
+    instrument: Any,
+    thesis_side: str,
+    *,
+    underlying_spot: float,
+    available_funds: float,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """Rank chain-defined vehicles before querying executable quote snapshots.
+
+    Groww's documented ``get_option_chain`` response contains LTP, Greeks, open
+    interest and volume, but it does not contain the two-sided order book needed
+    for execution validation.  This stage uses only those documented chain fields
+    plus the verified instrument master/lot size to construct a small shortlist.
+    The next stage calls documented ``get_quote`` for that shortlist and the final
+    stage requires live LTP + market-depth websocket state before any order.
+    """
+    raw = getattr(getattr(instrument, "primary", None), "raw", {}) or {}
+    chain = [dict(x) for x in (raw.get("chain_candidates") or []) if isinstance(x, Mapping)]
+    side = str(thesis_side or "").lower()
+    desired = "call" if side == "long" else "put" if side == "short" else ""
+    if not chain or not desired:
+        return []
+    spot = max(0.0, safe_float(underlying_spot or raw.get("underlying_spot_price") or raw.get("spot_price"), 0.0))
+    min_dte = float(_cfg("GROWW_OPTION_MIN_DTE", 2.0))
+    max_dte = float(_cfg("GROWW_OPTION_MAX_DTE", 21.0))
+    target_delta = float(_cfg("GROWW_INDEX_OPTION_TARGET_ABS_DELTA", 0.45) if raw.get("desk_id") == "GROWW_INDEX_OPTIONS" else _cfg("GROWW_STOCK_OPTION_TARGET_ABS_DELTA", 0.50))
+    max_fraction = clamp(safe_float(_cfg("GROWW_OPTION_MAX_FUNDS_FRACTION_PER_TRADE", 0.42), 0.42), 0.01, 1.0)
+    cash_buffer = max(0.0, safe_float(_cfg("GROWW_OPTION_MIN_CASH_BUFFER_INR", 0.0), 0.0))
+    max_cost = max(0.0, (safe_float(available_funds, 0.0) - cash_buffer) * max_fraction)
+    max_rows = max(1, int(limit if limit is not None else _cfg("GROWW_SESSION_BOOK_QUOTE_SHORTLIST_PER_SIDE", 4)))
+    ranked: list[tuple[float, dict[str, Any]]] = []
+    for candidate in chain:
+        if _right(candidate) != desired:
+            continue
+        dte = _dte(candidate)
+        strike = _strike(candidate)
+        lot = _lot_size(candidate)
+        premium = _premium(candidate)
+        if strike <= 0 or lot <= 0 or premium <= 0 or dte < min_dte or dte > max_dte:
+            continue
+        cost = premium * lot
+        if max_cost <= 0 or cost > max_cost:
+            continue
+        greeks = candidate.get("greeks") if isinstance(candidate.get("greeks"), Mapping) else {}
+        signed_delta = safe_float(candidate.get("delta") or greeks.get("delta"), 0.0)
+        abs_delta = abs(signed_delta)
+        # An official chain row without a reported delta remains eligible but ranks
+        # below otherwise comparable rows; do not manufacture a broker Greek.
+        delta_score = clamp(1.0 - abs(abs_delta - target_delta) / max(target_delta, 1e-9)) if abs_delta > 0 else 0.15
+        dte_mid = (min_dte + max_dte) / 2.0
+        dte_score = clamp(1.0 - abs(dte - dte_mid) / max(1.0, max_dte - min_dte))
+        affordability = clamp(1.0 - abs(cost / max(max_cost, 1e-9) - 0.58) / 0.58)
+        volume = max(0.0, safe_float(candidate.get("volume"), 0.0))
+        open_interest = max(0.0, safe_float(candidate.get("open_interest"), 0.0))
+        activity = 0.55 * clamp(math.log1p(volume) / math.log1p(100000.0)) + 0.45 * clamp(math.log1p(open_interest) / math.log1p(100000.0))
+        if spot > 0:
+            proximity = clamp(1.0 - abs(strike - spot) / max(spot * 0.12, 1.0))
+        else:
+            proximity = 0.0
+        score = 0.40 * delta_score + 0.18 * activity + 0.17 * affordability + 0.15 * dte_score + 0.10 * proximity
+        enriched = dict(candidate)
+        enriched["shortlist_score"] = score
+        enriched["shortlist_basis"] = "groww_option_chain_greeks_oi_volume_then_get_quote"
+        enriched["shortlist_contract_cost"] = cost
+        enriched["runtime_lot_size"] = lot
+        ranked.append((score, enriched))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [row for _, row in ranked[:max_rows]]
+
+
 def build_session_contract_book(
     instrument: Any,
     *,
@@ -568,7 +640,7 @@ def select_contract_for_thesis(
         if require_two_sided and spread_bps > max_spread_bps:
             continue
         bid_qty = safe_float(c.get("best_bid_quantity") or q.get("best_bid_quantity") or c.get("bid_quantity") or q.get("bid_quantity"), 0.0)
-        ask_qty = safe_float(c.get("best_offer_quantity") or q.get("best_offer_quantity") or c.get("ask_quantity") or q.get("ask_quantity"), 0.0)
+        ask_qty = safe_float(c.get("best_offer_quantity") or q.get("best_offer_quantity") or c.get("offer_quantity") or q.get("offer_quantity") or c.get("ask_quantity") or q.get("ask_quantity"), 0.0)
         min_book_lots = max(0.0, safe_float(_cfg("GROWW_OPTION_MIN_BOOK_LOTS", 1.0), 1.0))
         if require_two_sided and min(bid_qty, ask_qty) < lot * min_book_lots:
             continue

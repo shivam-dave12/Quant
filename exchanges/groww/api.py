@@ -437,6 +437,11 @@ class GrowwRestClient:
                 if str(side).upper() not in {"CE", "PE"} or not isinstance(payload, Mapping):
                     continue
                 row = dict(payload)
+                # Groww's documented Option Chain returns Greeks nested under
+                # ``greeks`` and provides LTP/OI/volume, but not bid/offer depth.
+                # Preserve and flatten these official values for session screening;
+                # executable depth is obtained separately from get_quote/feed.
+                greeks = row.get("greeks") if isinstance(row.get("greeks"), Mapping) else {}
                 row.update({
                     "stock_code": underlying,
                     "exchange_code": "NFO",
@@ -449,6 +454,13 @@ class GrowwRestClient:
                     "strike_price": _num(strike_raw, 0.0),
                     "TradingSymbol": row.get("trading_symbol"),
                     "underlying_ltp": (resp.get("underlying_ltp") if isinstance(resp, Mapping) else None),
+                    "delta": _num(greeks.get("delta"), 0.0),
+                    "gamma": _num(greeks.get("gamma"), 0.0),
+                    "theta": _num(greeks.get("theta"), 0.0),
+                    "vega": _num(greeks.get("vega"), 0.0),
+                    "rho": _num(greeks.get("rho"), 0.0),
+                    "iv": _num(greeks.get("iv"), 0.0),
+                    "official_greeks_source": "groww_option_chain",
                     "quote_source": "groww_option_chain",
                 })
                 rows.append(row)
