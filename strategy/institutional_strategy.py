@@ -412,12 +412,19 @@ class InstitutionalStrategy:
         except Exception:
             return None
 
+    @staticmethod
+    def _telemetry_reason_key(reason: Any) -> str:
+        text = str(reason or "").strip()
+        if not text:
+            return ""
+        return text.split(":", 1)[0].strip() or text
+
     def _decision_telemetry_signature(self, decision: OpportunityDecision) -> tuple[Any, ...]:
         model = decision.model_values or {}
         option_context = model.get("option_volatility_context", {}) if isinstance(model.get("option_volatility_context"), dict) else {}
         execution_feed = model.get("execution_feed", {}) if isinstance(model.get("execution_feed"), dict) else {}
         session_book = model.get("session_execution_book", {}) if isinstance(model.get("session_execution_book"), dict) else {}
-        reasons = list(decision.reasons[:2])
+        reasons = [self._telemetry_reason_key(reason) for reason in decision.reasons[:2]]
         signal_source = str(model.get("signal_source", ""))
         direction_key = decision.direction.value
         raw_non_actionable = {"ofi_tfi_microprice_long", "ofi_tfi_microprice_short", "flow_signal_flat"}
@@ -441,14 +448,32 @@ class InstitutionalStrategy:
             "nifty_no_valid_structural_displacement",
             "unqualified_signal_below_required_edge",
             "flow_signal_flat",
+            "active_option_ltp_depth_stream_not_fresh",
+            "direction_specific_groww_vehicle_not_fresh_or_not_executable",
+            "net_edge_does_not_clear_uncertainty_and_minimum",
+            "option_premium_edge_does_not_clear_cost_and_uncertainty",
+            "order_notional_below_venue_minimum",
+            "policy_margin_budget_exceeded",
+            "quantity_rounds_to_zero_after_venue_step",
+            "selected_route_cost_exceeds_limit",
+            "selected_route_nonpositive_expected_net_edge",
+            "selected_route_nonpositive_expected_net_profit",
+            "signal_horizon_below_protected_execution_min",
+            "stop_risk_budget_exceeded",
         }
         if (
-            decision.decision is DecisionOutput.NO_TRADE_INSUFFICIENT_EDGE
+            decision.decision in {
+                DecisionOutput.NO_TRADE_INSUFFICIENT_EDGE,
+                DecisionOutput.NO_TRADE_EXECUTION_UNSAFE,
+                DecisionOutput.NO_TRADE_RISK_BUDGET,
+            }
             and reasons and reasons[0] in stable_non_actionable_reasons
         ):
             # Regime stays in the heartbeat payload but cannot cause operational
             # transition spam while the same execution/edge blocker is unchanged.
             regime_key = "HEARTBEAT_ONLY_WHILE_NON_ACTIONABLE"
+            direction_key = "HEARTBEAT_ONLY_WHILE_NON_ACTIONABLE"
+            signal_source = f"non_actionable:{reasons[0]}"
         return (
             decision.decision.value, direction_key, regime_key, tuple(reasons),
             signal_source, str(model.get("thesis_reason", "")),

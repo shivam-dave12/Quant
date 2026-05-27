@@ -241,6 +241,35 @@ def test_groww_lifecycle_partial_fill_protects_actual_qty_and_cancels_remainder(
     assert "PARTIAL_FILL_REMAINDER_CANCELLED" in result.reasons
 
 
+def test_groww_lifecycle_uses_trade_vwap_for_actual_fill_price(monkeypatch):
+    monkeypatch.setattr("execution.order_manager.config.GROWW_REQUIRE_STATIC_IP_FOR_LIVE_ORDERS", False, raising=False)
+    monkeypatch.setattr("execution.order_manager.config.GROWW_REQUIRE_SEBI_ALGO_CONFIRMATION_FOR_LIVE_ORDERS", False, raising=False)
+
+    class SplitFillSDK(FakeGrowwSDK):
+        def get_order_detail(self, groww_order_id, segment="FNO", **kwargs):
+            row = super().get_order_detail(groww_order_id, segment=segment, **kwargs)
+            row["average_price"] = 0
+            return row
+
+        def get_trade_list_for_order(self, groww_order_id, segment="FNO", **kwargs):
+            return {
+                "trade_list": [
+                    {"price": 118.0, "quantity": 25, "trade_status": "EXECUTED", "segment": segment},
+                    {"price": 120.0, "quantity": 25, "trade_status": "EXECUTED", "segment": segment},
+                ]
+            }
+
+    fake = SplitFillSDK(fill_status="FILLED", filled_qty=50, fill_price=0)
+    api = _client(fake)
+    om = OrderManager(api, exchange_name="groww", instrument=_groww_inst())
+    result = om.execute_groww_long_option_with_protection(
+        "BUY", 50, limit_price=118.75, sl_price=95.0, tp_price=160.0, timeout_sec=0.0
+    )
+    assert result.approved is True
+    assert result.average_fill_price == 119.0
+    assert fake.last_smart_order["quantity"] == 50
+
+
 def test_groww_lifecycle_oco_failure_blocks_new_entries_and_emergency_exits(monkeypatch):
     monkeypatch.setattr("execution.order_manager.config.GROWW_REQUIRE_STATIC_IP_FOR_LIVE_ORDERS", False, raising=False)
     monkeypatch.setattr("execution.order_manager.config.GROWW_REQUIRE_SEBI_ALGO_CONFIRMATION_FOR_LIVE_ORDERS", False, raising=False)

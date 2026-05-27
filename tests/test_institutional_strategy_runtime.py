@@ -696,6 +696,42 @@ def test_nonactionable_blocker_does_not_emit_transition_only_for_regime_flip(tmp
     assert caplog.text.count("DECISION_TRANSITION") == 1
 
 
+def test_numeric_route_rejection_updates_do_not_emit_transition_spam(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr("strategy.institutional_strategy._cfg", lambda name, default: {
+        "RESEARCH_STORE_PATH": str(tmp_path),
+        "INSTITUTIONAL_DECISION_TELEMETRY_ENABLED": True,
+        "INSTITUTIONAL_DECISION_TELEMETRY_HEARTBEAT_SEC": 60.0,
+    }.get(name, default))
+    strategy = InstitutionalStrategy(instrument=_instrument())
+    from strategy.domain import DecisionOutput, Direction, Regime
+
+    def blocked(reason, direction):
+        return strategy._decision(
+            desk="DESK_A_BTC", venue="hyperliquid", instrument="BTC",
+            decision=DecisionOutput.NO_TRADE_EXECUTION_UNSAFE, direction=direction,
+            regime=Regime.TREND, expected_net_edge_bps=-2.0, uncertainty_bps=3.0,
+            liquidity_score=0.99, execution_quality_score=1.0,
+            sizing=None, protection_plan=None,
+            reasons=[reason],
+            model_values={
+                "signal_source": "selected_venue_validated:hyperliquid:market_state_flow_short",
+                "costs_bps": 7.1,
+            },
+            research_features={},
+        )
+
+    import logging
+    with caplog.at_level(logging.INFO):
+        strategy._log_decision_calculation(
+            blocked("selected_route_nonpositive_expected_net_edge:-2.480", Direction.SHORT)
+        )
+        strategy._log_decision_calculation(
+            blocked("selected_route_nonpositive_expected_net_edge:-2.971", Direction.LONG)
+        )
+    assert caplog.text.count("DECISION_TRANSITION") == 1
+    assert "selected_route_nonpositive_expected_net_edge:-2.480" in caplog.text
+
+
 def test_shadow_validated_telemetry_is_not_labelled_insufficient_edge(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr("strategy.institutional_strategy._cfg", lambda name, default: {
         "RESEARCH_STORE_PATH": str(tmp_path),

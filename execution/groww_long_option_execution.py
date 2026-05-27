@@ -496,6 +496,11 @@ class GrowwLongOptionExecutor:
                 filled = requested_qty
             avg = self._average_fill_price(row)
             if status in self.FILL_STATUSES | self.PARTIAL_STATUSES | self.DEAD_STATUSES:
+                trade_fill = self._get_trade_fill(order_id) if filled > 0 else {}
+                if trade_fill:
+                    filled = int(_num(trade_fill.get("filled_quantity"), filled) or filled)
+                    avg = _num(trade_fill.get("average_price"), avg)
+                    row["fill_source"] = trade_fill.get("fill_source")
                 row["status"] = status
                 row["filled_quantity"] = filled
                 row["average_price"] = avg
@@ -521,6 +526,78 @@ class GrowwLongOptionExecutor:
         if not row:
             raise RuntimeError(f"Groww get_order_detail returned no order row for {order_id}.")
         return row
+
+    def _get_trade_fill(self, order_id: str) -> dict[str, Any]:
+        """Use Groww's documented trade list to compute actual filled VWAP."""
+        getter = getattr(self.api, "get_trade_detail", None)
+        if not callable(getter):
+            return {}
+        try:
+            resp = getter(
+                groww_order_id=order_id,
+                segment=_const(self.api, "SEGMENT_FNO", "FNO"),
+            )
+        except TypeError:
+            try:
+                resp = getter(
+                    order_id=order_id,
+                    segment=_const(self.api, "SEGMENT_FNO", "FNO"),
+                )
+            except Exception as exc:
+                logger.debug("Groww get_trade_detail failed for %s: %s", order_id, exc)
+                return {}
+        except Exception as exc:
+            logger.debug("Groww get_trade_detail failed for %s: %s", order_id, exc)
+            return {}
+
+        rows = self._trade_rows(resp)
+        num = den = 0.0
+        for trade in rows:
+            status = str(trade.get("trade_status") or trade.get("status") or "").strip().upper()
+            if status and status not in {"EXECUTED", "FILLED", "COMPLETE", "COMPLETED"}:
+                continue
+            qty = _num(
+                trade.get("quantity")
+                or trade.get("qty")
+                or trade.get("filled_quantity")
+                or trade.get("executed_quantity"),
+                0.0,
+            )
+            px = _num(
+                trade.get("price")
+                or trade.get("trade_price")
+                or trade.get("average_fill_price")
+                or trade.get("average_price")
+                or trade.get("execution_price"),
+                0.0,
+            )
+            if qty > 0 and px > 0:
+                num += qty * px
+                den += qty
+        if den <= 0:
+            return {}
+        return {
+            "filled_quantity": int(den),
+            "average_price": num / den,
+            "fill_source": "groww.get_trade_list_for_order",
+        }
+
+    @staticmethod
+    def _trade_rows(value: Any) -> list[Mapping[str, Any]]:
+        if isinstance(value, list):
+            return [row for row in value if isinstance(row, Mapping)]
+        if not isinstance(value, Mapping):
+            return []
+        rows: list[Mapping[str, Any]] = []
+        for key in ("trade_list", "trades", "orders", "data", "result", "Success", "success"):
+            nested = value.get(key)
+            if isinstance(nested, list):
+                rows.extend(row for row in nested if isinstance(row, Mapping))
+            elif isinstance(nested, Mapping):
+                rows.extend(GrowwLongOptionExecutor._trade_rows(nested))
+        if rows:
+            return rows
+        return [value]
 
     def _cancel_order(self, order_id: str) -> dict[str, Any]:
         """Cancel through Groww's documented cancel_order endpoint only."""
@@ -689,4 +766,3 @@ class GrowwLongOptionExecutor:
         else:
             rounded = round(raw / self.tick_size) * self.tick_size
         return round(max(self.tick_size, rounded), 2)
-
