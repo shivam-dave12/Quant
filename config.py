@@ -18,13 +18,13 @@ load_dotenv()
 # ── OPERATOR CONTROL PANEL — change policy only here, never in .env ───────────
 # LIVE TRADING MASTER SWITCH. Keep False for shadow validation. Change only this
 # line to True once the live venues below are explicitly approved.
-LIVE_TRADING_ENABLED = False
+LIVE_TRADING_ENABLED = True
 
 # Analysis may run across all configured feeds. Orders may route ONLY to venues
 # explicitly listed in LIVE_EXECUTION_VENUES when LIVE_TRADING_ENABLED=True.
 # Safe first-live default: Groww/NIFTY only; add "delta" deliberately later.
 ANALYSIS_DATA_VENUES = ("delta", "coinswitch", "groww")
-LIVE_EXECUTION_VENUES = ("groww",)
+LIVE_EXECUTION_VENUES = ("groww","delta", "coinswitch")
 EXECUTION_EXCHANGE = "delta"  # legacy discovery preference; not live-order permission
 
 # Venue activation / environments are runtime policy, not secrets.
@@ -531,7 +531,7 @@ GROWW_SESSION_BOOK_REQUIRE_FIRST_OPTION_TICK_ON_STARTUP = False
 GROWW_OPTION_STREAM_FIRST_TICK_TIMEOUT_SEC = 12.0
 GROWW_OPTION_STREAM_MAX_STALE_SEC = 15.0
 GROWW_REQUIRE_STATIC_IP_FOR_LIVE_ORDERS = True
-GROWW_APPROVED_STATIC_IPS: tuple[str, ...] = ()  # SET TO ("<YOUR_EC2_ELASTIC_IP>",) BEFORE GROWW LIVE
+GROWW_APPROVED_STATIC_IPS: tuple[str, ...] = ("13.51.193.234",)  # SET TO ("<YOUR_EC2_ELASTIC_IP>",) BEFORE GROWW LIVE
 GROWW_OUTBOUND_IP_CHECK_URL = "https://api.ipify.org?format=json"
 GROWW_OUTBOUND_IP_OVERRIDE = ""  # testing only; leave empty in production
 # Groww SDK exposes order_reference_id (8-20 chars) for traceability. Broker-side
