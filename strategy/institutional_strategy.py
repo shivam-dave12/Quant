@@ -13,6 +13,8 @@ reasons instead of falling back to older entry logic.
 
 from __future__ import annotations
 
+import json
+import logging
 import math
 import time
 from collections import deque
@@ -39,6 +41,8 @@ from strategy.domain import (
     ProtectionPlan,
     Regime,
 )
+
+logger = logging.getLogger(__name__)
 
 try:
     import config
@@ -223,9 +227,34 @@ class InstitutionalStrategy:
         decision = self.evaluate(data_manager, order_manager, risk_manager, now_ms)
         self._last_decision = decision
         self._last_decision_ts = time.time()
+        self._log_decision_calculation(decision)
         self._persist_decision(decision, now_ms)
         if decision.approved:
             self._execute_approved(decision, order_manager, risk_manager)
+
+    def _log_decision_calculation(self, decision: OpportunityDecision) -> None:
+        """Publish the exact calculated state used for every decision.
+
+        This intentionally logs rejected/no-trade decisions as well as approved
+        entries so the operator can audit every input, model output and gate.
+        Secrets/tokens never enter ``model_values`` and are not logged here.
+        """
+        if not bool(_cfg("INSTITUTIONAL_DECISION_TELEMETRY_ENABLED", True)):
+            return
+        sizing = asdict(decision.sizing) if decision.sizing is not None else None
+        protection = asdict(decision.protection_plan) if decision.protection_plan is not None else None
+        payload = {
+            "desk": decision.desk, "venue": decision.venue, "instrument": decision.instrument,
+            "decision": decision.decision.value, "direction": decision.direction.value,
+            "regime": decision.regime.value, "net_edge_bps": decision.expected_net_edge_bps,
+            "uncertainty_bps": decision.uncertainty_bps, "liquidity_score": decision.liquidity_score,
+            "execution_quality": decision.execution_quality_score, "reasons": decision.reasons,
+            "model": decision.model_values, "sizing": sizing, "protection": protection,
+        }
+        try:
+            logger.info("🧮 DECISION_CALC %s", json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str))
+        except Exception as exc:
+            logger.warning("DECISION_CALC serialization failed: %s", exc)
 
     def evaluate(self, data_manager, order_manager, risk_manager, now_ms: int) -> OpportunityDecision:
         venue = self._venue(order_manager)
@@ -271,12 +300,14 @@ class InstitutionalStrategy:
         direction, directional_edge_bps, direction_reason = self._direction_and_edge(
             desk, price, liquidity_score, execution_state=execution_state, btc_composite=btc_composite
         )
-        costs_bps = self._execution_cost_bps(data_manager)
+        cost_components = self._execution_cost_components(data_manager)
+        costs_bps = cost_components["total_cost_bps"]
         uncertainty_bps = self._uncertainty_bps(regime, liquidity_score, execution_quality)
         net_edge = directional_edge_bps - costs_bps
         model_values = {
             "directional_edge_bps": directional_edge_bps,
             "costs_bps": costs_bps,
+            "execution_cost_components": cost_components,
             "net_edge_bps": net_edge,
             "uncertainty_bps": uncertainty_bps,
             "liquidity_score": liquidity_score,
@@ -503,14 +534,21 @@ class InstitutionalStrategy:
         # First-order premium edge: Delta * expected underlying move, converted
         # into option-premium bps. Gamma is not credited before it materialises.
         premium_edge_bps = underlying_edge_bps * delta * underlying_price / max(option_price, 1e-9)
-        costs_bps = self._execution_cost_bps(data_manager)
-        net_edge = premium_edge_bps - costs_bps
+        expected_hold_sec = max(1.0, float(_cfg("POLICY_OPTION_MAX_HOLD_SEC", 2700.0)))
+        theta_day_ratio = abs(_num(getattr(choice, "theta_to_premium", 0.0), 0.0))
+        theta_carry_bps = theta_day_ratio * (expected_hold_sec / 86400.0) * 10000.0
+        cost_components = self._execution_cost_components(data_manager)
+        costs_bps = cost_components["total_cost_bps"]
+        net_edge = premium_edge_bps - costs_bps - theta_carry_bps
         uncertainty_bps = self._uncertainty_bps(regime, liquidity_score, feed_health.quality_score)
         model_values.update({
             "thesis": thesis.value, "thesis_reason": thesis_reason,
             "underlying_edge_bps": underlying_edge_bps, "selected_option_symbol": getattr(choice, "selected_symbol", ""),
             "selected_option_delta": delta, "selected_option_premium": option_price,
-            "premium_delta_edge_bps": premium_edge_bps, "costs_bps": costs_bps,
+            "premium_delta_edge_bps": premium_edge_bps, "execution_cost_components": cost_components,
+            "costs_bps": costs_bps, "theta_to_premium_per_day": theta_day_ratio,
+            "theta_expected_hold_sec": expected_hold_sec, "theta_carry_bps_expected_hold": theta_carry_bps,
+            "net_edge_formula": "premium_delta_edge_bps - total_cost_bps - theta_carry_bps_expected_hold",
             "net_edge_bps": net_edge, "uncertainty_bps": uncertainty_bps,
             "execution_feed": execution_feed, "liquidity_score": liquidity_score,
         })
@@ -537,7 +575,9 @@ class InstitutionalStrategy:
                 reasons=(protection.reasons if protection else ["option_premium_protection_unavailable"]),
                 model_values=model_values, research_features=features,
             )
+        model_values["protection_plan"] = asdict(protection)
         sizing = self._size_position(DeskId.INDIA_OPTIONS.value, instrument, thesis, option_price, net_edge, liquidity_score, protection, risk_manager)
+        model_values["sizing_decision"] = asdict(sizing)
         if not sizing.approved:
             return self._decision(
                 desk=DeskId.INDIA_OPTIONS.value, venue=venue, instrument=instrument,
@@ -642,7 +682,7 @@ class InstitutionalStrategy:
         return ProtectionPlan(
             entry_price=premium, stop_price=max(0.05, premium - stop_distance), target_price=premium + target_distance,
             protection_type="GROWW_OCO_AFTER_FILL", protection_feasible=True,
-            reasons=["premium_domain_atr_protection", "groww_long_option_oco_required"],
+            reasons=[f"premium_domain_atr_protection atr={atr:.4f} stop_dist={stop_distance:.4f} target_dist={target_distance:.4f} rr={rr:.3f}", "groww_long_option_oco_required"],
         )
 
     def _decision(self, **kwargs: Any) -> OpportunityDecision:
@@ -663,8 +703,8 @@ class InstitutionalStrategy:
                     model_values=decision.model_values,
                     reasons=decision.reasons,
                     features=decision.research_features,
-                    model_version="deterministic-institutional-baseline-v1",
-                    policy_version="multi-desk-protected-flow-v1",
+                    model_version="observable-groww-carry-aware-v2.8",
+                    policy_version="official-feed-protected-execution-v2.8",
                 )
             )
         except Exception:
@@ -948,7 +988,7 @@ class InstitutionalStrategy:
             return Regime.EXPANSION
         return Regime.BALANCE
 
-    def _execution_cost_bps(self, data_manager) -> float:
+    def _execution_cost_components(self, data_manager) -> dict[str, float]:
         spread = 2.0
         try:
             book = data_manager.get_orderbook()
@@ -963,7 +1003,10 @@ class InstitutionalStrategy:
             pass
         fee = float(_cfg("INSTITUTIONAL_DEFAULT_FEE_BPS", 1.5))
         slippage = float(_cfg("INSTITUTIONAL_STRESS_SLIPPAGE_BPS", 1.0))
-        return max(0.0, spread + fee + slippage)
+        return {"spread_bps": max(0.0, spread), "fee_bps": max(0.0, fee), "slippage_bps": max(0.0, slippage), "total_cost_bps": max(0.0, spread + fee + slippage)}
+
+    def _execution_cost_bps(self, data_manager) -> float:
+        return self._execution_cost_components(data_manager)["total_cost_bps"]
 
     def _uncertainty_bps(self, regime: Regime, liquidity_score: float, execution_quality: float) -> float:
         base = {

@@ -324,3 +324,50 @@ def test_groww_live_decision_places_buy_with_oco_only_after_all_gates(tmp_path, 
     assert orders.placed
     assert orders.placed[0][0][0] == "BUY"
     assert strategy.get_position()["protection_model"] == "GROWW_OCO_AFTER_FILL"
+
+
+def test_groww_option_edge_deducts_hold_horizon_theta_carry(tmp_path, monkeypatch):
+    def cfg(name, default):
+        values = {
+            "RESEARCH_STORE_PATH": str(tmp_path), "INSTITUTIONAL_ENABLE_LIVE_ENTRIES": False,
+            "INSTITUTIONAL_MIN_NET_EDGE_BPS": 0.0, "INSTITUTIONAL_RISK_FRACTION_PER_TRADE": 1.0,
+            "INSTITUTIONAL_QUARTER_KELLY": 1.0, "INSTITUTIONAL_TARGET_OBSERVATION_VOL_BPS": 100000.0,
+            "POLICY_OPTION_MAX_HOLD_SEC": 2700.0,
+        }
+        return values.get(name, default)
+    monkeypatch.setattr("strategy.institutional_strategy._cfg", cfg)
+    inst = _groww_instrument_for_strategy()
+    strategy = InstitutionalStrategy(instrument=inst)
+    data = _GrowwReadyData(inst)
+    original = data.activate_groww_execution_vehicle
+    def activate(thesis_side, available_funds):
+        choice = original(thesis_side, available_funds)
+        choice.theta_to_premium = 0.10
+        return choice
+    data.activate_groww_execution_vehicle = activate
+    decision = strategy.evaluate(data, _GrowwOrders(), SimpleNamespace(get_available_balance=lambda: {"available": 1000000.0}), 1)
+    expected_theta = 0.10 * (2700.0 / 86400.0) * 10000.0
+    assert abs(decision.model_values["theta_carry_bps_expected_hold"] - expected_theta) < 1e-9
+    assert decision.model_values["net_edge_formula"] == "premium_delta_edge_bps - total_cost_bps - theta_carry_bps_expected_hold"
+
+
+def test_decision_telemetry_logs_calculation_payload(tmp_path, monkeypatch, caplog):
+    def cfg(name, default):
+        values = {"RESEARCH_STORE_PATH": str(tmp_path), "INSTITUTIONAL_DECISION_TELEMETRY_ENABLED": True}
+        return values.get(name, default)
+    monkeypatch.setattr("strategy.institutional_strategy._cfg", cfg)
+    inst = _groww_instrument_for_strategy()
+    strategy = InstitutionalStrategy(instrument=inst)
+    from strategy.domain import DecisionOutput, Direction, Regime
+    decision = strategy._decision(
+        desk="DESK_B_NIFTY_OPTIONS", venue="groww", instrument="NIFTY",
+        decision=DecisionOutput.NO_TRADE_INSUFFICIENT_EDGE, direction=Direction.NO_TRADE,
+        regime=Regime.BALANCE, expected_net_edge_bps=0.0, uncertainty_bps=1.0,
+        liquidity_score=0.0, execution_quality_score=1.0, sizing=None, protection_plan=None,
+        reasons=["audit"], model_values={"calculation": 42.0}, research_features={},
+    )
+    import logging
+    with caplog.at_level(logging.INFO):
+        strategy._log_decision_calculation(decision)
+    assert "DECISION_CALC" in caplog.text
+    assert '"calculation":42.0' in caplog.text

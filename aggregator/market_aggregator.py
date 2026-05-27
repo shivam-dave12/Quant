@@ -445,7 +445,14 @@ class MarketAggregator:
             lot_getter = getattr(self._primary, "get_session_book_lot_size", None)
             lot = int(lot_getter() or 0) if callable(lot_getter) else 0
             if lot <= 0:
-                return {"ready_for_long_premium_decision": False, "reasons": ["verified_option_lot_unavailable"]}
+                ensure = getattr(self._primary, "ensure_session_contract_book", None)
+                if callable(ensure):
+                    ensure(float(spot or 0.0))
+                    lot = int(lot_getter() or 0) if callable(lot_getter) else 0
+            if lot <= 0:
+                status_getter = getattr(self._primary, "session_contract_book_status", None)
+                status = status_getter() if callable(status_getter) else {"status": "MISSING"}
+                return {"ready_for_long_premium_decision": False, "reasons": ["verified_option_lot_unavailable_execution_universe_monitoring"], "execution_book_status": status}
             return build_option_volatility_context(
                 chain=chain, underlying_candles=candles, spot=spot, lot_size=lot
             ).as_dict()

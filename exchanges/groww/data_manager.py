@@ -98,6 +98,9 @@ class GrowwOptionDataManager:
         self._stream_unroutable_last_ts = 0.0
         self._stream_last_route_warning_ts = 0.0
         self._last_identity_reject_log_ts = 0.0
+        self._last_stream_discovery_diagnostics: dict[str, Any] = {}
+        self._last_session_available_funds = 0.0
+        self._last_session_underlying_spot = 0.0
         self._underlying_route_fields = self._route_field_snapshot()
         logger.info("GrowwOptionDataManager initialised [%s]", getattr(instrument, "asset_id", "GROWW"))
 
@@ -855,15 +858,18 @@ class GrowwOptionDataManager:
                     # Do not stop on the first two-sided CE/PE packets.  Confirm that
                     # the live books can actually produce the session execution pair;
                     # otherwise continue observing the remaining ranked candidates.
+                    trial_diagnostics: dict[str, Any] = {}
                     trial_book = build_session_contract_book(
                         self.instrument, underlying_spot=underlying_spot,
                         available_funds=available_funds, option_quote_by_symbol=live, commit=False,
+                        diagnostics=trial_diagnostics,
                     )
+                    self._last_stream_discovery_diagnostics = trial_diagnostics
                     if trial_book is not None:
                         logger.info(
                             "GROWW live stream discovery selectable books ready: requested=%d live_two_sided=%d "
-                            "basis=option_chain_rank_then_official_fno_ltp_market_depth",
-                            len(states), len(live),
+                            "basis=option_chain_rank_then_official_fno_ltp_market_depth model_audit=%s",
+                            len(states), len(live), trial_diagnostics,
                         )
                         return live
                 tick_event.wait(min(0.5, max(0.0, deadline - time.time())))
@@ -885,12 +891,31 @@ class GrowwOptionDataManager:
                     "ask_qty": float(row.get("offer_quantity", 0.0) or 0.0),
                     "spread_bps": round(spread_bps, 2) if spread_bps is not None else None,
                 })
-            logger.error(
-                "GROWW live stream discovery produced no selectable CE/PE pair within %.1fs: subscribed=%d ltp_live=%d two_sided_depth=%d sample_books=%s; "
-                "desk remains fail-closed on official FNO market-depth evidence",
-                timeout, len(states), ltp_count, len(depth_rows), sample,
+            live_after_timeout = {
+                str(row.get("trading_symbol") or row.get("TradingSymbol") or ""): row
+                for row in depth_rows
+                if str(row.get("trading_symbol") or row.get("TradingSymbol") or "")
+                and float(row.get("ltp_ts", 0.0) or 0.0) > 0
+            }
+            side_counts = {
+                "call": sum(1 for row in live_after_timeout.values() if row.get("thesis") == "long"),
+                "put": sum(1 for row in live_after_timeout.values() if row.get("thesis") == "short"),
+            }
+            final_diagnostics: dict[str, Any] = {}
+            if live_after_timeout:
+                build_session_contract_book(
+                    self.instrument, underlying_spot=underlying_spot,
+                    available_funds=available_funds, option_quote_by_symbol=live_after_timeout,
+                    commit=False, diagnostics=final_diagnostics,
+                )
+            self._last_stream_discovery_diagnostics = final_diagnostics
+            logger.warning(
+                "GROWW live execution universe observed but no current CE/PE book selected within %.1fs: "
+                "subscribed=%d ltp_live=%d two_sided_depth=%d side_live=%s model_audit=%s sample_books=%s; "
+                "analysis remains live and execution will be rescanned without fallback prices",
+                timeout, len(states), ltp_count, len(depth_rows), side_counts, final_diagnostics, sample,
             )
-            return {}
+            return live_after_timeout
         except Exception as exc:
             logger.error("GROWW live option stream discovery failed: %s", exc)
             return {}
@@ -932,33 +957,46 @@ class GrowwOptionDataManager:
 
     def prepare_session_contract_book(self, underlying_spot: float, available_funds: float, *, force_refresh: bool = False, reason: str = "session_start") -> bool:
         self._session_book_last_refresh_attempt_ts = time.time()
+        self._last_session_available_funds = float(available_funds or 0.0)
+        self._last_session_underlying_spot = float(underlying_spot or 0.0)
         if not self._is_chain_mode():
             return True
+        raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
         if underlying_spot <= 0 or available_funds <= 0:
-            logger.error("GROWW session contract book rejected: underlying spot/funds not ready spot=%.4f funds=%.2f", underlying_spot, available_funds)
+            logger.error("GROWW session execution universe unavailable: underlying spot/funds not ready spot=%.4f funds=%.2f", underlying_spot, available_funds)
             return False
         if not self._hydrate_chain_candidates(force_refresh=force_refresh, underlying_spot=underlying_spot):
             return False
-        # The official option chain supplies screening fields; actual CE/PE
-        # executability must be proven by the official FNO LTP + market-depth feed.
+        # Official option-chain data builds the candidate set. Official FNO LTP +
+        # market-depth streams determine executable books; no REST-price fallback.
         live_book_by_symbol = self._stream_executable_shortlist(underlying_spot, available_funds)
         if not live_book_by_symbol:
-            logger.error("GROWW session contract book rejected: official FNO market-depth stream did not verify executable CE and PE vehicles")
-            return False
+            if isinstance(raw, dict):
+                raw["session_contract_book_status"] = "MONITORING_NO_LIVE_EXECUTION_BOOK"
+                raw["session_contract_diagnostics"] = dict(self._last_stream_discovery_diagnostics)
+            logger.warning("GROWW execution universe currently has no paired live CE/PE book; NIFTY analysis remains enabled and execution stays blocked pending rescan")
+            return True
+        diagnostics: dict[str, Any] = {}
         book = build_session_contract_book(
             self.instrument, underlying_spot=underlying_spot,
             available_funds=available_funds, option_quote_by_symbol=live_book_by_symbol, commit=False,
+            diagnostics=diagnostics,
         )
         if book is None:
-            logger.error("GROWW session contract book rejected: no live-stream CE/PE pair passed sizing and liquidity-cost checks")
-            return False
+            if isinstance(raw, dict):
+                raw["session_contract_book_status"] = "MONITORING_NO_POLICY_ELIGIBLE_PAIR"
+                raw["session_contract_diagnostics"] = diagnostics
+            logger.warning(
+                "GROWW live execution books exist but no pair is currently model-eligible; NIFTY analysis remains live, "
+                "entries blocked until rescan. model_audit=%s", diagnostics,
+            )
+            return True
         if bool(_cfg("GROWW_SESSION_BOOK_PREWARM_EXECUTION_DATA", True)):
             if not self._prewarm_session_vehicle(book.call) or not self._prewarm_session_vehicle(book.put):
-                logger.error("GROWW session contract book rejected: CE/PE option premium historical/quote warmup failed")
+                logger.error("GROWW session contract book rejected: CE/PE option premium historical warmup failed")
                 return False
         if not self._arm_session_book_streams(book):
             return False
-        raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
         if not isinstance(raw, dict):
             return False
         stream_ready = all(
@@ -970,18 +1008,37 @@ class GrowwOptionDataManager:
             for state in self._book_stream_state.values()
         ) if self._book_stream_state else False
         raw["session_contract_book"] = book.as_dict()
+        raw["session_contract_diagnostics"] = diagnostics
         raw["session_contract_book_status"] = "READY" if stream_ready else "ARMED_PENDING_WEBSOCKET_TICK"
         raw["session_contract_book_mode"] = "preselected_call_and_put_live_direction"
         self._session_book_last_refresh_ts = time.time()
         logger.info(
             "GROWW SESSION CONTRACT BOOK %s [%s] reason=%s spot=%.2f funds=₹%.2f | "
-            "CE=%s strike=%.2f expiry=%s lot=%.0f prem=₹%.2f score=%.3f delta=%+.3f theta/prem=%.4f | "
-            "PE=%s strike=%.2f expiry=%s lot=%.0f prem=₹%.2f score=%.3f delta=%+.3f theta/prem=%.4f",
+            "CE=%s strike=%.2f expiry=%s lot=%.0f prem=₹%.2f score=%.3f delta=%+.3f theta/day=%.4f theta/hold=%.2fbps | "
+            "PE=%s strike=%.2f expiry=%s lot=%.0f prem=₹%.2f score=%.3f delta=%+.3f theta/day=%.4f theta/hold=%.2fbps | model_audit=%s",
             raw["session_contract_book_status"], book.trade_date_ist, reason, underlying_spot, available_funds,
-            book.call.selected_symbol, book.call.strike, book.call.expiry, float(book.call.raw.get("runtime_lot_size", 0.0) or 0.0), float(book.call.raw.get("selected_entry_premium", 0.0) or 0.0), book.call.score, book.call.delta, book.call.theta_to_premium,
-            book.put.selected_symbol, book.put.strike, book.put.expiry, float(book.put.raw.get("runtime_lot_size", 0.0) or 0.0), float(book.put.raw.get("selected_entry_premium", 0.0) or 0.0), book.put.score, book.put.delta, book.put.theta_to_premium,
+            book.call.selected_symbol, book.call.strike, book.call.expiry, float(book.call.raw.get("runtime_lot_size", 0.0) or 0.0), float(book.call.raw.get("selected_entry_premium", 0.0) or 0.0), book.call.score, book.call.delta, book.call.theta_to_premium, float(book.call.raw.get("theta_carry_bps_expected_hold", 0.0) or 0.0),
+            book.put.selected_symbol, book.put.strike, book.put.expiry, float(book.put.raw.get("runtime_lot_size", 0.0) or 0.0), float(book.put.raw.get("selected_entry_premium", 0.0) or 0.0), book.put.score, book.put.delta, book.put.theta_to_premium, float(book.put.raw.get("theta_carry_bps_expected_hold", 0.0) or 0.0), diagnostics,
         )
         return True
+
+    def ensure_session_contract_book(self, underlying_spot: float) -> bool:
+        """Retry live option vehicle construction while keeping NIFTY analysis running.
+
+        A momentarily unsuitable option surface must block orders, not permanently
+        disable the underlying desk.  Rebuilds remain bounded and official-feed only.
+        """
+        raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
+        if isinstance(raw, dict) and isinstance(raw.get("session_contract_book"), dict):
+            return True
+        cooldown = max(5.0, float(_cfg("GROWW_SESSION_BOOK_RESCAN_SEC", 30.0)))
+        if time.time() - self._session_book_last_refresh_attempt_ts < cooldown:
+            return False
+        return self.prepare_session_contract_book(
+            float(underlying_spot or self._last_session_underlying_spot or 0.0),
+            float(self._last_session_available_funds or 0.0),
+            force_refresh=True, reason="execution_universe_rescan",
+        )
 
     def get_verified_option_chain_snapshot(self) -> list[dict[str, Any]]:
         """Return the official hydrated NFO chain retained for valuation context.
@@ -1017,7 +1074,11 @@ class GrowwOptionDataManager:
         raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
         book = raw.get("session_contract_book") if isinstance(raw, dict) else None
         if not isinstance(book, dict):
-            return {"status": "MISSING", "execution_freshness_gate": "DOCUMENTED_OPTION_LTP_AND_DEPTH_STREAM_REQUIRED"}
+            return {
+                "status": str(raw.get("session_contract_book_status") or "MISSING") if isinstance(raw, dict) else "MISSING",
+                "execution_freshness_gate": "DOCUMENTED_OPTION_LTP_AND_DEPTH_STREAM_REQUIRED",
+                "model_audit": dict(raw.get("session_contract_diagnostics") or {}) if isinstance(raw, dict) else {},
+            }
         now = time.time()
         max_stale = max(0.1, float(_cfg("GROWW_OPTION_STREAM_MAX_STALE_SEC", 15.0)))
 
@@ -1116,7 +1177,9 @@ class GrowwOptionDataManager:
         elif self._stream_subscription_ids:
             status = "ARMED_PENDING_OPTION_WEBSOCKET_TICK"
         else:
-            status = "OPTION_STREAM_NOT_ARMED"
+            raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
+            configured = str(raw.get("session_contract_book_status") or "") if isinstance(raw, dict) else ""
+            status = configured if configured.startswith("MONITORING_") else "OPTION_STREAM_NOT_ARMED"
         return {
             "status": status,
             "session_vehicle_stream_ready": bool(active_ready or (state_rows and len(executable) == len(state_rows))),

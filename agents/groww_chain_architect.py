@@ -9,6 +9,7 @@ assets for structural analysis.
 """
 from __future__ import annotations
 
+import logging
 import math
 import time
 from dataclasses import dataclass, asdict
@@ -22,6 +23,8 @@ except Exception:  # pragma: no cover
 
 from core.instruments import normalise_symbol
 from .indian_options_desk import BlackScholesModel
+
+logger = logging.getLogger(__name__)
 
 
 def _cfg(name: str, default: Any) -> Any:
@@ -447,19 +450,27 @@ def build_session_contract_book(
     option_quote_by_symbol: Optional[Mapping[str, Mapping[str, Any]]] = None,
     now_ts: Optional[float] = None,
     commit: bool = True,
+    diagnostics: Optional[dict[str, Any]] = None,
 ) -> Optional[GrowwSessionContractBook]:
-    """Preselect one executable CE and one executable PE for the session.
+    """Select an executable CE and PE from the official live candidate universe.
 
-    Direction remains entirely with the intraday underlying thesis.  This function
-    reduces execution latency by choosing execution vehicles before a signal rather
-    than rescanning the chain at the moment of entry.
+    This is execution preparation only; it does not assert direction.  Critically,
+    theta is not a static session-start veto.  Carry is measured for each vehicle
+    and charged against signal edge at decision time, when expected holding horizon
+    and direction are known.
     """
+    call_diag: dict[str, Any] = {}
+    put_diag: dict[str, Any] = {}
     call = select_contract_for_thesis(
         instrument, "long", underlying_spot=underlying_spot,
-        option_quote_by_symbol=option_quote_by_symbol, available_funds=available_funds)
+        option_quote_by_symbol=option_quote_by_symbol, available_funds=available_funds,
+        diagnostics=call_diag)
     put = select_contract_for_thesis(
         instrument, "short", underlying_spot=underlying_spot,
-        option_quote_by_symbol=option_quote_by_symbol, available_funds=available_funds)
+        option_quote_by_symbol=option_quote_by_symbol, available_funds=available_funds,
+        diagnostics=put_diag)
+    if diagnostics is not None:
+        diagnostics.update({"call": call_diag, "put": put_diag})
     if call is None or put is None:
         return None
     raw = getattr(getattr(instrument, "primary", None), "raw", {}) or {}
@@ -476,6 +487,7 @@ def build_session_contract_book(
         raw["session_contract_book"] = book.as_dict()
         raw["session_contract_book_status"] = "READY"
         raw["session_contract_book_mode"] = "preselected_call_and_put_live_direction"
+        raw["session_contract_diagnostics"] = {"call": call_diag, "put": put_diag}
     return book
 
 
@@ -585,29 +597,36 @@ def select_contract_for_thesis(
     underlying_spot: float = 0.0,
     option_quote_by_symbol: Optional[Mapping[str, Mapping[str, Any]]] = None,
     available_funds: float = 0.0,
+    diagnostics: Optional[dict[str, Any]] = None,
 ) -> Optional[GrowwContractChoice]:
-    """Score one directional execution vehicle while preparing the session book.
+    """Rank a live executable option vehicle for one possible underlying thesis.
 
-    The function is invoked once for CE and once for PE before live alpha
-    decisions begin.  The intraday thesis only activates the preselected side;
-    it does not rescan the option chain on every signal.
+    Selection uses verified lot/identity, official streamed bid/offer, affordability,
+    delta and live-IV Black-Scholes diagnostics.  Theta is a *measured carry cost*,
+    not a hard session-start veto: the strategy deducts carry over its actual hold
+    horizon from net expected edge before any order can be approved.
     """
     raw = getattr(getattr(instrument, "primary", None), "raw", {}) or {}
     chain = [dict(x) for x in (raw.get("chain_candidates") or []) if isinstance(x, Mapping)]
-    if not chain:
-        return None
     side = str(thesis_side or "").lower()
     desired = "call" if side == "long" else "put" if side == "short" else ""
-    if not desired:
+    rejected: dict[str, int] = {}
+    audit_rows: list[dict[str, Any]] = []
+    def reject(name: str) -> None:
+        rejected[name] = rejected.get(name, 0) + 1
+    if not chain or not desired:
+        if diagnostics is not None:
+            diagnostics.update({"side": side, "desired": desired, "chain_rows": len(chain), "rejected": {"invalid_request_or_empty_chain": 1}, "accepted": 0})
         return None
     spot = float(underlying_spot or safe_float(raw.get("underlying_spot_price") or raw.get("spot_price"), 0.0))
     min_dte = float(_cfg("GROWW_OPTION_MIN_DTE", 2.0))
     max_dte = float(_cfg("GROWW_OPTION_MAX_DTE", 21.0))
-    target_delta = float(_cfg("GROWW_INDEX_OPTION_TARGET_ABS_DELTA", 0.45) if raw.get("desk_id") in {"GROWW_INDEX_OPTIONS", "GROWW_INDEX_OPTIONS"} else _cfg("GROWW_STOCK_OPTION_TARGET_ABS_DELTA", 0.50))
+    target_delta = float(_cfg("GROWW_INDEX_OPTION_TARGET_ABS_DELTA", 0.45) if raw.get("desk_id") == "GROWW_INDEX_OPTIONS" else _cfg("GROWW_STOCK_OPTION_TARGET_ABS_DELTA", 0.50))
     delta_band = float(_cfg("GROWW_OPTION_DELTA_BAND", 0.22))
-    max_theta = float(_cfg("GROWW_OPTION_MAX_THETA_TO_PREMIUM", 0.08))
     iv_prior = float(_cfg("GROWW_OPTION_IV_STRESS_PRIOR", 0.24))
     rate = float(_cfg("INDIA_RISK_FREE_RATE", 0.065))
+    expected_hold_sec = max(1.0, float(_cfg("POLICY_OPTION_MAX_HOLD_SEC", 2700.0)))
+    carry_reference_bps = max(1.0, float(_cfg("GROWW_OPTION_SELECTION_CARRY_REFERENCE_BPS", 100.0)))
     funds = max(0.0, safe_float(available_funds, 0.0))
     cash_buffer = max(0.0, safe_float(_cfg("GROWW_OPTION_MIN_CASH_BUFFER_INR", 0.0), 0.0))
     funds_fraction = clamp(safe_float(_cfg("GROWW_OPTION_MAX_FUNDS_FRACTION_PER_TRADE", 0.42), 0.42), 0.01, 1.0)
@@ -617,121 +636,93 @@ def select_contract_for_thesis(
     for c in chain:
         if _right(c) != desired:
             continue
-        dte = _dte(c)
-        strike = _strike(c)
-        if strike <= 0 or dte < min_dte or dte > max_dte:
-            continue
+        dte = _dte(c); strike = _strike(c)
         symbol = normalise_symbol(c.get("TradingSymbol") or c.get("trading_symbol") or c.get("symbol") or f"{raw.get('stock_code')}_{c.get('expiry_date')}_{strike}_{desired[:1].upper()}")
         q = dict(quotes.get(symbol, {}) or {})
-        prem = _premium(c, q)
-        lot = _lot_size(c)
+        row_audit: dict[str, Any] = {"symbol": symbol, "right": desired, "strike": strike, "dte": round(dte, 3)}
+        if strike <= 0 or dte < min_dte or dte > max_dte:
+            reject("expiry_or_strike_outside_policy"); continue
+        prem = _premium(c, q); lot = _lot_size(c)
+        row_audit.update({"premium": round(prem, 4), "lot": lot})
         if lot <= 0:
-            # A contract without verified lot size cannot be safely selected,
-            # sized or routed as an NFO execution vehicle.
-            continue
+            reject("verified_lot_missing"); continue
         bid, ask = _bid_ask(c, q)
         require_two_sided = bool(_cfg("GROWW_SESSION_BOOK_REQUIRE_TWO_SIDED_QUOTE", True))
         if require_two_sided and not (bid > 0 and ask >= bid):
-            continue
+            reject("official_two_sided_book_missing"); continue
         spread_bps = ((ask - bid) / max((ask + bid) / 2.0, 1e-9) * 10000.0) if bid > 0 and ask > 0 else float("inf")
         max_spread_bps = max(1.0, safe_float(_cfg("GROWW_OPTION_MAX_SELECTION_SPREAD_BPS", 120.0), 120.0))
+        row_audit.update({"bid": round(bid, 4), "ask": round(ask, 4), "spread_bps": round(spread_bps, 2) if math.isfinite(spread_bps) else None})
         if require_two_sided and spread_bps > max_spread_bps:
-            continue
+            reject("spread_exceeds_execution_limit"); continue
         bid_qty = safe_float(c.get("best_bid_quantity") or q.get("best_bid_quantity") or c.get("bid_quantity") or q.get("bid_quantity"), 0.0)
         ask_qty = safe_float(c.get("best_offer_quantity") or q.get("best_offer_quantity") or c.get("offer_quantity") or q.get("offer_quantity") or c.get("ask_quantity") or q.get("ask_quantity"), 0.0)
         min_book_lots = max(0.0, safe_float(_cfg("GROWW_OPTION_MIN_BOOK_LOTS", 1.0), 1.0))
-        if require_two_sided and min(bid_qty, ask_qty) < lot * min_book_lots:
-            continue
+        visible_depth = min(bid_qty, ask_qty)
+        row_audit["visible_depth"] = visible_depth
+        if require_two_sided and visible_depth < lot * min_book_lots:
+            reject("visible_depth_below_one_lot"); continue
         contract_cost = prem * lot if prem > 0 else 0.0
+        row_audit.update({"contract_cost": round(contract_cost, 2), "max_contract_cost": round(max_contract_cost, 2)})
         if funds > 0 and (contract_cost <= 0 or contract_cost > max_contract_cost):
-            continue
-        local_spot = safe_float(q.get("underlying_spot_price") or q.get("underlying_ltp"), 0.0) or spot
-        if local_spot <= 0:
-            # Before streamed underlying/book validation, use strike-ladder proximity
-            # instead of fabricating a price.  This keeps the candidate eligible
-            # for later official live-depth validation but discounts the score.
-            local_spot = strike
+            reject("contract_cost_exceeds_budget"); continue
+        local_spot = safe_float(q.get("underlying_spot_price") or q.get("underlying_ltp"), 0.0) or spot or strike
         iv, iv_source = _market_volatility(desired, local_spot, strike, dte, rate, prem, c, q)
         if iv <= 0:
-            iv = iv_prior
-            iv_source = "stress_prior"
+            iv = iv_prior; iv_source = "stress_prior"
         bs = BlackScholesModel.greeks(desired, local_spot, strike, dte, rate, iv, premium=prem)
         if bs:
-            # Long-premium vehicles with daily theta drain above the configured
-            # policy ceiling are not execution candidates.  Previously this
-            # value only reduced the score, allowing contracts above a declared
-            # maximum (as observed live) to be armed for trading.
-            if bs.theta_to_premium > max_theta:
-                continue
-            # A session execution vehicle must already lie within the intended
-            # delta band; do not publish a CE/PE book that immediately fails its
-            # own intraday revalidation at the same underlying spot.
             session_delta_band = max(0.01, float(_cfg("GROWW_SESSION_BOOK_DELTA_RESELECT_BAND", delta_band)))
+            row_audit.update({"delta": round(bs.delta, 4), "theta_premium_day": round(bs.theta_to_premium, 6), "iv": round(iv, 6), "iv_source": iv_source})
             if abs(abs(bs.delta) - target_delta) > session_delta_band:
-                continue
+                reject("delta_outside_vehicle_band"); continue
+            theta_carry_bps = bs.theta_to_premium * (expected_hold_sec / 86400.0) * 10000.0
+            carry_score = clamp(1.0 - theta_carry_bps / carry_reference_bps)
             delta_score = clamp(1.0 - abs(abs(bs.delta) - target_delta) / max(delta_band, 1e-6))
-            theta_score = clamp(1.0 - bs.theta_to_premium / max_theta)
             moneyness_score = clamp(1.0 - abs(bs.moneyness - 1.0) / 0.10)
             model_edge_bps = abs(bs.theoretical_price - prem) / max(prem, 1e-9) * 10000.0 if prem > 0 else 0.0
             edge_score = clamp(1.0 - model_edge_bps / 2500.0)
-            bs_score = 0.38 * delta_score + 0.34 * theta_score + 0.20 * moneyness_score + 0.08 * edge_score
+            bs_score = 0.36 * delta_score + 0.28 * carry_score + 0.20 * moneyness_score + 0.16 * edge_score
             delta = bs.delta; theta = bs.theta_to_premium; mon = bs.moneyness
+            row_audit["theta_carry_bps_expected_hold"] = round(theta_carry_bps, 3)
         else:
-            prox = clamp(1.0 - abs(local_spot - strike) / max(abs(local_spot) * 0.12, 1.0))
-            bs_score = 0.35 * prox
-            delta = 0.0; theta = 0.0; mon = local_spot / strike if strike else 0.0
-            model_edge_bps = 0.0
+            reject("bs_snapshot_unavailable"); continue
         dte_mid = (min_dte + max_dte) / 2.0
         dte_score = clamp(1.0 - abs(dte - dte_mid) / max(1.0, max_dte - min_dte))
         live_score = 1.0 if (q or prem > 0) else 0.35
-        if max_contract_cost > 0 and contract_cost > 0:
-            utilization = contract_cost / max(max_contract_cost, 1e-9)
-            affordability_score = clamp(1.0 - abs(utilization - 0.58) / 0.58)
-        else:
-            affordability_score = 0.55 if funds <= 0 else 0.0
-        if bid > 0 and ask > 0:
-            spread_score = clamp(1.0 - spread_bps / max_spread_bps)
-            depth_score = clamp(min(bid_qty, ask_qty) / max(lot * max(1.0, min_book_lots) * 4.0, 1.0))
-            liquidity_score = 0.70 * spread_score + 0.30 * depth_score
-        else:
-            liquidity_score = 0.0
-        # Executability is a first-class criterion: Greek quality without a
-        # two-sided, adequately deep quote is not a tradable contract.
+        utilization = contract_cost / max(max_contract_cost, 1e-9) if max_contract_cost > 0 and contract_cost > 0 else 0.0
+        affordability_score = clamp(1.0 - abs(utilization - 0.58) / 0.58) if max_contract_cost > 0 and contract_cost > 0 else 0.0
+        spread_score = clamp(1.0 - spread_bps / max_spread_bps)
+        depth_score = clamp(visible_depth / max(lot * max(1.0, min_book_lots) * 4.0, 1.0))
+        liquidity_score = 0.70 * spread_score + 0.30 * depth_score
         score = clamp(0.36 * bs_score + 0.14 * dte_score + 0.25 * liquidity_score + 0.10 * live_score + 0.15 * affordability_score)
-        reasons = [f"thesis={side}", f"buy_{desired}", f"dte={dte:.1f}", f"strike={strike:g}"]
-        if bid > 0 and ask > 0:
-            reasons.extend([f"spread={spread_bps:.1f}bps", f"depth={min(bid_qty, ask_qty):.0f}"])
-        if q:
-            reasons.append("live_quote")
-        if contract_cost > 0:
-            reasons.append(f"cost={contract_cost:.0f}")
-        if max_contract_cost > 0:
-            reasons.append(f"funds_fit={contract_cost:.0f}/{max_contract_cost:.0f}")
-        if bs:
-            reasons.extend([f"delta={delta:+.2f}", f"theta/prem={theta:.2%}", f"iv={iv:.1%}", f"vol={iv_source}"])
+        reasons = [f"thesis={side}", f"buy_{desired}", f"dte={dte:.1f}", f"strike={strike:g}", f"spread={spread_bps:.1f}bps", f"depth={visible_depth:.0f}", f"cost={contract_cost:.0f}", f"funds_fit={contract_cost:.0f}/{max_contract_cost:.0f}", f"delta={delta:+.2f}", f"theta/day={theta:.2%}", f"theta_hold={theta_carry_bps:.1f}bps", f"iv={iv:.1%}", f"vol={iv_source}"]
         enriched = dict(c)
-        enriched.setdefault("runtime_lot_size", lot)
-        enriched.setdefault("selected_entry_premium", prem)
-        enriched.setdefault("selected_contract_cost", contract_cost)
-        enriched.setdefault("selected_max_contract_cost", max_contract_cost)
-        enriched.setdefault("selected_contract_utilization", contract_cost / max(max_contract_cost, 1e-9) if max_contract_cost > 0 else 0.0)
-        enriched.setdefault("bs_volatility", iv)
-        enriched.setdefault("bs_volatility_source", iv_source)
-        enriched.setdefault("bs_model_edge_bps", model_edge_bps)
-        if bs:
-            enriched.setdefault("bs_snapshot", bs.as_dict())
-            enriched.setdefault("bs_theoretical_price", bs.theoretical_price)
-            enriched.setdefault("bs_delta", bs.delta)
-            enriched.setdefault("bs_gamma", bs.gamma)
-            enriched.setdefault("bs_theta_per_day", bs.theta_per_day)
-            enriched.setdefault("bs_vega_per_vol_point", bs.vega_per_vol_point)
-            enriched.setdefault("bs_intrinsic", bs.intrinsic)
-            enriched.setdefault("bs_extrinsic", bs.extrinsic)
-            enriched.setdefault("bs_theta_to_premium", bs.theta_to_premium)
+        enriched.update({
+            "runtime_lot_size": lot, "selected_entry_premium": prem,
+            "selected_contract_cost": contract_cost, "selected_max_contract_cost": max_contract_cost,
+            "selected_contract_utilization": utilization, "bs_volatility": iv,
+            "bs_volatility_source": iv_source, "bs_model_edge_bps": model_edge_bps,
+            "theta_carry_horizon_sec": expected_hold_sec, "theta_carry_bps_expected_hold": theta_carry_bps,
+            "selection_liquidity_score": liquidity_score, "selection_spread_bps": spread_bps,
+            "selection_visible_depth": visible_depth,
+            "bs_snapshot": bs.as_dict(), "bs_theoretical_price": bs.theoretical_price,
+            "bs_delta": bs.delta, "bs_gamma": bs.gamma, "bs_theta_per_day": bs.theta_per_day,
+            "bs_theta_to_premium": bs.theta_to_premium,
+        })
         choices.append(GrowwContractChoice(score, normalise_symbol(raw.get("stock_code") or raw.get("underlying") or ""), side, symbol, desired, strike, str(c.get("expiry_date") or c.get("ExpiryDate") or ""), dte, delta, theta, mon, tuple(reasons), enriched))
-    choices.sort(key=lambda x: x.score, reverse=True)
+        row_audit.update({"accepted": True, "score": round(score, 5), "liquidity_score": round(liquidity_score, 5), "theta_carry_bps_expected_hold": round(theta_carry_bps, 3)})
+        audit_rows.append(row_audit)
+    choices.sort(key=lambda choice: choice.score, reverse=True)
+    if diagnostics is not None:
+        diagnostics.update({
+            "side": side, "desired": desired, "chain_rows": len(chain), "live_book_rows": len(quotes),
+            "accepted": len(choices), "rejected": rejected,
+            "expected_hold_sec": expected_hold_sec, "carry_policy": "theta_charged_to_signal_edge_not_static_veto",
+            "top_accepted": audit_rows[:5],
+            "selected": choices[0].as_dict() if choices else None,
+        })
     return choices[0] if choices else None
-
 
 def apply_contract_choice(instrument: Any, choice: GrowwContractChoice) -> None:
     """Mutate the instrument raw payload so existing Groww order adapter routes

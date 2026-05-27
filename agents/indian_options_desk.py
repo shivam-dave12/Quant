@@ -341,22 +341,27 @@ class IndianOptionsDesk:
         desk_id = self.desk_id_for_underlying(underlying, raw)
         target_delta = float(_cfg("GROWW_INDEX_OPTION_TARGET_ABS_DELTA", 0.45) if desk_id == "GROWW_INDEX_OPTIONS" else _cfg("GROWW_STOCK_OPTION_TARGET_ABS_DELTA", 0.50))
         delta_band = float(_cfg("GROWW_OPTION_DELTA_BAND", 0.22))
-        max_theta_premium = float(_cfg("GROWW_OPTION_MAX_THETA_TO_PREMIUM", 0.08))
+        expected_hold_sec = max(1.0, float(_cfg("POLICY_OPTION_MAX_HOLD_SEC", 2700.0)))
+        theta_carry_reference_bps = max(1.0, float(_cfg("GROWW_OPTION_SELECTION_CARRY_REFERENCE_BPS", 100.0)))
         max_spread_bps = float(_cfg("GROWW_OPTION_MAX_SPREAD_BPS", 180.0))
 
         dte_score = clamp(1.0 - abs(((min_dte + max_dte) / 2.0) - dte) / max(1.0, (max_dte - min_dte))) if dte > 0 else 0.0
         spread_bps = ((ask - bid) / mid * 10000.0) if ask > 0 and bid > 0 and mid > 0 else 0.0
         spread_score = 0.55 if spread_bps <= 0 else clamp(1.0 - spread_bps / max_spread_bps)
         bs_score = 0.0
-        theta_score = 0.0
+        theta_carry_score = 0.0
+        theta_carry_bps = 0.0
         delta_score = 0.0
         if bs:
             abs_delta = abs(bs.delta)
             delta_score = clamp(1.0 - abs(abs_delta - target_delta) / max(delta_band, 1e-6))
-            theta_score = clamp(1.0 - bs.theta_to_premium / max_theta_premium)
+            # Theta is a hold-horizon carry cost. It is scored and later deducted from
+            # expected trade edge, never used as a hidden session-start veto.
+            theta_carry_bps = bs.theta_to_premium * (expected_hold_sec / 86400.0) * 10000.0
+            theta_carry_score = clamp(1.0 - theta_carry_bps / theta_carry_reference_bps)
             # Avoid deep OTM lottery and deep ITM capital lock; prefer tradable ATM/near-ATM alpha.
             moneyness_score = clamp(1.0 - abs(bs.moneyness - 1.0) / 0.08)
-            bs_score = 0.42 * delta_score + 0.36 * theta_score + 0.22 * moneyness_score
+            bs_score = 0.42 * delta_score + 0.36 * theta_carry_score + 0.22 * moneyness_score
         live_score = 1.0 if quote else 0.0 if bool(_cfg("GROWW_OPTION_REQUIRE_LIVE_QUOTE", True)) else 0.45
         score = clamp(0.35 * bs_score + 0.25 * dte_score + 0.20 * spread_score + 0.20 * live_score)
         if bool(_cfg("GROWW_OPTION_REQUIRE_LIVE_QUOTE", True)) and not quote:
@@ -373,7 +378,8 @@ class IndianOptionsDesk:
             reasons.append(f"dte={dte:.1f}")
         if bs:
             reasons.append(f"delta={bs.delta:+.2f}")
-            reasons.append(f"theta/prem={bs.theta_to_premium:.2%}")
+            reasons.append(f"theta/prem/day={bs.theta_to_premium:.2%}")
+            reasons.append(f"theta_carry_hold={theta_carry_bps:.2f}bps@{expected_hold_sec:.0f}s")
         if not iv_is_live:
             reasons.append("iv_stress_prior")
         if spread_bps > max_spread_bps:

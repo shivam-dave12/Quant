@@ -259,7 +259,6 @@ def test_session_book_screens_chain_then_accepts_documented_stream_depth(monkeyp
     monkeypatch.setattr(chain.config, "GROWW_OPTION_MIN_DTE", 1.0, raising=False)
     monkeypatch.setattr(chain.config, "GROWW_OPTION_MAX_DTE", 21.0, raising=False)
     # This test validates transport/executable-book wiring rather than theta policy.
-    monkeypatch.setattr(chain.config, "GROWW_OPTION_MAX_THETA_TO_PREMIUM", 1.0, raising=False)
 
     ce_shortlist = chain.shortlist_contracts_for_stream_validation(
         instrument, "long", underlying_spot=25000.0, available_funds=25852.96, limit=4
@@ -441,7 +440,7 @@ def test_native_hour_interval_aliases_do_not_collapse_to_one_minute():
 
 
 
-def test_session_book_hard_rejects_contract_above_theta_premium_ceiling(monkeypatch):
+def test_session_book_measures_theta_carry_instead_of_static_preselection_veto(monkeypatch):
     from datetime import datetime, timedelta, timezone
     from types import SimpleNamespace
     from agents import groww_chain_architect as chain
@@ -456,12 +455,20 @@ def test_session_book_hard_rejects_contract_above_theta_premium_ceiling(monkeypa
     monkeypatch.setattr(chain.config, "GROWW_SESSION_BOOK_REQUIRE_TWO_SIDED_QUOTE", True, raising=False)
     monkeypatch.setattr(chain.config, "GROWW_OPTION_MIN_DTE", 1.0, raising=False)
     monkeypatch.setattr(chain.config, "GROWW_OPTION_MAX_DTE", 21.0, raising=False)
-    monkeypatch.setattr(chain.config, "GROWW_OPTION_MAX_THETA_TO_PREMIUM", 0.0000001, raising=False)
+    monkeypatch.setattr(chain.config, "POLICY_OPTION_MAX_HOLD_SEC", 2700.0, raising=False)
     live = {
         "NIFTYCE": {"bid_price": 99.5, "offer_price": 100.0, "bid_quantity": 100, "offer_quantity": 100},
         "NIFTYPE": {"bid_price": 99.5, "offer_price": 100.0, "bid_quantity": 100, "offer_quantity": 100},
     }
-    assert chain.build_session_contract_book(instrument, underlying_spot=25000.0, available_funds=25852.96, option_quote_by_symbol=live, commit=False) is None
+    diagnostics = {}
+    book = chain.build_session_contract_book(
+        instrument, underlying_spot=25000.0, available_funds=25852.96,
+        option_quote_by_symbol=live, commit=False, diagnostics=diagnostics,
+    )
+    assert book is not None
+    assert book.call.raw["theta_carry_bps_expected_hold"] > 0
+    assert book.put.raw["theta_carry_bps_expected_hold"] > 0
+    assert diagnostics["call"]["carry_policy"] == "theta_charged_to_signal_edge_not_static_veto"
 
 
 def test_selected_vehicle_activation_keeps_official_premium_history_when_live_stream_is_sparse(monkeypatch):
@@ -505,3 +512,30 @@ def test_selected_vehicle_activation_keeps_official_premium_history_when_live_st
     assert len(rows) == 16
     assert rows[0]["t"] == 1
     assert rows[-1]["t"] == 16
+
+
+def test_live_books_without_current_model_pair_keep_nifty_analysis_live_for_rescan(monkeypatch):
+    from types import SimpleNamespace
+    from exchanges.groww import data_manager as dm
+    from exchanges.groww.data_manager import GrowwOptionDataManager
+
+    raw = {"stock_code": "NIFTY", "underlying": "NIFTY"}
+    manager = GrowwOptionDataManager(
+        instrument=SimpleNamespace(asset_id="NIFTY", primary=SimpleNamespace(raw=raw)),
+        api=SimpleNamespace(),
+    )
+    monkeypatch.setattr(manager, "_is_chain_mode", lambda: True)
+    monkeypatch.setattr(manager, "_hydrate_chain_candidates", lambda **_kw: True)
+    monkeypatch.setattr(manager, "_stream_executable_shortlist", lambda *_args, **_kwargs: {
+        "NIFTYCE": {"ltp": 100.0, "bid_price": 99.5, "offer_price": 100.0},
+        "NIFTYPE": {"ltp": 101.0, "bid_price": 100.5, "offer_price": 101.0},
+    })
+    def no_pair(*_args, diagnostics=None, **_kwargs):
+        if diagnostics is not None:
+            diagnostics.update({"call": {"rejected": {"delta_outside_vehicle_band": 1}}, "put": {"rejected": {"delta_outside_vehicle_band": 1}}})
+        return None
+    monkeypatch.setattr(dm, "build_session_contract_book", no_pair)
+
+    assert manager.prepare_session_contract_book(23950.0, 25852.96) is True
+    assert raw["session_contract_book_status"] == "MONITORING_NO_POLICY_ELIGIBLE_PAIR"
+    assert raw["session_contract_diagnostics"]["call"]["rejected"]["delta_outside_vehicle_band"] == 1
