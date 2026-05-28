@@ -2035,6 +2035,118 @@ class _HyperliquidAdapter:
                 return qty
         return 0.0
 
+    @staticmethod
+    def _extract_hl_statuses(resp: Any) -> list:
+        if not isinstance(resp, dict):
+            return []
+        data = (((resp.get("response") or {}).get("data") or {}) if isinstance(resp.get("response"), dict) else {})
+        statuses = data.get("statuses") if isinstance(data, dict) else None
+        return list(statuses or [])
+
+    @classmethod
+    def _tpsl_triggers_accepted(cls, resp: Any) -> bool:
+        statuses = cls._extract_hl_statuses(resp)
+        if len(statuses) < 2:
+            return False
+        accepted = 0
+        for row in statuses:
+            if isinstance(row, str):
+                if row.strip().lower() == "waitingfortrigger":
+                    accepted += 1
+                continue
+            if not isinstance(row, dict) or row.get("error"):
+                return False
+            if any(key in row for key in ("resting", "filled", "waitingForTrigger")):
+                accepted += 1
+        return accepted >= 2
+
+    @staticmethod
+    def _normalise_hl_side(value: Any) -> str:
+        raw = str(value or "").strip().upper()
+        if raw in {"B", "BID", "BUY"}:
+            return "BUY"
+        if raw in {"A", "ASK", "SELL"}:
+            return "SELL"
+        return raw
+
+    def _normalise_open_order(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        raw = row if isinstance(row, dict) else {}
+        order_type_node = raw.get("order_type")
+        trigger_node = order_type_node.get("trigger", {}) if isinstance(order_type_node, dict) else {}
+        tpsl = str(raw.get("tpsl") or trigger_node.get("tpsl") or "").strip().lower()
+        raw_type = str(raw.get("orderType") or raw.get("order_type") or raw.get("type") or "").strip()
+        type_key = raw_type.upper().replace(" ", "_").replace("-", "_")
+        if tpsl == "sl" or ("STOP" in type_key and "PROFIT" not in type_key and "TAKE" not in type_key):
+            order_type = "STOP_MARKET"
+        elif tpsl == "tp" or "PROFIT" in type_key or "TAKE" in type_key:
+            order_type = "TAKE_PROFIT_MARKET"
+        elif "TRIGGER" in type_key:
+            order_type = "TRIGGER"
+        else:
+            order_type = type_key
+
+        oid = raw.get("oid") or raw.get("order_id") or raw.get("id")
+        trigger_price = self._num(
+            raw.get("triggerPx", raw.get("trigger_price", raw.get("stop_price", trigger_node.get("triggerPx")))),
+            0.0,
+        )
+        limit_price = self._num(raw.get("limitPx", raw.get("limit_price", raw.get("price", raw.get("px")))), 0.0)
+        quantity = self._num(raw.get("sz", raw.get("origSz", raw.get("quantity", raw.get("size")))), 0.0)
+        reduce_only = bool(raw.get("reduceOnly", raw.get("reduce_only", False)))
+        coin = str(raw.get("coin") or raw.get("symbol") or self.symbol)
+        return {
+            "order_id": str(oid or ""),
+            "id": str(oid or ""),
+            "type": order_type,
+            "order_type": order_type,
+            "side": self._normalise_hl_side(raw.get("side")),
+            "quantity": quantity,
+            "trigger_price": trigger_price,
+            "price": limit_price,
+            "status": str(raw.get("status") or raw.get("state") or "OPEN").upper(),
+            "product_symbol": coin.upper(),
+            "reduce_only": reduce_only,
+            "raw": raw,
+        }
+
+    def _resolve_tpsl_child_order_ids(self, exit_is_buy: bool, sl_price: float, tp_price: float) -> list[str]:
+        expected_side = "BUY" if exit_is_buy else "SELL"
+        deadline = time.time() + max(0.0, float(_cfg("HYPERLIQUID_TPSL_OPEN_ORDER_RECONCILE_SEC", 3.0)))
+        poll = max(0.25, float(_cfg("HYPERLIQUID_TPSL_OPEN_ORDER_POLL_SEC", 0.5)))
+        tick_tol = max(float(self.tick_size or 0.0) * 5.0, 1e-9)
+
+        def _price_ok(actual: float, expected: float) -> bool:
+            if expected <= 0.0:
+                return False
+            if actual <= 0.0:
+                return False
+            return abs(actual - expected) <= max(tick_tol, abs(expected) * 0.0002)
+
+        sl_oid = ""
+        tp_oid = ""
+        while True:
+            rows = self.get_open_orders(self.symbol) or []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                oid = str(row.get("order_id") or row.get("id") or "")
+                if not oid:
+                    continue
+                side = str(row.get("side") or "").upper()
+                if side and side != expected_side:
+                    continue
+                typ = str(row.get("type") or row.get("order_type") or "").upper()
+                trigger = self._num(row.get("trigger_price") or row.get("price"), 0.0)
+                if not sl_oid and ("STOP" in typ or _price_ok(trigger, sl_price)) and _price_ok(trigger, sl_price):
+                    sl_oid = oid
+                elif not tp_oid and ("PROFIT" in typ or "TAKE" in typ or _price_ok(trigger, tp_price)) and _price_ok(trigger, tp_price):
+                    tp_oid = oid
+            if sl_oid and tp_oid:
+                return [sl_oid, tp_oid]
+            if time.time() >= deadline:
+                return [oid for oid in (sl_oid, tp_oid) if oid]
+            time.sleep(poll)
+
     def _entry_status(self, oid: str, fallback_price: float, fallback_qty: float) -> Dict:
         raw = self.get_order(oid) or {}
         status = self.extract_status(raw)
@@ -2127,10 +2239,13 @@ class _HyperliquidAdapter:
                 target_px=float(tp_price),
             )
             child_oids = self.api.child_order_ids(tpsl_resp)
+            if len(child_oids) < 2:
+                child_oids = self._resolve_tpsl_child_order_ids(exit_is_buy, float(sl_price), float(tp_price))
         except Exception as exc:
             child_oids = []
             tpsl_resp = {"error": str(exc)}
-        if len(child_oids) < 2:
+        protection_accepted = self._tpsl_triggers_accepted(tpsl_resp)
+        if len(child_oids) < 2 and not protection_accepted:
             close_resp = None
             if bool(_cfg("HYPERLIQUID_EMERGENCY_CLOSE_ON_PROTECTION_FAILURE", True)):
                 try:
@@ -2147,6 +2262,12 @@ class _HyperliquidAdapter:
                 "_raw": {"entry_oid": oid, "tpsl_response": tpsl_resp, "emergency_close": close_resp},
                 "_err_msg": "hyperliquid_protection_orders_not_confirmed",
             }
+        if len(child_oids) < 2 and protection_accepted:
+            logger.warning(
+                "Hyperliquid TP/SL accepted as waitingForTrigger but child order ids were not returned yet; "
+                "position remains protected and open-order reconciliation will recover ids. entry_oid=%s",
+                oid,
+            )
 
         return {
             "order_id": oid,
@@ -2156,13 +2277,14 @@ class _HyperliquidAdapter:
             "fill_type": "maker",
             "fill_price": float(fill_price),
             "bracket_order": True,
-            "bracket_child_verified": True,
-            "bracket_sl_order_id": str(child_oids[0]),
-            "bracket_tp_order_id": str(child_oids[1]),
+            "bracket_child_verified": len(child_oids) >= 2,
+            "bracket_sl_order_id": str(child_oids[0]) if len(child_oids) >= 1 else "",
+            "bracket_tp_order_id": str(child_oids[1]) if len(child_oids) >= 2 else "",
             "bracket_sl_price": float(sl_price),
             "bracket_tp_price": float(tp_price),
             "protection_model": "HYPERLIQUID_TPSL_AFTER_FILL",
             "protection_confirmed": True,
+            "protection_reconcile_required": len(child_oids) < 2,
             "paid_commission": 0.0,
             "paid_commission_exact": False,
             "_raw_entry": parsed.get("raw", entry_resp),
@@ -2234,7 +2356,15 @@ class _HyperliquidAdapter:
         self.limiter.wait()
         rows = self.api.open_orders(coin=self.symbol)
         sym = str(symbol or self.symbol)
-        return [r for r in rows if str(r.get("coin", "")).upper() == sym.upper()]
+        out = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            normalised = self._normalise_open_order(row)
+            coin = str((normalised.get("raw") or {}).get("coin") or normalised.get("product_symbol") or "").upper()
+            if coin == sym.upper():
+                out.append(normalised)
+        return out
 
     def get_positions(self, symbol: str) -> Optional[Dict]:
         self.limiter.wait()

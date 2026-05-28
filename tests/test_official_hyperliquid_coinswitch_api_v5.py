@@ -188,3 +188,66 @@ def test_hyperliquid_post_fill_protection_uses_position_tpsl_grouping():
     assert HyperliquidAPI.child_order_ids(out) == [201, 202]
     assert [row["order_type"]["trigger"]["tpsl"] for row in orders] == ["sl", "tp"]
     assert all(row["reduce_only"] is True for row in orders)
+
+
+class _WaitingTriggerTpslApi:
+    def __init__(self, open_orders):
+        self.open_order_rows = open_orders
+        self.market_close_calls = []
+        self.limit_orders = []
+
+    def round_size(self, coin, size):
+        return float(size)
+
+    def round_price(self, coin, price):
+        return float(price)
+
+    def place_limit_order(self, **kwargs):
+        self.limit_orders.append(kwargs)
+        return {"entry": True}
+
+    def first_order_result(self, resp):
+        return {"ok": True, "status": "FILLED", "oid": 101, "avg_px": 74962.0, "total_sz": 0.00063, "raw": resp}
+
+    def place_reduce_only_tpsl(self, **kwargs):
+        return {"status": "ok", "response": {"type": "order", "data": {"statuses": ["waitingForTrigger", "waitingForTrigger"]}}}
+
+    def child_order_ids(self, resp):
+        return HyperliquidAPI.child_order_ids(resp)
+
+    def open_orders(self, coin=None):
+        return list(self.open_order_rows)
+
+    def market_close(self, *args, **kwargs):
+        self.market_close_calls.append((args, kwargs))
+        return {"status": "ok"}
+
+
+def test_hyperliquid_waiting_for_trigger_response_does_not_emergency_close():
+    api = _WaitingTriggerTpslApi([
+        {"coin": "BTC", "oid": 301, "side": "B", "orderType": "Stop Market", "triggerPx": 75178.0, "sz": "0.00063", "reduceOnly": True},
+        {"coin": "BTC", "oid": 302, "side": "B", "orderType": "Take Profit Market", "triggerPx": 74247.0, "sz": "0.00063", "reduceOnly": True},
+    ])
+    adapter = _HyperliquidAdapter(api, SimpleNamespace(symbol="BTC", display_symbol="BTC", tick_size=1.0, lot_step=0.00001, min_qty=0.00001, max_qty=1.0))
+    adapter.limiter = _NoWait()
+
+    out = adapter.place_bracket_limit_entry("SELL", 0.00063, 74962.0, 75178.0, 74247.0, timeout_sec=1.0)
+
+    assert out["protection_confirmed"] is True
+    assert out["bracket_child_verified"] is True
+    assert out["bracket_sl_order_id"] == "301"
+    assert out["bracket_tp_order_id"] == "302"
+    assert api.market_close_calls == []
+
+
+def test_hyperliquid_waiting_for_trigger_without_ids_still_stays_open():
+    api = _WaitingTriggerTpslApi([])
+    adapter = _HyperliquidAdapter(api, SimpleNamespace(symbol="BTC", display_symbol="BTC", tick_size=1.0, lot_step=0.00001, min_qty=0.00001, max_qty=1.0))
+    adapter.limiter = _NoWait()
+
+    out = adapter.place_bracket_limit_entry("SELL", 0.00063, 74962.0, 75178.0, 74247.0, timeout_sec=1.0)
+
+    assert out["protection_confirmed"] is True
+    assert out["bracket_child_verified"] is False
+    assert out["protection_reconcile_required"] is True
+    assert api.market_close_calls == []
