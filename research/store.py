@@ -63,6 +63,29 @@ class DeltaForwardLabel:
     adverse_excursion_bps: float
 
 
+@dataclass(frozen=True)
+class PredictiveBarrierLabel:
+    observation_ts_ns: int
+    resolved_ts_ns: int
+    asset_id: str
+    venue: str
+    instrument: str
+    candidate_id: str
+    model_key: str
+    setup_family: str
+    side: str
+    reference_entry_price: float
+    stop_price: float
+    target_price: float
+    estimated_round_trip_cost_bps: float
+    predicted_target_before_stop_probability: float
+    predicted_directional_move_probability: float
+    outcome: str
+    resolution_price: float
+    favorable_excursion_bps: float
+    adverse_excursion_bps: float
+
+
 class JsonlResearchStore:
     """Small deterministic JSONL store.
 
@@ -83,6 +106,9 @@ class JsonlResearchStore:
 
     def append_delta_forward_label(self, label: DeltaForwardLabel) -> Path:
         return self._append("delta_forward_labels.jsonl", label)
+
+    def append_predictive_barrier_label(self, label: PredictiveBarrierLabel) -> Path:
+        return self._append("predictive_barrier_labels.jsonl", label)
 
     def read_records(self, name: str) -> list[dict[str, Any]]:
         path = self.root / name
@@ -113,9 +139,76 @@ def append_many(store: JsonlResearchStore, records: Iterable[Any]) -> list[Path]
             paths.append(store.append_execution(record))
         elif isinstance(record, DeltaForwardLabel):
             paths.append(store.append_delta_forward_label(record))
+        elif isinstance(record, PredictiveBarrierLabel):
+            paths.append(store.append_predictive_barrier_label(record))
         else:
             raise TypeError(f"unsupported research record type: {type(record)!r}")
     return paths
+
+
+@dataclass
+class _PendingPredictiveBarrier:
+    observation_ts_ns: int
+    asset_id: str
+    venue: str
+    instrument: str
+    candidate_id: str
+    model_key: str
+    setup_family: str
+    side: str
+    entry_price: float
+    stop_price: float
+    target_price: float
+    estimated_round_trip_cost_bps: float
+    predicted_target_before_stop_probability: float
+    predicted_directional_move_probability: float
+    timeout_s: int
+    favorable_bps: float = 0.0
+    adverse_bps: float = 0.0
+
+
+class PredictiveBarrierLabelWriter:
+    """Resolve every shadow/live predictive setup by exact TP-before-SL outcome."""
+    def __init__(self, store: JsonlResearchStore, min_spacing_sec: float = 1.0, timeout_s: int = 300) -> None:
+        self.store = store
+        self.min_spacing_sec = max(0.0, float(min_spacing_sec))
+        self.timeout_s = max(1, int(timeout_s))
+        self._pending: list[_PendingPredictiveBarrier] = []
+        self._last_key_ts_ns: dict[str, int] = {}
+
+    def record_candidate(self, *, observation_ts_ns: int, asset_id: str, venue: str, instrument: str, candidate_id: str, model_key: str, setup_family: str, side: str, entry_price: float, stop_price: float, target_price: float, estimated_round_trip_cost_bps: float, predicted_target_before_stop_probability: float, predicted_directional_move_probability: float) -> bool:
+        if float(entry_price) <= 0 or float(stop_price) <= 0 or float(target_price) <= 0:
+            return False
+        key = f"{model_key}:{side}"
+        last = int(self._last_key_ts_ns.get(key, 0))
+        if last and (int(observation_ts_ns) - last) / 1_000_000_000.0 < self.min_spacing_sec:
+            return False
+        self._last_key_ts_ns[key] = int(observation_ts_ns)
+        self._pending.append(_PendingPredictiveBarrier(int(observation_ts_ns), str(asset_id), str(venue), str(instrument), str(candidate_id), str(model_key), str(setup_family), str(side).lower(), float(entry_price), float(stop_price), float(target_price), float(estimated_round_trip_cost_bps), float(predicted_target_before_stop_probability), float(predicted_directional_move_probability), self.timeout_s))
+        return True
+
+    def observe(self, *, now_ts_ns: int, current_price: float) -> list[Path]:
+        if float(current_price) <= 0:
+            return []
+        written: list[Path] = []
+        remaining: list[_PendingPredictiveBarrier] = []
+        for obs in self._pending:
+            sign = 1.0 if obs.side in {"buy", "long"} else -1.0
+            move_bps = (float(current_price) / obs.entry_price - 1.0) * 10_000.0 * sign
+            obs.favorable_bps = max(obs.favorable_bps, move_bps, 0.0)
+            obs.adverse_bps = min(obs.adverse_bps, move_bps, 0.0)
+            tp_hit = float(current_price) >= obs.target_price if sign > 0 else float(current_price) <= obs.target_price
+            sl_hit = float(current_price) <= obs.stop_price if sign > 0 else float(current_price) >= obs.stop_price
+            elapsed_s = max(0.0, (int(now_ts_ns) - obs.observation_ts_ns) / 1_000_000_000.0)
+            outcome = "TP_FIRST" if tp_hit and not sl_hit else "SL_FIRST" if sl_hit else "TIMEOUT" if elapsed_s >= obs.timeout_s else ""
+            if not outcome:
+                remaining.append(obs)
+                continue
+            written.append(self.store.append_predictive_barrier_label(PredictiveBarrierLabel(
+                observation_ts_ns=obs.observation_ts_ns, resolved_ts_ns=int(now_ts_ns), asset_id=obs.asset_id, venue=obs.venue, instrument=obs.instrument, candidate_id=obs.candidate_id, model_key=obs.model_key, setup_family=obs.setup_family, side=obs.side, reference_entry_price=obs.entry_price, stop_price=obs.stop_price, target_price=obs.target_price, estimated_round_trip_cost_bps=obs.estimated_round_trip_cost_bps, predicted_target_before_stop_probability=obs.predicted_target_before_stop_probability, predicted_directional_move_probability=obs.predicted_directional_move_probability, outcome=outcome, resolution_price=float(current_price), favorable_excursion_bps=obs.favorable_bps, adverse_excursion_bps=obs.adverse_bps,
+            )))
+        self._pending = remaining
+        return written
 
 
 @dataclass

@@ -315,18 +315,13 @@ class DynamicProtectionPlanBuilder:
                 min_hold_sec = float(min_hold_map.get(asset_key, min_hold_map.get("DEFAULT", 0.0)) or 0.0)
             except (TypeError, ValueError):
                 min_hold_sec = 0.0
-        if decay.ready and decay.optimal_hold_sec is not None and min_hold_sec > 0.0 and float(decay.optimal_hold_sec) < min_hold_sec:
-            diagnostics = {
-                "model": "dynamic_exit_state_v1",
-                "asset_id": asset_key,
-                "venue": venue_key,
-                "required_min_executable_hold_sec": min_hold_sec,
-                "signal_decay": asdict(decay),
-                "kyle_impact": asdict(impact),
-                "vpin": asdict(toxicity),
-            }
-            reason = f"signal_horizon_below_protected_execution_min:{float(decay.optimal_hold_sec):.3f}<{min_hold_sec:.3f}"
-            return ProtectionPlan(price, price, price, protection_type, False, [reason], diagnostics=diagnostics)
+        # Signal half-life is execution-urgency and research telemetry only.
+        # A micro-horizon estimate may not veto an otherwise valid closed-state
+        # structural thesis or act as a timer-driven exit instruction.
+        horizon_below_reference_min = bool(
+            decay.ready and decay.optimal_hold_sec is not None and min_hold_sec > 0.0
+            and float(decay.optimal_hold_sec) < min_hold_sec
+        )
         # Kyle and VPIN readiness are venue-specific. The previous implementation
         # named these policies *_FOR_DELTA but accidentally blocked Hyperliquid and
         # CoinSwitch forever when their selected feed had no Delta-style event tape.
@@ -368,7 +363,39 @@ class DynamicProtectionPlanBuilder:
             if coverage < min_coverage:
                 depth_floor = price * stress_bps * (1.0 - max(0.0, coverage) / min_coverage) / 10000.0
         base_stop = max(vol_floor, min_bps_floor, spread_floor, tick_floor, cost_floor, depth_floor)
-        stop_distance = base_stop * stop_mult
+        # A hard SL is outside the nearest observable CLOSED parent anchor, not
+        # inside the same support/resistance pocket that authorised the trade.
+        # This uses wired venue-local closed bars only; no synthetic pool is invented.
+        regime = str(market.get("regime") or "").upper()
+        regime_mults = _cfg("ADAPTIVE_PROTECTION_REGIME_STOP_MULTIPLIER", {})
+        regime_stop_mult = _num(regime_mults.get(regime), 1.0) if isinstance(regime_mults, Mapping) else 1.0
+        expansion_ratio = max(0.25, _num(market.get("volatility_expansion_ratio"), 1.0))
+        expansion_mult = _clamp(
+            1.0 + max(0.0, expansion_ratio - 1.0) * float(_cfg("ADAPTIVE_PROTECTION_VOL_EXPANSION_STOP_SLOPE", 0.20)),
+            1.0, float(_cfg("ADAPTIVE_PROTECTION_MAX_VOL_EXPANSION_STOP_MULT", 1.50)),
+        )
+        base_stop_distance = base_stop * stop_mult * regime_stop_mult * expansion_mult
+        structural_anchor = None
+        structural_anchor_role = "unavailable"
+        structural_clearance = max(
+            float(volatility_price) * float(_cfg("ADAPTIVE_PROTECTION_STRUCTURAL_CLEARANCE_VOL_MULT", 0.35)),
+            price * float(_cfg("ADAPTIVE_PROTECTION_STRUCTURAL_CLEARANCE_MIN_BPS", 2.0)) / 10000.0,
+            tick_size * float(_cfg("ADAPTIVE_PROTECTION_STRUCTURAL_CLEARANCE_TICKS", 2.0)),
+        ) if bool(_cfg("ADAPTIVE_PROTECTION_STRUCTURAL_ANCHORS_ENABLED", True)) else 0.0
+        if asset_class != "option" and bool(_cfg("ADAPTIVE_PROTECTION_STRUCTURAL_ANCHORS_ENABLED", True)):
+            if direction in {Direction.LONG, Direction.BULLISH}:
+                candidates = [v for v in (_num(market.get("last_closed_low"), 0.0), _num(market.get("prior_range_low"), 0.0)) if 0.0 < v < price]
+                if candidates:
+                    structural_anchor = max(candidates)
+                    structural_anchor_role = "support_invalidation_below_closed_anchor"
+                    base_stop_distance = max(base_stop_distance, price - (structural_anchor - structural_clearance))
+            elif direction in {Direction.SHORT, Direction.BEARISH}:
+                candidates = [v for v in (_num(market.get("last_closed_high"), 0.0), _num(market.get("prior_range_high"), 0.0)) if v > price]
+                if candidates:
+                    structural_anchor = min(candidates)
+                    structural_anchor_role = "resistance_invalidation_above_closed_anchor"
+                    base_stop_distance = max(base_stop_distance, (structural_anchor + structural_clearance) - price)
+        stop_distance = base_stop_distance
         floor_rr = float(_cfg("DYNAMIC_PROTECTION_OPTION_RR_FLOOR", 1.10) if asset_class == "option" else _cfg("DYNAMIC_PROTECTION_RR_FLOOR", 1.15))
         policy_min_rr = _num(market.get("policy_min_rr"), 0.0)
         if policy_min_rr > 0:
@@ -382,7 +409,35 @@ class DynamicProtectionPlanBuilder:
         min_target_bps = _lookup_float_map("DYNAMIC_PROTECTION_ASSET_MIN_TARGET_BPS", (asset_key,), 0.0)
         min_target_rr = (price * min_target_bps / 10000.0) / max(stop_distance, 1e-9) if min_target_bps > 0 else 0.0
         target_rr = _clamp(max(edge_scalar, min_target_rr), floor_rr, ceiling_rr)
-        target_distance = stop_distance * target_rr
+        model_target_distance = stop_distance * target_rr
+        # Front-run a reachable closed structural objective when it is visible.
+        # If it is too close to justify the risk, keep the smaller real objective
+        # and allow the barrier-EV gate to reject the trade; do not fabricate a TP
+        # beyond nearby opposing liquidity merely to make RR look attractive.
+        target_buffer = max(
+            float(volatility_price) * float(_cfg("ADAPTIVE_PROTECTION_TARGET_FRONT_RUN_VOL_MULT", 0.20)),
+            price * float(_cfg("ADAPTIVE_PROTECTION_TARGET_FRONT_RUN_MIN_BPS", 1.0)) / 10000.0,
+            tick_size * float(_cfg("ADAPTIVE_PROTECTION_TARGET_FRONT_RUN_TICKS", 1.0)),
+        ) if bool(_cfg("ADAPTIVE_PROTECTION_STRUCTURAL_TARGETS_ENABLED", True)) else 0.0
+        structural_objective = None
+        target_source = "projected_edge_volatility_objective_no_closed_pool_ahead"
+        target_distance = model_target_distance
+        if asset_class != "option" and bool(_cfg("ADAPTIVE_PROTECTION_STRUCTURAL_TARGETS_ENABLED", True)):
+            if direction in {Direction.LONG, Direction.BULLISH}:
+                objectives = [v for v in (_num(market.get("last_closed_high"), 0.0), _num(market.get("prior_range_high"), 0.0)) if v > price]
+                if objectives:
+                    structural_objective = min(objectives)
+                    objective_distance = max(tick_size, (structural_objective - target_buffer) - price)
+                    target_distance = min(model_target_distance, objective_distance)
+                    target_source = "front_run_nearest_closed_sell_side_objective"
+            elif direction in {Direction.SHORT, Direction.BEARISH}:
+                objectives = [v for v in (_num(market.get("last_closed_low"), 0.0), _num(market.get("prior_range_low"), 0.0)) if 0.0 < v < price]
+                if objectives:
+                    structural_objective = max(objectives)
+                    objective_distance = max(tick_size, price - (structural_objective + target_buffer))
+                    target_distance = min(model_target_distance, objective_distance)
+                    target_source = "front_run_nearest_closed_buy_side_objective"
+        realised_target_rr = target_distance / max(stop_distance, 1e-9)
         if direction in {Direction.LONG, Direction.BULLISH}:
             stop_price = price - stop_distance
             target_price = price + target_distance
@@ -393,7 +448,7 @@ class DynamicProtectionPlanBuilder:
             return ProtectionPlan(price, price, price, protection_type, False, ["dynamic_protection_direction_unavailable"], diagnostics={})
         liquidation = self.almgren_chriss(quantity=quantity, half_life_sec=decay.half_life_sec, expected_impact_bps=impact.expected_exit_impact_bps)
         diagnostics: dict[str, Any] = {
-            "model": "dynamic_exit_state_v1",
+            "model": "adaptive_structural_protection_v3",
             "asset_class": asset_class,
             "base_volatility_stop_distance": base_stop,
             "stop_distance": stop_distance,
@@ -417,13 +472,33 @@ class DynamicProtectionPlanBuilder:
                 "tick_floor_distance": tick_floor,
                 "cost_floor_distance": cost_floor,
                 "depth_floor_distance": depth_floor,
+                "toxicity_stop_multiplier": stop_mult,
+                "regime_stop_multiplier": regime_stop_mult,
+                "volatility_expansion_stop_multiplier": expansion_mult,
+                "structural_anchor_price": structural_anchor,
+                "structural_anchor_role": structural_anchor_role,
+                "structural_clearance_distance": structural_clearance,
+                "stop_distance": stop_distance,
                 "policy_min_rr": policy_min_rr,
                 "policy_max_rr": policy_max_rr,
                 "asset_min_target_bps": min_target_bps,
+                "model_target_distance": model_target_distance,
+                "target_distance": target_distance,
+                "target_rr_before_structural_objective": target_rr,
+                "realised_target_rr": realised_target_rr,
+                "structural_objective_price": structural_objective,
+                "target_source": target_source,
+                "target_front_run_buffer_distance": target_buffer,
+                "closed_anchor_source": str(market.get("closed_anchor_source") or "unavailable"),
                 "volatility_source": str(market.get("volatility_source") or "unknown"),
                 "venue_local_robust_vol_bps": market.get("venue_local_robust_vol_bps"),
             },
             "signal_decay": asdict(decay),
+            "signal_horizon_policy": {
+                "authority": "telemetry_only_not_entry_veto",
+                "reference_min_executable_hold_sec": min_hold_sec,
+                "below_reference_min": horizon_below_reference_min,
+            },
             "kyle_impact": asdict(impact),
             "vpin": asdict(toxicity),
             "almgren_chriss": asdict(liquidation),
@@ -436,7 +511,7 @@ class DynamicProtectionPlanBuilder:
             target_price=max(0.01, target_price),
             protection_type=protection_type,
             protection_feasible=stop_price > 0 and target_price > 0,
-            reasons=["dynamic_state_dependent_protection", "hard_protection_required_at_entry"],
+            reasons=["adaptive_structural_market_protection", "hard_protection_required_at_entry"],
             diagnostics=diagnostics,
         )
 

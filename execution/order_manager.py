@@ -2019,8 +2019,14 @@ class _HyperliquidAdapter:
         return mapping.get(raw, "UNKNOWN")
 
     def extract_fill_price(self, order_data: Dict) -> Optional[float]:
+        """Return only an actual Hyperliquid execution price.
+
+        ``limitPx``/``price`` are order instructions, and for stop-market TP/SL
+        protection may be deliberately far from the trigger. They are never
+        realised-P&L evidence.
+        """
         node = self._order_node(order_data)
-        for key in ("avgPx", "avgFillPrice", "fillPrice", "limitPx", "limit_px", "price"):
+        for key in ("avgPx", "avgFillPrice", "fillPrice"):
             value = node.get(key, order_data.get(key))
             price = self._num(value, 0.0)
             if price > 0:
@@ -2148,15 +2154,20 @@ class _HyperliquidAdapter:
             time.sleep(poll)
 
     def _entry_status(self, oid: str, fallback_price: float, fallback_qty: float) -> Dict:
-        raw = self.get_order(oid) or {}
-        status = self.extract_status(raw)
+        resolved = self.resolve_order_execution(oid) or {}
+        raw = resolved.get("raw_order") if isinstance(resolved, dict) else {}
+        status = str(resolved.get("status") or self.extract_status(raw or {}))
+        fill_price = self._num(resolved.get("fill_price"), 0.0)
+        # A GTC limit entry can never execute worse than its submitted limit; use
+        # the limit for temporary activation only when exact fill retrieval is
+        # unavailable. Exit/P&L reconciliation never applies this fallback.
         return {
             "status": status,
-            "fill_price": float(self.extract_fill_price(raw) or fallback_price),
-            "filled_qty": float(self.extract_filled_qty(raw) or (fallback_qty if status == "FILLED" else 0.0)),
-            "raw_order": raw,
-            "paid_commission": 0.0,
-            "paid_commission_exact": False,
+            "fill_price": float(fill_price or fallback_price),
+            "filled_qty": float(self._num(resolved.get("filled_qty"), 0.0) or (fallback_qty if status == "FILLED" else 0.0)),
+            "raw_order": raw or {},
+            "paid_commission": float(resolved.get("paid_commission", 0.0) or 0.0),
+            "paid_commission_exact": bool(resolved.get("paid_commission_exact", False)),
         }
 
     def place_bracket_limit_entry(
@@ -2366,6 +2377,47 @@ class _HyperliquidAdapter:
         self.limiter.wait()
         return self.api.cancel_order(self.symbol, int(order_id)) or {}
 
+    @classmethod
+    def _single_trigger_modify_accepted(cls, resp: Any) -> bool:
+        statuses = cls._extract_hl_statuses(resp)
+        if not statuses:
+            return False
+        first = statuses[0]
+        if isinstance(first, str):
+            return first.strip().lower() in {"waitingfortrigger", "success", "ok"}
+        if not isinstance(first, dict) or first.get("error"):
+            return False
+        return any(key in first for key in ("resting", "waitingForTrigger", "filled"))
+
+    def edit_protective_stop(
+        self, *, order_id: str, side: str, quantity: float, new_stop_price: float
+    ) -> Optional[Dict]:
+        """Modify a Hyperliquid native SL trigger atomically in place.
+
+        A profit-lock move is permitted only through this native trigger modify
+        endpoint.  The legacy generic cancel/replace path is never used for a
+        Hyperliquid bracket SL because it cannot safely reproduce the position
+        TP/SL trigger lifecycle.
+        """
+        close_side = str(side or "").upper()
+        is_buy = close_side in {"BUY", "LONG"}
+        qty = self._round_qty(quantity)
+        try:
+            trigger = self._round_px(float(new_stop_price))
+            self.limiter.wait()
+            resp = self.api.modify_reduce_only_trigger(
+                coin=self.symbol, oid=int(order_id), is_buy=is_buy, size=qty,
+                trigger_px=trigger, tpsl="sl",
+            )
+        except Exception as exc:
+            return {"_error": True, "_sc": 0, "_err_msg": str(exc), "_raw": {"error": str(exc)}}
+        if not self._single_trigger_modify_accepted(resp):
+            return {"_error": True, "_sc": 200, "_err_msg": "hyperliquid_native_sl_modify_not_accepted", "_raw": resp}
+        return {
+            "order_id": str(order_id), "status": "PENDING", "trigger_price": float(trigger),
+            "native_trigger_modified": True, "_raw": resp,
+        }
+
     def get_order(self, order_id: str) -> Optional[Dict]:
         self.limiter.wait()
         try:
@@ -2374,16 +2426,53 @@ class _HyperliquidAdapter:
             return None
 
     def resolve_order_execution(self, order_id: str) -> Optional[Dict]:
-        raw = self.get_order(str(order_id or "").strip())
+        oid = str(order_id or "").strip()
+        raw = self.get_order(oid)
         if not isinstance(raw, dict):
             return None
         status = self.extract_status(raw)
+        exact_fill_price = 0.0
+        exact_filled_qty = 0.0
+        paid_commission = 0.0
+        commission_exact = False
+        if status == "FILLED":
+            end_ms = int(time.time() * 1000) + 1000
+            lookback_ms = max(60_000, int(_cfg("HYPERLIQUID_FILL_RECONCILIATION_LOOKBACK_MS", 86_400_000)))
+            try:
+                fills = self.api.user_fills_by_time(
+                    coin=self.symbol, start_time_ms=end_ms - lookback_ms, end_time_ms=end_ms, aggregate_by_time=False
+                ) or []
+            except Exception as exc:
+                logger.debug("Hyperliquid exact-fill retrieval deferred oid=%s coin=%s: %s", oid, self.symbol, exc)
+                fills = []
+            symbol_key = str(self.symbol or "").upper()
+            base_key = symbol_key.split(":", 1)[-1]
+            matching = []
+            for row in fills if isinstance(fills, list) else []:
+                if not isinstance(row, dict) or str(row.get("oid") or "") != oid:
+                    continue
+                coin = str(row.get("coin") or "").upper()
+                if coin and coin not in {symbol_key, base_key}:
+                    continue
+                px = self._num(row.get("px"), 0.0)
+                qty = self._num(row.get("sz"), 0.0)
+                if px > 0.0 and qty > 0.0:
+                    matching.append((px, qty, row))
+            if matching:
+                total_qty = sum(qty for _, qty, _ in matching)
+                exact_fill_price = sum(px * qty for px, qty, _ in matching) / max(total_qty, 1e-12)
+                exact_filled_qty = total_qty
+                fees = [self._num(row.get("fee"), 0.0) for _, _, row in matching if row.get("fee") is not None]
+                if fees:
+                    paid_commission = sum(fees)
+                    commission_exact = True
         return {
             "status": status,
-            "fill_price": float(self.extract_fill_price(raw) or 0.0),
-            "filled_qty": float(self.extract_filled_qty(raw) or 0.0),
-            "paid_commission": 0.0,
-            "paid_commission_exact": False,
+            "fill_price": float(exact_fill_price or self.extract_fill_price(raw) or 0.0),
+            "filled_qty": float(exact_filled_qty or self.extract_filled_qty(raw) or 0.0),
+            "paid_commission": float(paid_commission),
+            "paid_commission_exact": bool(commission_exact),
+            "fill_price_authority": "user_fills_vwap" if exact_fill_price > 0.0 else "order_status_execution_fields_only",
             "raw_order": raw,
         }
 
@@ -3870,6 +3959,33 @@ class OrderManager:
         new_limit_price = self._sl_limit_price(api_side, new_trigger_price)
 
         try:
+            # ── Path 0: Native trigger modify (Hyperliquid position TP/SL) ───
+            # Hyperliquid bracket SLs are native trigger orders.  Profit locking
+            # must atomically modify that trigger; never cancel the live SL and
+            # fall through to a generic ordinary-order replacement.
+            if existing_sl_order_id and hasattr(self._adapter, "edit_protective_stop"):
+                edited = self._adapter.edit_protective_stop(
+                    order_id=existing_sl_order_id, side=api_side, quantity=quantity,
+                    new_stop_price=new_trigger_price,
+                )
+                if edited and not edited.get("_error"):
+                    logger.info(
+                        f"✅ Native protective SL modified {existing_sl_order_id[:10]}… "
+                        f"trigger=${new_trigger_price:,.6f}"
+                    )
+                    edited["order_id"] = edited.get("order_id", existing_sl_order_id)
+                    return edited
+                logger.warning(
+                    "Native protective SL modify failed for %s — original native SL remains live; retry deferred",
+                    existing_sl_order_id[:10],
+                )
+                return {
+                    "error": "NATIVE_MODIFY_FAILED_RETRY",
+                    "reason": str((edited or {}).get("_err_msg", "native_trigger_modify_failed"))[:200],
+                    "sl_cancelled": False,
+                    "order_id": existing_sl_order_id,
+                }
+
             # ── Path 1: Edit-in-place (Delta only) ───────────────────────────
             if existing_sl_order_id and hasattr(self._adapter, "edit_order"):
                 edited = self._adapter.edit_order(

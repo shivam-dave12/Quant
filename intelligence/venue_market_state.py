@@ -291,6 +291,14 @@ class VenueMarketStateEngine:
                              "active_bar_excluded": True, "acceptance_source": "latest_closed_1m_close",
                              "live_impulse_is_timing_only": True, "live_blend_bps_diagnostic": live_blend,
                              "parent_state_id": parent_state_id,
+                             # Observable closed-range anchors are exported for protection geometry only.
+                             # They are never derived from the mutable intrabar midpoint.
+                             "confirmed_parent_close": confirmed_parent_close,
+                             "last_closed_high": _high(candles_1m[-1]) if candles_1m else 0.0,
+                             "last_closed_low": _low(candles_1m[-1]) if candles_1m else 0.0,
+                             "prior_range_high": prior_high,
+                             "prior_range_low": prior_low,
+                             "closed_anchor_source": "venue_local_closed_1m_range",
                              "closed_candle_counts": {"1m": len(candles_1m), "5m": len(candles_5m), "15m": len(candles_15m)}},
             )
         return results

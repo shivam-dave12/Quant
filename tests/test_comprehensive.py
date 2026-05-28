@@ -3587,9 +3587,11 @@ def test_route_cost_never_becomes_negative_price_dislocation_alpha(monkeypatch):
     assert est.expected_net_edge_bps is not None and est.expected_net_edge_bps < 86.72
 
 
-def test_short_alpha_horizon_is_not_allowed_to_open_wide_silver_bracket(monkeypatch):
+def test_short_alpha_horizon_is_telemetry_only_not_a_structural_entry_veto(monkeypatch):
     monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_REQUIRE_SIGNAL_DECAY_READY", True, raising=False)
     monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_MIN_EXECUTABLE_HOLD_SEC_BY_ASSET", {"SILVER_SLVON": 60.0}, raising=False)
+    monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_VENUES", (), raising=False)
+    monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_VENUES", (), raising=False)
     engine = DynamicProtectionPlanBuilder("SILVER_SLVON")
     monkeypatch.setattr(engine, "signal_decay", lambda **kwargs: SignalDecayEstimate(
         True, 20, phi=0.4, observation_interval_sec=1.0, half_life_sec=3.0,
@@ -3600,8 +3602,10 @@ def test_short_alpha_horizon_is_not_allowed_to_open_wide_silver_bracket(monkeypa
         gross_edge_bps=80.0, execution_cost_bps=4.0, protection_type="VENUE_NATIVE_BRACKET",
         asset_class="commodity", market_state={"asset_id": "SILVER_SLVON", "venue": "delta"},
     )
-    assert plan.protection_feasible is False
-    assert plan.reasons[0].startswith("signal_horizon_below_protected_execution_min")
+    assert plan.protection_feasible is True
+    horizon = plan.diagnostics["signal_horizon_policy"]
+    assert horizon["authority"] == "telemetry_only_not_entry_veto"
+    assert horizon["below_reference_min"] is True
 
 class _FakeDeltaCatalog:
     def get_products(self, contract_types=None):
@@ -4735,3 +4739,574 @@ def test_hyperliquid_existing_cross_enabled_metals_keep_verified_cross_margin():
     assert result["success"] is True
     assert result["margin_mode"] == "CROSS"
     assert api.calls == [("xyz:GOLD", 25, True)]
+
+
+# ── V18 protected bracket outcome / exact fill accounting ───────────────────
+from strategy.barrier_outcome import ProtectedBarrierOutcomeEngine
+from strategy.predictive_flow import PreMoveOrderFlowHazardEngine, PredictiveFlowAssessment
+from market_data.normalizer import VenueMicrostate
+from strategy.domain import ProtectionPlan
+
+
+def _barrier_microstate(mid: float, flow: float, ts: int) -> VenueMicrostate:
+    return VenueMicrostate(
+        venue="hyperliquid", symbol="xyz:CL", exchange_ts_ns=ts, receive_ts_ns=ts,
+        feed_quality_score=1.0, best_bid=mid - 0.005, best_ask=mid + 0.005,
+        mid=mid, microprice=mid + (0.002 if flow > 0 else -0.002), spread_bps=1.0,
+        bid_depth_usd_by_band={"0-1": 50_000.0, "1-3": 50_000.0},
+        ask_depth_usd_by_band={"0-1": 50_000.0, "1-3": 50_000.0},
+        obi_by_band={}, ofi_usd_1s=flow, ofi_usd_10s=flow * 2.0, ofi_usd_60s=flow * 2.0,
+        tfi_usd_1s=flow * 0.25, tfi_usd_10s=flow * 0.5, tfi_usd_60s=flow,
+        basis_bps=None, funding_rate=0.0, update_latency_ms=1.0, sequence_valid=True,
+        product_class="linear_perp", execution_enabled=True,
+    )
+
+
+def _approved_predictive_flow(*, direction="SHORT", probability=0.90, alpha_bps=8.0):
+    return PredictiveFlowAssessment(
+        ready=True, approved=True, model="pre_move_orderflow_hazard_v1", venue="hyperliquid",
+        direction=direction, sample_count=4, prediction_horizon_sec=1.0,
+        directional_move_probability=probability, required_directional_probability=0.55,
+        predictive_alpha_bps=alpha_bps, queue_imbalance_directional=0.40,
+        microprice_lean_directional_bps=0.30, ofi_acceleration_directional_bps=3.0,
+        tfi_acceleration_directional_bps=1.0, depletion_advantage=0.45,
+        displayed_support_replenishment_proxy=0.10, displayed_opposition_withdrawal_proxy=0.20,
+        displayed_support_withdrawal_proxy=0.0, displayed_opposition_replenishment_proxy=0.0,
+        near_bid_depth_usd=40000.0, near_ask_depth_usd=10000.0,
+        cross_venue_agreement=None, leader_venue=None,
+        evidence_authority="pre_move_observable_state_only_depth_changes_are_proxies", reasons=(),
+    )
+
+
+def test_barrier_outcome_model_approves_pre_move_predictor_without_realised_price_confirmation(monkeypatch):
+    monkeypatch.setattr("strategy.barrier_outcome.config.BARRIER_OUTCOME_MIN_TARGET_BEFORE_STOP_PROBABILITY_BY_ASSET", {"OIL": 0.45}, raising=False)
+    monkeypatch.setattr("strategy.barrier_outcome.config.BARRIER_OUTCOME_ROUND_TRIP_COST_MULTIPLIER", 1.0, raising=False)
+    monkeypatch.setattr("strategy.barrier_outcome.config.BARRIER_OUTCOME_MIN_EXPECTED_VALUE_BPS", 0.0, raising=False)
+    engine = ProtectedBarrierOutcomeEngine("OIL")
+    plan = ProtectionPlan(99.44, 99.74, 98.50, "VENUE_NATIVE_BRACKET", True, [])
+    assessed = engine.assess(
+        venue="hyperliquid", direction=Direction.SHORT, protection=plan,
+        parent_alpha_bps=-18.0, child_timing_contribution_bps=-4.0,
+        uncertainty_bps=1.0, route_cost_bps=0.50, robust_volatility_bps=3.0,
+        liquidity_score=1.0, execution_quality=1.0,
+        predictive_flow=_approved_predictive_flow(),
+    )
+    assert assessed.flow_response.ready is False  # no post-move observations were required
+    assert assessed.predictive_flow.approved is True
+    assert assessed.target_before_stop_probability > assessed.required_target_before_stop_probability
+    assert assessed.expected_value_bps > 0
+    assert assessed.approved is True
+
+
+def test_realised_absorption_is_telemetry_only_not_a_pre_move_entry_dependency(monkeypatch):
+    monkeypatch.setattr("strategy.barrier_outcome.config.BARRIER_OUTCOME_MIN_FLOW_OBSERVATIONS", 5, raising=False)
+    monkeypatch.setattr("strategy.barrier_outcome.config.BARRIER_OUTCOME_MIN_TARGET_BEFORE_STOP_PROBABILITY_BY_ASSET", {"OIL": 0.45}, raising=False)
+    monkeypatch.setattr("strategy.barrier_outcome.config.BARRIER_OUTCOME_ROUND_TRIP_COST_MULTIPLIER", 1.0, raising=False)
+    monkeypatch.setattr("strategy.barrier_outcome.config.BARRIER_OUTCOME_MIN_EXPECTED_VALUE_BPS", 0.0, raising=False)
+    engine = ProtectedBarrierOutcomeEngine("OIL")
+    for i in range(8):
+        engine.observe({"hyperliquid": _barrier_microstate(100.0 + i * 0.08, -50_000.0, i + 1)})
+    plan = ProtectionPlan(100.56, 100.86, 99.62, "VENUE_NATIVE_BRACKET", True, [])
+    assessed = engine.assess(
+        venue="hyperliquid", direction=Direction.SHORT, protection=plan,
+        parent_alpha_bps=-18.0, child_timing_contribution_bps=-4.0,
+        uncertainty_bps=1.0, route_cost_bps=0.50, robust_volatility_bps=3.0,
+        liquidity_score=1.0, execution_quality=1.0,
+        predictive_flow=_approved_predictive_flow(),
+    )
+    assert assessed.flow_response.absorption_probability > 0.75
+    assert assessed.approved is True
+    assert assessed.as_dict()["flow_response_role"] == "post_entry_toxicity_and_calibration_only"
+
+def test_hyperliquid_exit_fill_never_uses_stop_safety_limit_as_realised_price(monkeypatch):
+    from execution.order_manager import _HyperliquidAdapter
+
+    class _API:
+        def query_order(self, oid):
+            return {"order": {"status": "filled", "order": {"oid": int(oid), "coin": "xyz:CL", "limitPx": "99.49", "origSz": "0.251"}}}
+        def user_fills_by_time(self, **kwargs):
+            return [{"oid": 123, "coin": "xyz:CL", "px": "90.445", "sz": "0.251", "fee": "0.001"}]
+
+    inst = SimpleNamespace(symbol="xyz:CL", display_symbol="xyz:CL", tick_size=0.001, lot_step=0.001, min_qty=0.001, max_qty=1000)
+    adapter = _HyperliquidAdapter(_API(), inst)
+    adapter.limiter.wait = lambda: None
+    resolved = adapter.resolve_order_execution("123")
+    assert resolved["status"] == "FILLED"
+    assert resolved["fill_price"] == 90.445
+    assert resolved["fill_price"] != 99.49
+    assert resolved["fill_price_authority"] == "user_fills_vwap"
+
+
+def test_hyperliquid_filled_trigger_without_exact_fill_stays_unpriced(monkeypatch):
+    from execution.order_manager import _HyperliquidAdapter
+
+    class _API:
+        def query_order(self, oid):
+            return {"order": {"status": "filled", "order": {"oid": int(oid), "coin": "xyz:CL", "limitPx": "99.49", "origSz": "0.251"}}}
+        def user_fills_by_time(self, **kwargs):
+            return []
+
+    inst = SimpleNamespace(symbol="xyz:CL", display_symbol="xyz:CL", tick_size=0.001, lot_step=0.001, min_qty=0.001, max_qty=1000)
+    adapter = _HyperliquidAdapter(_API(), inst)
+    adapter.limiter.wait = lambda: None
+    resolved = adapter.resolve_order_execution("123")
+    assert resolved["status"] == "FILLED"
+    assert resolved["fill_price"] == 0.0
+    assert resolved["fill_price_authority"] == "order_status_execution_fields_only"
+
+# ── V19 causal setup-family and protected-profit-lock regressions ─────────────
+
+from strategy.setup_classifier import InstitutionalSetupClassifier
+from strategy.profit_lock import InstitutionalProfitLockEngine
+from intelligence.venue_market_state import VenueMarketState
+from strategy.barrier_outcome import BarrierOutcomeAssessment, FlowResponseEstimate
+
+
+def _setup_barrier(*, approved=True, parent=-10.0, predictive=None):
+    flow = FlowResponseEstimate(
+        ready=False, sample_count=0, direction="SHORT", flow_effectiveness=0.0,
+        continuation_probability=0.0, absorption_probability=1.0,
+        aligned_flow_observations=0, directional_mid_displacement_bps=0.0,
+        latest_directional_flow_bps=0.0, reason="post_entry_flow_warmup",
+    )
+    pred = predictive or _approved_predictive_flow()
+    return BarrierOutcomeAssessment(
+        ready=True, approved=approved, model="predictive_protected_barrier_outcome_v2", direction="SHORT",
+        stop_distance_bps=25.0, target_distance_bps=55.0, route_cost_bps=3.0,
+        round_trip_cost_reserve_bps=6.0, parent_alpha_bps=parent,
+        child_timing_contribution_bps=-2.0, uncertainty_bps=0.5,
+        robust_volatility_bps=3.0, drift_after_predictive_timing_bps=6.0,
+        raw_target_before_stop_probability=0.75, target_before_stop_probability=0.70,
+        required_target_before_stop_probability=0.60, expected_value_bps=12.0,
+        predictive_flow=pred, flow_response=flow, reasons=(),
+    )
+
+
+def _setup_market_state(*, alpha=-10.0, regime="TREND", acceptance=-1.0):
+    return VenueMarketState(
+        venue="hyperliquid", symbol="xyz:CL", ready=True, reason="venue_local_structural_state_ready",
+        signed_alpha_bps=alpha, confidence=0.80, uncertainty_bps=0.5, regime_label=regime,
+        returns_bps={}, robust_one_minute_vol_bps=3.0, volatility_expansion_ratio=1.5,
+        acceptance_bps=acceptance, live_impulse_bps={}, diagnostics={"parent_state_id": "state-1"},
+    )
+
+
+def test_setup_classifier_allows_pre_move_queue_depletion_entry(monkeypatch):
+    monkeypatch.setattr("strategy.setup_classifier.config.SETUP_CLASSIFIER_MIN_DIRECTIONAL_PARENT_ALPHA_BPS", 0.5, raising=False)
+    classifier = InstitutionalSetupClassifier("OIL")
+    pred = _approved_predictive_flow()
+    assessed = classifier.classify(
+        venue="hyperliquid", direction=Direction.SHORT,
+        market_state=_setup_market_state(alpha=-10.0, regime="TREND", acceptance=0.0),
+        barrier=_setup_barrier(predictive=pred), predictive_flow=pred, cross_venue_evidence=None,
+    )
+    assert assessed.approved is True
+    assert assessed.setup_family == "PREMOVE_QUEUE_DEPLETION_INITIATION"
+    assert assessed.forced_flow_evidence_available is False
+
+
+def test_setup_classifier_rejects_unclassified_predictive_candidate():
+    classifier = InstitutionalSetupClassifier("OIL")
+    rejected = PredictiveFlowAssessment(
+        ready=True, approved=False, model="pre_move_orderflow_hazard_v1", venue="hyperliquid", direction="SHORT",
+        sample_count=4, prediction_horizon_sec=1.0, directional_move_probability=0.42,
+        required_directional_probability=0.61, predictive_alpha_bps=0.0, queue_imbalance_directional=-0.2,
+        microprice_lean_directional_bps=-0.4, ofi_acceleration_directional_bps=-1.0,
+        tfi_acceleration_directional_bps=-1.0, depletion_advantage=-0.3,
+        displayed_support_replenishment_proxy=0.0, displayed_opposition_withdrawal_proxy=0.0,
+        displayed_support_withdrawal_proxy=0.2, displayed_opposition_replenishment_proxy=0.2,
+        near_bid_depth_usd=10000.0, near_ask_depth_usd=40000.0, cross_venue_agreement=None,
+        leader_venue=None, evidence_authority="pre_move_observable_state_only_depth_changes_are_proxies",
+        reasons=("pre_move_probability_insufficient:0.4200<0.6100",),
+    )
+    assessed = classifier.classify(
+        venue="hyperliquid", direction=Direction.SHORT,
+        market_state=_setup_market_state(alpha=-10.0, regime="TREND", acceptance=0.0),
+        barrier=_setup_barrier(predictive=rejected), predictive_flow=rejected, cross_venue_evidence=None,
+    )
+    assert assessed.approved is False
+    assert assessed.setup_family == "NO_TRADE_UNCLASSIFIED_EDGE"
+    assert any("pre_move_probability_insufficient" in r for r in assessed.reasons)
+
+def test_profit_lock_does_not_claim_initial_stop_is_profitable(monkeypatch):
+    monkeypatch.setattr("strategy.profit_lock.config.PROFIT_LOCK_EXIT_SLIPPAGE_RESERVE_BPS_BY_ASSET", {"OIL": 7.0}, raising=False)
+    engine = InstitutionalProfitLockEngine("OIL")
+    assessed = engine.assess(
+        side="short", entry_price=100.0, mark_price=99.90, initial_stop_price=100.40,
+        current_stop_price=100.40, route_cost_bps=5.0, spread_bps=0.5, protection_confirmed=True,
+    )
+    assert assessed.should_request is False
+    assert assessed.execution_envelope_only is True
+    assert assessed.requested_stop_price == 100.40
+
+
+def test_profit_lock_moves_short_stop_below_entry_only_after_cost_covered(monkeypatch):
+    monkeypatch.setattr("strategy.profit_lock.config.PROFIT_LOCK_EXIT_SLIPPAGE_RESERVE_BPS_BY_ASSET", {"OIL": 5.0}, raising=False)
+    monkeypatch.setattr("strategy.profit_lock.config.PROFIT_LOCK_MIN_ACTIVATION_R", 0.50, raising=False)
+    engine = InstitutionalProfitLockEngine("OIL")
+    assessed = engine.assess(
+        side="short", entry_price=100.0, mark_price=99.20, initial_stop_price=100.40,
+        current_stop_price=100.40, route_cost_bps=3.0, spread_bps=0.5, protection_confirmed=True,
+    )
+    assert assessed.should_request is True
+    assert assessed.requested_stop_price < 100.0
+    assert assessed.protected_net_floor_bps > 0.0
+    assert assessed.locked_price_move_bps >= assessed.protected_net_floor_bps
+
+
+def test_hyperliquid_profit_lock_modifies_native_trigger_without_cancel_replace():
+    from execution.order_manager import _HyperliquidAdapter
+
+    class _API:
+        def __init__(self):
+            self.calls = []
+        def round_price(self, coin, price):
+            return float(price)
+        def round_size(self, coin, size):
+            return float(size)
+        def modify_reduce_only_trigger(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"response": {"data": {"statuses": ["waitingForTrigger"]}}}
+
+    api = _API()
+    inst = SimpleNamespace(symbol="xyz:CL", display_symbol="xyz:CL", tick_size=0.001, lot_step=0.001, min_qty=0.001, max_qty=1000)
+    adapter = _HyperliquidAdapter(api, inst)
+    adapter.limiter.wait = lambda: None
+    updated = adapter.edit_protective_stop(order_id="123", side="BUY", quantity=0.251, new_stop_price=90.10)
+    assert updated["order_id"] == "123"
+    assert updated["native_trigger_modified"] is True
+    assert api.calls == [{"coin": "xyz:CL", "oid": 123, "is_buy": True, "size": 0.251, "trigger_px": 90.1, "tpsl": "sl"}]
+
+
+def test_hyperliquid_api_native_trigger_modify_uses_reduce_only_trigger_payload():
+    from exchanges.hyperliquid.api import HyperliquidAPI
+
+    class _Exchange:
+        def __init__(self):
+            self.args = None
+        def modify_order(self, *args, **kwargs):
+            self.args = (args, kwargs)
+            return {"response": {"data": {"statuses": ["waitingForTrigger"]}}}
+
+    api = object.__new__(HyperliquidAPI)
+    api.exchange = _Exchange()
+    api.round_size = lambda coin, qty: qty
+    api.round_price = lambda coin, px: px
+    out = api.modify_reduce_only_trigger(coin="xyz:CL", oid=7, is_buy=True, size=0.251, trigger_px=90.10, tpsl="sl")
+    args, kwargs = api.exchange.args
+    assert args[:4] == (7, "xyz:CL", True, 0.251)
+    assert kwargs["reduce_only"] is True
+    assert kwargs["order_type"]["trigger"]["tpsl"] == "sl"
+    assert out["response"]["data"]["statuses"][0] == "waitingForTrigger"
+
+
+# ── V20 pre-displacement predictive entry and startup-exposure regressions ───
+from dataclasses import replace as dataclass_replace
+
+
+def test_pre_move_orderflow_can_approve_before_midprice_displacement(monkeypatch):
+    monkeypatch.setattr("strategy.predictive_flow.config.PREDICTIVE_FLOW_MIN_DIRECTIONAL_PROBABILITY_BY_ASSET", {"OIL": 0.52}, raising=False)
+    monkeypatch.setattr("strategy.predictive_flow.config.PREDICTIVE_FLOW_MIN_DEPLETION_ADVANTAGE", -1.0, raising=False)
+    engine = PreMoveOrderFlowHazardEngine("OIL")
+    for i in range(4):
+        state = dataclass_replace(
+            _barrier_microstate(100.0, 5000.0 * (i + 1), i + 1),
+            microprice=100.01,
+            bid_depth_usd_by_band={"0-1": 90000.0 + 10000 * i, "1-3": 40000.0},
+            ask_depth_usd_by_band={"0-1": 50000.0 - 10000 * i, "1-3": 20000.0},
+            tfi_usd_1s=3000.0 * (i + 1), tfi_usd_10s=3000.0,
+        )
+        engine.observe({"hyperliquid": state})
+    assessed = engine.assess(venue="hyperliquid", direction=Direction.LONG)
+    assert assessed.ready is True
+    assert assessed.approved is True
+    assert assessed.directional_move_probability >= assessed.required_directional_probability
+    assert all(abs(row.mid - 100.0) < 1e-12 for row in engine._snapshots["hyperliquid"])
+
+
+def test_pre_move_orderflow_rejects_pressure_against_parent_before_move(monkeypatch):
+    monkeypatch.setattr("strategy.predictive_flow.config.PREDICTIVE_FLOW_MIN_DEPLETION_ADVANTAGE", -1.0, raising=False)
+    engine = PreMoveOrderFlowHazardEngine("OIL")
+    for i in range(4):
+        state = dataclass_replace(
+            _barrier_microstate(100.0, 8000.0 * (i + 1), i + 1),
+            microprice=100.01,
+            bid_depth_usd_by_band={"0-1": 120000.0, "1-3": 40000.0},
+            ask_depth_usd_by_band={"0-1": 20000.0, "1-3": 10000.0},
+        )
+        engine.observe({"hyperliquid": state})
+    assessed = engine.assess(venue="hyperliquid", direction=Direction.SHORT)
+    assert assessed.ready is True
+    assert assessed.approved is False
+
+
+def test_startup_external_hyperliquid_locked_collateral_blocks_fresh_entries(monkeypatch):
+    from orchestration.multi_asset_bot import MultiAssetInstitutionalBot
+    manager = SimpleNamespace(
+        symbol="xyz:CL",
+        get_open_position=lambda: {"size": 0.0},
+        get_open_orders=lambda symbol=None: [],
+        get_balance=lambda: {"available": 14.90, "locked": 0.6455, "total": 15.55},
+    )
+    router = SimpleNamespace(available_exchanges=lambda: ("hyperliquid",), manager_for=lambda venue: manager)
+    ctx = SimpleNamespace(ready=True, execution_router=router, instrument=SimpleNamespace(asset_id="OIL", display_symbol="xyz:CL"), startup_exposure_verified=False)
+    bot = MultiAssetInstitutionalBot(); bot.contexts = [ctx]
+    monkeypatch.setattr(bot, "_is_indian_options_context", lambda _ctx: False)
+    assert bot._startup_external_exposure_preflight() is False
+    assert bot.trading_enabled is False
+    assert bot.trading_pause_reason == "STARTUP_EXTERNAL_EXPOSURE_RECONCILIATION_REQUIRED"
+
+
+def test_startup_flat_verified_account_leaves_entries_enabled(monkeypatch):
+    from orchestration.multi_asset_bot import MultiAssetInstitutionalBot
+    manager = SimpleNamespace(
+        symbol="xyz:CL", get_open_position=lambda: {"size": 0.0},
+        get_open_orders=lambda symbol=None: [], get_balance=lambda: {"available": 15.55, "locked": 0.0, "total": 15.55},
+    )
+    router = SimpleNamespace(available_exchanges=lambda: ("hyperliquid",), manager_for=lambda venue: manager)
+    ctx = SimpleNamespace(ready=True, execution_router=router, instrument=SimpleNamespace(asset_id="OIL", display_symbol="xyz:CL"), startup_exposure_verified=False)
+    bot = MultiAssetInstitutionalBot(); bot.contexts = [ctx]
+    monkeypatch.setattr(bot, "_is_indian_options_context", lambda _ctx: False)
+    assert bot._startup_external_exposure_preflight() is True
+    assert bot.trading_enabled is True
+
+
+def test_slvon_route_penalty_is_explicit_in_auditable_cost_components(monkeypatch):
+    monkeypatch.setattr("execution.venue_selection._cfg", lambda name, default: {
+        "VENUE_ROUND_TRIP_FEE_BPS": {"delta": 3.0}, "VENUE_SLIPPAGE_IMPACT_MULTIPLIER": 0.0,
+        "SILVER_DELTA_MIN_NEAR_DEPTH_USD": 50000.0, "SILVER_DELTA_ILLIQUIDITY_PENALTY_BPS": 15.0,
+    }.get(name, default))
+    state = _state__test_institutional_v6_exposure_feed_execution_fixes("delta", "SLVONUSD", 67.395)
+    state = dataclass_replace(state, bid_depth_usd_by_band={"0-1": 50.0, "1-3": 25.0}, ask_depth_usd_by_band={"0-1": 50.0, "1-3": 25.0})
+    est = estimate_venue_cost(state=state, direction="SHORT", asset_id="SILVER_SLVON", reference_mid=67.395, notional_usd=10.0, routeable=True, available_cash_usd=100.0, required_margin_usd=1.0, protection_capable=True, gross_edge_bps=30.0)
+    assert est.preference_adjustment_bps == 15.0
+    assert est.total_cost_bps >= est.fee_bps + est.preference_adjustment_bps
+
+# ── V20 calibrated live-authority and predictive barrier labelling ───────────
+from strategy.calibration_gate import PredictiveCalibrationAuthority
+from research.store import JsonlResearchStore, PredictiveBarrierLabelWriter
+
+
+def test_predictive_calibration_missing_model_is_shadow_only(monkeypatch):
+    monkeypatch.setattr("strategy.calibration_gate.config.PREDICTIVE_CALIBRATION_REQUIRE_FOR_LIVE", True, raising=False)
+    monkeypatch.setattr("strategy.calibration_gate.config.PREDICTIVE_CALIBRATED_LIVE_MODELS", {}, raising=False)
+    assessed = PredictiveCalibrationAuthority("OIL").assess(
+        venue="hyperliquid", setup_family="PREMOVE_QUEUE_DEPLETION_INITIATION",
+        model_version="pre_move_orderflow_hazard_v1+predictive_protected_barrier_outcome_v2",
+    )
+    assert assessed.authorised_for_live is False
+    assert assessed.authority == "shadow_only_until_walk_forward_calibrated"
+    assert "OIL:hyperliquid:PREMOVE_QUEUE_DEPLETION_INITIATION" in assessed.reasons[0]
+
+
+def test_predictive_calibration_allows_only_approved_walk_forward_model(monkeypatch):
+    key = "OIL:hyperliquid:PREMOVE_QUEUE_DEPLETION_INITIATION"
+    version = "pre_move_orderflow_hazard_v1+predictive_protected_barrier_outcome_v2"
+    monkeypatch.setattr("strategy.calibration_gate.config.PREDICTIVE_CALIBRATION_REQUIRE_FOR_LIVE", True, raising=False)
+    monkeypatch.setattr("strategy.calibration_gate.config.PREDICTIVE_CALIBRATION_MIN_OUT_OF_SAMPLE_OBSERVATIONS", 100, raising=False)
+    monkeypatch.setattr("strategy.calibration_gate.config.PREDICTIVE_CALIBRATION_MIN_LOWER_CONFIDENCE_BY_ASSET", {"OIL": 0.60}, raising=False)
+    monkeypatch.setattr("strategy.calibration_gate.config.PREDICTIVE_CALIBRATED_LIVE_MODELS", {
+        key: {"model_version": version, "out_of_sample_observations": 250, "walk_forward_validated": True, "brier_score": 0.15, "lower_confidence_tp_before_sl": 0.64}
+    }, raising=False)
+    assessed = PredictiveCalibrationAuthority("OIL").assess(venue="hyperliquid", setup_family="PREMOVE_QUEUE_DEPLETION_INITIATION", model_version=version)
+    assert assessed.authorised_for_live is True
+    assert assessed.authority == "approved_walk_forward_calibration"
+
+
+def test_predictive_barrier_label_writer_labels_shadow_candidate_tp_first(tmp_path):
+    store = JsonlResearchStore(tmp_path)
+    writer = PredictiveBarrierLabelWriter(store, min_spacing_sec=0.0, timeout_s=30)
+    assert writer.record_candidate(
+        observation_ts_ns=1_000_000_000, asset_id="OIL", venue="hyperliquid", instrument="xyz:CL",
+        candidate_id="candidate-1", model_key="OIL:hyperliquid:PREMOVE_QUEUE_DEPLETION_INITIATION",
+        setup_family="PREMOVE_QUEUE_DEPLETION_INITIATION", side="short", entry_price=100.0,
+        stop_price=101.0, target_price=98.0, estimated_round_trip_cost_bps=7.0,
+        predicted_target_before_stop_probability=0.66, predicted_directional_move_probability=0.64,
+    ) is True
+    paths = writer.observe(now_ts_ns=2_000_000_000, current_price=97.9)
+    assert len(paths) == 1
+    rows = store.read_records("predictive_barrier_labels.jsonl")
+    assert rows[0]["outcome"] == "TP_FIRST"
+    assert rows[0]["model_key"] == "OIL:hyperliquid:PREMOVE_QUEUE_DEPLETION_INITIATION"
+    assert rows[0]["predicted_target_before_stop_probability"] == 0.66
+
+
+def test_predictive_hazard_telemetry_states_calibration_authority():
+    payload = _approved_predictive_flow().as_dict()
+    assert payload["probability_authority"] == "analytic_hazard_score_requires_walk_forward_calibration_for_live"
+
+
+def test_walk_forward_calibration_tool_promotes_only_sufficient_holdout(tmp_path):
+    import importlib.util
+    tool_path = PROJECT_ROOT / "tools" / "calibrate_predictive_setups.py"
+    spec = importlib.util.spec_from_file_location("calibrate_predictive_setups", tool_path)
+    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    labels = tmp_path / "labels.jsonl"
+    key = "OIL:hyperliquid:PREMOVE_QUEUE_DEPLETION_INITIATION"
+    rows = []
+    for i in range(300):
+        rows.append({
+            "model_key": key, "observation_ts_ns": i + 1,
+            "outcome": "TP_FIRST" if i % 10 != 0 else "SL_FIRST",
+            "predicted_target_before_stop_probability": 0.90,
+        })
+    labels.write_text("\n".join(__import__("json").dumps(r) for r in rows) + "\n", encoding="utf-8")
+    report = module.run(labels, min_obs=100, max_brier=0.20, min_lower=0.70, holdout_fraction=0.40)
+    assert key in report["approved_registry"]
+    assert report["approved_registry"][key]["walk_forward_validated"] is True
+
+
+def test_pre_size_route_ledger_uses_bounded_probe_not_full_slvon_broker_capacity(monkeypatch):
+    monkeypatch.setattr("strategy.institutional_strategy._cfg", lambda name, default: {
+        "VENUE_SELECTION_PRE_SIZE_REFERENCE_NOTIONAL_USD": 50.0,
+        "VENUE_SELECTION_PRE_SIZE_REFERENCE_NOTIONAL_USD_BY_ASSET": {"SILVER_SLVON": 25.0},
+        "VENUE_SELECTION_MAX_QUANTITY_REPRESENTATION_ERROR_BPS": 0.5,
+        "VENUE_SELECTION_MIN_FREE_MARGIN_USD": 1.0,
+        "LEVERAGE": 25.0,
+        "INSTITUTIONAL_MAX_SELECTED_LEVERAGE": 25.0,
+    }.get(name, default))
+    strategy = object.__new__(InstitutionalStrategy)
+    strategy._asset_id = "SILVER_SLVON"
+    strategy._venue_min_order_notional_usd = lambda venue: 10.0
+    strategy._venue_max_leverage = lambda venue: 25.0
+    strategy._symbol_for_venue = lambda venue, fallback: "SLVONUSD"
+    strategy._instrument_mapping = lambda symbol, venue=None: SimpleNamespace(qty_step=0.001)
+    state = _state__test_institutional_v6_exposure_feed_execution_fixes("delta", "SLVONUSD", 67.395)
+    qty, notionals, _margins, _diag, _exec = strategy._risk_normalised_route_inputs(
+        states={"delta": state}, candidate_venues={"delta"},
+        capacity_notional_by_venue={"delta": 2552.34}, approved_quantity=None,
+    )
+    assert qty > 0
+    assert notionals["delta"] == pytest.approx(25.0)
+    assert notionals["delta"] < 2552.34
+
+# ── V21 adaptive structural TP/SL and post-fill performance exits ───────────
+from strategy.position_performance import PostFillPerformanceExitEngine
+
+
+def _relax_adaptive_protection_warmup(monkeypatch):
+    monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_REQUIRE_SIGNAL_DECAY_READY", False, raising=False)
+    monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_REQUIRE_TOXICITY_READY_VENUES", (), raising=False)
+    monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_REQUIRE_KYLE_READY_VENUES", (), raising=False)
+    monkeypatch.setattr(dp.config, "ADAPTIVE_PROTECTION_REGIME_STOP_MULTIPLIER", {"TREND": 1.0}, raising=False)
+    monkeypatch.setattr(dp.config, "ADAPTIVE_PROTECTION_VOL_EXPANSION_STOP_SLOPE", 0.0, raising=False)
+    monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_ASSET_MIN_STOP_BPS", {}, raising=False)
+    monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_VENUE_ASSET_MIN_STOP_BPS", {}, raising=False)
+    monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_ASSET_MIN_TARGET_BPS", {}, raising=False)
+
+
+def test_adaptive_long_sl_is_beyond_closed_support_and_tp_front_runs_objective(monkeypatch):
+    _relax_adaptive_protection_warmup(monkeypatch)
+    engine = DynamicProtectionPlanBuilder("OIL")
+    plan = engine.build_plan(
+        direction=Direction.LONG, entry_price=100.0, volatility_price=0.20,
+        gross_edge_bps=30.0, execution_cost_bps=2.0,
+        protection_type="VENUE_NATIVE_BRACKET", asset_class="commodity",
+        position_notional=100.0, quantity=1.0,
+        market_state={
+            "asset_id": "OIL", "venue": "hyperliquid", "regime": "TREND",
+            "spread_bps": 0.2, "price_tick": 0.01, "near_touch_depth_usd": 100000.0,
+            "last_closed_low": 99.50, "prior_range_low": 99.00,
+            "last_closed_high": 101.50, "prior_range_high": 102.00,
+            "closed_anchor_source": "venue_local_closed_1m_range", "volatility_expansion_ratio": 1.0,
+        },
+    )
+    geometry = plan.diagnostics["market_geometry"]
+    assert plan.protection_feasible is True
+    assert geometry["structural_anchor_price"] == pytest.approx(99.50)
+    assert plan.stop_price < 99.50  # outside support, never inside it
+    assert geometry["target_source"] == "front_run_nearest_closed_sell_side_objective"
+    assert plan.target_price < 101.50
+    assert plan.target_price > plan.entry_price
+
+
+def test_adaptive_short_sl_is_beyond_closed_resistance_and_tp_front_runs_objective(monkeypatch):
+    _relax_adaptive_protection_warmup(monkeypatch)
+    engine = DynamicProtectionPlanBuilder("OIL")
+    plan = engine.build_plan(
+        direction=Direction.SHORT, entry_price=100.0, volatility_price=0.20,
+        gross_edge_bps=30.0, execution_cost_bps=2.0,
+        protection_type="VENUE_NATIVE_BRACKET", asset_class="commodity",
+        position_notional=100.0, quantity=1.0,
+        market_state={
+            "asset_id": "OIL", "venue": "hyperliquid", "regime": "TREND",
+            "spread_bps": 0.2, "price_tick": 0.01, "near_touch_depth_usd": 100000.0,
+            "last_closed_high": 100.60, "prior_range_high": 101.20,
+            "last_closed_low": 98.70, "prior_range_low": 98.00,
+            "closed_anchor_source": "venue_local_closed_1m_range", "volatility_expansion_ratio": 1.0,
+        },
+    )
+    geometry = plan.diagnostics["market_geometry"]
+    assert geometry["structural_anchor_price"] == pytest.approx(100.60)
+    assert plan.stop_price > 100.60
+    assert geometry["target_source"] == "front_run_nearest_closed_buy_side_objective"
+    assert plan.target_price > 98.70
+    assert plan.target_price < plan.entry_price
+
+
+def test_post_fill_performance_exit_cuts_confirmed_early_adverse_selection(monkeypatch):
+    import strategy.position_performance as ppe
+    monkeypatch.setattr(ppe.config, "POST_FILL_PERFORMANCE_EXIT_CONFIRMATION_INTERVAL_SEC", 0.0, raising=False)
+    monkeypatch.setattr(ppe.config, "POST_FILL_PERFORMANCE_EXIT_ADVERSE_TRIGGER_R", 0.20, raising=False)
+    monkeypatch.setattr(ppe.config, "POST_FILL_PERFORMANCE_EXIT_MIN_ADVERSE_BPS", 2.0, raising=False)
+    engine = PostFillPerformanceExitEngine("BTC")
+    kwargs = dict(
+        side="long", entry_price=100.0, mark_price=99.70, initial_stop_price=99.0,
+        route_cost_bps=2.0, spread_bps=0.2, protection_confirmed=True,
+        same_direction_probability=0.30, opposing_direction_probability=0.80,
+        same_direction_ready=True, opposing_direction_ready=True,
+    )
+    first = engine.assess(**kwargs)
+    second = engine.assess(**kwargs)
+    assert first.should_exit is False
+    assert second.should_exit is True
+    assert second.action == "CUT_CONFIRMED_POST_FILL_ADVERSE_SELECTION"
+    assert second.protection_retained_until_flat is True
+
+
+def test_post_fill_performance_exit_captures_net_profit_on_predictive_reversal(monkeypatch):
+    import strategy.position_performance as ppe
+    monkeypatch.setattr(ppe.config, "POST_FILL_PERFORMANCE_EXIT_CONFIRMATION_INTERVAL_SEC", 0.0, raising=False)
+    engine = PostFillPerformanceExitEngine("OIL")
+    kwargs = dict(
+        side="short", entry_price=100.0, mark_price=99.50, initial_stop_price=101.0,
+        route_cost_bps=2.0, spread_bps=0.2, protection_confirmed=True,
+        same_direction_probability=0.30, opposing_direction_probability=0.82,
+        same_direction_ready=True, opposing_direction_ready=True,
+    )
+    engine.assess(**kwargs)
+    assessed = engine.assess(**kwargs)
+    assert assessed.should_exit is True
+    assert assessed.action == "CAPTURE_NET_PROFIT_ON_PREDICTIVE_EDGE_REVERSAL"
+    assert assessed.net_mark_after_reserve_bps > 0
+
+
+def test_post_fill_performance_exit_does_not_close_when_entry_hazard_still_supported(monkeypatch):
+    import strategy.position_performance as ppe
+    monkeypatch.setattr(ppe.config, "POST_FILL_PERFORMANCE_EXIT_CONFIRMATION_INTERVAL_SEC", 0.0, raising=False)
+    engine = PostFillPerformanceExitEngine("OIL")
+    assessed = engine.assess(
+        side="short", entry_price=100.0, mark_price=100.40, initial_stop_price=101.0,
+        route_cost_bps=2.0, spread_bps=0.2, protection_confirmed=True,
+        same_direction_probability=0.72, opposing_direction_probability=0.30,
+        same_direction_ready=True, opposing_direction_ready=True,
+    )
+    assert assessed.should_exit is False
+    assert assessed.action == "HOLD"
+
+
+def test_groww_bearish_thesis_long_put_uses_long_premium_protection_geometry(monkeypatch):
+    monkeypatch.setattr(dp.config, "DYNAMIC_PROTECTION_REQUIRE_SIGNAL_DECAY_READY", False, raising=False)
+    strategy = InstitutionalStrategy(instrument=None)
+    class _PremiumData:
+        def get_execution_candles(self, timeframe, limit):
+            assert timeframe == "1m"
+            return [{"high": 102.0, "low": 98.0, "close": 100.0} for _ in range(20)]
+    plan = strategy._option_premium_protection_plan(
+        _PremiumData(), 100.0, Direction.BEARISH, 50.0, 2.0,
+        option_state={"selected_option_symbol": "NIFTY_PUT", "selected_option_delta": -0.45},
+    )
+    assert plan is not None and plan.protection_feasible is True
+    assert plan.stop_price < plan.entry_price < plan.target_price
+    assert plan.diagnostics["option_state_at_entry"]["underlying_thesis_direction"] == "BEARISH"
+    assert plan.diagnostics["option_state_at_entry"]["premium_position_side"] == "LONG_PREMIUM_BUY_ONLY"

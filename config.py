@@ -385,6 +385,23 @@ VENUE_SELECTION_MAX_COST_BPS = 100.0
 # telemetry only and cannot distort the cross-venue cost ranking.
 VENUE_SELECTION_RISK_NORMALISED_LEDGER_ENABLED = True
 VENUE_SELECTION_MAX_QUANTITY_REPRESENTATION_ERROR_BPS = 0.50
+# Pre-size route economics must be evaluated at a bounded executable probe,
+# never at the full broker collateral capacity. Final approval still replays the
+# exact risk-sized quantity on every candidate venue.
+VENUE_SELECTION_PRE_SIZE_REFERENCE_NOTIONAL_USD = 50.0
+VENUE_SELECTION_PRE_SIZE_REFERENCE_NOTIONAL_USD_BY_ASSET = {
+    "OIL": 15.0,
+    "NATGAS": 15.0,
+    "SILVER_SLVON": 25.0,
+    "SILVER_XAG": 50.0,
+}
+
+# Fail closed before any fresh live entry when broker exposure cannot be
+# reconciled. Locked collateral/open orders/existing positions must be adopted
+# by a later explicit lifecycle, never ignored at startup.
+STARTUP_EXTERNAL_EXPOSURE_PREFLIGHT_ENABLED = True
+STARTUP_EXTERNAL_EXPOSURE_BLOCK_ALL_NEW_ENTRIES = True
+STARTUP_UNKNOWN_LOCKED_COLLATERAL_TOLERANCE_USD = 0.01
 # Expected round-trip cost: maker entry plus protected-market exit. Replace
 # these approved-account assumptions when a venue/account fee tier changes.
 VENUE_ROUND_TRIP_FEE_BPS = {
@@ -468,8 +485,9 @@ DYNAMIC_PROTECTION_ASSET_MIN_TARGET_BPS = {
     "SILVER_XAG": 100.0,
     "SILVER_HL": 100.0,
 }
-# A short-lived OFI/TFI burst cannot justify a wide structural bracket. Entries
-# fail closed when the estimated alpha life is shorter than protected execution.
+# Reference horizons are retained only for research/urgency telemetry. They do
+# not veto a parent-structural entry; protected-trade approval is owned by the
+# target-before-stop barrier outcome model below.
 DYNAMIC_PROTECTION_MIN_EXECUTABLE_HOLD_SEC_BY_ASSET = {
     "BTC": 5.0,
     "OIL": 20.0,
@@ -483,6 +501,169 @@ DYNAMIC_PROTECTION_MIN_EXECUTABLE_HOLD_SEC_BY_ASSET = {
 DYNAMIC_PROTECTION_RR_FLOOR = 1.15
 DYNAMIC_PROTECTION_OPTION_RR_FLOOR = 1.10
 DYNAMIC_PROTECTION_RR_CAP = 5.0
+
+# ── Adaptive structural TP/SL geometry ──────────────────────────────────────
+# Initial native protection uses only observable venue-local CLOSED structural
+# anchors. SL is kept beyond the nearest support/resistance invalidation with a
+# volatility/tick clearance. TP front-runs the first reachable closed structural
+# objective; if it is too close for adequate bracket EV, the barrier gate rejects
+# the trade rather than inventing a more attractive target.
+ADAPTIVE_PROTECTION_STRUCTURAL_ANCHORS_ENABLED = True
+ADAPTIVE_PROTECTION_STRUCTURAL_TARGETS_ENABLED = True
+ADAPTIVE_PROTECTION_STRUCTURAL_CLEARANCE_VOL_MULT = 0.35
+ADAPTIVE_PROTECTION_STRUCTURAL_CLEARANCE_MIN_BPS = 2.0
+ADAPTIVE_PROTECTION_STRUCTURAL_CLEARANCE_TICKS = 2.0
+ADAPTIVE_PROTECTION_TARGET_FRONT_RUN_VOL_MULT = 0.20
+ADAPTIVE_PROTECTION_TARGET_FRONT_RUN_MIN_BPS = 1.0
+ADAPTIVE_PROTECTION_TARGET_FRONT_RUN_TICKS = 1.0
+ADAPTIVE_PROTECTION_REGIME_STOP_MULTIPLIER = {
+    "BALANCE": 0.95, "TREND": 1.05, "EXPANSION": 1.15,
+    "SHOCK": 1.35, "ILLIQUID": 1.45, "UNKNOWN": 1.10,
+}
+ADAPTIVE_PROTECTION_VOL_EXPANSION_STOP_SLOPE = 0.20
+ADAPTIVE_PROTECTION_MAX_VOL_EXPANSION_STOP_MULT = 1.50
+
+# ── Protected Barrier Outcome / Flow-Efficiency Model ───────────────────────
+# Entry approval is based on the exact bracket trade, not directional movement
+# alone. A live candidate must show positive first-passage expectancy: the
+# estimated probability of reaching TP before SL after route cost, local
+# volatility and observed absorption/replenishment risk.
+BARRIER_OUTCOME_MODEL_ENABLED = True
+# Realised flow response is post-entry toxicity/calibration telemetry only.
+# Predictive entry permission is owned by the pre-move hazard engine below.
+BARRIER_OUTCOME_REQUIRE_FLOW_RESPONSE_READY_FOR_ENTRY = False
+BARRIER_OUTCOME_MAX_OBSERVATIONS = 240
+BARRIER_OUTCOME_MIN_FLOW_OBSERVATIONS = 10
+BARRIER_OUTCOME_FLOW_WINDOW_SEC = 30.0
+BARRIER_OUTCOME_FLOW_ALPHA_CAP_BPS = 30.0
+BARRIER_OUTCOME_EFFECTIVENESS_SCALE_BPS = 1.5
+BARRIER_OUTCOME_ABSORPTION_DRIFT_PENALTY = 0.70
+BARRIER_OUTCOME_ABSORPTION_PROBABILITY_HAIRCUT = 0.20
+BARRIER_OUTCOME_MAX_ABSORPTION_PROBABILITY_FOR_ENTRY = 0.70
+BARRIER_OUTCOME_LOW_QUALITY_PROBABILITY_HAIRCUT = 0.08
+BARRIER_OUTCOME_WARMUP_DRIFT_MULTIPLIER = 0.25
+BARRIER_OUTCOME_MIN_VOLATILITY_BPS = 2.0
+# Cost is reserved for entry and protected liquidation leg; never evaluate a
+# bracket on one-way route friction only.
+BARRIER_OUTCOME_ROUND_TRIP_COST_MULTIPLIER = 2.0
+BARRIER_OUTCOME_BREAK_EVEN_PROBABILITY_RESERVE = 0.03
+BARRIER_OUTCOME_MIN_EXPECTED_VALUE_BPS = 1.0
+BARRIER_OUTCOME_MIN_TARGET_BEFORE_STOP_PROBABILITY = 0.58
+# ── Predictive pre-displacement order-flow hazard authority ──────────────────
+# Entry timing must be based on book/flow state observable before displacement;
+# no favourable realised price move is required before entry submission.
+PREDICTIVE_FLOW_ENABLED = True
+PREDICTIVE_FLOW_REQUIRE_READY_FOR_ENTRY = True
+PREDICTIVE_FLOW_MAX_OBSERVATIONS = 240
+PREDICTIVE_FLOW_MIN_OBSERVATIONS = 4
+PREDICTIVE_FLOW_FEATURE_WINDOW_SEC = 5.0
+PREDICTIVE_FLOW_PREDICTION_HORIZON_SEC = 1.0
+PREDICTIVE_FLOW_ALPHA_CAP_BPS = 12.0
+PREDICTIVE_FLOW_LOGISTIC_SCORE_SCALE = 1.0
+PREDICTIVE_FLOW_MIN_DIRECTIONAL_PROBABILITY = 0.60
+PREDICTIVE_FLOW_MIN_DIRECTIONAL_PROBABILITY_BY_ASSET = {
+    "BTC": 0.60, "OIL": 0.61, "NATGAS": 0.63,
+    "GOLD_PAXG": 0.61, "GOLD_HL": 0.61,
+    "SILVER_SLVON": 0.64, "SILVER_XAG": 0.64, "SILVER_HL": 0.64,
+}
+PREDICTIVE_FLOW_MIN_DEPLETION_ADVANTAGE = 0.02
+PREDICTIVE_FLOW_MAX_ADVERSE_MICROPRICE_BPS = 0.25
+PREDICTIVE_FLOW_SCORE_WEIGHTS = {
+    "queue_imbalance": 0.90, "microprice": 0.12,
+    "ofi_acceleration": 0.14, "tfi_acceleration": 0.10,
+    "depletion_advantage": 1.20, "support_refill": 0.80,
+    "opposition_withdrawal": 0.80, "support_withdrawal": 1.10,
+    "opposition_refill": 1.10, "cross_venue": 0.40,
+}
+# Analytic pre-move hazard scores create shadow candidates immediately, but
+# live order authority requires an approved walk-forward calibration row for
+# the exact asset/venue/setup family. Hand weights are never a hit-rate proof.
+PREDICTIVE_CALIBRATION_REQUIRE_FOR_LIVE = True
+PREDICTIVE_CALIBRATION_MIN_OUT_OF_SAMPLE_OBSERVATIONS = 250
+PREDICTIVE_CALIBRATION_MAX_BRIER_SCORE = 0.20
+PREDICTIVE_CALIBRATION_MIN_LOWER_CONFIDENCE = 0.58
+PREDICTIVE_CALIBRATION_MIN_LOWER_CONFIDENCE_BY_ASSET = {
+    "BTC": 0.58, "OIL": 0.60, "NATGAS": 0.62, "GOLD_PAXG": 0.60,
+    "GOLD_HL": 0.60, "SILVER_SLVON": 0.62, "SILVER_XAG": 0.62, "SILVER_HL": 0.62,
+}
+PREDICTIVE_CALIBRATED_LIVE_MODELS = {}  # approved out-of-sample records only
+PREDICTIVE_LABEL_MIN_SPACING_SEC = 1.0
+PREDICTIVE_LABEL_TIMEOUT_SEC = 300
+
+BARRIER_OUTCOME_MIN_TARGET_BEFORE_STOP_PROBABILITY_BY_ASSET = {
+    "BTC": 0.58,
+    "OIL": 0.60,
+    "NATGAS": 0.62,
+    "GOLD_PAXG": 0.60,
+    "GOLD_HL": 0.60,
+    "SILVER_SLVON": 0.62,
+    "SILVER_XAG": 0.62,
+    "SILVER_HL": 0.62,
+}
+# ── Observable Institutional Setup-Family Authority ─────────────────────────
+# A directionally valid parent thesis is not enough for live submission.  The
+# exact protected trade must also belong to a repeatable setup family directly
+# supported by closed structure and *pre-displacement* order-flow hazard.
+# Realised price response is reserved for post-fill toxicity/calibration.
+# Liquidation/forced-flow families are not asserted until dedicated evidence exists.
+SETUP_CLASSIFIER_ENABLED = True
+SETUP_CLASSIFIER_REQUIRE_CLASSIFIED_ENTRY = True
+SETUP_CLASSIFIER_MIN_DIRECTIONAL_PARENT_ALPHA_BPS = 0.50
+SETUP_CLASSIFIER_MIN_CLOSED_ACCEPTANCE_BPS = 0.25
+SETUP_CLASSIFIER_CROSS_VENUE_CONFIRMATION_MIN_AGREEMENT = 0.60
+
+# ── Cost-Aware Profit-Lock Protection ───────────────────────────────────────
+# No initial SL can guarantee profit: entry invalidation remains real risk.
+# After sufficient favourable excursion, the position supervisor may atomically
+# move the native stop beyond net breakeven after conservative cost/slippage
+# reserves.  This is a protected floor under the modelled execution envelope,
+# not a guarantee against gaps or fills outside the reserve.
+PROFIT_LOCK_ENABLED = True
+PROFIT_LOCK_ROUTE_COST_RESERVE_MULTIPLIER = 2.0
+PROFIT_LOCK_MIN_NET_PROFIT_BPS = 2.0
+PROFIT_LOCK_MIN_ACTIVATION_R = 1.0
+PROFIT_LOCK_CAPTURE_FRACTION = 0.45
+PROFIT_LOCK_MIN_UPDATE_STEP_BPS = 2.0
+PROFIT_LOCK_ACTIVATION_BUFFER_BPS = 2.0
+PROFIT_LOCK_SPREAD_RESERVE_MULTIPLIER = 1.5
+PROFIT_LOCK_EXIT_SLIPPAGE_RESERVE_BPS = 5.0
+PROFIT_LOCK_EXIT_SLIPPAGE_RESERVE_BPS_BY_ASSET = {
+    "BTC": 5.0,
+    "OIL": 7.0,
+    "NATGAS": 15.0,
+    "GOLD_PAXG": 8.0,
+    "GOLD_HL": 8.0,
+    "SILVER_SLVON": 18.0,
+    "SILVER_XAG": 15.0,
+    "SILVER_HL": 15.0,
+}
+PROFIT_LOCK_RETRY_SEC = 1.0
+
+# ── Post-fill predictive performance exit ───────────────────────────────────
+# Fast exit authority is neither a timer nor a one-tick flow reversal. A reduce-
+# only close can be requested while the native bracket remains armed only after
+# repeated live hazard confirmation plus (a) quantified adverse performance, or
+# (b) net-profitable edge reversal after full unwind/slippage reserve.
+POST_FILL_PERFORMANCE_EXIT_ENABLED = True
+POST_FILL_PERFORMANCE_EXIT_MIN_CONFIRMATIONS = 2
+POST_FILL_PERFORMANCE_EXIT_CONFIRMATION_INTERVAL_SEC = 0.25
+POST_FILL_PERFORMANCE_EXIT_ROUTE_COST_MULTIPLIER = 2.0
+POST_FILL_PERFORMANCE_EXIT_SPREAD_RESERVE_MULTIPLIER = 1.0
+POST_FILL_PERFORMANCE_EXIT_MIN_OPPOSING_PROBABILITY = 0.66
+POST_FILL_PERFORMANCE_EXIT_MIN_OPPOSING_PROBABILITY_BY_ASSET = {
+    "BTC": 0.64, "OIL": 0.66, "NATGAS": 0.68, "GOLD_PAXG": 0.66,
+    "GOLD_HL": 0.66, "SILVER_SLVON": 0.68, "SILVER_XAG": 0.68, "SILVER_HL": 0.68,
+}
+POST_FILL_PERFORMANCE_EXIT_MAX_RETAIN_PROBABILITY = 0.48
+POST_FILL_PERFORMANCE_EXIT_ADVERSE_TRIGGER_R = 0.20
+POST_FILL_PERFORMANCE_EXIT_MIN_ADVERSE_BPS = 2.0
+POST_FILL_PERFORMANCE_EXIT_MIN_CAPTURE_PROFIT_BPS = 2.0
+POST_FILL_PERFORMANCE_EXIT_SLIPPAGE_RESERVE_BPS = 5.0
+POST_FILL_PERFORMANCE_EXIT_SLIPPAGE_RESERVE_BPS_BY_ASSET = {
+    "BTC": 5.0, "OIL": 7.0, "NATGAS": 15.0, "GOLD_PAXG": 8.0,
+    "GOLD_HL": 8.0, "SILVER_SLVON": 18.0, "SILVER_XAG": 15.0, "SILVER_HL": 15.0,
+}
+
 DYNAMIC_PROTECTION_MAX_LIQUIDATION_HORIZON_SEC = 300.0
 DYNAMIC_PROTECTION_LIQUIDATION_STEP_SEC = 15.0
 DYNAMIC_PROTECTION_MAX_LIQUIDATION_STEPS = 8

@@ -479,8 +479,52 @@ class HyperliquidAPI:
         ]
         return ex.bulk_orders(orders, grouping="positionTpsl")
 
+    def modify_reduce_only_trigger(
+        self, *, coin: str, oid: str | int, is_buy: bool, size: float, trigger_px: float, tpsl: str
+    ) -> Any:
+        """Atomically modify an existing native TP/SL trigger order.
+
+        Hyperliquid's official exchange endpoint supports modifying trigger
+        orders.  Profit-lock protection must use this native modification path;
+        cancel/replacing a live trigger with a plain limit order would create an
+        invalid and potentially unprotected position lifecycle.
+        """
+        trigger_kind = str(tpsl or "").strip().lower()
+        if trigger_kind not in {"sl", "tp"}:
+            raise ValueError(f"invalid_hyperliquid_tpsl_kind:{tpsl}")
+        ex = self._require_exchange()
+        rounded_size = self.round_size(coin, size)
+        rounded_trigger = self.round_price(coin, trigger_px)
+        return ex.modify_order(
+            int(oid), str(coin), bool(is_buy), rounded_size, float(rounded_trigger),
+            order_type={"trigger": {"triggerPx": float(rounded_trigger), "isMarket": True, "tpsl": trigger_kind}},
+            reduce_only=True,
+        )
+
     def query_order(self, oid: str | int) -> Any:
         return self.info.query_order_by_oid(self.account_address, int(oid))
+
+    def user_fills_by_time(
+        self, *, coin: str | None = None, start_time_ms: int, end_time_ms: int | None = None, aggregate_by_time: bool = True
+    ) -> Any:
+        """Retrieve exact execution fills, including HIP-3 DEX scoping.
+
+        Trigger-order orderStatus can expose a protection limit price rather than
+        execution VWAP. Realised P&L authority is therefore userFillsByTime only.
+        The raw info request includes the DEX prefix for builder-deployed perps.
+        """
+        payload: dict[str, Any] = {
+            "type": "userFillsByTime",
+            "user": self.account_address,
+            "startTime": int(start_time_ms),
+            "aggregateByTime": bool(aggregate_by_time),
+        }
+        if end_time_ms is not None:
+            payload["endTime"] = int(end_time_ms)
+        dex = self.dex_for_coin(coin)
+        if dex:
+            payload["dex"] = dex
+        return self.info.post("/info", payload)
 
 
     def cancel_order(self, coin: str, oid: str | int) -> Any:

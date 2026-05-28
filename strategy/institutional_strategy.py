@@ -40,8 +40,17 @@ from market_data.normalizer import (
     VenueMicrostate,
     build_venue_microstate,
 )
-from research.store import ForwardLabelWriter, JsonlResearchStore, ResearchDecisionRecord, ResearchExecutionRecord
+from research.store import (
+    ForwardLabelWriter, JsonlResearchStore, PredictiveBarrierLabelWriter,
+    ResearchDecisionRecord, ResearchExecutionRecord,
+)
 from strategy.dynamic_protection import DynamicProtectionPlanBuilder
+from strategy.barrier_outcome import ProtectedBarrierOutcomeEngine
+from strategy.predictive_flow import PreMoveOrderFlowHazardEngine
+from strategy.calibration_gate import PredictiveCalibrationAuthority
+from strategy.setup_classifier import InstitutionalSetupClassifier
+from strategy.profit_lock import InstitutionalProfitLockEngine
+from strategy.position_performance import PostFillPerformanceExitEngine
 from strategy.domain import (
     DecisionOutput,
     DeskId,
@@ -152,6 +161,16 @@ class PositionState:
     dynamic_exit_order_id: str = ""
     dynamic_exit_attempts: int = 0
     dynamic_exit_last_error: str = ""
+    # Net-positive protective stop lifecycle.  The original invalidation SL
+    # remains valid until an atomic/native replacement is confirmed off the
+    # market-data hot path.
+    initial_sl_price: float = 0.0
+    profit_lock_requested: bool = False
+    profit_lock_requested_stop_price: float = 0.0
+    profit_lock_requested_floor_bps: float = 0.0
+    profit_lock_applied: bool = False
+    profit_lock_attempts: int = 0
+    profit_lock_last_error: str = ""
 
     def is_flat(self) -> bool:
         return self.phase is PositionPhase.FLAT or self.quantity <= 0
@@ -176,6 +195,10 @@ class PositionState:
             "dynamic_exit_requested": self.dynamic_exit_requested,
             "dynamic_exit_order_id": self.dynamic_exit_order_id,
             "dynamic_exit_reasons": list(self.dynamic_exit_reasons),
+            "profit_lock_requested": self.profit_lock_requested,
+            "profit_lock_applied": self.profit_lock_applied,
+            "profit_lock_stop_price": self.sl_price if self.profit_lock_applied else None,
+            "profit_lock_floor_bps": self.profit_lock_requested_floor_bps if self.profit_lock_applied else None,
         }
 
 
@@ -234,8 +257,30 @@ class InstitutionalStrategy:
         store_root = str(_cfg("RESEARCH_STORE_PATH", "research_output"))
         self._research_store = JsonlResearchStore(store_root)
         self._forward_labels = ForwardLabelWriter(self._research_store)
+        self._barrier_candidate_labels = PredictiveBarrierLabelWriter(
+            self._research_store,
+            min_spacing_sec=float(_cfg("PREDICTIVE_LABEL_MIN_SPACING_SEC", 1.0)),
+            timeout_s=int(_cfg("PREDICTIVE_LABEL_TIMEOUT_SEC", 300)),
+        )
         self._last_candidate_id = ""
         self._protection_engine = DynamicProtectionPlanBuilder(asset_id=self._asset_id)
+        # The barrier engine evaluates the actual protected bracket outcome; it
+        # never originates direction or replaces the structural parent thesis.
+        self._barrier_outcome_engine = ProtectedBarrierOutcomeEngine(asset_id=self._asset_id)
+        # Entry timing is predictive: consume current queue-depletion/flow hazard
+        # before displacement; realised price response is not an entry permission.
+        self._predictive_flow_engine = PreMoveOrderFlowHazardEngine(asset_id=self._asset_id)
+        self._predictive_calibration = PredictiveCalibrationAuthority(asset_id=self._asset_id)
+        # Live entries must be assigned to an observable, repeatable setup family;
+        # unclassified directional states remain research-only/no-trade.
+        self._setup_classifier = InstitutionalSetupClassifier(asset_id=self._asset_id)
+        # Protective profit locking is state management only: it never originates
+        # entries and cannot issue broker calls on the quote-driven thread.
+        self._profit_lock_engine = InstitutionalProfitLockEngine(asset_id=self._asset_id)
+        # Fast exits do not react to a timer or one book flip. They require
+        # repeated live predictive deterioration plus actual adverse/net-profitable
+        # position performance while venue-native protection remains attached.
+        self._performance_exit_engine = PostFillPerformanceExitEngine(asset_id=self._asset_id)
         self._market_state_engine = VenueMarketStateEngine(asset_id=self._asset_id)
         # Shared normalised factor bus: executable alpha transfers only inside
         # validated equivalence groups; related products remain context-only.
@@ -409,6 +454,109 @@ class InstitutionalStrategy:
                 self._asset_id, self._pos.exchange,
             )
 
+    def _profit_lock_supervision(self, mark_price: float) -> None:
+        """Arm a net-positive protective stop request using in-memory market state.
+
+        This method performs calculations only.  Native broker order mutation is
+        serviced by the reconciliation worker so a market-data tick never blocks
+        on REST/RPC I/O.  The initial invalidation stop remains live until the
+        venue confirms the tighter protective stop.
+        """
+        if not bool(_cfg("PROFIT_LOCK_ENABLED", True)) or self._pos.is_flat() or self._pos.phase is not PositionPhase.ACTIVE:
+            return
+        components = self._pos.quant_components if isinstance(self._pos.quant_components, dict) else {}
+        costs_bps = _num(components.get("costs_bps"), 0.0)
+        execution_costs = components.get("execution_cost_components") if isinstance(components.get("execution_cost_components"), Mapping) else {}
+        spread_bps = _num(execution_costs.get("spread_bps", components.get("spread_bps", 0.0)), 0.0)
+        initial_sl = float(self._pos.initial_sl_price or self._pos.sl_price or 0.0)
+        assessed = self._profit_lock_engine.assess(
+            side=self._pos.side, entry_price=self._pos.entry_price, mark_price=float(mark_price),
+            initial_stop_price=initial_sl, current_stop_price=self._pos.sl_price,
+            route_cost_bps=costs_bps, spread_bps=spread_bps, protection_confirmed=self._pos.protection_confirmed,
+        )
+        components["profit_lock_latest_assessment"] = assessed.as_dict()
+        if not assessed.should_request:
+            return
+        with self._entry_lock:
+            if self._pos.is_flat() or self._pos.phase is not PositionPhase.ACTIVE:
+                return
+            existing_requested = float(self._pos.profit_lock_requested_stop_price or 0.0)
+            improves_pending = (
+                self._pos.side.lower() == "long" and assessed.requested_stop_price > existing_requested
+            ) or (
+                self._pos.side.lower() == "short" and (existing_requested <= 0.0 or assessed.requested_stop_price < existing_requested)
+            )
+            if self._pos.profit_lock_requested and not improves_pending:
+                return
+            self._pos.profit_lock_requested = True
+            self._pos.profit_lock_requested_stop_price = assessed.requested_stop_price
+            self._pos.profit_lock_requested_floor_bps = assessed.protected_net_floor_bps
+            components["profit_lock_requested_assessment"] = assessed.as_dict()
+        self._position_reconcile_wakeup.set()
+        logger.info(
+            "PROFIT_LOCK_ARMED asset=%s venue=%s side=%s mark=%.6f requested_sl=%.6f protected_net_floor_bps=%.3f execution_envelope_only=true",
+            self._pos.asset_id, self._pos.exchange, self._pos.side, float(mark_price), assessed.requested_stop_price, assessed.protected_net_floor_bps,
+        )
+
+    def _service_profit_lock_request(self, manager) -> None:
+        """Atomically tighten the native SL from the lifecycle supervisor only."""
+        with self._entry_lock:
+            if self._pos.is_flat() or self._pos.phase is not PositionPhase.ACTIVE or not self._pos.profit_lock_requested:
+                return
+            requested_stop = float(self._pos.profit_lock_requested_stop_price or 0.0)
+            existing_sl = str(self._pos.sl_order_id or "")
+            old_stop = float(self._pos.sl_price or 0.0)
+            quantity = float(self._pos.quantity or 0.0)
+            close_side = "SELL" if self._pos.side.lower() == "long" else "BUY"
+            current_price = float(self._latest_event_price or self._pos.entry_price or 0.0)
+            self._pos.profit_lock_attempts += 1
+        replacer = getattr(manager, "replace_stop_loss", None)
+        if not callable(replacer) or not existing_sl:
+            with self._entry_lock:
+                self._pos.profit_lock_last_error = "native_stop_replacement_interface_unavailable"
+                self._pos.profit_lock_requested = False
+            logger.error("PROFIT_LOCK_NOT_EXECUTABLE asset=%s venue=%s reason=native_stop_replacement_interface_unavailable original_sl_retained=true", self._asset_id, self._pos.exchange)
+            return
+        try:
+            replaced = replacer(
+                existing_sl_order_id=existing_sl, side=close_side, quantity=quantity,
+                new_trigger_price=requested_stop, old_trigger_price=old_stop, current_price=current_price,
+            )
+        except Exception as exc:
+            replaced = {"error": f"replacement_exception:{exc}"}
+        if isinstance(replaced, Mapping) and replaced.get("order_id") and not replaced.get("error"):
+            new_order_id = str(replaced.get("order_id") or existing_sl)
+            with self._entry_lock:
+                self._pos.sl_order_id = new_order_id
+                self._pos.sl_price = requested_stop
+                self._pos.profit_lock_applied = True
+                self._pos.profit_lock_requested = False
+                self._pos.profit_lock_last_error = ""
+                components = self._pos.quant_components if isinstance(self._pos.quant_components, dict) else {}
+                components["profit_lock_active"] = {
+                    "stop_price": requested_stop, "protected_net_floor_bps": self._pos.profit_lock_requested_floor_bps,
+                    "order_id": new_order_id, "execution_envelope_only": True,
+                }
+            logger.warning(
+                "PROFIT_LOCK_CONFIRMED asset=%s venue=%s side=%s stop=%.6f protected_net_floor_bps=%.3f native_protection_retained=true execution_envelope_only=true",
+                self._pos.asset_id, self._pos.exchange, self._pos.side, requested_stop, self._pos.profit_lock_requested_floor_bps,
+            )
+            return
+        if replaced is None:
+            with self._entry_lock:
+                if not self._pos.is_flat():
+                    self._pos.phase = PositionPhase.RECONCILIATION_REQUIRED
+                    self._pos.profit_lock_last_error = "existing_sl_may_have_filled_during_native_modify"
+                    self._pos.profit_lock_requested = False
+            logger.warning("PROFIT_LOCK_MODIFY_RACE asset=%s venue=%s; reconciling existing protective fill", self._asset_id, self._pos.exchange)
+            return
+        err = str((replaced or {}).get("error") or (replaced or {}).get("reason") or "native_stop_modify_deferred") if isinstance(replaced, Mapping) else "native_stop_modify_deferred"
+        with self._entry_lock:
+            self._pos.profit_lock_last_error = err
+            # The original native SL is still live on atomic-edit failure. Keep the
+            # request pending for a later supervisor retry.
+        logger.warning("PROFIT_LOCK_DEFERRED asset=%s venue=%s reason=%s original_sl_retained=true", self._asset_id, self._pos.exchange, err)
+
     def _position_reconciliation_loop(self) -> None:
         interval = max(0.25, float(_cfg("POSITION_RECONCILIATION_REFRESH_SEC", 1.0)))
         flat_retry = max(interval, float(_cfg("POSITION_RECONCILIATION_FLAT_UNCONFIRMED_SEC", 2.0)))
@@ -426,7 +574,11 @@ class InstitutionalStrategy:
                 next_interval = interval
                 try:
                     with self._entry_lock:
+                        profit_lock_pending = bool(self._pos.profit_lock_requested and self._pos.phase is PositionPhase.ACTIVE)
                         dynamic_exit_pending = bool(self._pos.dynamic_exit_requested and not self._pos.dynamic_exit_order_id)
+                    if profit_lock_pending:
+                        self._service_profit_lock_request(manager)
+                        next_interval = min(next_interval, max(0.25, float(_cfg("PROFIT_LOCK_RETRY_SEC", 1.0))))
                     if dynamic_exit_pending:
                         self._service_dynamic_exit_request(manager)
                         next_interval = min(next_interval, max(0.25, float(_cfg("DYNAMIC_EXIT_REDUCE_ONLY_RETRY_SEC", 1.0))))
@@ -785,6 +937,7 @@ class InstitutionalStrategy:
                         "latency_penalty_bps": self._round_or_none(selected_estimate.get("latency_penalty_bps")),
                         "quality_penalty_bps": self._round_or_none(selected_estimate.get("quality_penalty_bps")),
                         "liquidity_penalty_bps": self._round_or_none(selected_estimate.get("liquidity_penalty_bps")),
+                        "preference_adjustment_bps": self._round_or_none(selected_estimate.get("preference_adjustment_bps")),
                         "protection_activation_penalty_bps": self._round_or_none(selected_estimate.get("protection_activation_penalty_bps")),
                     },
                 }
@@ -859,7 +1012,9 @@ class InstitutionalStrategy:
         feed_health = self._feed_health(data_manager)
         execution_quality = feed_health.quality_score
         if price > 0:
-            self._forward_labels.observe(now_ts_ns=time.time_ns(), current_price=price)
+            now_ts_ns = time.time_ns()
+            self._forward_labels.observe(now_ts_ns=now_ts_ns, current_price=price)
+            self._barrier_candidate_labels.observe(now_ts_ns=now_ts_ns, current_price=price)
         if feed_health.quality_score <= 0:
             return self._decision(
                 desk=desk,
@@ -886,6 +1041,11 @@ class InstitutionalStrategy:
             )
 
         states = self._venue_states(data_manager)
+        # Observe market state without broker I/O. The predictive engine uses only
+        # current/prior queue state available before displacement; the barrier
+        # engine retains realised response for post-entry toxicity/calibration.
+        self._predictive_flow_engine.observe(states)
+        self._barrier_outcome_engine.observe(states)
         execution_state, btc_composite = self._microstructure_context(data_manager, venue, instrument, feed_health, states=states)
         market_states: dict[str, VenueMarketState] = {}
         if bool(_cfg("INSTITUTIONAL_ENABLE_MARKET_STATE_ALPHA", True)) and states:
@@ -1334,6 +1494,196 @@ class InstitutionalStrategy:
                 model_values=model_values, research_features=features,
             )
 
+        # Final adaptive protection may widen SL after the real sized notional and
+        # selected-venue depth are known. Re-size against that final geometry and,
+        # when quantity must fall, replay the same-quantity route ledger before any
+        # submission. This prevents a wider structural SL from silently exceeding
+        # the approved risk envelope.
+        adaptive_geometry_iterations: list[dict[str, Any]] = []
+        adaptive_geometry_converged = True
+        try:
+            qty_step = max(1e-12, float(getattr(self._instrument_mapping(instrument, venue), "qty_step", 0.0) or 0.0))
+        except Exception:
+            qty_step = 1e-12
+        for adaptive_iteration in range(3):
+            re_sized = self._size_position(
+                desk, instrument, direction, price, net_edge, liquidity_score, protection, risk_manager,
+                venue=venue, balance_source=self._execution_manager_for(order_manager, venue),
+                venue_market_state=market_states.get(str(venue).lower()),
+                available_cash_snapshot=(venue_available_cash.get(str(venue).lower()) if venue_available_cash else None),
+                balance_source_label=(f"shared_verified_collateral_snapshot:{str(venue).lower()}" if venue_available_cash else None),
+            )
+            if not re_sized.approved:
+                return self._decision(
+                    desk=desk, venue=venue, instrument=instrument, decision=DecisionOutput.NO_TRADE_RISK_BUDGET,
+                    direction=direction, regime=regime, expected_net_edge_bps=net_edge, uncertainty_bps=uncertainty_bps,
+                    liquidity_score=liquidity_score, execution_quality_score=execution_quality, sizing=re_sized,
+                    protection_plan=protection, reasons=["adaptive_final_protection_risk_not_fundable", *list(re_sized.reasons)],
+                    model_values=model_values, research_features=features,
+                )
+            adaptive_geometry_iterations.append({
+                "iteration": adaptive_iteration + 1, "previous_quantity": float(sizing.quantity),
+                "risk_checked_quantity": float(re_sized.quantity),
+                "stop_price": float(protection.stop_price), "target_price": float(protection.target_price),
+                "risk_to_invalidation": float(re_sized.risk_to_invalidation),
+            })
+            if float(re_sized.quantity) + qty_step * 0.5 >= float(sizing.quantity):
+                break
+            sizing = re_sized
+            adaptive_geometry_converged = False
+            if bool(_cfg("VENUE_SELECTION_RISK_NORMALISED_LEDGER_ENABLED", True)) and venue_selection is not None and states and validated_edge_by_venue:
+                converged_candidate_venues = self._routeable_venues(order_manager).intersection(set(validated_edge_by_venue))
+                (
+                    converged_quantity, converged_notional, converged_margin,
+                    converged_representation, converged_routeable,
+                ) = self._risk_normalised_route_inputs(
+                    states=states, candidate_venues=converged_candidate_venues,
+                    capacity_notional_by_venue=venue_candidate_notional, approved_quantity=float(sizing.quantity),
+                )
+                converged_ledger = select_execution_venue(
+                    states=states, direction=direction, asset_id=self._asset_id, current_venue=venue,
+                    routeable_venues=converged_routeable, notional_usd=0.0,
+                    available_cash_by_venue=venue_available_cash, required_margin_usd=0.0,
+                    protection_capable_venues=self._protection_capable_venues(order_manager, converged_routeable),
+                    gross_edge_bps=directional_edge_bps, gross_edge_by_venue=validated_edge_by_venue,
+                    notional_by_venue=converged_notional, required_margin_by_venue=converged_margin,
+                    comparison_quantity=converged_quantity,
+                    comparison_notional_usd=min(converged_notional.values()) if converged_notional else 0.0,
+                    snapshot_ts_ns=time.time_ns(),
+                )
+                converged_dict = converged_ledger.as_dict(); converged_dict["quantity_representation"] = converged_representation
+                model_values["adaptive_protection_venue_replay"] = converged_dict
+                if str(converged_ledger.selected_venue).lower() != str(venue).lower():
+                    return self._decision(
+                        desk=desk, venue=venue, instrument=instrument, decision=DecisionOutput.NO_TRADE_EXECUTION_UNSAFE,
+                        direction=direction, regime=regime, expected_net_edge_bps=net_edge, uncertainty_bps=uncertainty_bps,
+                        liquidity_score=liquidity_score, execution_quality_score=execution_quality, sizing=sizing,
+                        protection_plan=protection, reasons=[f"adaptive_protection_route_changed:{venue}->{converged_ledger.selected_venue}"],
+                        model_values=model_values, research_features=features,
+                    )
+                estimate = converged_ledger.estimates.get(str(venue).lower())
+                if estimate is None:
+                    return self._decision(
+                        desk=desk, venue=venue, instrument=instrument, decision=DecisionOutput.NO_TRADE_EXECUTION_UNSAFE,
+                        direction=direction, regime=regime, expected_net_edge_bps=net_edge, uncertainty_bps=uncertainty_bps,
+                        liquidity_score=liquidity_score, execution_quality_score=execution_quality, sizing=sizing,
+                        protection_plan=protection, reasons=["adaptive_protection_route_estimate_missing"],
+                        model_values=model_values, research_features=features,
+                    )
+                costs_bps = float(estimate.total_cost_bps)
+                cost_components["venue_selection_cost_bps"] = costs_bps; cost_components["total_cost_bps"] = costs_bps
+                net_edge = directional_edge_bps - costs_bps
+                model_values["execution_cost_components"] = dict(cost_components); model_values["costs_bps"] = costs_bps; model_values["net_edge_bps"] = net_edge
+                if net_edge <= max(float(_cfg("INSTITUTIONAL_MIN_NET_EDGE_BPS", 3.0)), uncertainty_bps):
+                    return self._decision(
+                        desk=desk, venue=venue, instrument=instrument, decision=DecisionOutput.NO_TRADE_INSUFFICIENT_EDGE,
+                        direction=direction, regime=regime, expected_net_edge_bps=net_edge, uncertainty_bps=uncertainty_bps,
+                        liquidity_score=liquidity_score, execution_quality_score=execution_quality, sizing=sizing,
+                        protection_plan=protection, reasons=["adaptive_protection_resized_route_net_edge_not_sufficient"],
+                        model_values=model_values, research_features=features,
+                    )
+            protection = self._protection_plan(
+                desk, direction, price, liquidity_score, data_manager=data_manager,
+                gross_edge_bps=directional_edge_bps, costs_bps=costs_bps,
+                position_notional=sizing.notional, quantity=sizing.quantity,
+                venue=venue, instrument=instrument, execution_state=execution_state, regime=regime,
+                venue_market_state=market_states.get(str(venue).lower()),
+            )
+            model_values["dynamic_protection_plan"] = protection.diagnostics if protection is not None else {}
+            if protection is None or not protection.protection_feasible:
+                return self._decision(
+                    desk=desk, venue=venue, instrument=instrument, decision=DecisionOutput.NO_TRADE_EXECUTION_UNSAFE,
+                    direction=direction, regime=regime, expected_net_edge_bps=net_edge, uncertainty_bps=uncertainty_bps,
+                    liquidity_score=liquidity_score, execution_quality_score=execution_quality, sizing=sizing,
+                    protection_plan=protection, reasons=(protection.reasons if protection else ["adaptive_resized_protection_unavailable"]),
+                    model_values=model_values, research_features=features,
+                )
+        else:
+            adaptive_geometry_converged = False
+        model_values["adaptive_protection_sizing_convergence"] = {
+            "converged": adaptive_geometry_converged or (adaptive_geometry_iterations and adaptive_geometry_iterations[-1]["risk_checked_quantity"] + qty_step * 0.5 >= float(sizing.quantity)),
+            "iterations": adaptive_geometry_iterations, "qty_step": qty_step,
+            "authority": "final_structural_sl_geometry_must_fit_risk_before_submission",
+        }
+        if not model_values["adaptive_protection_sizing_convergence"]["converged"]:
+            return self._decision(
+                desk=desk, venue=venue, instrument=instrument, decision=DecisionOutput.NO_TRADE_RISK_BUDGET,
+                direction=direction, regime=regime, expected_net_edge_bps=net_edge, uncertainty_bps=uncertainty_bps,
+                liquidity_score=liquidity_score, execution_quality_score=execution_quality, sizing=sizing,
+                protection_plan=protection, reasons=["adaptive_protection_sizing_did_not_converge"],
+                model_values=model_values, research_features=features,
+            )
+
+        # Institutional outcome authority: the approved direction is already owned
+        # by parent structure.  Before entering, evaluate the exact executable
+        # bracket as a first-passage problem and reject trades whose estimated
+        # TP-before-SL expectancy is inadequate after all-in cost and absorption.
+        if bool(_cfg("BARRIER_OUTCOME_MODEL_ENABLED", True)) and bool(_cfg("INSTITUTIONAL_PARENT_THESIS_EXECUTION_MODEL_ENABLED", True)):
+            selected_market_state = market_states.get(str(venue).lower())
+            predictive_flow = self._predictive_flow_engine.assess(
+                venue=venue, direction=direction, cross_venue_evidence=cross_venue_evidence,
+            )
+            model_values["pre_move_orderflow_hazard"] = predictive_flow.as_dict()
+            barrier_outcome = self._barrier_outcome_engine.assess(
+                venue=venue, direction=direction, protection=protection,
+                parent_alpha_bps=_num(signal_breakdown.get("parent_structural_alpha_bps"), 0.0),
+                child_timing_contribution_bps=_num(signal_breakdown.get("child_timing_contribution_bps"), 0.0),
+                uncertainty_bps=uncertainty_bps, route_cost_bps=costs_bps,
+                robust_volatility_bps=(float(selected_market_state.robust_one_minute_vol_bps) if selected_market_state is not None and selected_market_state.ready else 0.0),
+                liquidity_score=liquidity_score, execution_quality=execution_quality, predictive_flow=predictive_flow,
+            )
+            model_values["barrier_outcome_model"] = barrier_outcome.as_dict()
+            if not barrier_outcome.approved:
+                return self._decision(
+                    desk=desk, venue=venue, instrument=instrument, decision=DecisionOutput.NO_TRADE_INSUFFICIENT_EDGE,
+                    direction=direction, regime=regime, expected_net_edge_bps=net_edge, uncertainty_bps=uncertainty_bps,
+                    liquidity_score=liquidity_score, execution_quality_score=execution_quality, sizing=sizing,
+                    protection_plan=protection, reasons=list(barrier_outcome.reasons),
+                    model_values=model_values, research_features=features,
+                )
+            if bool(_cfg("SETUP_CLASSIFIER_ENABLED", True)):
+                setup_assessment = self._setup_classifier.classify(
+                    venue=venue, direction=direction, market_state=selected_market_state,
+                    barrier=barrier_outcome, predictive_flow=predictive_flow,
+                    cross_venue_evidence=cross_venue_evidence,
+                )
+                model_values["setup_classifier"] = setup_assessment.as_dict()
+                if bool(_cfg("SETUP_CLASSIFIER_REQUIRE_CLASSIFIED_ENTRY", True)) and not setup_assessment.approved:
+                    return self._decision(
+                        desk=desk, venue=venue, instrument=instrument, decision=DecisionOutput.NO_TRADE_INSUFFICIENT_EDGE,
+                        direction=direction, regime=regime, expected_net_edge_bps=net_edge, uncertainty_bps=uncertainty_bps,
+                        liquidity_score=liquidity_score, execution_quality_score=execution_quality, sizing=sizing,
+                        protection_plan=protection, reasons=list(setup_assessment.reasons),
+                        model_values=model_values, research_features=features,
+                    )
+                if setup_assessment.approved:
+                    candidate_id = f"{self._asset_id}:{venue}:{instrument}:{time.time_ns()}"
+                    model_key = f"{self._asset_id}:{str(venue).lower()}:{setup_assessment.setup_family}"
+                    side_label = "long" if direction in {Direction.LONG, Direction.BULLISH} else "short"
+                    self._barrier_candidate_labels.record_candidate(
+                        observation_ts_ns=time.time_ns(), asset_id=self._asset_id, venue=venue,
+                        instrument=instrument, candidate_id=candidate_id, model_key=model_key,
+                        setup_family=setup_assessment.setup_family, side=side_label,
+                        entry_price=float(protection.entry_price), stop_price=float(protection.stop_price),
+                        target_price=float(protection.target_price), estimated_round_trip_cost_bps=float(costs_bps) * 2.0,
+                        predicted_target_before_stop_probability=float(barrier_outcome.target_before_stop_probability),
+                        predicted_directional_move_probability=float(predictive_flow.directional_move_probability),
+                    )
+                    calibration = self._predictive_calibration.assess(
+                        venue=venue, setup_family=setup_assessment.setup_family,
+                        model_version="pre_move_orderflow_hazard_v1+predictive_protected_barrier_outcome_v2",
+                    )
+                    model_values["predictive_calibration_authority"] = calibration.as_dict()
+                    live_candidate, _ = _live_routing_permission(venue)
+                    if live_candidate and not calibration.authorised_for_live:
+                        return self._decision(
+                            desk=desk, venue=venue, instrument=instrument, decision=DecisionOutput.SHADOW_SIGNAL_VALIDATED,
+                            direction=direction, regime=regime, expected_net_edge_bps=net_edge, uncertainty_bps=uncertainty_bps,
+                            liquidity_score=liquidity_score, execution_quality_score=execution_quality, sizing=sizing,
+                            protection_plan=protection, reasons=list(calibration.reasons),
+                            model_values=model_values, research_features=features,
+                        )
+
         live_allowed, live_reason = _live_routing_permission(venue)
         if not live_allowed:
             return self._decision(
@@ -1687,11 +2037,19 @@ class InstitutionalStrategy:
         if len(ranges) < 5:
             return ProtectionPlan(premium, premium, premium, "GROWW_OCO_AFTER_FILL", False, ["option_premium_dynamic_volatility_invalid"], diagnostics={})
         premium_realized_range = sum(ranges[-14:]) / min(len(ranges), 14)
+        # Groww execution is long-premium only: a bearish underlying thesis selects
+        # a PUT to BUY; it is never a short option-premium position. Therefore the
+        # executable premium protection must always be LONG geometry (SL below
+        # premium, TP above premium), while the underlying thesis is retained only
+        # as attribution/selection context.
+        protected_option_state = dict(option_state or {})
+        protected_option_state["underlying_thesis_direction"] = direction.value
+        protected_option_state["premium_position_side"] = "LONG_PREMIUM_BUY_ONLY"
         return self._protection_engine.build_plan(
-            direction=direction, entry_price=premium, volatility_price=premium_realized_range,
+            direction=Direction.LONG, entry_price=premium, volatility_price=premium_realized_range,
             gross_edge_bps=gross_edge_bps, execution_cost_bps=execution_cost_bps,
             protection_type="GROWW_OCO_AFTER_FILL", asset_class="option",
-            position_notional=position_notional, quantity=quantity, option_state=option_state,
+            position_notional=position_notional, quantity=quantity, option_state=protected_option_state,
         )
 
     def _decision(self, **kwargs: Any) -> OpportunityDecision:
@@ -1873,6 +2231,7 @@ class InstitutionalStrategy:
             entry_price=fill_price,
             sl_price=protection.stop_price,
             tp_price=protection.target_price,
+            initial_sl_price=protection.stop_price,
             entry_order_id=str(result.get("order_id") or ""),
             sl_order_id=str(result.get("bracket_sl_order_id") or ""),
             tp_order_id=str(result.get("bracket_tp_order_id") or ""),
@@ -1907,6 +2266,8 @@ class InstitutionalStrategy:
         order_manager = self._execution_manager_for(order_manager, self._pos.exchange)
         self._ensure_position_reconciliation_worker(order_manager, risk_manager)
         self._forward_labels.observe(now_ts_ns=time.time_ns(), current_price=price)
+        self._profit_lock_supervision(price)
+        self._post_fill_performance_supervision(data_manager, price)
         self._dynamic_exit_supervision(data_manager, order_manager)
         if self._pos.side.lower() == "long":
             target_hit = price >= self._pos.tp_price > 0
@@ -2149,6 +2510,67 @@ class InstitutionalStrategy:
         except Exception:
             pass
         return True
+
+    def _post_fill_performance_supervision(self, data_manager, mark_price: float) -> None:
+        """Request a fast reduce-only exit only after quantified post-fill failure.
+
+        This path is intentionally separate from parent-structural invalidation. It
+        is an execution-quality/risk response: when a newly filled protected trade
+        is already moving adversely and repeated *current* queue hazards predict the
+        opposite displacement, cut before the distant structural SL. If the trade
+        is already net profitable but live hazard strongly reverses, capture the
+        profit instead of waiting for TP give-back. Native SL/TP remains live until
+        reduce-only reconciliation confirms flat.
+        """
+        if not bool(_cfg("POST_FILL_PERFORMANCE_EXIT_ENABLED", True)) or self._pos.is_flat() or self._pos.phase is not PositionPhase.ACTIVE:
+            return
+        venue = str(self._pos.exchange or "").lower()
+        states = self._venue_states(data_manager)
+        if venue not in states:
+            return
+        self._predictive_flow_engine.observe(states)
+        same_direction = Direction.LONG if self._pos.side.lower() == "long" else Direction.SHORT
+        opposite_direction = Direction.SHORT if same_direction is Direction.LONG else Direction.LONG
+        same = self._predictive_flow_engine.assess(venue=venue, direction=same_direction)
+        opposite = self._predictive_flow_engine.assess(venue=venue, direction=opposite_direction)
+        components = self._pos.quant_components if isinstance(self._pos.quant_components, dict) else {}
+        costs_bps = _num(components.get("costs_bps"), 0.0)
+        state = states.get(venue)
+        spread_bps = float(state.spread_bps or 0.0) if state is not None else 0.0
+        initial_sl = float(self._pos.initial_sl_price or self._pos.sl_price or 0.0)
+        assessed = self._performance_exit_engine.assess(
+            side=self._pos.side, entry_price=self._pos.entry_price, mark_price=float(mark_price),
+            initial_stop_price=initial_sl, route_cost_bps=costs_bps, spread_bps=spread_bps,
+            protection_confirmed=self._pos.protection_confirmed,
+            same_direction_probability=(same.directional_move_probability if same.ready else None),
+            opposing_direction_probability=(opposite.directional_move_probability if opposite.ready else None),
+            same_direction_ready=bool(same.ready), opposing_direction_ready=bool(opposite.ready),
+        )
+        components["post_fill_performance_exit"] = assessed.as_dict()
+        components["post_fill_same_direction_hazard"] = same.as_dict()
+        components["post_fill_opposing_direction_hazard"] = opposite.as_dict()
+        if not assessed.should_exit:
+            return
+        with self._entry_lock:
+            if self._pos.is_flat() or self._pos.phase is not PositionPhase.ACTIVE or self._pos.dynamic_exit_requested:
+                return
+            self._pos.dynamic_exit_requested = True
+            self._pos.dynamic_exit_reasons = (assessed.action.lower(),)
+            self._pos.dynamic_exit_requested_at = time.time()
+            self._pos.manual_exit_reason = "performance_exit:" + assessed.action.lower()
+        self._position_reconcile_wakeup.set()
+        logger.warning(
+            "POST_FILL_PERFORMANCE_EXIT_ENQUEUED %s",
+            json.dumps({
+                "asset": self._pos.asset_id, "venue": self._pos.exchange, "symbol": self._pos.execution_symbol,
+                "side": self._pos.side, "action": assessed.action, "mark_move_bps": round(assessed.mark_move_bps, 3),
+                "net_mark_after_reserve_bps": round(assessed.net_mark_after_reserve_bps, 3),
+                "same_direction_probability": assessed.same_direction_probability,
+                "opposing_direction_probability": assessed.opposing_direction_probability,
+                "confirmations": assessed.confirmations, "required_confirmations": assessed.required_confirmations,
+                "native_protection_retained_until_flat": True,
+            }, sort_keys=True, separators=(",", ":"), default=str),
+        )
 
     def _dynamic_exit_live_state(self, data_manager) -> dict[str, Any]:
         """Measure whether the live, executable thesis still supports an open position.
@@ -2590,6 +3012,11 @@ class InstitutionalStrategy:
         near_depth = sum(float(execution_state.bid_depth_usd_by_band.get(k, 0.0) + execution_state.ask_depth_usd_by_band.get(k, 0.0)) for k in ("0-1", "1-3"))
         breakdown["near_touch_depth_usd"] = near_depth
         if near_depth <= 0:
+            spread = max(0.0, float(execution_state.spread_bps or 0.0))
+            if spread > 6.0:
+                reason = f"wide_spread_no_depth_inside_execution_band:{spread:.3f}bps"
+                breakdown["execution_depth_reason"] = reason
+                return Direction.NO_TRADE, 0.0, reason, breakdown
             return Direction.NO_TRADE, 0.0, "near_touch_depth_unavailable", breakdown
         ofi_norm = (execution_state.ofi_usd_1s + 0.50 * execution_state.ofi_usd_10s) / near_depth
         tfi_norm = (execution_state.tfi_usd_1s + 0.50 * execution_state.tfi_usd_10s) / near_depth
@@ -2862,6 +3289,16 @@ class InstitutionalStrategy:
             "venue_market_state_ready": bool(venue_market_state is not None and venue_market_state.ready),
             "venue_local_robust_vol_bps": float(venue_market_state.robust_one_minute_vol_bps) if venue_market_state is not None and venue_market_state.ready else None,
         }
+        if venue_market_state is not None and venue_market_state.ready and isinstance(venue_market_state.diagnostics, Mapping):
+            market_state.update({
+                "parent_state_id": str(venue_market_state.diagnostics.get("parent_state_id") or ""),
+                "prior_range_high": _num(venue_market_state.diagnostics.get("prior_range_high"), 0.0),
+                "prior_range_low": _num(venue_market_state.diagnostics.get("prior_range_low"), 0.0),
+                "last_closed_high": _num(venue_market_state.diagnostics.get("last_closed_high"), 0.0),
+                "last_closed_low": _num(venue_market_state.diagnostics.get("last_closed_low"), 0.0),
+                "closed_anchor_source": str(venue_market_state.diagnostics.get("closed_anchor_source") or ""),
+                "volatility_expansion_ratio": float(venue_market_state.volatility_expansion_ratio or 1.0),
+            })
         if venue_market_state is not None and venue_market_state.ready:
             volatility_price = max(price * float(venue_market_state.robust_one_minute_vol_bps) / 10_000.0, executable_price_tick)
             market_state["volatility_source"] = f"venue_local_confirmed_candles:{str(venue or '').lower()}"
@@ -3288,21 +3725,33 @@ class InstitutionalStrategy:
         """Build a one-quantity venue comparison ledger.
 
         Broker-local collateral determines whether a route can participate, never
-        the exposure at which it receives a score. Before sizing, the smallest
-        funded candidate capacity determines a common benchmark quantity. After
+        the exposure at which it receives a score. Before sizing, a bounded
+        executable probe determines a common benchmark quantity. After
         sizing, the exact approved base quantity is replayed across all candidates;
         venues that cannot represent or fund that identical exposure are recorded
         as ineligible rather than being scored at an incomparable size.
         """
         venues = {str(v).lower() for v in candidate_venues}
-        positive_capacity_qty: list[float] = []
+        benchmark_quantities: list[float] = []
+        reference_map = _cfg("VENUE_SELECTION_PRE_SIZE_REFERENCE_NOTIONAL_USD_BY_ASSET", {})
+        default_reference = max(0.0, float(_cfg("VENUE_SELECTION_PRE_SIZE_REFERENCE_NOTIONAL_USD", 50.0) or 50.0))
+        asset_reference = (
+            max(0.0, float(reference_map.get(self._asset_id, default_reference) or default_reference))
+            if isinstance(reference_map, Mapping) else default_reference
+        )
         for venue in sorted(venues):
             state = states.get(venue)
             mid = float(getattr(state, "mid", 0.0) or 0.0) if state is not None else 0.0
             cap_notional = max(0.0, _num(capacity_notional_by_venue.get(venue), 0.0))
             if mid > 0.0 and cap_notional > 0.0:
-                positive_capacity_qty.append(cap_notional / mid)
-        quantity = max(0.0, float(approved_quantity or 0.0)) if approved_quantity is not None else (min(positive_capacity_qty) if positive_capacity_qty else 0.0)
+                probe_notional = min(cap_notional, max(self._venue_min_order_notional_usd(venue), asset_reference))
+                if probe_notional > 0.0:
+                    benchmark_quantities.append(probe_notional / mid)
+        quantity = (
+            max(0.0, float(approved_quantity or 0.0))
+            if approved_quantity is not None
+            else (min(benchmark_quantities) if benchmark_quantities else 0.0)
+        )
         max_error_bps = max(0.0, float(_cfg("VENUE_SELECTION_MAX_QUANTITY_REPRESENTATION_ERROR_BPS", 0.50)))
         min_margin = max(0.0, float(_cfg("VENUE_SELECTION_MIN_FREE_MARGIN_USD", 1.0)))
         configured_lev = max(1.0, float(_cfg("LEVERAGE", 1.0) or 1.0))
