@@ -49,26 +49,27 @@ class MarketSessionState:
     is_open: bool
     reason: str
     now_ist: str
+    session_code: str = "UNKNOWN"
 
 
 def groww_market_session_state(now: datetime | None = None) -> MarketSessionState:
     """Return whether the GROWW F&O runtime should open live data adapters."""
     if not bool(_cfg("GROWW_MARKET_SESSION_GUARD_ENABLED", True)):
-        return MarketSessionState(True, "session guard disabled", datetime.now(IST).isoformat(timespec="seconds"))
+        return MarketSessionState(True, "session guard disabled", datetime.now(IST).isoformat(timespec="seconds"), "OPEN")
     current = (now or datetime.now(IST)).astimezone(IST)
     today = current.date().isoformat()
     if current.weekday() >= 5:
-        return MarketSessionState(False, f"Indian F&O market closed: weekend ({today})", current.isoformat(timespec="seconds"))
+        return MarketSessionState(False, f"Indian F&O market closed: weekend ({today})", current.isoformat(timespec="seconds"), "WEEKEND")
     if today in _holiday_set():
-        return MarketSessionState(False, f"Indian F&O market closed: configured trading holiday ({today})", current.isoformat(timespec="seconds"))
+        return MarketSessionState(False, f"Indian F&O market closed: NSE trading holiday ({today})", current.isoformat(timespec="seconds"), "HOLIDAY")
     open_t = _parse_hhmm(str(_cfg("GROWW_MARKET_OPEN_TIME", "09:15")), dtime(9, 15, tzinfo=IST))
     close_t = _parse_hhmm(str(_cfg("GROWW_MARKET_CLOSE_TIME", "15:30")), dtime(15, 30, tzinfo=IST))
     now_t = current.timetz()
     if now_t < open_t:
-        return MarketSessionState(False, f"Indian F&O market not open yet: opens {open_t.strftime('%H:%M')} IST", current.isoformat(timespec="seconds"))
+        return MarketSessionState(False, f"Indian F&O market not open yet: opens {open_t.strftime('%H:%M')} IST", current.isoformat(timespec="seconds"), "PREOPEN")
     if now_t > close_t:
-        return MarketSessionState(False, f"Indian F&O market closed for day: closed {close_t.strftime('%H:%M')} IST", current.isoformat(timespec="seconds"))
-    return MarketSessionState(True, "Indian F&O market session open", current.isoformat(timespec="seconds"))
+        return MarketSessionState(False, f"Indian F&O market closed for day: closed {close_t.strftime('%H:%M')} IST", current.isoformat(timespec="seconds"), "POSTCLOSE")
+    return MarketSessionState(True, "Indian F&O market session open", current.isoformat(timespec="seconds"), "OPEN")
 
 
 def groww_market_is_open() -> bool:

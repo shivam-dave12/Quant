@@ -249,6 +249,14 @@ class InstitutionalStrategy:
         self._entry_lock = threading.RLock()
         self._entry_thread: threading.Thread | None = None
         self._runtime_stop_requested = threading.Event()
+        # Broker position/order endpoints are reconciliation I/O, never market-evaluation I/O.
+        # Native venue protection remains armed at the broker while this supervisor
+        # confirms fills/exits independently of quote-driven signal latency.
+        self._position_reconcile_lock = threading.RLock()
+        self._position_reconcile_wakeup = threading.Event()
+        self._position_reconcile_thread: threading.Thread | None = None
+        self._position_reconcile_manager = None
+        self._position_reconcile_risk_manager = None
 
     def bind_market_wakeup(self, callback: Callable[[], Any]) -> None:
         self._market_wakeup = callback
@@ -281,9 +289,82 @@ class InstitutionalStrategy:
 
     def stop_runtime_services(self) -> None:
         self._runtime_stop_requested.set()
+        self._position_reconcile_wakeup.set()
         # Shared portfolio service is owned and stopped by the orchestrator.
         if self._collateral_service is None:
             self._venue_cash_refresh_stop.set()
+
+    def _ensure_position_reconciliation_worker(self, order_manager, risk_manager) -> None:
+        """Keep broker reconciliation off the quote-driven decision worker.
+
+        Once venue-native protection has been verified, market events only update
+        mark/risk diagnostics. Position and closing-order REST/RPC confirmation is
+        a distinct lifecycle service: otherwise each BTC/metal quote blocks on a
+        broker network round trip and destroys event latency.
+        """
+        if self._pos.is_flat() or self._pos.phase is PositionPhase.ENTERING:
+            return
+        manager = self._execution_manager_for(order_manager, self._pos.exchange)
+        with self._position_reconcile_lock:
+            self._position_reconcile_manager = manager
+            self._position_reconcile_risk_manager = risk_manager
+            if self._position_reconcile_thread is not None and self._position_reconcile_thread.is_alive():
+                return
+            self._position_reconcile_wakeup.clear()
+            self._position_reconcile_thread = threading.Thread(
+                target=self._position_reconciliation_loop,
+                daemon=True,
+                name=f"position-reconcile-{self._asset_id}-{self._pos.exchange}",
+            )
+            self._position_reconcile_thread.start()
+        logger.info(
+            "🧵 POSITION_RECONCILIATION_SUPERVISOR launched asset=%s venue=%s; broker I/O removed from on_tick hot path",
+            self._asset_id, self._pos.exchange,
+        )
+
+    def _position_reconciliation_loop(self) -> None:
+        interval = max(0.25, float(_cfg("POSITION_RECONCILIATION_REFRESH_SEC", 1.0)))
+        flat_retry = max(interval, float(_cfg("POSITION_RECONCILIATION_FLAT_UNCONFIRMED_SEC", 2.0)))
+        try:
+            while not self._runtime_stop_requested.is_set():
+                with self._entry_lock:
+                    if self._pos.is_flat() or self._pos.phase is PositionPhase.ENTERING:
+                        break
+                    mark_price = float(self._latest_event_price or self._pos.entry_price or 0.0)
+                with self._position_reconcile_lock:
+                    manager = self._position_reconcile_manager
+                    risk_manager = self._position_reconcile_risk_manager
+                if manager is None or risk_manager is None:
+                    break
+                next_interval = interval
+                try:
+                    broker_pos = manager.get_open_position()
+                    if isinstance(broker_pos, Mapping) and _num(broker_pos.get("size"), 0.0) <= 0:
+                        if not self._finalise_confirmed_exit(manager, risk_manager, mark_price):
+                            with self._entry_lock:
+                                if not self._pos.is_flat():
+                                    self._pos.phase = PositionPhase.RECONCILIATION_REQUIRED
+                            self._notify_exit_reconciliation_required(mark_price)
+                            next_interval = flat_retry
+                        else:
+                            remove_exposure = getattr(risk_manager, "remove_open_exposure", None)
+                            if callable(remove_exposure):
+                                remove_exposure(f"{self._desk_id(self._pos.exchange, self._pos.execution_symbol)}:{self._pos.execution_symbol}")
+                            with self._entry_lock:
+                                self._pos = PositionState(asset_id=self._asset_id)
+                            if callable(self._market_wakeup):
+                                try:
+                                    self._market_wakeup()
+                                except Exception:
+                                    pass
+                            break
+                except Exception as exc:
+                    logger.debug("Position reconciliation query deferred asset=%s venue=%s: %s", self._asset_id, self._pos.exchange, exc)
+                self._position_reconcile_wakeup.wait(timeout=next_interval)
+                self._position_reconcile_wakeup.clear()
+        finally:
+            with self._position_reconcile_lock:
+                self._position_reconcile_thread = None
 
     def _venue_cash_refresh_loop(self) -> None:
         interval = max(15.0, float(_cfg("VENUE_BALANCE_REFRESH_SEC", 30.0)))
@@ -585,11 +666,28 @@ class InstitutionalStrategy:
                 }
             venue_selection = model.get("venue_selection", {}) if isinstance(model.get("venue_selection"), dict) else {}
             if venue_selection:
+                selected_venue_key = str(venue_selection.get("selected_venue", "")).lower()
+                estimates = venue_selection.get("estimates", {}) if isinstance(venue_selection.get("estimates"), dict) else {}
+                selected_estimate = estimates.get(selected_venue_key, {}) if isinstance(estimates.get(selected_venue_key), dict) else {}
                 payload["route"] = {
                     "selected_venue": venue_selection.get("selected_venue"),
                     "selected_symbol": venue_selection.get("selected_symbol"),
                     "selected_cost_bps": self._round_or_none(venue_selection.get("selected_cost_bps")),
                     "reason": venue_selection.get("reason"),
+                    "diagnostics": {
+                        "proposed_notional_usd": self._round_or_none(selected_estimate.get("proposed_notional_usd"), 2),
+                        "available_cash_usd": self._round_or_none(selected_estimate.get("available_cash_usd"), 2),
+                        "required_margin_usd": self._round_or_none(selected_estimate.get("required_margin_usd"), 2),
+                        "directional_near_depth_usd": self._round_or_none(selected_estimate.get("near_depth_usd"), 2),
+                        "effective_touch_bps": self._round_or_none(selected_estimate.get("effective_touch_bps")),
+                        "fee_bps": self._round_or_none(selected_estimate.get("fee_bps")),
+                        "impact_bps": self._round_or_none(selected_estimate.get("impact_bps")),
+                        "funding_cost_bps": self._round_or_none(selected_estimate.get("funding_cost_bps")),
+                        "latency_penalty_bps": self._round_or_none(selected_estimate.get("latency_penalty_bps")),
+                        "quality_penalty_bps": self._round_or_none(selected_estimate.get("quality_penalty_bps")),
+                        "liquidity_penalty_bps": self._round_or_none(selected_estimate.get("liquidity_penalty_bps")),
+                        "protection_activation_penalty_bps": self._round_or_none(selected_estimate.get("protection_activation_penalty_bps")),
+                    },
                 }
             venue_state = model.get("venue_market_state", {}) if isinstance(model.get("venue_market_state"), dict) else {}
             selected_state = venue_state.get(str(decision.venue).lower(), {}) if isinstance(venue_state, dict) else {}
@@ -1500,6 +1598,19 @@ class InstitutionalStrategy:
             protection.target_price,
         )
         if not result:
+            err = getattr(execution_manager, "last_order_error", None) or {}
+            reason = str(err.get("reason") or "")
+            if "hyperliquid_entry_cancel_reconciliation_unresolved" in reason:
+                # A timed-out entry with unverified cancellation is not FLAT. Lock
+                # this asset from new entry decisions until broker state is proven.
+                with self._entry_lock:
+                    self._pos.phase = PositionPhase.RECONCILIATION_REQUIRED
+                    self._pos.manual_exit_reason = "entry_cancel_reconciliation_unresolved"
+                self._ensure_position_reconciliation_worker(execution_manager, risk_manager)
+                logger.critical(
+                    "Hyperliquid entry state unresolved after cancel reconciliation; asset=%s locked in RECONCILIATION_REQUIRED until broker state is verified",
+                    self._asset_id,
+                )
             self._notify_order_error(decision, execution_manager)
             return
         fill_price = float(result.get("fill_price") or protection.entry_price)
@@ -1561,6 +1672,7 @@ class InstitutionalStrategy:
             protection_model=str(result.get("protection_model") or protection.protection_type),
             quant_components=decision.model_values,
         )
+        self._ensure_position_reconciliation_worker(execution_manager, risk_manager)
         self._notify_entry_opened(decision, sizing, protection, result, fill_price, quantity_filled)
 
     def _monitor_position(self, data_manager, order_manager, risk_manager) -> None:
@@ -1574,6 +1686,7 @@ class InstitutionalStrategy:
         if price <= 0:
             return
         order_manager = self._execution_manager_for(order_manager, self._pos.exchange)
+        self._ensure_position_reconciliation_worker(order_manager, risk_manager)
         self._forward_labels.observe(now_ts_ns=time.time_ns(), current_price=price)
         self._dynamic_exit_supervision(data_manager, order_manager)
         if self._pos.side.lower() == "long":
@@ -1586,20 +1699,9 @@ class InstitutionalStrategy:
             self._pos.phase = PositionPhase.EXITING
             self._pos.manual_exit_reason = "target_reached" if target_hit else "stop_reached"
             self._notify_exit_level_hit("tp_hit" if target_hit else "sl_hit", price)
-            return
-        try:
-            broker_pos = order_manager.get_open_position()
-            if isinstance(broker_pos, Mapping) and _num(broker_pos.get("size"), 0.0) <= 0:
-                if not self._finalise_confirmed_exit(order_manager, risk_manager, price):
-                    self._pos.phase = PositionPhase.RECONCILIATION_REQUIRED
-                    self._notify_exit_reconciliation_required(price)
-                    return
-                remove_exposure = getattr(risk_manager, "remove_open_exposure", None)
-                if callable(remove_exposure):
-                    remove_exposure(f"{self._desk_id(self._pos.exchange, self._pos.execution_symbol)}:{self._pos.execution_symbol}")
-                self._pos = PositionState(asset_id=self._asset_id)
-        except Exception:
-            pass
+            # Venue-native TP/SL is already armed; immediately request broker
+            # reconciliation without issuing network I/O on this market tick.
+            self._position_reconcile_wakeup.set()
 
     def _quantity_unit_label(self, venue: str) -> str:
         try:

@@ -159,6 +159,12 @@ DELTA_REQUIRE_NATIVE_BRACKET      = True
 # enabled below and reports the failure to Telegram through the strategy.
 HYPERLIQUID_ENTRY_FILL_TIMEOUT_SEC = 45.0
 HYPERLIQUID_ENTRY_POLL_SEC = 1.0
+# Protected-position reconciliation is broker I/O and runs off the market-decision
+# worker. Venue-native TP/SL remains responsible for immediate protection.
+POSITION_RECONCILIATION_REFRESH_SEC = 1.0
+POSITION_RECONCILIATION_FLAT_UNCONFIRMED_SEC = 2.0
+HYPERLIQUID_ENTRY_CANCEL_RECONCILE_SEC = 3.0
+HYPERLIQUID_ENTRY_CANCEL_RECONCILE_POLL_SEC = 0.25
 HYPERLIQUID_TRIGGER_MARKET_SLIPPAGE_PCT = 0.10
 HYPERLIQUID_EMERGENCY_CLOSE_ON_PROTECTION_FAILURE = True
 HYPERLIQUID_PROTECTION_FAILURE_CLOSE_SLIPPAGE_PCT = 0.05
@@ -684,7 +690,29 @@ GROWW_SECURITY_MASTER_REQUIRE_TODAY = True
 GROWW_MARKET_SESSION_GUARD_ENABLED = True
 GROWW_MARKET_OPEN_TIME = "09:15"
 GROWW_MARKET_CLOSE_TIME = "15:30"
-GROWW_MARKET_HOLIDAYS: tuple[str, ...] = ()  # populate verified NSE holidays here when needed
+# Verified exchange reference data: NSE Equity & Equity Derivatives trading holidays, 2026.
+# Source: NSE India Market Timings & Holidays calendar, verified 2026-05-28.
+# This belongs to the session control-plane: a closed exchange must never be
+# diagnosed as a broken Groww feed or enter broker preflight/retry loops.
+GROWW_MARKET_HOLIDAY_CALENDAR_SOURCE = "NSE India Equity/Equity Derivatives trading holidays 2026; verified 2026-05-28"
+GROWW_MARKET_HOLIDAYS: tuple[str, ...] = (
+    "2026-01-15",  # Municipal Corporation Election - Maharashtra
+    "2026-01-26",  # Republic Day
+    "2026-03-03",  # Holi
+    "2026-03-26",  # Shri Ram Navami
+    "2026-03-31",  # Shri Mahavir Jayanti
+    "2026-04-03",  # Good Friday
+    "2026-04-14",  # Dr. Baba Saheb Ambedkar Jayanti
+    "2026-05-01",  # Maharashtra Day
+    "2026-05-28",  # Bakri Id
+    "2026-06-26",  # Muharram
+    "2026-09-14",  # Ganesh Chaturthi
+    "2026-10-02",  # Mahatma Gandhi Jayanti
+    "2026-10-20",  # Dussehra
+    "2026-11-10",  # Diwali-Balipratipada
+    "2026-11-24",  # Prakash Gurpurb Sri Guru Nanak Dev
+    "2026-12-25",  # Christmas
+)
 GROWW_ANALYZE_ONLY_DURING_MARKET_SESSION = True
 GROWW_ALLOW_CLOSED_MARKET_HISTORICAL_WARMUP = True
 GROWW_ALLOW_CLOSED_MARKET_WARMUP = False

@@ -163,20 +163,25 @@ class MultiAssetInstitutionalBot:
         return self._is_groww_context(ctx)
 
     @staticmethod
-    def _groww_market_open() -> tuple[bool, str]:
+    def _groww_market_open() -> tuple[bool, str, str]:
         if not bool(getattr(config, "GROWW_ANALYZE_ONLY_DURING_MARKET_SESSION", True)):
-            return True, "Groww session guard disabled"
+            return True, "Groww session guard disabled", "OPEN"
         if groww_market_session_state is None:
-            return False, "Groww market session guard unavailable"
+            return False, "Groww market session guard unavailable", "SESSION_GUARD_UNAVAILABLE"
         try:
             state = groww_market_session_state()
-            return bool(state.is_open), str(state.reason or "")
+            return bool(state.is_open), str(state.reason or ""), str(getattr(state, "session_code", "UNKNOWN") or "UNKNOWN")
         except Exception as exc:
-            return False, f"Groww market session check failed: {exc}"
+            return False, f"Groww market session check failed: {exc}", "SESSION_CHECK_FAILED"
 
-    def _indian_market_open(self, ctx: AssetContext) -> tuple[bool, str, str]:
-        ok, reason = self._groww_market_open()
-        return ok, reason, "GROWW"
+    def _indian_market_open(self, ctx: AssetContext) -> tuple[bool, str, str, str]:
+        ok, reason, session_code = self._groww_market_open()
+        return ok, reason, "GROWW", session_code
+
+    @staticmethod
+    def _indian_market_dormant_state(broker_label: str, session_code: str) -> str:
+        code = str(session_code or "MARKET_CLOSED").upper()
+        return f"{broker_label}_{code}"
 
     @staticmethod
     def _groww_auth_tz() -> timezone:
@@ -351,7 +356,7 @@ class MultiAssetInstitutionalBot:
             state = ctx.phase_name if pos else ("READY" if ctx.ready else (ctx.start_state or "NOT READY"))
             if not pos and not ctx.ready and is_indian:
                 try:
-                    is_open, _closed_reason, _broker_label = self._indian_market_open(ctx)
+                    is_open, _closed_reason, _broker_label, _session_code = self._indian_market_open(ctx)
                     if not is_open:
                         state = "DORMANT"
                 except Exception:
@@ -1100,10 +1105,10 @@ class MultiAssetInstitutionalBot:
         try:
             with instrument_scope(inst):
                 if self._is_indian_options_context(ctx):
-                    session_open, session_reason, broker_label = self._indian_market_open(ctx)
+                    session_open, session_reason, broker_label, session_code = self._indian_market_open(ctx)
                     if not session_open:
                         ctx.ready = False
-                        ctx.start_state = f"{broker_label}_MARKET_CLOSED"
+                        ctx.start_state = self._indian_market_dormant_state(broker_label, session_code)
                         logger.warning(
                             "%s %s desk dormant: %s. No NIFTY analysis, entries or adoption outside NSE/F&O hours.",
                             inst.asset_id,
@@ -1171,16 +1176,16 @@ class MultiAssetInstitutionalBot:
         """Wake a NIFTY desk that was created before NSE/NFO opened."""
         if ctx.ready or ctx.starting or not self._is_indian_options_context(ctx):
             return False
-        session_open, session_reason, broker_label = self._indian_market_open(ctx)
+        session_open, session_reason, broker_label, session_code = self._indian_market_open(ctx)
         if not session_open:
-            ctx.start_state = f"{broker_label}_MARKET_CLOSED"
+            ctx.start_state = self._indian_market_dormant_state(broker_label, session_code)
             self._log_throttled_asset(
                 ctx,
                 f"{broker_label} market closed: {session_reason}; NIFTY desk dormant, auto-start armed.",
             )
             return False
         now = time.time()
-        closed_state = ctx.start_state in ("", "GROWW_MARKET_CLOSED")
+        closed_state = ctx.start_state in ("", "GROWW_MARKET_CLOSED", "GROWW_HOLIDAY", "GROWW_WEEKEND", "GROWW_PREOPEN", "GROWW_POSTCLOSE")
         retry_default = "GROWW_DORMANT_START_RETRY_SEC" if closed_state else "GROWW_FAILED_START_RETRY_SEC"
         retry_fallback = 30.0 if closed_state else 180.0
         retry_sec = max(5.0, float(getattr(config, retry_default, retry_fallback) or retry_fallback))
@@ -1235,7 +1240,7 @@ class MultiAssetInstitutionalBot:
 
         ok_any = any(ok_flags.values())
         dormant_groww = any(
-            self._is_indian_options_context(ctx) and ctx.start_state == "GROWW_MARKET_CLOSED"
+            self._is_indian_options_context(ctx) and ctx.start_state in {"GROWW_MARKET_CLOSED", "GROWW_HOLIDAY", "GROWW_WEEKEND", "GROWW_PREOPEN", "GROWW_POSTCLOSE"}
             for ctx in self.contexts
         )
         if not ok_any and not dormant_groww:
@@ -1287,10 +1292,10 @@ class MultiAssetInstitutionalBot:
                     time.sleep(0.25)
                     continue
                 if self._is_indian_options_context(ctx):
-                    session_open, session_reason, broker_label = self._indian_market_open(ctx)
+                    session_open, session_reason, broker_label, session_code = self._indian_market_open(ctx)
                     if not session_open:
                         ctx.ready = False
-                        ctx.start_state = f"{broker_label}_MARKET_CLOSED"
+                        ctx.start_state = self._indian_market_dormant_state(broker_label, session_code)
                         self._log_throttled_asset(ctx, f"{broker_label} market closed: {session_reason}; NIFTY desk dormant, no analysis/entries.")
                         continue
                 interval = self.guard.evaluation_interval(ctx)

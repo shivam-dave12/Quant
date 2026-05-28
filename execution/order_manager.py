@@ -2222,11 +2222,46 @@ class _HyperliquidAdapter:
                 filled_qty = float(parsed.get("total_sz") or qty)
 
         if filled_qty <= 0:
+            # A maker entry may fill concurrently with cancellation. Treating the
+            # timeout as flat without reconciling creates an unmanaged live position.
+            cancel_resp: Any = {}
             try:
-                self.cancel_order(oid)
-            except Exception:
-                pass
-            return {"_error": True, "_sc": 0, "_raw": {"error": "hyperliquid_entry_fill_timeout", "oid": oid}}
+                cancel_resp = self.cancel_order(oid) or {}
+            except Exception as exc:
+                cancel_resp = {"error": str(exc)}
+            settle_deadline = time.time() + max(0.5, float(_cfg("HYPERLIQUID_ENTRY_CANCEL_RECONCILE_SEC", 3.0)))
+            settle_poll = max(0.1, float(_cfg("HYPERLIQUID_ENTRY_CANCEL_RECONCILE_POLL_SEC", 0.25)))
+            final_state: Dict[str, Any] = {}
+            while time.time() < settle_deadline:
+                final_state = self._entry_status(oid, float(limit_price), qty)
+                if final_state.get("status") in {"FILLED", "CANCELLED"}:
+                    break
+                time.sleep(settle_poll)
+            live_position: Dict[str, Any] = {}
+            try:
+                live_position = self.normalise_position(self.get_positions(self.symbol) or {}) or {}
+            except Exception as exc:
+                live_position = {"reconciliation_error": str(exc)}
+            live_qty = self._num(live_position.get("size"), 0.0)
+            if final_state.get("status") == "FILLED" or live_qty > 0:
+                filled_qty = self._num(final_state.get("filled_qty"), 0.0) or live_qty or qty
+                fill_price = self._num(final_state.get("fill_price"), 0.0) or self._num(live_position.get("entry_price"), 0.0) or float(limit_price)
+                logger.warning(
+                    "Hyperliquid entry filled during timeout/cancel reconciliation; attaching native TP/SL immediately coin=%s oid=%s qty=%s",
+                    self.symbol, oid, filled_qty,
+                )
+            elif final_state.get("status") == "CANCELLED" and live_qty <= 0:
+                return {
+                    "_error": True, "_sc": 0,
+                    "_err_msg": "hyperliquid_entry_fill_timeout_cancelled_flat_verified",
+                    "_raw": {"error": "hyperliquid_entry_fill_timeout_cancelled_flat_verified", "oid": oid, "cancel": cancel_resp, "final_state": final_state},
+                }
+            else:
+                return {
+                    "_error": True, "_sc": 0,
+                    "_err_msg": "hyperliquid_entry_cancel_reconciliation_unresolved",
+                    "_raw": {"error": "hyperliquid_entry_cancel_reconciliation_unresolved", "oid": oid, "cancel": cancel_resp, "final_state": final_state, "position": live_position},
+                }
 
         exit_is_buy = not is_buy
         try:
