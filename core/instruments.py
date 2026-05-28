@@ -184,6 +184,8 @@ def default_asset_intents() -> List[AssetIntent]:
                     ("NIFTY", "NIFTY50", "CNXNIFTY", "NSE NIFTY"), priority=5),
         AssetIntent("OIL", "Crude Oil / WTI", AssetClass.COMMODITY,
                     ("OIL", "WTI", "CL", "USOIL", "CRUDE", "CRUDEOIL", "OILUSD", "OILUSDT", "WTIUSDT"), priority=10),
+        AssetIntent("NATGAS", "Henry Hub Natural Gas", AssetClass.COMMODITY,
+                    ("xyz:NATGAS", "NATGAS", "NATURALGAS", "NATURAL GAS", "HENRYHUB", "NG"), priority=16),
         AssetIntent("GOLD_PAXG", "PAXG token derivatives", AssetClass.COMMODITY,
                     ("PAXGUSD", "PAXGUSDT", "PAXG"), priority=11),
         AssetIntent("GOLD_HL", "Hyperliquid GOLD HIP-3", AssetClass.COMMODITY,

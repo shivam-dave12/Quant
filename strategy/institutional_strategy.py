@@ -2273,7 +2273,7 @@ class InstitutionalStrategy:
 
         parent_exit_assets_raw = _cfg(
             "DYNAMIC_EXIT_PARENT_STRUCTURE_ASSETS",
-            ("BTC", "GOLD_PAXG", "GOLD_HL", "SILVER_SLVON", "SILVER_XAG", "SILVER_HL", "OIL"),
+            ("BTC", "GOLD_PAXG", "GOLD_HL", "SILVER_SLVON", "SILVER_XAG", "SILVER_HL", "OIL", "NATGAS"),
         )
         parent_exit_assets = {
             str(x).upper() for x in (
@@ -2614,7 +2614,7 @@ class InstitutionalStrategy:
             market_uncertainty_bps = float(composite_decision.diagnostics.get("execution_uncertainty_bps", 0.0) or 0.0)
             breakdown["composite_asset_intelligence"] = composite_decision.as_dict()
             breakdown["structural_alpha_authority"] = "normalised_execution_equivalence_composite"
-        elif market_state is not None and market_state.ready and self._asset_id.upper() in set(_cfg("INSTITUTIONAL_MARKET_STATE_ASSETS", ("BTC", "GOLD_PAXG", "GOLD_HL", "SILVER_SLVON", "SILVER_XAG", "SILVER_HL", "OIL"))):
+        elif market_state is not None and market_state.ready and self._asset_id.upper() in set(_cfg("INSTITUTIONAL_MARKET_STATE_ASSETS", ("BTC", "GOLD_PAXG", "GOLD_HL", "SILVER_SLVON", "SILVER_XAG", "SILVER_HL", "OIL", "NATGAS"))):
             structural_alpha_bps = float(market_state.signed_alpha_bps)
             market_uncertainty_bps = float(market_state.uncertainty_bps)
             breakdown["venue_market_state"] = market_state.as_dict()
@@ -2625,7 +2625,7 @@ class InstitutionalStrategy:
         # reverse a position; options retain their dedicated underlying/Greek path.
         parent_assets_raw = _cfg(
             "INSTITUTIONAL_PARENT_THESIS_ASSETS",
-            ("BTC", "GOLD_PAXG", "GOLD_HL", "SILVER_SLVON", "SILVER_XAG", "SILVER_HL", "OIL"),
+            ("BTC", "GOLD_PAXG", "GOLD_HL", "SILVER_SLVON", "SILVER_XAG", "SILVER_HL", "OIL", "NATGAS"),
         )
         parent_assets = {str(x).upper() for x in (parent_assets_raw if isinstance(parent_assets_raw, (tuple, list, set)) else str(parent_assets_raw).split(","))}
         parent_model_enabled = bool(_cfg("INSTITUTIONAL_PARENT_THESIS_EXECUTION_MODEL_ENABLED", True)) and self._asset_id.upper() in parent_assets
@@ -3159,7 +3159,7 @@ class InstitutionalStrategy:
         asset = self._asset_id.upper()
         if asset.startswith("GOLD") or asset.startswith("SILVER") or any(x in instrument.upper() for x in ("PAXG", "XAUT", "SLV", "XAG", "SILVER", "GOLD")):
             return DeskId.METALS.value
-        if asset == "OIL" or any(x in instrument.upper() for x in ("CL", "WTI", "OIL", "CRUDE")):
+        if asset in {"OIL", "NATGAS"} or any(x in instrument.upper() for x in ("CL", "WTI", "OIL", "CRUDE", "NATGAS")):
             return DeskId.COMMODITIES.value
         return DeskId.BTC.value
 

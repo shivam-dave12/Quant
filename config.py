@@ -50,6 +50,7 @@ HYPERLIQUID_REFERENCE_COIN_BY_ASSET = {
     # These are distinct exposure groups; no raw-price substitution is permitted.
     "GOLD_HL": "xyz:GOLD",
     "SILVER_HL": "xyz:SILVER",
+    "NATGAS": "xyz:NATGAS",
 }
 # No permanent venue preference: route from live executable economics,
 # collateral and protection feasibility on each approved candidate.
@@ -168,7 +169,18 @@ HYPERLIQUID_ENTRY_CANCEL_RECONCILE_POLL_SEC = 0.25
 HYPERLIQUID_TRIGGER_MARKET_SLIPPAGE_PCT = 0.10
 HYPERLIQUID_EMERGENCY_CLOSE_ON_PROTECTION_FAILURE = True
 HYPERLIQUID_PROTECTION_FAILURE_CLOSE_SLIPPAGE_PCT = 0.05
+# Default applies only to native/unprofiled products. HIP-3 commodity products
+# must use the exchange/deployer-verified capability profile below.
 HYPERLIQUID_USE_CROSS_MARGIN = True
+HYPERLIQUID_PRODUCT_CAPABILITIES = {
+    # Verified against trade[XYZ] Specification Index (2026-05-28).
+    # Normal Isolated allows isolated margin; cross margin is not permitted.
+    "xyz:CL": {"margin_mode": "isolated", "max_leverage": 20, "capability_source": "trade_xyz_specification_index"},
+    "xyz:NATGAS": {"margin_mode": "isolated", "max_leverage": 10, "capability_source": "trade_xyz_specification_index"},
+    # Existing HIP-3 metals are explicitly cross-enabled by the same specification.
+    "xyz:GOLD": {"margin_mode": "cross", "max_leverage": 25, "capability_source": "trade_xyz_specification_index"},
+    "xyz:SILVER": {"margin_mode": "cross", "max_leverage": 25, "capability_source": "trade_xyz_specification_index"},
+}
 
 # ── Data / Readiness ──────────────────────────────────────────────────────────
 READY_TIMEOUT_SEC    = 120.0
@@ -289,7 +301,7 @@ INSTITUTIONAL_FLOW_DISLOCATION_WEIGHT = 0.00  # raw venue dislocation is diagnos
 # Venue-local market-state alpha: robust shrinkage of confirmed displacement,
 # range acceptance and live impulse; it is additive alpha, not a loose filter.
 INSTITUTIONAL_ENABLE_MARKET_STATE_ALPHA = True
-INSTITUTIONAL_MARKET_STATE_ASSETS = ("BTC", "GOLD_PAXG", "GOLD_HL", "SILVER_SLVON", "SILVER_XAG", "SILVER_HL", "OIL")
+INSTITUTIONAL_MARKET_STATE_ASSETS = ("BTC", "GOLD_PAXG", "GOLD_HL", "SILVER_SLVON", "SILVER_XAG", "SILVER_HL", "OIL", "NATGAS")
 INSTITUTIONAL_MARKET_STATE_PARAMETERS = {
     "DEFAULT": {"capture_rate": 0.18, "max_alpha_bps": 18.0, "acceptance_weight": 0.25, "live_impulse_weight": 0.15, "min_confidence": 0.25},
     "BTC": {"capture_rate": 0.24, "max_alpha_bps": 32.0, "acceptance_weight": 0.30, "live_impulse_weight": 0.22, "min_confidence": 0.25},
@@ -299,15 +311,17 @@ INSTITUTIONAL_MARKET_STATE_PARAMETERS = {
     "SILVER_XAG": {"capture_rate": 0.24, "max_alpha_bps": 32.0, "acceptance_weight": 0.32, "live_impulse_weight": 0.14, "min_confidence": 0.30},
     "SILVER_HL": {"capture_rate": 0.24, "max_alpha_bps": 32.0, "acceptance_weight": 0.32, "live_impulse_weight": 0.14, "min_confidence": 0.30},
     "OIL": {"capture_rate": 0.22, "max_alpha_bps": 32.0, "acceptance_weight": 0.30, "live_impulse_weight": 0.15, "min_confidence": 0.30},
+    # New energy contract inherits the uncalibrated energy commodity prior until live research approves a bespoke model.
+    "NATGAS": {"capture_rate": 0.22, "max_alpha_bps": 32.0, "acceptance_weight": 0.30, "live_impulse_weight": 0.15, "min_confidence": 0.30},
 }
-INSTITUTIONAL_MICROSTRUCTURE_ALPHA_CAP_BPS = {"BTC": 22.0, "GOLD_PAXG": 18.0, "GOLD_HL": 18.0, "SILVER_SLVON": 15.0, "SILVER_XAG": 18.0, "SILVER_HL": 18.0, "OIL": 18.0}
+INSTITUTIONAL_MICROSTRUCTURE_ALPHA_CAP_BPS = {"BTC": 22.0, "GOLD_PAXG": 18.0, "GOLD_HL": 18.0, "SILVER_SLVON": 15.0, "SILVER_XAG": 18.0, "SILVER_HL": 18.0, "OIL": 18.0, "NATGAS": 18.0}
 # Parent/child signal hierarchy for every live directional underlying desk.
 # Closed-candle structural state originates or reverses a position; order-book /
 # tape flow may time execution only in that parent direction. This is not a veto
 # layer: it defines the investable thesis and prevents microstructure-only churn.
 INSTITUTIONAL_PARENT_THESIS_EXECUTION_MODEL_ENABLED = True
 INSTITUTIONAL_PARENT_THESIS_ASSETS = (
-    "BTC", "GOLD_PAXG", "GOLD_HL", "SILVER_SLVON", "SILVER_XAG", "SILVER_HL", "OIL",
+    "BTC", "GOLD_PAXG", "GOLD_HL", "SILVER_SLVON", "SILVER_XAG", "SILVER_HL", "OIL", "NATGAS",
 )
 INSTITUTIONAL_PARENT_TIMING_CONTRIBUTION_CAP_FRACTION = 0.35
 # Venue disagreement raises uncertainty and scales confidence continuously. A
@@ -321,13 +335,14 @@ INSTITUTIONAL_RELATIVE_VALUE_ALPHA_ENABLED = False
 # as PAXG vs HIP-3 GOLD and SLVON vs XAG/SILVER are context-only until a fitted,
 # formally approved basis/hedge-ratio model is installed below.
 INSTITUTIONAL_FACTOR_BY_ASSET = {
-    "BTC": "BTC", "OIL": "OIL",
+    "BTC": "BTC", "OIL": "OIL", "NATGAS": "NATGAS",
     "GOLD_PAXG": "GOLD", "GOLD_HL": "GOLD",
     "SILVER_SLVON": "SILVER", "SILVER_XAG": "SILVER", "SILVER_HL": "SILVER",
 }
 INSTITUTIONAL_EXECUTION_EQUIVALENCE_GROUP_BY_ASSET = {
     "BTC": "BTC_LINEAR_PERP",
     "OIL": "OIL_HL_ONLY",
+    "NATGAS": "NATGAS_HL_ONLY",
     "GOLD_PAXG": "PAXG_TOKEN_PERP",
     "GOLD_HL": "GOLD_HIP3_ONLY",
     "SILVER_SLVON": "SLVON_TOKEN_PERP_ONLY",
@@ -337,6 +352,7 @@ INSTITUTIONAL_EXECUTION_EQUIVALENCE_GROUP_BY_ASSET = {
 INSTITUTIONAL_FACTOR_TRANSFER_MODE_BY_ASSET = {
     "BTC": "TRANSFERABLE_EXECUTION_ALPHA",
     "OIL": "TRANSFERABLE_EXECUTION_ALPHA",
+    "NATGAS": "TRANSFERABLE_EXECUTION_ALPHA",
     "GOLD_PAXG": "CONFIDENCE_ONLY",
     "GOLD_HL": "CONFIDENCE_ONLY",
     "SILVER_SLVON": "CONFIDENCE_ONLY",
@@ -457,6 +473,7 @@ DYNAMIC_PROTECTION_ASSET_MIN_TARGET_BPS = {
 DYNAMIC_PROTECTION_MIN_EXECUTABLE_HOLD_SEC_BY_ASSET = {
     "BTC": 5.0,
     "OIL": 20.0,
+    "NATGAS": 20.0,
     "GOLD_PAXG": 30.0,
     "GOLD_HL": 20.0,
     "SILVER_SLVON": 60.0,
@@ -604,33 +621,6 @@ INSTITUTIONAL_TIME_STOP_FAILED_market_state_MAX_MFE_R = 0.50
 INSTITUTIONAL_TIME_STOP_MIN_PROGRESS_R = 0.20
 INSTITUTIONAL_TIME_STOP_HARD_MAX_MULT = 1.35
 
-# ── Fee engine ────────────────────────────────────────────────────────────────
-FEE_SPREAD_HIST_MAXLEN      = 500
-# CFG-2 fix: 0.20 matches fee_engine code-level default (line 115 comment says
-# "Warmup default: 0.20 bps — realistic for BTC inverse perp (actual ~0.15 bps).
-# The old default of 2.0 bps was 13× too wide, causing fee-floor over-rejection
-# during the first ~5 seconds of each session.")
-FEE_SPREAD_DEFAULT_BPS      = 0.20
-FEE_SLIP_ALPHA              = 0.25
-FEE_SLIP_DEFAULT_BPS        = 1.5
-FEE_SLIP_MIN_BPS            = 0.5
-FEE_FLOOR_MULT_LOW          = 2.5
-FEE_FLOOR_MULT_HIGH         = 1.2
-FEE_FLOOR_MAX_ATR_MULT      = 2.0
-FEE_FLOOR_INFLECT           = 0.45
-FEE_FLOOR_STEEPNESS         = 6.0
-# CFG-3 fix: fee_engine code comment (line 239) says "was 1.4" — lowered to 1.2
-FEE_FLOOR_ABS_MIN_MULT      = 1.2
-FEE_SPREAD_ATR_WARN         = 0.06
-FEE_SPREAD_PENALTY_K        = 4.0
-FEE_CONF_NEUTRAL            = 0.5
-FEE_CONF_MAX_DISCOUNT       = 0.30
-FEE_MAKER_MIN_SAVING_BPS    = 0.5
-FEE_MAKER_URGENCY_CUTOFF    = 0.82
-FEE_MAKER_DEPTH_LEVELS      = 5
-FEE_MAKER_DEPTH_MAX_FRAC    = 0.25
-FEE_MAKER_DEPTH_FILL_FLOOR  = 0.35
-FEE_MAKER_OPP_COST_WEIGHT   = 0.5
 
 # ── ATR engine ────────────────────────────────────────────────────────────────
 ATR_SEED_RETAIN         = 1
@@ -874,6 +864,7 @@ MULTI_ASSET_REQUESTS = [
 
     # Commodity exposure available on Delta is tokenised/RWA futures, not physical spot futures.
     {"asset_id": "OIL", "display_name": "Crude Oil / WTI", "asset_class": "commodity", "aliases": ["OIL", "WTI", "CL", "USOIL", "CRUDE", "CRUDEOIL", "OILUSD", "OILUSDT", "WTIUSDT"], "priority": 10},
+    {"asset_id": "NATGAS", "display_name": "Henry Hub Natural Gas", "asset_class": "commodity", "aliases": ["xyz:NATGAS", "NATGAS", "NATURALGAS", "NATURAL GAS", "HENRYHUB", "NG"], "priority": 16},
     # Exposure-equivalence groups.  Do not route raw prices between tokenised
     # ETF derivatives and commodity/HIP-3 products without a validated basis model.
     {"asset_id": "GOLD_PAXG", "display_name": "PAXG token derivatives", "asset_class": "commodity", "aliases": ["PAXGUSD", "PAXGUSDT", "PAXG"], "priority": 11},

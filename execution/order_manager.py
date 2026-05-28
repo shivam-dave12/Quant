@@ -2412,16 +2412,59 @@ class _HyperliquidAdapter:
         # for xyz:/km: instruments.
         return self.api.get_balance(self.symbol)
 
+    def _product_capability(self) -> Dict[str, Any]:
+        profiles = _cfg("HYPERLIQUID_PRODUCT_CAPABILITIES", {}) or {}
+        target = str(self.symbol or "").strip().upper()
+        if isinstance(profiles, dict):
+            for key, row in profiles.items():
+                if str(key).strip().upper() == target and isinstance(row, dict):
+                    mode = str(row.get("margin_mode", "")).strip().lower()
+                    if mode not in {"cross", "isolated"}:
+                        raise RuntimeError(f"Invalid Hyperliquid margin capability for {self.symbol}: {mode!r}")
+                    return {
+                        "margin_mode": mode,
+                        "max_leverage": int(row.get("max_leverage") or 0),
+                        "capability_source": str(row.get("capability_source") or "configured_verified_profile"),
+                        "verified": True,
+                    }
+        return {
+            "margin_mode": "cross" if bool(_cfg("HYPERLIQUID_USE_CROSS_MARGIN", True)) else "isolated",
+            "max_leverage": 0,
+            "capability_source": "legacy_default_unverified",
+            "verified": False,
+        }
+
     def set_leverage(self, leverage: int, product_id: Optional[int] = None) -> Dict:
         _ = product_id
-        self.limiter.wait()
-        resp = self.api.update_leverage(
-            self.symbol,
-            int(leverage),
-            is_cross=bool(getattr(config, "HYPERLIQUID_USE_CROSS_MARGIN", True)),
+        requested_leverage = max(1, int(leverage))
+        capability = self._product_capability()
+        max_leverage = int(capability.get("max_leverage") or 0)
+        effective_leverage = min(requested_leverage, max_leverage) if max_leverage > 0 else requested_leverage
+        margin_mode = str(capability["margin_mode"])
+        is_cross = margin_mode == "cross"
+        logger.info(
+            "HYPERLIQUID_CAPABILITY | symbol=%s margin_mode=%s cross_allowed=%s leverage_requested=%sx leverage_applied=%sx max_leverage=%s source=%s verified=%s",
+            self.symbol, margin_mode.upper(), is_cross, requested_leverage, effective_leverage,
+            max_leverage or "catalog/default", capability.get("capability_source"), capability.get("verified"),
         )
+        self.limiter.wait()
+        resp = self.api.update_leverage(self.symbol, effective_leverage, is_cross=is_cross)
         ok = isinstance(resp, dict) and str(resp.get("status", "")).lower() == "ok"
-        return {"success": ok, "leverage": int(leverage), "raw": resp}
+        if not ok and is_cross and "cross margin is not allowed" in str(resp).lower():
+            logger.error(
+                "HYPERLIQUID_CAPABILITY_REJECTED | symbol=%s attempted_mode=CROSS action=BLOCK_NO_RETRY reason=cross_margin_not_allowed",
+                self.symbol,
+            )
+        return {
+            "success": ok,
+            "leverage": effective_leverage,
+            "requested_leverage": requested_leverage,
+            "margin_mode": margin_mode.upper(),
+            "is_cross": is_cross,
+            "capability_verified": bool(capability.get("verified")),
+            "capability_source": capability.get("capability_source"),
+            "raw": resp,
+        }
 
     def normalise_position(self, raw) -> Optional[Dict]:
         positions = raw.get("assetPositions", []) if isinstance(raw, dict) else []

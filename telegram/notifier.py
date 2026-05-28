@@ -120,7 +120,7 @@ _worker_lock: threading.Lock = threading.Lock()
 _MIN_INTERVAL = 1.2
 _MAX_RETRIES  = 4
 
-# Watchdog uses these counters via /watchdog_status and notifier_queue_depth check
+# Outbound queue drop counters for diagnostics and operator reporting.
 _dropped_routine: int   = 0
 _dropped_important: int = 0
 
@@ -139,7 +139,7 @@ def _classify_priority(message: str) -> int:
         return PRIO_CRITICAL
     if any(tag in upper for tag in (
         "ENTRY", "EXIT", "TRADE OPEN", "TRADE CLOSED",
-        "POSITION ADOPTED", "WATCHDOG HEAL", "WATCHDOG CIRCUIT",
+        "POSITION ADOPTED",
         "market_state_DECISION", "INSTITUTIONAL_ORDER_THESIS", "INSTITUTIONAL_market_state",
         "STRUCTURAL SL", "LIQUIDITY TARGET", "EXACT-FILL",
     )):
@@ -503,7 +503,7 @@ def send_telegram_message(message: str, parse_mode: str = "HTML", *, instrument=
 
 
 def get_queue_stats() -> Dict[str, Any]:
-    """Watchdog and /diagnostics introspection."""
+    """Outbound notifier queue diagnostics."""
     try:
         depth = _send_queue.qsize()
     except Exception:
@@ -937,12 +937,6 @@ _TELEGRAM_SUPPRESS_PATTERNS: List[str] = [
     "Delta REST refresh ",
     "candles stale age=",
     "starting REST self-heal",
-    # Watchdog daily-counter consistency check — a known false-positive
-    # comparison (gate counts ENTRIES; risk_manager counts COMPLETED
-    # trades, or may not even track the same field). Fires every 5 min
-    # while a position is open. Diagnostic only, no auto-heal path.
-    "daily_counter_consistency",
-    "daily counter drift",
     # Structural liquidity_event-quality deferrals are INFO-level decision context and
     # should never be duplicated as Telegram WARNING notifications.
     "liquidity_event QUALITY IMPAIRED [tf_quality]:",
@@ -954,9 +948,6 @@ _TELEGRAM_SUPPRESS_PATTERNS: List[str] = [
     "Telegram API HTTP",
     "getUpdates skipped",
     "Telegram connection error",
-    # 3. Watchdog stuck-flag self-heal: routine maintenance, not actionable
-    "watchdog[stuck_exit_completed]",
-    "watchdog[no_trades_after_first]",
     # 4. Notifier internal retry chatter — the queue/retry mechanism is
     #    its own observability layer; don't notify Telegram about Telegram
     #    being slow.
@@ -973,10 +964,6 @@ _TELEGRAM_SUPPRESS_PATTERNS: List[str] = [
     #    surfaced via the throttled trail Telegram update, no need for
     #    duplicate via log handler.
     "FibTrail dispatch blocked:",
-    # 7. Circuit-breaker steady state. The breaker trip/clear messages are
-    #    actionable; the per-entry "still frozen" state is local telemetry.
-    "Entries paused: watchdog circuit breaker is engaged",
-    "Entries still paused by watchdog circuit breaker",
 ]
 _TELEGRAM_SUPPRESS_LOCK = threading.Lock()
 

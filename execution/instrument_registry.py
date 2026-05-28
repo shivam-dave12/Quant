@@ -48,6 +48,15 @@ def _cfg(name: str, default):
     return getattr(config, name, default) if config is not None else default
 
 
+def _hyperliquid_product_capability(symbol: str) -> dict:
+    profiles = _cfg("HYPERLIQUID_PRODUCT_CAPABILITIES", {}) or {}
+    target = str(symbol or "").strip().upper()
+    for key, value in profiles.items() if isinstance(profiles, dict) else []:
+        if str(key).strip().upper() == target and isinstance(value, dict):
+            return dict(value)
+    return {}
+
+
 def _csv_symbols(raw) -> list[str]:
     if isinstance(raw, str):
         vals = raw.replace(";", ",").split(",")
@@ -503,8 +512,16 @@ class InstrumentRegistry:
                 sz_decimals = _safe_int(row.get("szDecimals"), 5)
                 lot_step = 10 ** (-max(0, min(8, sz_decimals)))
                 inferred_class = AssetClass.CRYPTO
-                if base in {"PAXG", "XAUT", "GOLD", "SILVER", "XAG"}:
+                if base in {"PAXG", "XAUT", "GOLD", "SILVER", "XAG", "CL", "WTIOIL", "NATGAS"}:
                     inferred_class = AssetClass.COMMODITY
+                capability = _hyperliquid_product_capability(name)
+                catalog_max_leverage = first_positive(_safe_float(row.get("maxLeverage")), _safe_float(row.get("max_leverage")))
+                verified_max_leverage = first_positive(_safe_float(capability.get("max_leverage"))) if capability else 0.0
+                max_leverage = (
+                    min(catalog_max_leverage, verified_max_leverage)
+                    if catalog_max_leverage > 0 and verified_max_leverage > 0
+                    else first_positive(catalog_max_leverage, verified_max_leverage)
+                )
                 ei = ExchangeInstrument(
                     exchange=ExchangeName.HYPERLIQUID,
                     symbol=name,
@@ -521,8 +538,8 @@ class InstrumentRegistry:
                     lot_step=lot_step,
                     min_qty=lot_step,
                     max_qty=0.0,
-                    max_leverage=first_positive(_safe_float(row.get("maxLeverage")), _safe_float(row.get("max_leverage"))),
-                    raw={**row, "perp_dex": dex, "settlement_currency": "USDC"},
+                    max_leverage=max_leverage,
+                    raw={**row, "perp_dex": dex, "settlement_currency": "USDC", "verified_margin_mode": capability.get("margin_mode", ""), "verified_capability_source": capability.get("capability_source", ""), "verified_max_leverage": verified_max_leverage},
                 )
                 keys = [normalise_symbol(name), normalise_symbol(base)]
                 for key in keys:

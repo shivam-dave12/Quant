@@ -330,9 +330,6 @@ class TelegramBotController:
             "pause", "resume", "balance", "killswitch",
             "set", "help", "huntstatus", "setexchange", "resetrisk",
             "pnl", "market", "risk", "equity", "sl", "tp",
-            "watchdog", "watchdog_status", "watchdog_heal",
-            "watchdog_heal_on", "watchdog_heal_off",
-            "watchdog_freeze", "watchdog_unfreeze",
             "groww", "groww_status",
         }
         if not t.startswith("/"):
@@ -380,18 +377,6 @@ class TelegramBotController:
             elif cmd == "/risk":                return self._cmd_risk()
             elif cmd == "/equity":              return self._cmd_equity()
             elif cmd in ("/sl", "/tp"):         return self._cmd_sl_tp()
-            elif cmd in ("/watchdog", "/watchdog_status"):
-                return self._cmd_watchdog_status()
-            elif cmd == "/watchdog_heal":
-                return self._cmd_watchdog_heal(args)
-            elif cmd == "/watchdog_heal_on":
-                return self._cmd_watchdog_heal("on")
-            elif cmd == "/watchdog_heal_off":
-                return self._cmd_watchdog_heal("off")
-            elif cmd == "/watchdog_freeze":
-                return self._cmd_watchdog_freeze()
-            elif cmd == "/watchdog_unfreeze":
-                return self._cmd_watchdog_unfreeze()
             elif cmd in ("/groww", "/groww_status"):
                 return self._cmd_groww_status()
             elif cmd in ("/groww_token", "/groww_refresh", "/groww_login", "/groww_otp"):
@@ -680,53 +665,6 @@ class TelegramBotController:
 
     # ================================================================
 
-    # ================================================================
-    # /watchdog
-    # ================================================================
-
-    def _get_watchdog(self):
-        global bot_instance, bot_running
-        if not bot_running or not bot_instance:
-            return None, "Bot not running."
-        wd = getattr(bot_instance, "watchdog", None)
-        if wd is None:
-            return None, "Watchdog not running."
-        return wd, ""
-
-    def _cmd_watchdog_status(self) -> str:
-        wd, err = self._get_watchdog()
-        if err:
-            return err
-        return wd.format_status_telegram()
-
-    def _cmd_watchdog_heal(self, args: str) -> str:
-        wd, err = self._get_watchdog()
-        if err:
-            return err
-        mode = (args or "").strip().lower()
-        if mode in ("on", "enable", "enabled", "true", "1"):
-            wd.set_auto_heal_enabled(True)
-            return "Watchdog auto-heal: ON"
-        if mode in ("off", "disable", "disabled", "false", "0"):
-            wd.set_auto_heal_enabled(False)
-            return "Watchdog auto-heal: OFF"
-        return f"Watchdog auto-heal is {'ON' if wd.auto_heal_enabled else 'OFF'}."
-
-    def _cmd_watchdog_freeze(self) -> str:
-        wd, err = self._get_watchdog()
-        if err:
-            return err
-        wd.breaker.trip(reason="manual Telegram freeze")
-        return "Watchdog circuit breaker: ENGAGED."
-
-    def _cmd_watchdog_unfreeze(self) -> str:
-        wd, err = self._get_watchdog()
-        if err:
-            return err
-        if not wd.breaker.engaged:
-            return "Watchdog circuit breaker already clear."
-        wd.breaker.clear(operator="telegram")
-        return "Watchdog circuit breaker: CLEARED."
 
     # ================================================================
     # /huntstatus
