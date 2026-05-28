@@ -469,10 +469,19 @@ DYNAMIC_OPTION_EXIT_THETA_TO_PREMIUM_PER_DAY = 0.08
 DYNAMIC_OPTION_CHEAP_VRP_THRESHOLD = -0.10
 DYNAMIC_OPTION_CHEAP_VRP_THETA_LIMIT = 0.12
 DYNAMIC_OPTION_THETA_DTE_LIMIT = 5.0
-# Alpha expiry is a live risk event: after expected residual edge no longer covers
-# execution/protection cost, a supervisor submits a reduce-only close while the
-# broker-native SL/TP stays armed until close-fill reconciliation is complete.
+# A modelled alpha horizon is a re-evaluation timestamp, never a market-close
+# instruction by itself.  A live position is closed early only after post-fill,
+# same-direction economics have been invalidated by repeated executable evidence
+# (or profitable residual-edge exhaustion) while native SL/TP remains armed.
 DYNAMIC_EXIT_AUTOMATED_EARLY_LIQUIDATION_ENABLED = True
+DYNAMIC_EXIT_CLOCK_HORIZON_IS_REASSESSMENT_ONLY = True
+DYNAMIC_EXIT_REQUIRE_LIVE_THESIS_CONFIRMATION = True
+# Three independent observations prevents a single transient order-book update
+# from liquidating a protected trade; duration is then derived from the fitted
+# signal half-life and observed sampling interval in the position's own model.
+DYNAMIC_EXIT_MIN_CONSECUTIVE_CONFIRMATIONS = 3
+DYNAMIC_EXIT_CONFIRMATION_HALF_LIFE_FRACTION = 1.0
+DYNAMIC_EXIT_PROFIT_CAPTURE_REQUIRES_COST_COVERAGE = True
 DYNAMIC_EXIT_REDUCE_ONLY_RETRY_SEC = 1.0
 DYNAMIC_EXIT_MAX_SUBMISSION_ATTEMPTS = 5
 DYNAMIC_EXIT_CANCEL_RESIDUAL_PROTECTION_AFTER_CONFIRMED_FLAT = True

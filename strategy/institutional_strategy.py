@@ -2143,24 +2143,169 @@ class InstitutionalStrategy:
             pass
         return True
 
-    def _dynamic_exit_supervision(self, data_manager, order_manager) -> None:
-        """Promote expired alpha into a protected lifecycle exit request.
+    def _dynamic_exit_live_state(self, data_manager) -> dict[str, Any]:
+        """Measure whether the live, executable thesis still supports an open position.
 
-        The market-event thread calculates whether residual alpha still covers
-        execution cost; it never performs broker I/O. Once the horizon expires,
-        the reconciliation supervisor submits a reduce-only close while the
-        venue-native SL/TP remains armed until a closing fill is identified.
+        This is deliberately a read-only market-state calculation. It consumes the
+        already-normalised in-memory venue microstates and candle caches used for entry
+        decisions; it does not call broker position/order endpoints and cannot issue an
+        order on the quote-processing thread.
+        """
+        venue = str(self._pos.exchange or "").lower()
+        instrument = str(self._pos.execution_symbol or self._asset_id)
+        states = self._venue_states(data_manager)
+        if venue not in states:
+            return {"ready": False, "reason": "selected_venue_live_microstate_unavailable", "venue": venue}
+        feed_health = self._feed_health(data_manager)
+        execution_state, btc_composite = self._microstructure_context(
+            data_manager, venue, instrument, feed_health, states=states,
+        )
+        if execution_state is None or not execution_state.usable_for_decision:
+            return {"ready": False, "reason": "selected_venue_execution_microstate_unhealthy", "venue": venue}
+        market_states: dict[str, VenueMarketState] = {}
+        if bool(_cfg("INSTITUTIONAL_ENABLE_MARKET_STATE_ALPHA", True)):
+            market_states = self._market_state_engine.build(data_manager, states)
+        cross_venue_evidence = (
+            build_continuous_cross_venue_evidence(self._asset_id, market_states, states)
+            if self._asset_id.upper() == "BTC" and market_states else None
+        )
+        composite_decision = (
+            self._composite_bus.build_decision(asset_id=self._asset_id, market_states=market_states, microstates=states)
+            if bool(_cfg("INSTITUTIONAL_COMPOSITE_INTELLIGENCE_ENABLED", True)) and market_states else None
+        )
+        mark = float(execution_state.mid or 0.0) or self._safe_price(data_manager)
+        if mark <= 0:
+            return {"ready": False, "reason": "selected_venue_mark_unavailable", "venue": venue}
+        liquidity_score, _ = self._liquidity_score(data_manager, instrument, mark, execution_state=execution_state)
+        direction, edge_bps, direction_reason, breakdown = self._direction_and_edge(
+            self._desk_id(venue, instrument), mark, liquidity_score,
+            execution_state=execution_state, btc_composite=btc_composite,
+            market_state=market_states.get(venue), cross_venue_evidence=cross_venue_evidence,
+            composite_decision=composite_decision,
+        )
+        position_direction = Direction.LONG if str(self._pos.side).lower() == "long" else Direction.SHORT
+        aligned = direction is position_direction
+        opposed = direction not in (Direction.NO_TRADE,) and direction is not position_direction
+        live_cost = float(self._execution_cost_components(data_manager, execution_state=execution_state).get("total_cost_bps", 0.0))
+        recorded_costs = self._pos.quant_components.get("execution_cost_components", {}) if isinstance(self._pos.quant_components, dict) else {}
+        recorded_exit_proxy = _num(recorded_costs.get("total_cost_bps"), 0.0) if isinstance(recorded_costs, Mapping) else 0.0
+        # Use the more conservative of the live touch estimate and the recorded
+        # selected-route cost proxy; an early exit must earn its incremental cost.
+        unwind_cost_bps = max(live_cost, recorded_exit_proxy)
+        regime = self._market_state_regime(market_states.get(venue), self._regime())
+        uncertainty_bps = self._uncertainty_bps(regime, liquidity_score, float(execution_state.feed_quality_score or 0.0))
+        uncertainty_bps += max(0.0, _num(breakdown.get("cross_venue_uncertainty_bps"), 0.0))
+        side_sign = 1.0 if position_direction is Direction.LONG else -1.0
+        mark_move_bps = side_sign * ((mark / max(self._pos.entry_price, 1e-9)) - 1.0) * 10_000.0
+        retained_net_edge_bps = float(edge_bps) - unwind_cost_bps - uncertainty_bps if aligned else -unwind_cost_bps - uncertainty_bps
+        opposing_net_edge_bps = float(edge_bps) - unwind_cost_bps - uncertainty_bps if opposed else 0.0
+        return {
+            "ready": True,
+            "reason": direction_reason,
+            "venue": venue,
+            "mark": mark,
+            "direction": direction.value,
+            "position_direction": position_direction.value,
+            "aligned": bool(aligned),
+            "opposed": bool(opposed),
+            "gross_edge_bps": float(edge_bps),
+            "retained_net_edge_bps": retained_net_edge_bps,
+            "opposing_net_edge_bps": opposing_net_edge_bps,
+            "mark_move_bps": mark_move_bps,
+            "mark_after_unwind_cost_bps": mark_move_bps - unwind_cost_bps,
+            "unwind_cost_bps": unwind_cost_bps,
+            "uncertainty_bps": uncertainty_bps,
+        }
+
+    def _dynamic_exit_supervision(self, data_manager, order_manager) -> None:
+        """Validate post-entry thesis deterioration before requesting early exit.
+
+        The V12 defect treated an entry-time AR(1) cost-crossing estimate as a
+        liquidation timer. That can close a newly protected trade seconds after fill.
+        In this implementation the estimated horizon only arms a live re-assessment.
+        An automated close requires sequential, post-fill executable evidence that the
+        position thesis has reversed, or that profitable capture is complete and no
+        residual edge remains. Broker I/O still belongs solely to the reconciliation
+        supervisor and native hard protection is never removed before confirmed flat.
         """
         if self._pos.is_flat() or self._pos.phase is not PositionPhase.ACTIVE:
             return
         components = self._pos.quant_components if isinstance(self._pos.quant_components, dict) else {}
         plan = components.get("dynamic_protection_plan") or {}
         elapsed = max(0.0, time.time() - float(self._pos.entry_time or time.time()))
-        exit_reasons: list[str] = []
+        actionable_reasons: list[str] = []
         decay = plan.get("signal_decay") if isinstance(plan, Mapping) else {}
         optimal_hold = _num((decay or {}).get("optimal_hold_sec"), 0.0) if isinstance(decay, Mapping) else 0.0
-        if optimal_hold > 0 and elapsed >= optimal_hold:
-            exit_reasons.append("signal_alpha_cost_crossing_horizon_reached")
+        half_life = _num((decay or {}).get("half_life_sec"), 0.0) if isinstance(decay, Mapping) else 0.0
+        observation_interval = max(0.05, _num((decay or {}).get("observation_interval_sec"), 1.0)) if isinstance(decay, Mapping) else 1.0
+        horizon_crossed = bool(optimal_hold > 0.0 and elapsed >= optimal_hold)
+        confirmation_state = components.setdefault("dynamic_exit_validation", {})
+        live_state: dict[str, Any] = {}
+        if horizon_crossed:
+            if not confirmation_state.get("reassessment_armed_logged"):
+                confirmation_state["reassessment_armed_logged"] = True
+                logger.warning(
+                    "🧮 DYNAMIC_EXIT_REASSESSMENT_ARMED %s",
+                    json.dumps({
+                        "asset": self._pos.asset_id, "venue": self._pos.exchange,
+                        "symbol": self._pos.execution_symbol, "side": self._pos.side,
+                        "elapsed_sec": round(elapsed, 3), "model_horizon_sec": round(optimal_hold, 3),
+                        "action": "observe_live_thesis_not_liquidate",
+                        "clock_only_liquidation_disabled": bool(_cfg("DYNAMIC_EXIT_CLOCK_HORIZON_IS_REASSESSMENT_ONLY", True)),
+                        "hard_protection_remains_active": True,
+                    }, sort_keys=True, separators=(",", ":"), default=str),
+                )
+            live_state = self._dynamic_exit_live_state(data_manager)
+            confirmation_state["latest_live_state"] = live_state
+            if bool(live_state.get("ready", False)):
+                observation_gap = max(0.05, observation_interval * 0.80)
+                now = time.time()
+                if now - _num(confirmation_state.get("last_observation_ts"), 0.0) >= observation_gap:
+                    confirmation_state["last_observation_ts"] = now
+                    classification = ""
+                    if bool(live_state.get("opposed")) and _num(live_state.get("opposing_net_edge_bps"), 0.0) > 0.0:
+                        classification = "opposing_executable_alpha"
+                    else:
+                        absent = (
+                            str(live_state.get("direction")) == Direction.NO_TRADE.value
+                            or _num(live_state.get("retained_net_edge_bps"), -1.0) <= 0.0
+                        )
+                        captured = _num(live_state.get("mark_after_unwind_cost_bps"), -1.0) > 0.0
+                        require_capture = bool(_cfg("DYNAMIC_EXIT_PROFIT_CAPTURE_REQUIRES_COST_COVERAGE", True))
+                        if absent and (captured or not require_capture):
+                            classification = "captured_profit_without_residual_alpha"
+                    observations = confirmation_state.setdefault("observations", [])
+                    if classification:
+                        if observations and observations[-1].get("classification") != classification:
+                            observations.clear()
+                        observations.append({"ts": now, "classification": classification, "live": live_state})
+                        max_keep = max(3, int(_cfg("DYNAMIC_EXIT_MIN_CONSECUTIVE_CONFIRMATIONS", 3))) + 2
+                        del observations[:-max_keep]
+                    else:
+                        observations.clear()
+                observations = confirmation_state.get("observations", [])
+                required_observations = max(3, int(_cfg("DYNAMIC_EXIT_MIN_CONSECUTIVE_CONFIRMATIONS", 3)))
+                horizon_fraction = max(0.0, float(_cfg("DYNAMIC_EXIT_CONFIRMATION_HALF_LIFE_FRACTION", 1.0)))
+                required_span = max(
+                    observation_interval * float(required_observations - 1),
+                    min(max(half_life * horizon_fraction, observation_interval), max(optimal_hold, observation_interval)),
+                )
+                confirmation_state["required_observations"] = required_observations
+                confirmation_state["required_span_sec"] = required_span
+                if len(observations) >= required_observations:
+                    span = float(observations[-1]["ts"] - observations[0]["ts"])
+                    if span >= required_span:
+                        classification = str(observations[-1].get("classification") or "")
+                        if classification == "opposing_executable_alpha":
+                            actionable_reasons.append("confirmed_opposing_executable_alpha_after_horizon")
+                        elif classification == "captured_profit_without_residual_alpha":
+                            actionable_reasons.append("confirmed_profit_capture_residual_alpha_exhausted")
+            elif not confirmation_state.get("live_state_unavailable_logged"):
+                confirmation_state["live_state_unavailable_logged"] = True
+                logger.warning(
+                    "DYNAMIC_EXIT_REASSESSMENT_PENDING asset=%s venue=%s reason=%s; clock expiry alone cannot liquidate; native hard protection remains active",
+                    self._pos.asset_id, self._pos.exchange, str(live_state.get("reason") or "live_state_not_ready"),
+                )
 
         option_diag: dict[str, Any] = {}
         if str(self._pos.exchange or "").lower() == "groww":
@@ -2173,38 +2318,33 @@ class InstitutionalStrategy:
                     current_delta = live.get("current_delta")
                     abs_delta = abs(float(current_delta)) if current_delta is not None and math.isfinite(float(current_delta)) else None
                     diag = self._protection_engine.option_exit_diagnostics(
-                        abs_delta=abs_delta,
-                        current_iv=live.get("current_iv"),
+                        abs_delta=abs_delta, current_iv=live.get("current_iv"),
                         entry_iv=entry_state.get("iv") if isinstance(entry_state, Mapping) else None,
                         theta_to_premium_per_day=live.get("current_theta_to_premium"),
-                        dte=live.get("dte"),
-                        vrp=vol_ctx.get("vrp") if isinstance(vol_ctx, Mapping) else None,
+                        dte=live.get("dte"), vrp=vol_ctx.get("vrp") if isinstance(vol_ctx, Mapping) else None,
                     )
                     option_diag = asdict(diag)
                     components["dynamic_option_exit_state"] = option_diag
-                    exit_reasons.extend(list(diag.reasons) if diag.exit_required else [])
+                    actionable_reasons.extend(list(diag.reasons) if diag.exit_required else [])
                 except Exception as exc:
                     option_diag = {"ready": False, "reason": f"option_exit_diagnostics_error:{exc}"}
                     components["dynamic_option_exit_state"] = option_diag
 
-        if not exit_reasons:
+        if not actionable_reasons:
             return
-        deduped_reasons = sorted(set(exit_reasons))
+        deduped_reasons = sorted(set(actionable_reasons))
         key = "dynamic_exit_alerted:" + "|".join(deduped_reasons)
         if components.get(key):
             return
         components[key] = True
         auto_enabled = bool(_cfg("DYNAMIC_EXIT_AUTOMATED_EARLY_LIQUIDATION_ENABLED", False))
         payload = {
-            "asset": self._pos.asset_id,
-            "venue": self._pos.exchange,
-            "symbol": self._pos.execution_symbol,
-            "side": self._pos.side,
+            "asset": self._pos.asset_id, "venue": self._pos.exchange,
+            "symbol": self._pos.execution_symbol, "side": self._pos.side,
             "elapsed_sec": round(elapsed, 3),
-            "optimal_hold_sec": round(optimal_hold, 3) if optimal_hold > 0 else None,
-            "reasons": deduped_reasons,
-            "option_exit": option_diag,
-            "automated_early_liquidation_enabled": auto_enabled,
+            "model_horizon_sec": round(optimal_hold, 3) if optimal_hold > 0 else None,
+            "reasons": deduped_reasons, "live_confirmation": live_state,
+            "option_exit": option_diag, "automated_early_liquidation_enabled": auto_enabled,
             "hard_protection_remains_active": True,
         }
         logger.warning("🧮 DYNAMIC_EXIT_SIGNAL %s", json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str))
@@ -2215,8 +2355,6 @@ class InstitutionalStrategy:
                     self._pos.dynamic_exit_reasons = tuple(deduped_reasons)
                     self._pos.dynamic_exit_requested_at = time.time()
                     self._pos.manual_exit_reason = "dynamic_exit:" + ",".join(deduped_reasons)
-            # Broker I/O belongs to the reconciliation supervisor, not this
-            # quote-processing callback. Hard protection stays live immediately.
             self._position_reconcile_wakeup.set()
             logger.warning(
                 "DYNAMIC_EXIT_ENQUEUED asset=%s venue=%s reasons=%s protection_retained=true",
