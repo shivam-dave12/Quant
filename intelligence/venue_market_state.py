@@ -251,11 +251,16 @@ class VenueMarketStateEngine:
             prior_low = min((_low(row) for row in prev_rows if _low(row) > 0), default=0.0)
             acceptance_bps = 0.0
             mid = float(state.mid or 0.0)
-            if prior_high > 0 and mid > prior_high:
-                acceptance_bps = min(_return_bps(mid, prior_high), params["max_alpha_bps"])
-            elif prior_low > 0 and mid < prior_low:
-                acceptance_bps = -min(abs(_return_bps(mid, prior_low)), params["max_alpha_bps"])
+            # Structural acceptance must be confirmed by a CLOSED parent bar.
+            # The former mid-vs-range test converted an intrabar impulse into
+            # parent trend alpha and caused BTC entries on transient queue flow.
+            confirmed_parent_close = closes_1m[-1] if closes_1m else 0.0
+            if prior_high > 0 and confirmed_parent_close > prior_high:
+                acceptance_bps = min(_return_bps(confirmed_parent_close, prior_high), params["max_alpha_bps"])
+            elif prior_low > 0 and confirmed_parent_close < prior_low:
+                acceptance_bps = -min(abs(_return_bps(confirmed_parent_close, prior_low)), params["max_alpha_bps"])
             live_blend = 0.55 * live.get("30s", 0.0) + 0.45 * live.get("60s", 0.0)
+            parent_state_id = f"{venue_key}:{len(candles_1m)}:{confirmed_parent_close:.8f}:{r_bar_5m:.6f}:{r_bar_15m:.6f}"
             # Bayesian-style shrinkage: directional persistence and volatility
             # expansion increase the fraction of observed drift treated as
             # executable continuation; noisy disagreement shrinks toward zero.
@@ -264,7 +269,8 @@ class VenueMarketStateEngine:
             confidence = _clamp(persistence * expansion_confidence, params["min_confidence"], 1.0)
             structural_alpha = params["capture_rate"] * weighted_drift * confidence
             structural_alpha += params["acceptance_weight"] * acceptance_bps
-            structural_alpha += params["live_impulse_weight"] * live_blend * confidence
+            # Live impulse is child execution-timing evidence only. It is kept
+            # in diagnostics but cannot create or reverse a parent thesis.
             alpha = _clamp(structural_alpha, -params["max_alpha_bps"], params["max_alpha_bps"])
             z_drift = abs(weighted_drift) / max(robust_vol, 1e-9)
             if expansion_ratio >= 1.35 and z_drift >= 2.0:
@@ -282,7 +288,9 @@ class VenueMarketStateEngine:
                 robust_one_minute_vol_bps=robust_vol, volatility_expansion_ratio=expansion_ratio,
                 acceptance_bps=acceptance_bps, live_impulse_bps=live,
                 diagnostics={"weighted_drift_bps": weighted_drift, "sign_agreement": sign_agreement, "z_drift": z_drift,
-                             "active_bar_excluded": True,
+                             "active_bar_excluded": True, "acceptance_source": "latest_closed_1m_close",
+                             "live_impulse_is_timing_only": True, "live_blend_bps_diagnostic": live_blend,
+                             "parent_state_id": parent_state_id,
                              "closed_candle_counts": {"1m": len(candles_1m), "5m": len(candles_5m), "15m": len(candles_15m)}},
             )
         return results

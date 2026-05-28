@@ -112,7 +112,8 @@ def test_cross_venue_disagreement_is_uncertainty_not_hard_veto(monkeypatch, tmp_
     )
     assert direction is Direction.LONG
     assert edge > 0
-    assert reason == "market_state_flow_long"
+    assert reason == "parent_structural_thesis_long_child_timing_validated"
+    assert breakdown["signal_architecture"] == "parent_structural_thesis_child_execution_timing_v1"
     assert breakdown["cross_venue_uncertainty_bps"] > 0
     assert breakdown["cross_venue_confidence_multiplier"] > 0
 

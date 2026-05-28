@@ -124,9 +124,13 @@ def test_strategy_direction_consumes_collective_execution_alpha_without_local_do
     )
     assert direction is Direction.LONG
     assert edge > 0
-    assert breakdown["weighted_signal_bps"] == 14.0
-    assert breakdown["collective_transferable_total_alpha_bps"] == 14.0
-    assert breakdown["local_execution_timing_alpha_bps"] == 0.0
+    # Parent structural alpha originates the trade; child flow may add at most
+    # 35% of the parent and can never originate or reverse it.
+    assert breakdown["weighted_signal_bps"] == 10.8
+    assert breakdown["parent_structural_alpha_bps"] == 8.0
+    assert breakdown["child_timing_alpha_bps"] == 6.0
+    assert breakdown["child_timing_contribution_bps"] == 2.8
+    assert breakdown["microstructure_cannot_originate_or_flip_thesis"] is True
 
 
 def test_config_requires_product_aware_factor_routing_policy():

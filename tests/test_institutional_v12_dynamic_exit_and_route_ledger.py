@@ -47,75 +47,66 @@ class _Data:
     pass
 
 
-def test_alpha_horizon_only_arms_reassessment_and_never_liquidates_without_live_confirmation(monkeypatch):
+def test_alpha_horizon_is_telemetry_only_and_microstructure_reversal_cannot_liquidate_btc(monkeypatch):
     monkeypatch.setattr(
         "strategy.institutional_strategy._cfg",
         lambda name, default: {
             "DYNAMIC_EXIT_AUTOMATED_EARLY_LIQUIDATION_ENABLED": True,
-            "DYNAMIC_EXIT_CLOCK_HORIZON_IS_REASSESSMENT_ONLY": True,
+            "DYNAMIC_EXIT_PARENT_STRUCTURE_ONLY": True,
+            "DYNAMIC_EXIT_MIN_DISTINCT_PARENT_OBSERVATIONS": 2,
         }.get(name, default),
     )
     strategy = InstitutionalStrategy(instrument=None)
+    strategy._asset_id = "BTC"
     strategy._pos = PositionState(
-        phase=PositionPhase.ACTIVE,
-        side="long",
-        quantity=0.00055,
-        entry_price=73170.0,
-        sl_price=72950.0,
-        tp_price=73700.0,
-        entry_time=time.time() - 8.0,
-        exchange="hyperliquid",
-        execution_symbol="BTC",
-        asset_id="BTC",
+        phase=PositionPhase.ACTIVE, side="long", quantity=0.00055,
+        entry_price=73170.0, sl_price=72950.0, tp_price=73700.0,
+        entry_time=time.time() - 8.0, exchange="hyperliquid", execution_symbol="BTC", asset_id="BTC",
         protection_confirmed=True,
-        quant_components={"dynamic_protection_plan": {"signal_decay": {"optimal_hold_sec": 7.093, "half_life_sec": 3.0, "observation_interval_sec": 1.0}}},
+        quant_components={"dynamic_protection_plan": {"signal_decay": {"optimal_hold_sec": 1.0}}},
     )
-
+    # A violently opposed child tape is deliberately not sufficient.  The
+    # parent state has not reversed, so the broker must remain protected/open.
+    strategy._dynamic_exit_live_state = lambda data: {
+        "ready": True, "direction": "SHORT", "opposed": True, "opposing_net_edge_bps": 50.0,
+        "parent_state_id": "btc-parent-101", "parent_structure_opposed": False,
+        "parent_opposing_net_edge_bps": 0.0,
+    }
     strategy._dynamic_exit_supervision(_Data(), _NoBrokerIoOnTick())
-
     assert strategy._pos.dynamic_exit_requested is False
     assert strategy._pos.dynamic_exit_order_id == ""
     assert strategy._pos.phase is PositionPhase.ACTIVE
     assert strategy._position_reconcile_wakeup.is_set() is False
-    assert strategy._pos.quant_components["dynamic_exit_validation"]["reassessment_armed_logged"] is True
+    assert strategy._pos.quant_components["dynamic_exit_validation"]["structural_monitor_logged"] is True
 
 
-def test_confirmed_opposing_executable_alpha_enqueues_reconciled_exit_only_after_sequence(monkeypatch):
-    clock = [100.0]
-    monkeypatch.setattr("strategy.institutional_strategy.time.time", lambda: clock[0])
+def test_distinct_parent_structural_reversals_enqueue_reconciled_exit(monkeypatch):
     monkeypatch.setattr(
         "strategy.institutional_strategy._cfg",
         lambda name, default: {
             "DYNAMIC_EXIT_AUTOMATED_EARLY_LIQUIDATION_ENABLED": True,
-            "DYNAMIC_EXIT_CLOCK_HORIZON_IS_REASSESSMENT_ONLY": True,
-            "DYNAMIC_EXIT_MIN_CONSECUTIVE_CONFIRMATIONS": 3,
-            "DYNAMIC_EXIT_CONFIRMATION_HALF_LIFE_FRACTION": 1.0,
+            "DYNAMIC_EXIT_PARENT_STRUCTURE_ONLY": True,
+            "DYNAMIC_EXIT_MIN_DISTINCT_PARENT_OBSERVATIONS": 2,
         }.get(name, default),
     )
     strategy = InstitutionalStrategy(instrument=None)
+    strategy._asset_id = "BTC"
     strategy._pos = PositionState(
         phase=PositionPhase.ACTIVE, side="short", quantity=0.00055,
         entry_price=73170.0, sl_price=73400.0, tp_price=72600.0,
-        entry_time=90.0, exchange="hyperliquid", execution_symbol="BTC", asset_id="BTC",
-        protection_confirmed=True,
-        quant_components={"dynamic_protection_plan": {"signal_decay": {"optimal_hold_sec": 5.0, "half_life_sec": 0.2, "observation_interval_sec": 0.1}}},
+        entry_time=time.time() - 20.0, exchange="hyperliquid", execution_symbol="BTC", asset_id="BTC",
+        protection_confirmed=True, quant_components={"dynamic_protection_plan": {"signal_decay": {"optimal_hold_sec": 1.0}}},
     )
+    parent_ids = iter(["closed-parent-1", "closed-parent-2"])
     strategy._dynamic_exit_live_state = lambda data: {
-        "ready": True, "direction": "LONG", "opposed": True,
-        "opposing_net_edge_bps": 5.0, "retained_net_edge_bps": -9.0,
-        "mark_after_unwind_cost_bps": -2.0,
+        "ready": True, "parent_state_id": next(parent_ids),
+        "parent_structure_opposed": True, "parent_opposing_net_edge_bps": 5.0,
     }
-
     strategy._dynamic_exit_supervision(_Data(), _NoBrokerIoOnTick())
     assert strategy._pos.dynamic_exit_requested is False
-    clock[0] += 0.11
     strategy._dynamic_exit_supervision(_Data(), _NoBrokerIoOnTick())
-    assert strategy._pos.dynamic_exit_requested is False
-    clock[0] += 0.11
-    strategy._dynamic_exit_supervision(_Data(), _NoBrokerIoOnTick())
-
     assert strategy._pos.dynamic_exit_requested is True
-    assert strategy._pos.dynamic_exit_reasons == ("confirmed_opposing_executable_alpha_after_horizon",)
+    assert strategy._pos.dynamic_exit_reasons == ("confirmed_parent_structural_invalidation",)
     assert strategy._position_reconcile_wakeup.is_set()
 
 

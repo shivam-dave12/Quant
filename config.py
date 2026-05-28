@@ -301,6 +301,12 @@ INSTITUTIONAL_MARKET_STATE_PARAMETERS = {
     "OIL": {"capture_rate": 0.22, "max_alpha_bps": 32.0, "acceptance_weight": 0.30, "live_impulse_weight": 0.15, "min_confidence": 0.30},
 }
 INSTITUTIONAL_MICROSTRUCTURE_ALPHA_CAP_BPS = {"BTC": 22.0, "GOLD_PAXG": 18.0, "GOLD_HL": 18.0, "SILVER_SLVON": 15.0, "SILVER_XAG": 18.0, "SILVER_HL": 18.0, "OIL": 18.0}
+# BTC parent/child signal hierarchy: closed-candle structural state originates
+# trades; order-book/tape flow may improve timing but cannot originate or flip
+# a directional thesis. This is a signal model, not an added retail veto layer.
+INSTITUTIONAL_PARENT_THESIS_EXECUTION_MODEL_ENABLED = True
+INSTITUTIONAL_PARENT_THESIS_ASSETS = ("BTC",)
+INSTITUTIONAL_PARENT_TIMING_CONTRIBUTION_CAP_FRACTION = 0.35
 # Venue disagreement raises uncertainty and scales confidence continuously. A
 # leader venue may still trade a genuine impulse before followers converge.
 INSTITUTIONAL_CROSS_VENUE_MODE = "continuous_confidence"
@@ -474,13 +480,19 @@ DYNAMIC_OPTION_THETA_DTE_LIMIT = 5.0
 # same-direction economics have been invalidated by repeated executable evidence
 # (or profitable residual-edge exhaustion) while native SL/TP remains armed.
 DYNAMIC_EXIT_AUTOMATED_EARLY_LIQUIDATION_ENABLED = True
+# The entry-time AR(1) estimate is telemetry for research and protective-order
+# geometry only. It is never an early-liquidation clock or a parent-thesis gate.
 DYNAMIC_EXIT_CLOCK_HORIZON_IS_REASSESSMENT_ONLY = True
 DYNAMIC_EXIT_REQUIRE_LIVE_THESIS_CONFIRMATION = True
-# Three independent observations prevents a single transient order-book update
-# from liquidating a protected trade; duration is then derived from the fitted
-# signal half-life and observed sampling interval in the position's own model.
-DYNAMIC_EXIT_MIN_CONSECUTIVE_CONFIRMATIONS = 3
-DYNAMIC_EXIT_CONFIRMATION_HALF_LIFE_FRACTION = 1.0
+DYNAMIC_EXIT_PARENT_STRUCTURE_ONLY = True
+DYNAMIC_EXIT_ALLOW_MICROSTRUCTURE_ONLY_INVALIDATION = False
+DYNAMIC_EXIT_ALLOW_RESIDUAL_ALPHA_PROFIT_CAPTURE = False
+# Each confirmation must represent a distinct closed parent-state observation,
+# never repeated evaluation of the same intrabar impulse. Native SL/TP protects
+# adverse motion while the structural thesis is being re-estimated.
+DYNAMIC_EXIT_MIN_DISTINCT_PARENT_OBSERVATIONS = 2
+DYNAMIC_EXIT_MIN_CONSECUTIVE_CONFIRMATIONS = 2
+DYNAMIC_EXIT_CONFIRMATION_HALF_LIFE_FRACTION = 0.0
 DYNAMIC_EXIT_PROFIT_CAPTURE_REQUIRES_COST_COVERAGE = True
 DYNAMIC_EXIT_REDUCE_ONLY_RETRY_SEC = 1.0
 DYNAMIC_EXIT_MAX_SUBMISSION_ATTEMPTS = 5

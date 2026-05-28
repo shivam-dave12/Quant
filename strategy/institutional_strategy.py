@@ -737,6 +737,13 @@ class InstitutionalStrategy:
                 "tfi_10s_usd": self._round_or_none(model.get("tfi_usd_10s"), 2),
                 "near_touch_depth_usd": self._round_or_none(model.get("near_touch_depth_usd"), 2),
                 "weighted_signal_bps": self._round_or_none(model.get("weighted_signal_bps")),
+                "signal_architecture": model.get("signal_architecture"),
+                "parent_structural_alpha_bps": self._round_or_none(model.get("parent_structural_alpha_bps")),
+                "parent_structural_uncertainty_bps": self._round_or_none(model.get("parent_structural_uncertainty_bps")),
+                "parent_state_id": model.get("parent_state_id"),
+                "child_timing_alpha_bps": self._round_or_none(model.get("child_timing_alpha_bps")),
+                "child_timing_contribution_bps": self._round_or_none(model.get("child_timing_contribution_bps")),
+                "microstructure_cannot_originate_or_flip_thesis": bool(model.get("microstructure_cannot_originate_or_flip_thesis", False)),
                 "signal_components_bps": {
                     "ofi": self._round_or_none(model.get("ofi_component_bps")),
                     "tfi": self._round_or_none(model.get("tfi_component_bps")),
@@ -2199,6 +2206,27 @@ class InstitutionalStrategy:
         mark_move_bps = side_sign * ((mark / max(self._pos.entry_price, 1e-9)) - 1.0) * 10_000.0
         retained_net_edge_bps = float(edge_bps) - unwind_cost_bps - uncertainty_bps if aligned else -unwind_cost_bps - uncertainty_bps
         opposing_net_edge_bps = float(edge_bps) - unwind_cost_bps - uncertainty_bps if opposed else 0.0
+        selected_parent = market_states.get(venue)
+        parent_structural_alpha_bps = (
+            float(composite_decision.transferable_structural_alpha_bps)
+            if composite_decision is not None and composite_decision.ready
+            else float(selected_parent.signed_alpha_bps) if selected_parent is not None and selected_parent.ready else 0.0
+        )
+        parent_structural_uncertainty_bps = (
+            float(composite_decision.diagnostics.get("execution_uncertainty_bps", 0.0) or 0.0)
+            if composite_decision is not None and composite_decision.ready
+            else float(selected_parent.uncertainty_bps) if selected_parent is not None and selected_parent.ready else 0.0
+        )
+        parent_sign = 1 if parent_structural_alpha_bps > 0 else -1 if parent_structural_alpha_bps < 0 else 0
+        position_sign = 1 if position_direction is Direction.LONG else -1
+        parent_opposed = bool(parent_sign and parent_sign == -position_sign and abs(parent_structural_alpha_bps) > parent_structural_uncertainty_bps)
+        parent_opposing_net_edge_bps = (
+            abs(parent_structural_alpha_bps) - unwind_cost_bps - parent_structural_uncertainty_bps
+            if parent_opposed else 0.0
+        )
+        parent_state_id = ""
+        if selected_parent is not None and isinstance(selected_parent.diagnostics, Mapping):
+            parent_state_id = str(selected_parent.diagnostics.get("parent_state_id") or "")
         return {
             "ready": True,
             "reason": direction_reason,
@@ -2211,6 +2239,12 @@ class InstitutionalStrategy:
             "gross_edge_bps": float(edge_bps),
             "retained_net_edge_bps": retained_net_edge_bps,
             "opposing_net_edge_bps": opposing_net_edge_bps,
+            "parent_state_id": parent_state_id,
+            "parent_structural_alpha_bps": parent_structural_alpha_bps,
+            "parent_structural_uncertainty_bps": parent_structural_uncertainty_bps,
+            "parent_structure_opposed": parent_opposed,
+            "parent_opposing_net_edge_bps": parent_opposing_net_edge_bps,
+            "microstructure_only_invalidation_disabled": True,
             "mark_move_bps": mark_move_bps,
             "mark_after_unwind_cost_bps": mark_move_bps - unwind_cost_bps,
             "unwind_cost_bps": unwind_cost_bps,
@@ -2218,15 +2252,13 @@ class InstitutionalStrategy:
         }
 
     def _dynamic_exit_supervision(self, data_manager, order_manager) -> None:
-        """Validate post-entry thesis deterioration before requesting early exit.
+        """Supervise a live position against its parent structural thesis.
 
-        The V12 defect treated an entry-time AR(1) cost-crossing estimate as a
-        liquidation timer. That can close a newly protected trade seconds after fill.
-        In this implementation the estimated horizon only arms a live re-assessment.
-        An automated close requires sequential, post-fill executable evidence that the
-        position thesis has reversed, or that profitable capture is complete and no
-        residual edge remains. Broker I/O still belongs solely to the reconciliation
-        supervisor and native hard protection is never removed before confirmed flat.
+        BTC cannot be closed by elapsed micro-alpha horizon, queue-flow reversal,
+        or repeated evaluation of one intrabar state.  Native SL/TP owns immediate
+        downside protection.  A discretionary reduce-only exit is permitted only
+        when distinct CLOSED parent-state observations establish an executable
+        opposing structural thesis.
         """
         if self._pos.is_flat() or self._pos.phase is not PositionPhase.ACTIVE:
             return
@@ -2236,76 +2268,55 @@ class InstitutionalStrategy:
         actionable_reasons: list[str] = []
         decay = plan.get("signal_decay") if isinstance(plan, Mapping) else {}
         optimal_hold = _num((decay or {}).get("optimal_hold_sec"), 0.0) if isinstance(decay, Mapping) else 0.0
-        half_life = _num((decay or {}).get("half_life_sec"), 0.0) if isinstance(decay, Mapping) else 0.0
-        observation_interval = max(0.05, _num((decay or {}).get("observation_interval_sec"), 1.0)) if isinstance(decay, Mapping) else 1.0
-        horizon_crossed = bool(optimal_hold > 0.0 and elapsed >= optimal_hold)
         confirmation_state = components.setdefault("dynamic_exit_validation", {})
         live_state: dict[str, Any] = {}
-        if horizon_crossed:
-            if not confirmation_state.get("reassessment_armed_logged"):
-                confirmation_state["reassessment_armed_logged"] = True
-                logger.warning(
-                    "🧮 DYNAMIC_EXIT_REASSESSMENT_ARMED %s",
+
+        parent_structure_only = bool(_cfg("DYNAMIC_EXIT_PARENT_STRUCTURE_ONLY", True)) and self._asset_id.upper() == "BTC"
+        if parent_structure_only:
+            if not confirmation_state.get("structural_monitor_logged"):
+                confirmation_state["structural_monitor_logged"] = True
+                logger.info(
+                    "🧮 DYNAMIC_EXIT_STRUCTURAL_MONITOR_ACTIVE %s",
                     json.dumps({
                         "asset": self._pos.asset_id, "venue": self._pos.exchange,
                         "symbol": self._pos.execution_symbol, "side": self._pos.side,
-                        "elapsed_sec": round(elapsed, 3), "model_horizon_sec": round(optimal_hold, 3),
-                        "action": "observe_live_thesis_not_liquidate",
-                        "clock_only_liquidation_disabled": bool(_cfg("DYNAMIC_EXIT_CLOCK_HORIZON_IS_REASSESSMENT_ONLY", True)),
-                        "hard_protection_remains_active": True,
+                        "elapsed_sec": round(elapsed, 3),
+                        "model_horizon_sec_telemetry_only": round(optimal_hold, 3) if optimal_hold > 0 else None,
+                        "microstructure_only_liquidation_disabled": True,
+                        "clock_only_liquidation_disabled": True,
+                        "native_protection_authority": "venue_attached_sl_tp",
                     }, sort_keys=True, separators=(",", ":"), default=str),
                 )
             live_state = self._dynamic_exit_live_state(data_manager)
             confirmation_state["latest_live_state"] = live_state
             if bool(live_state.get("ready", False)):
-                observation_gap = max(0.05, observation_interval * 0.80)
-                now = time.time()
-                if now - _num(confirmation_state.get("last_observation_ts"), 0.0) >= observation_gap:
-                    confirmation_state["last_observation_ts"] = now
-                    classification = ""
-                    if bool(live_state.get("opposed")) and _num(live_state.get("opposing_net_edge_bps"), 0.0) > 0.0:
-                        classification = "opposing_executable_alpha"
-                    else:
-                        absent = (
-                            str(live_state.get("direction")) == Direction.NO_TRADE.value
-                            or _num(live_state.get("retained_net_edge_bps"), -1.0) <= 0.0
-                        )
-                        captured = _num(live_state.get("mark_after_unwind_cost_bps"), -1.0) > 0.0
-                        require_capture = bool(_cfg("DYNAMIC_EXIT_PROFIT_CAPTURE_REQUIRES_COST_COVERAGE", True))
-                        if absent and (captured or not require_capture):
-                            classification = "captured_profit_without_residual_alpha"
-                    observations = confirmation_state.setdefault("observations", [])
-                    if classification:
-                        if observations and observations[-1].get("classification") != classification:
-                            observations.clear()
-                        observations.append({"ts": now, "classification": classification, "live": live_state})
-                        max_keep = max(3, int(_cfg("DYNAMIC_EXIT_MIN_CONSECUTIVE_CONFIRMATIONS", 3))) + 2
-                        del observations[:-max_keep]
-                    else:
+                evidence_id = str(live_state.get("parent_state_id") or "")
+                parent_invalidated = bool(live_state.get("parent_structure_opposed")) and _num(live_state.get("parent_opposing_net_edge_bps"), 0.0) > 0.0
+                observations = confirmation_state.setdefault("distinct_parent_observations", [])
+                if parent_invalidated and evidence_id:
+                    if not observations or str(observations[-1].get("parent_state_id")) != evidence_id:
+                        observations.append({"ts": time.time(), "parent_state_id": evidence_id, "live": live_state})
+                        del observations[:-max(2, int(_cfg("DYNAMIC_EXIT_MIN_DISTINCT_PARENT_OBSERVATIONS", 2)))]
+                elif evidence_id and (not parent_invalidated):
+                    # A fresh parent state still supporting, or not invalidating,
+                    # the position invalidates any previous reversal sequence.
+                    if not observations or str(observations[-1].get("parent_state_id")) != evidence_id:
                         observations.clear()
-                observations = confirmation_state.get("observations", [])
-                required_observations = max(3, int(_cfg("DYNAMIC_EXIT_MIN_CONSECUTIVE_CONFIRMATIONS", 3)))
-                horizon_fraction = max(0.0, float(_cfg("DYNAMIC_EXIT_CONFIRMATION_HALF_LIFE_FRACTION", 1.0)))
-                required_span = max(
-                    observation_interval * float(required_observations - 1),
-                    min(max(half_life * horizon_fraction, observation_interval), max(optimal_hold, observation_interval)),
-                )
-                confirmation_state["required_observations"] = required_observations
-                confirmation_state["required_span_sec"] = required_span
-                if len(observations) >= required_observations:
-                    span = float(observations[-1]["ts"] - observations[0]["ts"])
-                    if span >= required_span:
-                        classification = str(observations[-1].get("classification") or "")
-                        if classification == "opposing_executable_alpha":
-                            actionable_reasons.append("confirmed_opposing_executable_alpha_after_horizon")
-                        elif classification == "captured_profit_without_residual_alpha":
-                            actionable_reasons.append("confirmed_profit_capture_residual_alpha_exhausted")
-            elif not confirmation_state.get("live_state_unavailable_logged"):
-                confirmation_state["live_state_unavailable_logged"] = True
+                required = max(2, int(_cfg("DYNAMIC_EXIT_MIN_DISTINCT_PARENT_OBSERVATIONS", 2)))
+                confirmation_state["required_distinct_parent_observations"] = required
+                confirmation_state["observed_distinct_parent_invalidations"] = len(observations)
+                if len(observations) >= required:
+                    actionable_reasons.append("confirmed_parent_structural_invalidation")
+            elif not confirmation_state.get("parent_state_unavailable_logged"):
+                confirmation_state["parent_state_unavailable_logged"] = True
                 logger.warning(
-                    "DYNAMIC_EXIT_REASSESSMENT_PENDING asset=%s venue=%s reason=%s; clock expiry alone cannot liquidate; native hard protection remains active",
-                    self._pos.asset_id, self._pos.exchange, str(live_state.get("reason") or "live_state_not_ready"),
+                    "DYNAMIC_EXIT_STRUCTURAL_MONITOR_PENDING asset=%s venue=%s reason=%s; native hard protection remains active",
+                    self._pos.asset_id, self._pos.exchange, str(live_state.get("reason") or "parent_state_not_ready"),
                 )
+        else:
+            # Non-BTC desks keep their existing specialised exit diagnostics; the
+            # unsafe BTC micro-alpha invalidation pathway is not reused here.
+            live_state = {}
 
         option_diag: dict[str, Any] = {}
         if str(self._pos.exchange or "").lower() == "groww":
@@ -2596,6 +2607,83 @@ class InstitutionalStrategy:
             market_uncertainty_bps = float(market_state.uncertainty_bps)
             breakdown["venue_market_state"] = market_state.as_dict()
             breakdown["structural_alpha_authority"] = "venue_local_fallback"
+        # Parent/child alpha hierarchy for BTC.  A live OFI/TFI burst is a
+        # child timing observation, not an investable thesis.  Only confirmed
+        # closed-bar structural alpha may originate or reverse a BTC position.
+        parent_assets_raw = _cfg("INSTITUTIONAL_PARENT_THESIS_ASSETS", ("BTC",))
+        parent_assets = {str(x).upper() for x in (parent_assets_raw if isinstance(parent_assets_raw, (tuple, list, set)) else str(parent_assets_raw).split(","))}
+        parent_model_enabled = bool(_cfg("INSTITUTIONAL_PARENT_THESIS_EXECUTION_MODEL_ENABLED", True)) and self._asset_id.upper() in parent_assets
+        if parent_model_enabled:
+            parent_alpha_bps = float(structural_alpha_bps)
+            timing_alpha_bps = (
+                float(composite_decision.transferable_microstructure_alpha_bps)
+                if composite_decision is not None and composite_decision.ready
+                else float(robust_micro_signal_bps)
+            )
+            parent_sign = 1 if parent_alpha_bps > 0 else -1 if parent_alpha_bps < 0 else 0
+            parent_uncertainty_bps = max(0.0, float(market_uncertainty_bps))
+            if market_state is not None and market_state.ready:
+                parent_uncertainty_bps = max(parent_uncertainty_bps, float(market_state.uncertainty_bps or 0.0))
+            cap_fraction = max(0.0, min(0.95, float(_cfg("INSTITUTIONAL_PARENT_TIMING_CONTRIBUTION_CAP_FRACTION", 0.35))))
+            timing_cap_bps = abs(parent_alpha_bps) * cap_fraction
+            signed_timing_support_bps = parent_sign * timing_alpha_bps if parent_sign else 0.0
+            bounded_support_bps = max(-timing_cap_bps, min(timing_cap_bps, signed_timing_support_bps))
+            timing_contribution_bps = parent_sign * bounded_support_bps if parent_sign else 0.0
+            combined_signal_bps = parent_alpha_bps + timing_contribution_bps
+            parent_state_id = ""
+            if market_state is not None and isinstance(market_state.diagnostics, Mapping):
+                parent_state_id = str(market_state.diagnostics.get("parent_state_id") or "")
+            breakdown.update({
+                "signal_architecture": "parent_structural_thesis_child_execution_timing_v1",
+                "parent_structural_alpha_bps": parent_alpha_bps,
+                "parent_structural_uncertainty_bps": parent_uncertainty_bps,
+                "parent_state_id": parent_state_id,
+                "child_timing_alpha_bps": timing_alpha_bps,
+                "child_timing_contribution_bps": timing_contribution_bps,
+                "child_timing_cap_bps": timing_cap_bps,
+                "microstructure_cannot_originate_or_flip_thesis": True,
+                "raw_microstructure_signal_bps": raw_micro_signal_bps,
+                "robust_microstructure_alpha_bps": robust_micro_signal_bps,
+                "venue_local_market_state_alpha_bps": structural_alpha_bps,
+                "collective_transferable_microstructure_alpha_bps": float(composite_decision.transferable_microstructure_alpha_bps) if composite_decision is not None and composite_decision.ready else 0.0,
+                "collective_transferable_total_alpha_bps": combined_signal_bps,
+                "weighted_signal_bps": combined_signal_bps,
+                "ofi_component_bps": ofi_component_bps,
+                "tfi_component_bps": tfi_component_bps,
+                "microprice_component_bps": microprice_component_bps,
+                "dislocation_diagnostic_bps": dislocation_diagnostic_bps,
+                "dislocation_component_bps": 0.0,
+                "market_state_uncertainty_bps": parent_uncertainty_bps,
+            })
+            if parent_sign == 0 or abs(parent_alpha_bps) <= parent_uncertainty_bps:
+                breakdown["directional_edge_after_quality_liquidity_bps"] = 0.0
+                return Direction.NO_TRADE, 0.0, "parent_structural_thesis_not_established", breakdown
+            cross_confidence = 1.0
+            cross_uncertainty_bps = 0.0
+            if composite_decision is not None and composite_decision.ready:
+                cross_confidence = composite_decision.directional_confidence_multiplier(parent_sign)
+                cross_uncertainty_bps = composite_decision.contextual_uncertainty_for(parent_sign)
+                breakdown["collective_factor_policy"] = {
+                    "factor_id": composite_decision.factor_id,
+                    "execution_equivalence_group": composite_decision.equivalence_group,
+                    "factor_translation_enabled": composite_decision.basis_translation_enabled,
+                    "related_products_are_context_only": not composite_decision.basis_translation_enabled,
+                }
+            elif desk == DeskId.BTC.value and cross_venue_evidence is not None:
+                cross_confidence = cross_venue_evidence.confidence_for(venue_key, parent_sign)
+                cross_uncertainty_bps = cross_venue_evidence.uncertainty_for(venue_key)
+                breakdown["cross_venue_evidence"] = cross_venue_evidence.as_dict()
+            breakdown["cross_venue_confidence_multiplier"] = cross_confidence
+            breakdown["cross_venue_uncertainty_bps"] = cross_uncertainty_bps
+            edge = abs(combined_signal_bps) * max(0.0, min(1.0, execution_quality)) * max(0.0, min(1.0, liquidity_score)) * cross_confidence
+            breakdown["directional_edge_after_quality_liquidity_bps"] = edge
+            threshold = float(_cfg("INSTITUTIONAL_MIN_SIGNAL_BPS", 0.50))
+            if parent_sign > 0 and combined_signal_bps > threshold:
+                return Direction.LONG, edge, "parent_structural_thesis_long_child_timing_validated", breakdown
+            if parent_sign < 0 and combined_signal_bps < -threshold:
+                return Direction.SHORT, edge, "parent_structural_thesis_short_child_timing_validated", breakdown
+            return Direction.NO_TRADE, 0.0, "parent_structural_thesis_below_executable_strength", breakdown
+
         local_timing_confidence = 1.0
         local_timing_uncertainty_bps = 0.0
         if composite_decision is not None and composite_decision.ready:

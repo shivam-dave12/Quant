@@ -227,7 +227,7 @@ def test_shadow_mode_blocks_live_order_even_when_flow_edge_is_positive(tmp_path,
     def cfg(name, default):
         values = {"RESEARCH_STORE_PATH": str(tmp_path), "INSTITUTIONAL_ENABLE_LIVE_ENTRIES": False,
                   "INSTITUTIONAL_MIN_NET_EDGE_BPS": 0.1, "INSTITUTIONAL_MIN_SIGNAL_BPS": 0.01,
-                      "VENUE_SELECTION_ENABLED": False}
+                      "VENUE_SELECTION_ENABLED": False, "INSTITUTIONAL_PARENT_THESIS_EXECUTION_MODEL_ENABLED": False}
         return values.get(name, default)
     monkeypatch.setattr("strategy.institutional_strategy._cfg", cfg)
     strategy = InstitutionalStrategy(instrument=_instrument())
@@ -254,7 +254,7 @@ def test_price_walk_without_venue_local_structural_state_is_not_a_trade_signal(t
         decision = strategy.evaluate(data, _Orders(), _Risk(), i)
     assert decision is not None
     assert decision.direction.value == "NO_TRADE"
-    assert any(reason.startswith(("market_state_and_flow_flat", "venue_flow_disagreement")) for reason in decision.reasons)
+    assert any(reason.startswith(("parent_structural_thesis_not_established", "market_state_and_flow_flat", "venue_flow_disagreement")) for reason in decision.reasons)
 
 
 def test_live_entry_requires_protection_confirmation(tmp_path, monkeypatch):
@@ -266,7 +266,8 @@ def test_live_entry_requires_protection_confirmation(tmp_path, monkeypatch):
     def cfg(name, default):
         values = {"RESEARCH_STORE_PATH": str(tmp_path), "INSTITUTIONAL_ENABLE_LIVE_ENTRIES": True,
                   "INSTITUTIONAL_MIN_NET_EDGE_BPS": 0.1, "INSTITUTIONAL_MIN_SIGNAL_BPS": 0.01,
-                  "LEVERAGE": 2.0, "VENUE_SELECTION_ENABLED": False}
+                  "LEVERAGE": 2.0, "VENUE_SELECTION_ENABLED": False,
+                  "INSTITUTIONAL_PARENT_THESIS_EXECUTION_MODEL_ENABLED": False}
         return values.get(name, default)
     monkeypatch.setattr("strategy.institutional_strategy._cfg", cfg)
     strategy = InstitutionalStrategy(instrument=_instrument())
@@ -298,6 +299,7 @@ def test_live_entry_is_blocked_by_risk_manager_trade_gate(tmp_path, monkeypatch)
             "INSTITUTIONAL_MIN_SIGNAL_BPS": 0.01,
             "LEVERAGE": 2.0,
             "VENUE_SELECTION_ENABLED": False,
+            "INSTITUTIONAL_PARENT_THESIS_EXECUTION_MODEL_ENABLED": False,
         }
         return values.get(name, default)
 
@@ -771,9 +773,10 @@ def test_microstructure_telemetry_includes_weighted_edge_components(tmp_path, mo
         values["ofi_component_bps"] + values["tfi_component_bps"]
         + values["microprice_component_bps"]
     )) < 1e-9
-    assert abs(values["weighted_signal_bps"] - (
-        values["robust_microstructure_alpha_bps"] + values["venue_local_market_state_alpha_bps"]
-    )) < 1e-9
+    assert values["signal_architecture"] == "parent_structural_thesis_child_execution_timing_v1"
+    assert values["microstructure_cannot_originate_or_flip_thesis"] is True
+    assert values["weighted_signal_bps"] == 0.0
+    assert values["robust_microstructure_alpha_bps"] > 0.0
     assert values["dislocation_component_bps"] == 0.0
 
 
@@ -873,6 +876,7 @@ def test_current_venue_cannot_trade_when_route_model_values_it_at_a_loss(tmp_pat
             "INSTITUTIONAL_MIN_NET_EDGE_BPS": 0.1,
             "INSTITUTIONAL_MIN_SIGNAL_BPS": 0.01,
             "VENUE_SELECTION_MAX_COST_BPS": 100.0,
+            "INSTITUTIONAL_PARENT_THESIS_EXECUTION_MODEL_ENABLED": False,
         }.get(name, default)
 
     selected = SimpleNamespace(
