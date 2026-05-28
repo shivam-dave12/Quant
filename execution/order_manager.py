@@ -2956,6 +2956,65 @@ class OrderManager:
             logger.error(f"emergency_flatten error: {e}", exc_info=True)
             return None
 
+    def place_reconciled_reduce_only_exit(
+        self, *, reason: str, expected_side: str = "", expected_quantity: float = 0.0
+    ) -> Optional[Dict]:
+        """Submit a model-directed reduce-only close without disarming protection.
+
+        This is deliberately different from emergency flattening: the live
+        broker position is used as the quantity authority, but no generic
+        minimum-position shortcut may treat a small genuine BTC position as flat.
+        Existing venue-native SL/TP orders remain armed until a closing fill is
+        confirmed and the position is broker-flat.
+        """
+        try:
+            ex_pos = self.get_open_position()
+            if not isinstance(ex_pos, dict):
+                logger.error("Dynamic exit [%s]: broker position unavailable; close not submitted", reason)
+                return None
+            signed_size = float(ex_pos.get("size", 0.0) or 0.0)
+            ex_size = abs(signed_size)
+            if ex_size <= 0.0:
+                return {
+                    "status": "ALREADY_FLAT_RECONCILE_FILL",
+                    "exit_lifecycle": "ALREADY_FLAT_RECONCILE_FILL",
+                    "order_id": "",
+                    "reason": reason,
+                }
+            ex_side = str(ex_pos.get("side") or "").upper()
+            if ex_side not in {"LONG", "SHORT"}:
+                ex_side = "LONG" if signed_size > 0 else "SHORT" if signed_size < 0 else ""
+            if ex_side not in {"LONG", "SHORT"}:
+                logger.critical("Dynamic exit [%s] refused: broker position side cannot be resolved from %s", reason, ex_pos)
+                return None
+            expected = str(expected_side or "").upper()
+            if expected and expected != ex_side:
+                logger.critical(
+                    "Dynamic exit [%s] side mismatch strategy=%s broker=%s; using broker side as reduce-only authority",
+                    reason, expected, ex_side,
+                )
+            if expected_quantity > 0.0 and abs(ex_size - float(expected_quantity)) > max(1e-12, float(expected_quantity) * 1e-4):
+                logger.warning(
+                    "Dynamic exit [%s] quantity reconciliation strategy=%.12g broker=%.12g; closing broker-live residual",
+                    reason, float(expected_quantity), ex_size,
+                )
+            close_side = "SELL" if ex_side == "LONG" else "BUY"
+            logger.warning(
+                "DYNAMIC REDUCE-ONLY EXIT [%s] — closing broker-live %s size=%s via %s; native SL/TP retained pending fill reconciliation",
+                reason, ex_side, ex_size, close_side,
+            )
+            result = self.place_market_order(side=close_side, quantity=ex_size, reduce_only=True)
+            if not isinstance(result, dict):
+                logger.critical("Dynamic reduce-only exit submission FAILED [%s]; native SL/TP still active", reason)
+                return None
+            result["exit_lifecycle"] = "DYNAMIC_REDUCE_ONLY_CLOSE_PROTECTION_REMAINS_ARMED"
+            result["dynamic_exit_reason"] = reason
+            result["closed_broker_quantity"] = ex_size
+            return result
+        except Exception as exc:
+            logger.error("place_reconciled_reduce_only_exit error [%s]: %s", reason, exc, exc_info=True)
+            return None
+
     def place_limit_order(self, side: str, quantity: float,
                           price: float, reduce_only: bool = False) -> Optional[Dict]:
         try:
@@ -4152,20 +4211,23 @@ class OrderManager:
         sl_order_id: Optional[str],
         tp_order_id: Optional[str],
         trail_active: bool = False,
+        dynamic_exit_order_id: Optional[str] = None,
     ) -> Dict:
         """Resolve a closing execution by its tracked order ids only.
 
-        Delta, CoinSwitch and GROWW all route through ``get_fill_details``.
-        A broker-flat position is not sufficient evidence for realised P&L: an
-        exit is confirmed only when a known closing order is filled and exposes
-        an execution price.  This prevents zero/mark-price P&L from polluting
-        portfolio drawdown controls and post-trade learning.
+        Delta, CoinSwitch, Hyperliquid and GROWW all route through
+        ``get_fill_details``. A broker-flat position is not sufficient evidence
+        for realised P&L: an exit is confirmed only when a tracked bracket,
+        trailing-stop, or model-directed reduce-only order is filled and exposes
+        an execution price. This resolves races between alpha exits and native
+        protection without manufacturing mark-price P&L.
         """
         unconfirmed = {
             "confirmed": False, "exit_type": "unknown", "fill_price": 0.0,
             "order_id": "", "fee_paid": 0.0, "fee_exact": False,
         }
         known = [
+            (str(dynamic_exit_order_id or "").strip(), "dynamic_exit"),
             (str(sl_order_id or "").strip(), "trail_sl" if trail_active else "sl"),
             (str(tp_order_id or "").strip(), "tp"),
         ]

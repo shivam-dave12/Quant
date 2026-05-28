@@ -3,8 +3,10 @@
 Books are never merged.  Each venue is independently priced using the actual
 side of the trade, visible depth, round-trip cost assumptions, observed feed
 latency, funding/carry when supplied by the feed, available collateral and
-hard-protection capability.  The route is selected only from venues on which
-this exact order can be protected and funded.
+hard-protection capability. For trade approval, candidate venues are priced at
+one risk-normalised base quantity from one decision snapshot; broker collateral
+is an eligibility constraint, not a score-enhancing reason to test a larger
+order on one venue than another.
 """
 
 from __future__ import annotations
@@ -132,6 +134,10 @@ class VenueSelection:
     improvement_bps: float
     estimates: dict[str, VenueCostEstimate]
     reason: str
+    selection_mode: str = "BROKER_LOCAL_CAPACITY"
+    comparison_quantity: float = 0.0
+    comparison_notional_usd: float = 0.0
+    snapshot_ts_ns: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -142,6 +148,10 @@ class VenueSelection:
             "current_cost_bps": self.current_cost_bps,
             "improvement_bps": self.improvement_bps,
             "reason": self.reason,
+            "selection_mode": self.selection_mode,
+            "comparison_quantity": self.comparison_quantity,
+            "comparison_notional_usd": self.comparison_notional_usd,
+            "snapshot_ts_ns": self.snapshot_ts_ns,
             "estimates": {k: v.as_dict() for k, v in self.estimates.items()},
         }
 
@@ -251,6 +261,9 @@ def select_execution_venue(
     gross_edge_by_venue: Mapping[str, float] | None = None,
     notional_by_venue: Mapping[str, float] | None = None,
     required_margin_by_venue: Mapping[str, float] | None = None,
+    comparison_quantity: float = 0.0,
+    comparison_notional_usd: float = 0.0,
+    snapshot_ts_ns: int = 0,
 ) -> VenueSelection:
     current = str(current_venue or "").lower()
     usable = [s for s in states.values() if isinstance(s, VenueMicrostate) and float(s.mid or 0.0) > 0 and s.usable_for_decision]
@@ -289,16 +302,22 @@ def select_execution_venue(
     if not candidates:
         cur = estimates.get(current)
         return VenueSelection(current, cur.symbol if cur else "", cur.total_cost_bps if cur else math.inf, current, cur.total_cost_bps if cur else None, 0.0, estimates, "no_funded_protected_route_candidate")
-    # If each venue is priced at its own supported size, choosing merely the
-    # lowest cost bps would systematically favour tiny balances. Select the
-    # venue with highest expected dollar alpha after execution/protection cost.
-    # Cost-only mode remains available for callers that do not supply edge.
+    # Institutional execution selection has two explicit modes. Approval uses
+    # a single risk-normalised quantity sampled at one instant, so score by
+    # expected net edge/cost at identical exposure. The legacy broker-capacity
+    # mode remains available to callers that are estimating deployable capacity
+    # rather than deciding a live route.
+    risk_normalised = float(comparison_quantity or 0.0) > 0.0 or float(comparison_notional_usd or 0.0) > 0.0
     if gross_edge_bps is not None or isinstance(gross_edge_by_venue, Mapping):
-        best = max(candidates, key=lambda e: (float(e.expected_net_profit_usd) if e.expected_net_profit_usd is not None else -math.inf, -e.total_cost_bps))
-        reason = "highest_broker_local_expected_net_profit_route"
+        if risk_normalised:
+            best = max(candidates, key=lambda e: (float(e.expected_net_edge_bps) if e.expected_net_edge_bps is not None else -math.inf, -e.total_cost_bps))
+            reason = "highest_risk_normalised_expected_net_edge_route"
+        else:
+            best = max(candidates, key=lambda e: (float(e.expected_net_profit_usd) if e.expected_net_profit_usd is not None else -math.inf, -e.total_cost_bps))
+            reason = "highest_broker_local_expected_net_profit_route"
     else:
         best = min(candidates, key=lambda e: e.total_cost_bps)
-        reason = "best_funded_protected_expected_cost_route"
+        reason = "best_risk_normalised_expected_cost_route" if risk_normalised else "best_funded_protected_expected_cost_route"
     cur = estimates.get(current)
     improvement = (cur.total_cost_bps - best.total_cost_bps) if cur is not None else 0.0
     min_improvement = float(_cfg("VENUE_SELECTION_MIN_IMPROVEMENT_BPS", 0.50))
@@ -318,4 +337,8 @@ def select_execution_venue(
         improvement_bps=improvement,
         estimates=estimates,
         reason=reason,
+        selection_mode="RISK_NORMALISED_COMMON_QUANTITY" if risk_normalised else "BROKER_LOCAL_CAPACITY",
+        comparison_quantity=float(comparison_quantity or 0.0),
+        comparison_notional_usd=float(comparison_notional_usd or 0.0),
+        snapshot_ts_ns=int(snapshot_ts_ns or 0),
     )

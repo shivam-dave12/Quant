@@ -355,6 +355,11 @@ VENUE_SELECTION_NOTIONAL_FRACTION = VENUE_SELECTION_MARGIN_FRACTION  # legacy al
 VENUE_SELECTION_MIN_FREE_MARGIN_USD = 1.00
 VENUE_BALANCE_CACHE_TTL_SEC = 8.0
 VENUE_SELECTION_MAX_COST_BPS = 100.0
+# Route approval must compare exchange candidates at one base exposure quantity
+# from one decision snapshot; any broker-local size/capital values are eligibility
+# telemetry only and cannot distort the cross-venue cost ranking.
+VENUE_SELECTION_RISK_NORMALISED_LEDGER_ENABLED = True
+VENUE_SELECTION_MAX_QUANTITY_REPRESENTATION_ERROR_BPS = 0.50
 # Expected round-trip cost: maker entry plus protected-market exit. Replace
 # these approved-account assumptions when a venue/account fee tier changes.
 VENUE_ROUND_TRIP_FEE_BPS = {
@@ -464,7 +469,13 @@ DYNAMIC_OPTION_EXIT_THETA_TO_PREMIUM_PER_DAY = 0.08
 DYNAMIC_OPTION_CHEAP_VRP_THRESHOLD = -0.10
 DYNAMIC_OPTION_CHEAP_VRP_THETA_LIMIT = 0.12
 DYNAMIC_OPTION_THETA_DTE_LIMIT = 5.0
-DYNAMIC_EXIT_AUTOMATED_EARLY_LIQUIDATION_ENABLED = False
+# Alpha expiry is a live risk event: after expected residual edge no longer covers
+# execution/protection cost, a supervisor submits a reduce-only close while the
+# broker-native SL/TP stays armed until close-fill reconciliation is complete.
+DYNAMIC_EXIT_AUTOMATED_EARLY_LIQUIDATION_ENABLED = True
+DYNAMIC_EXIT_REDUCE_ONLY_RETRY_SEC = 1.0
+DYNAMIC_EXIT_MAX_SUBMISSION_ATTEMPTS = 5
+DYNAMIC_EXIT_CANCEL_RESIDUAL_PROTECTION_AFTER_CONFIRMED_FLAT = True
 
 # ── Institutional Strategy ────────────────────────────────────────────────────────────
 INSTITUTIONAL_MARGIN_PCT               = 0.85

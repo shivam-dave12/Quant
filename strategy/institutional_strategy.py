@@ -144,6 +144,14 @@ class PositionState:
     protection_confirmed: bool = False
     protection_model: str = ""
     quant_components: dict[str, Any] = field(default_factory=dict)
+    # State-dependent exits are executed by the off-hot-path lifecycle worker.
+    # Bracket protection remains broker-live until the close fill is reconciled.
+    dynamic_exit_requested: bool = False
+    dynamic_exit_reasons: tuple[str, ...] = field(default_factory=tuple)
+    dynamic_exit_requested_at: float = 0.0
+    dynamic_exit_order_id: str = ""
+    dynamic_exit_attempts: int = 0
+    dynamic_exit_last_error: str = ""
 
     def is_flat(self) -> bool:
         return self.phase is PositionPhase.FLAT or self.quantity <= 0
@@ -165,6 +173,9 @@ class PositionState:
             "currency": self.currency_symbol,
             "protection_confirmed": self.protection_confirmed,
             "protection_model": self.protection_model,
+            "dynamic_exit_requested": self.dynamic_exit_requested,
+            "dynamic_exit_order_id": self.dynamic_exit_order_id,
+            "dynamic_exit_reasons": list(self.dynamic_exit_reasons),
         }
 
 
@@ -322,6 +333,82 @@ class InstitutionalStrategy:
             self._asset_id, self._pos.exchange,
         )
 
+    def _service_dynamic_exit_request(self, manager) -> None:
+        """Submit a model-directed close only from the lifecycle supervisor.
+
+        Hard SL/TP protection is intentionally left live while the new
+        reduce-only close is outstanding.  The order identifier is captured so
+        broker-flat reconciliation can attribute the closing fill exactly, even
+        if the dynamic close races with an already-armed protective order.
+        """
+        with self._entry_lock:
+            if self._pos.is_flat() or not self._pos.dynamic_exit_requested or self._pos.dynamic_exit_order_id:
+                return
+            if self._pos.phase not in {PositionPhase.ACTIVE, PositionPhase.EXITING}:
+                return
+            max_attempts = max(1, int(_cfg("DYNAMIC_EXIT_MAX_SUBMISSION_ATTEMPTS", 5)))
+            if self._pos.dynamic_exit_attempts >= max_attempts:
+                components = self._pos.quant_components if isinstance(self._pos.quant_components, dict) else {}
+                if not components.get("dynamic_exit_submission_exhausted_logged"):
+                    components["dynamic_exit_submission_exhausted_logged"] = True
+                    logger.critical(
+                        "DYNAMIC_EXIT_SUBMISSION_EXHAUSTED asset=%s venue=%s attempts=%s; native hard protection remains active",
+                        self._pos.asset_id, self._pos.exchange, self._pos.dynamic_exit_attempts,
+                    )
+                return
+            reason = "dynamic_exit:" + ",".join(self._pos.dynamic_exit_reasons)
+            expected_side = self._pos.side
+            expected_qty = self._pos.quantity
+            self._pos.dynamic_exit_attempts += 1
+            attempt = self._pos.dynamic_exit_attempts
+        submitter = getattr(manager, "place_reconciled_reduce_only_exit", None)
+        if not callable(submitter):
+            with self._entry_lock:
+                self._pos.dynamic_exit_last_error = "reduce_only_exit_interface_unavailable"
+            logger.critical(
+                "DYNAMIC_EXIT_NOT_EXECUTABLE asset=%s venue=%s reason=reduce_only_exit_interface_unavailable; native hard protection remains active",
+                self._asset_id, self._pos.exchange,
+            )
+            return
+        try:
+            result = submitter(reason=reason, expected_side=expected_side, expected_quantity=expected_qty)
+        except Exception as exc:
+            result = None
+            with self._entry_lock:
+                self._pos.dynamic_exit_last_error = f"submission_exception:{exc}"
+            logger.exception("Dynamic reduce-only close submission failed asset=%s attempt=%s", self._asset_id, attempt)
+        if not isinstance(result, Mapping):
+            with self._entry_lock:
+                self._pos.dynamic_exit_last_error = self._pos.dynamic_exit_last_error or "submission_returned_no_order"
+            logger.error(
+                "DYNAMIC_EXIT_SUBMISSION_DEFERRED asset=%s venue=%s attempt=%s; native hard protection remains active",
+                self._asset_id, self._pos.exchange, attempt,
+            )
+            return
+        order_id = str(result.get("order_id") or "")
+        lifecycle = str(result.get("exit_lifecycle") or result.get("status") or "")
+        with self._entry_lock:
+            if order_id:
+                self._pos.dynamic_exit_order_id = order_id
+                self._pos.phase = PositionPhase.EXITING
+                self._pos.manual_exit_reason = reason
+                self._pos.dynamic_exit_last_error = ""
+            elif lifecycle.upper().startswith("ALREADY_FLAT"):
+                # A protective order may have won the race before the alpha exit
+                # was sent. Attribute that exact fill before resetting state.
+                self._pos.phase = PositionPhase.RECONCILIATION_REQUIRED
+                self._pos.manual_exit_reason = reason
+        if order_id:
+            logger.warning(
+                "DYNAMIC_EXIT_REDUCE_ONLY_SUBMITTED asset=%s venue=%s order=%s attempt=%s protection_retained_until_flat_reconciled=true",
+                self._asset_id, self._pos.exchange, order_id, attempt,
+            )
+        elif lifecycle.upper().startswith("ALREADY_FLAT"):
+            logger.info(
+                "DYNAMIC_EXIT_RACE_BROKER_ALREADY_FLAT asset=%s venue=%s; resolving tracked exit fill",
+                self._asset_id, self._pos.exchange,
+            )
+
     def _position_reconciliation_loop(self) -> None:
         interval = max(0.25, float(_cfg("POSITION_RECONCILIATION_REFRESH_SEC", 1.0)))
         flat_retry = max(interval, float(_cfg("POSITION_RECONCILIATION_FLAT_UNCONFIRMED_SEC", 2.0)))
@@ -338,6 +425,11 @@ class InstitutionalStrategy:
                     break
                 next_interval = interval
                 try:
+                    with self._entry_lock:
+                        dynamic_exit_pending = bool(self._pos.dynamic_exit_requested and not self._pos.dynamic_exit_order_id)
+                    if dynamic_exit_pending:
+                        self._service_dynamic_exit_request(manager)
+                        next_interval = min(next_interval, max(0.25, float(_cfg("DYNAMIC_EXIT_REDUCE_ONLY_RETRY_SEC", 1.0))))
                     broker_pos = manager.get_open_position()
                     if isinstance(broker_pos, Mapping) and _num(broker_pos.get("size"), 0.0) <= 0:
                         if not self._finalise_confirmed_exit(manager, risk_manager, mark_price):
@@ -826,8 +918,16 @@ class InstitutionalStrategy:
                 regime = self._market_state_regime(market_states.get(venue), regime)
         venue_selection = None
         venue_available_cash: dict[str, float] = {}
+        # Broker-local capacities are kept as eligibility telemetry only. The
+        # selection score itself is produced from a common base exposure.
         venue_candidate_notional: dict[str, float] = {}
         venue_required_margin: dict[str, float] = {}
+        venue_comparison_notional: dict[str, float] = {}
+        venue_comparison_margin: dict[str, float] = {}
+        venue_comparison_quantity: float = 0.0
+        venue_quantity_representation: dict[str, Any] = {}
+        venue_selection_snapshot_ts_ns: int = 0
+        routeable_candidates: set[str] = set()
         validated_edge_by_venue: dict[str, float] = {}
         if (
             bool(_cfg("VENUE_SELECTION_ENABLED", True))
@@ -849,22 +949,39 @@ class InstitutionalStrategy:
                 if not validated_edge_by_venue:
                     validated_edge_by_venue[str(venue).lower()] = float(directional_edge_bps)
                     routeable = routeable.intersection({str(venue).lower()})
-                venue_available_cash = self._venue_available_cash(order_manager, routeable)
+                routeable_candidates = set(routeable)
+                venue_available_cash = self._venue_available_cash(order_manager, routeable_candidates)
                 venue_candidate_notional, venue_required_margin = self._venue_selection_budgets(venue_available_cash)
+                venue_selection_snapshot_ts_ns = time.time_ns()
+                (
+                    venue_comparison_quantity,
+                    venue_comparison_notional,
+                    venue_comparison_margin,
+                    venue_quantity_representation,
+                    routeable_candidates,
+                ) = self._risk_normalised_route_inputs(
+                    states=states,
+                    candidate_venues=routeable_candidates,
+                    capacity_notional_by_venue=venue_candidate_notional,
+                    approved_quantity=None,
+                )
                 venue_selection = select_execution_venue(
                     states=states,
                     direction=direction,
                     asset_id=self._asset_id,
                     current_venue=venue,
-                    routeable_venues=routeable,
+                    routeable_venues=routeable_candidates,
                     notional_usd=0.0,
                     available_cash_by_venue=venue_available_cash,
                     required_margin_usd=0.0,
-                    protection_capable_venues=self._protection_capable_venues(order_manager, routeable),
+                    protection_capable_venues=self._protection_capable_venues(order_manager, routeable_candidates),
                     gross_edge_bps=directional_edge_bps,
                     gross_edge_by_venue=validated_edge_by_venue,
-                    notional_by_venue=venue_candidate_notional,
-                    required_margin_by_venue=venue_required_margin,
+                    notional_by_venue=venue_comparison_notional,
+                    required_margin_by_venue=venue_comparison_margin,
+                    comparison_quantity=venue_comparison_quantity,
+                    comparison_notional_usd=min(venue_comparison_notional.values()) if venue_comparison_notional else 0.0,
+                    snapshot_ts_ns=venue_selection_snapshot_ts_ns,
                 )
                 if venue_selection.reason == "no_funded_protected_route_candidate":
                     direction = Direction.NO_TRADE
@@ -988,8 +1105,13 @@ class InstitutionalStrategy:
         if venue_selection is not None:
             model_values["venue_selection"] = venue_selection.as_dict()
             model_values["venue_available_cash_usd"] = dict(venue_available_cash)
-            model_values["venue_candidate_notional_usd"] = dict(venue_candidate_notional)
-            model_values["venue_required_margin_usd"] = dict(venue_required_margin)
+            model_values["venue_capacity_notional_usd"] = dict(venue_candidate_notional)
+            model_values["venue_capacity_required_margin_usd"] = dict(venue_required_margin)
+            model_values["venue_comparison_quantity"] = float(venue_comparison_quantity)
+            model_values["venue_comparison_notional_usd"] = dict(venue_comparison_notional)
+            model_values["venue_comparison_required_margin_usd"] = dict(venue_comparison_margin)
+            model_values["venue_quantity_representation"] = dict(venue_quantity_representation)
+            model_values["venue_selection_snapshot_ts_ns"] = int(venue_selection_snapshot_ts_ns)
             model_values["selected_venue_available_cash_usd"] = float(venue_available_cash.get(str(venue).lower(), 0.0))
             model_values["venue_validated_directional_edge_bps"] = dict(validated_edge_by_venue)
         if execution_state is not None:
@@ -1097,6 +1219,96 @@ class InstitutionalStrategy:
                 model_values=model_values,
                 research_features=features,
             )
+
+        # Final execution authorisation is based on one exact approved base
+        # quantity replayed across every direction-validated route at one
+        # snapshot. Broker balance controls eligibility only; it never changes
+        # the quantity used to rank Delta/CoinSwitch/Hyperliquid.
+        if (
+            bool(_cfg("VENUE_SELECTION_RISK_NORMALISED_LEDGER_ENABLED", True))
+            and venue_selection is not None
+            and states
+            and validated_edge_by_venue
+        ):
+            final_candidate_venues = self._routeable_venues(order_manager).intersection(set(validated_edge_by_venue))
+            (
+                final_comparison_quantity,
+                final_comparison_notional,
+                final_comparison_margin,
+                final_quantity_representation,
+                final_routeable_candidates,
+            ) = self._risk_normalised_route_inputs(
+                states=states,
+                candidate_venues=final_candidate_venues,
+                capacity_notional_by_venue=venue_candidate_notional,
+                approved_quantity=float(sizing.quantity),
+            )
+            final_ledger = select_execution_venue(
+                states=states, direction=direction, asset_id=self._asset_id, current_venue=venue,
+                routeable_venues=final_routeable_candidates, notional_usd=0.0,
+                available_cash_by_venue=venue_available_cash, required_margin_usd=0.0,
+                protection_capable_venues=self._protection_capable_venues(order_manager, final_routeable_candidates),
+                gross_edge_bps=directional_edge_bps, gross_edge_by_venue=validated_edge_by_venue,
+                notional_by_venue=final_comparison_notional, required_margin_by_venue=final_comparison_margin,
+                comparison_quantity=final_comparison_quantity,
+                comparison_notional_usd=min(final_comparison_notional.values()) if final_comparison_notional else 0.0,
+                snapshot_ts_ns=time.time_ns(),
+            )
+            final_ledger_dict = final_ledger.as_dict()
+            final_ledger_dict["quantity_representation"] = final_quantity_representation
+            final_ledger_dict["capacity_notional_usd"] = dict(venue_candidate_notional)
+            model_values["venue_selection_ledger"] = final_ledger_dict
+            logger.info(
+                "🧾 VENUE_SELECTION_LEDGER %s",
+                json.dumps({
+                    "asset": self._asset_id, "direction": direction.value, "approved_quantity": sizing.quantity,
+                    "selected_venue": final_ledger.selected_venue, "selected_cost_bps": final_ledger.selected_cost_bps,
+                    "reason": final_ledger.reason, "snapshot_ts_ns": final_ledger.snapshot_ts_ns,
+                    "quantity_representation": final_quantity_representation,
+                    "estimates": {k: v.as_dict() for k, v in final_ledger.estimates.items()},
+                }, sort_keys=True, separators=(",", ":"), default=str),
+            )
+            if str(venue).lower() not in final_routeable_candidates:
+                return self._decision(
+                    desk=desk, venue=venue, instrument=instrument, decision=DecisionOutput.NO_TRADE_EXECUTION_UNSAFE,
+                    direction=direction, regime=regime, expected_net_edge_bps=net_edge, uncertainty_bps=uncertainty_bps,
+                    liquidity_score=liquidity_score, execution_quality_score=execution_quality, sizing=sizing,
+                    protection_plan=protection, reasons=[f"selected_venue_cannot_execute_risk_normalised_quantity:{venue}"],
+                    model_values=model_values, research_features=features,
+                )
+            if str(final_ledger.selected_venue).lower() != str(venue).lower():
+                return self._decision(
+                    desk=desk, venue=venue, instrument=instrument, decision=DecisionOutput.NO_TRADE_EXECUTION_UNSAFE,
+                    direction=direction, regime=regime, expected_net_edge_bps=net_edge, uncertainty_bps=uncertainty_bps,
+                    liquidity_score=liquidity_score, execution_quality_score=execution_quality, sizing=sizing,
+                    protection_plan=protection,
+                    reasons=[f"risk_normalised_route_changed_after_final_sizing:{venue}->{final_ledger.selected_venue}"],
+                    model_values=model_values, research_features=features,
+                )
+            final_selected_estimate = final_ledger.estimates.get(str(venue).lower())
+            if final_selected_estimate is None:
+                return self._decision(
+                    desk=desk, venue=venue, instrument=instrument, decision=DecisionOutput.NO_TRADE_EXECUTION_UNSAFE,
+                    direction=direction, regime=regime, expected_net_edge_bps=net_edge, uncertainty_bps=uncertainty_bps,
+                    liquidity_score=liquidity_score, execution_quality_score=execution_quality, sizing=sizing,
+                    protection_plan=protection, reasons=["risk_normalised_selected_route_estimate_missing"],
+                    model_values=model_values, research_features=features,
+                )
+            costs_bps = float(final_selected_estimate.total_cost_bps)
+            cost_components["venue_selection_cost_bps"] = costs_bps
+            cost_components["total_cost_bps"] = costs_bps
+            net_edge = directional_edge_bps - costs_bps
+            model_values["execution_cost_components"] = dict(cost_components)
+            model_values["costs_bps"] = costs_bps
+            model_values["net_edge_bps"] = net_edge
+            if net_edge <= max(float(_cfg("INSTITUTIONAL_MIN_NET_EDGE_BPS", 3.0)), uncertainty_bps):
+                return self._decision(
+                    desk=desk, venue=venue, instrument=instrument, decision=DecisionOutput.NO_TRADE_INSUFFICIENT_EDGE,
+                    direction=direction, regime=regime, expected_net_edge_bps=net_edge, uncertainty_bps=uncertainty_bps,
+                    liquidity_score=liquidity_score, execution_quality_score=execution_quality, sizing=sizing,
+                    protection_plan=protection, reasons=["risk_normalised_final_quantity_net_edge_not_sufficient"],
+                    model_values=model_values, research_features=features,
+                )
 
         protection = self._protection_plan(
             desk, direction, price, liquidity_score, data_manager=data_manager,
@@ -1826,7 +2038,7 @@ class InstitutionalStrategy:
                 "\n".join([
                     "<b>EXIT UNCONFIRMED</b>",
                     f"<code>{self._pos.exchange.upper()}:{self._pos.execution_symbol}</code>",
-                    "<code>broker flat but known SL/TP fill could not be confirmed</code>",
+                    "<code>broker flat but tracked exit fill (SL/TP/dynamic close) could not be confirmed</code>",
                     f"<code>mark={price:.4f} entry={self._pos.entry_price:.4f} qty={self._pos.quantity:.8g}</code>",
                 ]),
                 instrument=self._instrument,
@@ -1840,7 +2052,15 @@ class InstitutionalStrategy:
         identifier = getattr(order_manager, "identify_exit_order", None)
         if not callable(identifier):
             return False
-        details = identifier(self._pos.sl_order_id, self._pos.tp_order_id)
+        try:
+            details = identifier(
+                self._pos.sl_order_id, self._pos.tp_order_id,
+                dynamic_exit_order_id=self._pos.dynamic_exit_order_id,
+            )
+        except TypeError:
+            # Compatibility for test/simulation managers that pre-date tracked
+            # model-directed close identifiers. Production OrderManager accepts it.
+            details = identifier(self._pos.sl_order_id, self._pos.tp_order_id)
         if not isinstance(details, Mapping) or not bool(details.get("confirmed", False)):
             return False
         exit_price = _num(details.get("fill_price"), 0.0)
@@ -1859,6 +2079,16 @@ class InstitutionalStrategy:
             conservative_fee_estimate = (self._pos.entry_price + exit_price) * self._pos.quantity * fee_rate
             fees = max(known_fees, conservative_fee_estimate)
         net = gross - fees
+        # Only after a confirmed close fill and broker-flat state may residual
+        # bracket conditionals be swept. During submission/fill races they remain
+        # live protection and must never be cancelled pre-emptively.
+        if bool(_cfg("DYNAMIC_EXIT_CANCEL_RESIDUAL_PROTECTION_AFTER_CONFIRMED_FLAT", True)):
+            sweeper = getattr(order_manager, "cancel_symbol_conditionals", None)
+            if callable(sweeper):
+                try:
+                    sweeper(self._pos.execution_symbol)
+                except Exception as exc:
+                    logger.warning("Residual protection sweep deferred after confirmed flat asset=%s: %s", self._asset_id, exc)
         try:
             recorder = getattr(risk_manager, "record_trade", None)
             if callable(recorder):
@@ -1914,13 +2144,12 @@ class InstitutionalStrategy:
         return True
 
     def _dynamic_exit_supervision(self, data_manager, order_manager) -> None:
-        """Audit state-dependent early exits without silently defeating hard protection.
+        """Promote expired alpha into a protected lifecycle exit request.
 
-        Entry always carries the venue-native bracket/OCO generated by the
-        dynamic protection plan.  Alpha-expiry and option-Greek exits are
-        calculated continuously; live early liquidation is disabled by default
-        until a cancel/replace-and-close lifecycle is explicitly enabled and
-        validated for each venue.
+        The market-event thread calculates whether residual alpha still covers
+        execution cost; it never performs broker I/O. Once the horizon expires,
+        the reconciliation supervisor submits a reduce-only close while the
+        venue-native SL/TP remains armed until a closing fill is identified.
         """
         if self._pos.is_flat() or self._pos.phase is not PositionPhase.ACTIVE:
             return
@@ -1980,14 +2209,19 @@ class InstitutionalStrategy:
         }
         logger.warning("🧮 DYNAMIC_EXIT_SIGNAL %s", json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str))
         if auto_enabled:
-            # This path is deliberately opt-in: emergency flatten is only used
-            # after the operator accepts the venue-specific cancel/close lifecycle.
-            flatten = getattr(order_manager, "emergency_flatten", None)
-            if callable(flatten):
-                result = flatten(reason="dynamic_exit:" + ",".join(deduped_reasons))
-                if result:
-                    self._pos.phase = PositionPhase.EXITING
+            with self._entry_lock:
+                if not self._pos.is_flat() and self._pos.phase is PositionPhase.ACTIVE:
+                    self._pos.dynamic_exit_requested = True
+                    self._pos.dynamic_exit_reasons = tuple(deduped_reasons)
+                    self._pos.dynamic_exit_requested_at = time.time()
                     self._pos.manual_exit_reason = "dynamic_exit:" + ",".join(deduped_reasons)
+            # Broker I/O belongs to the reconciliation supervisor, not this
+            # quote-processing callback. Hard protection stays live immediately.
+            self._position_reconcile_wakeup.set()
+            logger.warning(
+                "DYNAMIC_EXIT_ENQUEUED asset=%s venue=%s reasons=%s protection_retained=true",
+                self._pos.asset_id, self._pos.exchange, ",".join(deduped_reasons),
+            )
 
     def _safe_price(self, data_manager) -> float:
         for name in ("get_analysis_price", "get_last_price"):
@@ -2802,6 +3036,75 @@ class InstitutionalStrategy:
             notionals[key] = notional
             margins[key] = max(min_margin, notional / leverage) if notional > 0 else min_margin
         return notionals, margins
+
+    def _risk_normalised_route_inputs(
+        self, *, states: Mapping[str, VenueMicrostate], candidate_venues: set[str],
+        capacity_notional_by_venue: Mapping[str, float], approved_quantity: float | None,
+    ) -> tuple[float, dict[str, float], dict[str, float], dict[str, Any], set[str]]:
+        """Build a one-quantity venue comparison ledger.
+
+        Broker-local collateral determines whether a route can participate, never
+        the exposure at which it receives a score. Before sizing, the smallest
+        funded candidate capacity determines a common benchmark quantity. After
+        sizing, the exact approved base quantity is replayed across all candidates;
+        venues that cannot represent or fund that identical exposure are recorded
+        as ineligible rather than being scored at an incomparable size.
+        """
+        venues = {str(v).lower() for v in candidate_venues}
+        positive_capacity_qty: list[float] = []
+        for venue in sorted(venues):
+            state = states.get(venue)
+            mid = float(getattr(state, "mid", 0.0) or 0.0) if state is not None else 0.0
+            cap_notional = max(0.0, _num(capacity_notional_by_venue.get(venue), 0.0))
+            if mid > 0.0 and cap_notional > 0.0:
+                positive_capacity_qty.append(cap_notional / mid)
+        quantity = max(0.0, float(approved_quantity or 0.0)) if approved_quantity is not None else (min(positive_capacity_qty) if positive_capacity_qty else 0.0)
+        max_error_bps = max(0.0, float(_cfg("VENUE_SELECTION_MAX_QUANTITY_REPRESENTATION_ERROR_BPS", 0.50)))
+        min_margin = max(0.0, float(_cfg("VENUE_SELECTION_MIN_FREE_MARGIN_USD", 1.0)))
+        configured_lev = max(1.0, float(_cfg("LEVERAGE", 1.0) or 1.0))
+        code_cap = max(1.0, float(_cfg("INSTITUTIONAL_MAX_SELECTED_LEVERAGE", configured_lev) or configured_lev))
+        notionals: dict[str, float] = {}
+        margins: dict[str, float] = {}
+        diagnostics: dict[str, Any] = {}
+        executable: set[str] = set()
+        for venue in sorted(venues):
+            state = states.get(venue)
+            mid = float(getattr(state, "mid", 0.0) or 0.0) if state is not None else 0.0
+            cap_notional = max(0.0, _num(capacity_notional_by_venue.get(venue), 0.0))
+            notional = quantity * mid if quantity > 0.0 and mid > 0.0 else 0.0
+            venue_cap = self._venue_max_leverage(venue)
+            caps = [configured_lev, code_cap]
+            if venue_cap > 0.0:
+                caps.append(venue_cap)
+            leverage = max(1.0, min(caps))
+            margin = max(min_margin, notional / leverage) if notional > 0.0 else min_margin
+            mapping = self._instrument_mapping(self._symbol_for_venue(venue, self._asset_id), venue=venue)
+            step = max(float(mapping.qty_step or 0.0), 1e-12)
+            represented_qty = math.floor((quantity + 1e-15) / step) * step if quantity > 0.0 else 0.0
+            representation_error_bps = (max(0.0, quantity - represented_qty) / quantity * 10_000.0) if quantity > 0.0 else math.inf
+            exact_quantity = approved_quantity is None or representation_error_bps <= max_error_bps
+            min_notional = self._venue_min_order_notional_usd(venue)
+            broker_minimum_ok = notional + 1e-9 >= min_notional
+            capacity_ok = notional > 0.0 and notional <= cap_notional + 1e-9
+            eligible = bool(mid > 0.0 and capacity_ok and broker_minimum_ok and exact_quantity)
+            if eligible:
+                executable.add(venue)
+            notionals[venue] = notional
+            margins[venue] = margin
+            diagnostics[venue] = {
+                "quantity": quantity,
+                "represented_quantity": represented_qty,
+                "quantity_step": step,
+                "representation_error_bps": representation_error_bps,
+                "exact_executable_quantity": exact_quantity,
+                "notional_usd": notional,
+                "broker_local_capacity_notional_usd": cap_notional,
+                "capacity_ok": capacity_ok,
+                "broker_minimum_notional_usd": min_notional,
+                "broker_minimum_ok": broker_minimum_ok,
+                "route_eligible_at_common_quantity": eligible,
+            }
+        return quantity, notionals, margins, diagnostics, executable
 
     def _entry_risk_gate(self, risk_manager, *, balance_source=None, cached_equity: float | None = None) -> tuple[bool, str]:
         """Gate live entries through the same risk controls that record entries.
