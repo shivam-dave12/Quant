@@ -31,6 +31,7 @@ class Direction(str, Enum):
 class DeskId(str, Enum):
     BTC = "DESK_A_BTC"
     METALS = "DESK_A_METALS"
+    COMMODITIES = "DESK_A_COMMODITIES"
     INDIA_OPTIONS = "DESK_B_NIFTY_OPTIONS"
 
 

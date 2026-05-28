@@ -132,9 +132,11 @@ def test_gold_structural_displacement_generates_alpha_without_spoofable_flow(mon
         market_state=_market("delta", 12.0), cross_venue_evidence=None,
     )
     assert direction is Direction.LONG
-    assert reason == "market_state_flow_long"
+    assert reason == "parent_structural_thesis_long_child_timing_validated"
     assert edge > 0
     assert breakdown["venue_local_market_state_alpha_bps"] == 12.0
+    assert breakdown["signal_architecture"] == "parent_structural_thesis_child_execution_timing_v1"
+    assert breakdown["microstructure_cannot_originate_or_flip_thesis"] is True
 
 from execution.venue_selection import select_execution_venue
 

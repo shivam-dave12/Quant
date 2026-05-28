@@ -2254,11 +2254,11 @@ class InstitutionalStrategy:
     def _dynamic_exit_supervision(self, data_manager, order_manager) -> None:
         """Supervise a live position against its parent structural thesis.
 
-        BTC cannot be closed by elapsed micro-alpha horizon, queue-flow reversal,
-        or repeated evaluation of one intrabar state.  Native SL/TP owns immediate
-        downside protection.  A discretionary reduce-only exit is permitted only
-        when distinct CLOSED parent-state observations establish an executable
-        opposing structural thesis.
+        Directional underlying positions cannot be closed by elapsed micro-alpha
+        horizon, queue-flow reversal, or repeated evaluation of one intrabar state.
+        Native SL/TP owns immediate downside protection. A discretionary reduce-only
+        exit is permitted only when distinct CLOSED parent-state observations
+        establish an executable opposing structural thesis.
         """
         if self._pos.is_flat() or self._pos.phase is not PositionPhase.ACTIVE:
             return
@@ -2271,7 +2271,18 @@ class InstitutionalStrategy:
         confirmation_state = components.setdefault("dynamic_exit_validation", {})
         live_state: dict[str, Any] = {}
 
-        parent_structure_only = bool(_cfg("DYNAMIC_EXIT_PARENT_STRUCTURE_ONLY", True)) and self._asset_id.upper() == "BTC"
+        parent_exit_assets_raw = _cfg(
+            "DYNAMIC_EXIT_PARENT_STRUCTURE_ASSETS",
+            ("BTC", "GOLD_PAXG", "GOLD_HL", "SILVER_SLVON", "SILVER_XAG", "SILVER_HL", "OIL"),
+        )
+        parent_exit_assets = {
+            str(x).upper() for x in (
+                parent_exit_assets_raw
+                if isinstance(parent_exit_assets_raw, (tuple, list, set))
+                else str(parent_exit_assets_raw).split(",")
+            )
+        }
+        parent_structure_only = bool(_cfg("DYNAMIC_EXIT_PARENT_STRUCTURE_ONLY", True)) and self._asset_id.upper() in parent_exit_assets
         if parent_structure_only:
             if not confirmation_state.get("structural_monitor_logged"):
                 confirmation_state["structural_monitor_logged"] = True
@@ -2314,8 +2325,9 @@ class InstitutionalStrategy:
                     self._pos.asset_id, self._pos.exchange, str(live_state.get("reason") or "parent_state_not_ready"),
                 )
         else:
-            # Non-BTC desks keep their existing specialised exit diagnostics; the
-            # unsafe BTC micro-alpha invalidation pathway is not reused here.
+            # Non-directional desks (currently options) keep their specialised
+            # Greek/volatility lifecycle. Microstructure-only invalidation is never
+            # reused by any underlying directional desk.
             live_state = {}
 
         option_diag: dict[str, Any] = {}
@@ -2602,15 +2614,19 @@ class InstitutionalStrategy:
             market_uncertainty_bps = float(composite_decision.diagnostics.get("execution_uncertainty_bps", 0.0) or 0.0)
             breakdown["composite_asset_intelligence"] = composite_decision.as_dict()
             breakdown["structural_alpha_authority"] = "normalised_execution_equivalence_composite"
-        elif market_state is not None and market_state.ready and self._asset_id.upper() in set(_cfg("INSTITUTIONAL_MARKET_STATE_ASSETS", ("BTC", "GOLD_PAXG", "GOLD_HL"))):
+        elif market_state is not None and market_state.ready and self._asset_id.upper() in set(_cfg("INSTITUTIONAL_MARKET_STATE_ASSETS", ("BTC", "GOLD_PAXG", "GOLD_HL", "SILVER_SLVON", "SILVER_XAG", "SILVER_HL", "OIL"))):
             structural_alpha_bps = float(market_state.signed_alpha_bps)
             market_uncertainty_bps = float(market_state.uncertainty_bps)
             breakdown["venue_market_state"] = market_state.as_dict()
             breakdown["structural_alpha_authority"] = "venue_local_fallback"
-        # Parent/child alpha hierarchy for BTC.  A live OFI/TFI burst is a
-        # child timing observation, not an investable thesis.  Only confirmed
-        # closed-bar structural alpha may originate or reverse a BTC position.
-        parent_assets_raw = _cfg("INSTITUTIONAL_PARENT_THESIS_ASSETS", ("BTC",))
+        # Parent/child alpha hierarchy for every directional underlying asset.
+        # A live OFI/TFI burst is a child timing observation, not an investable
+        # thesis. Only confirmed closed-bar structural alpha may originate or
+        # reverse a position; options retain their dedicated underlying/Greek path.
+        parent_assets_raw = _cfg(
+            "INSTITUTIONAL_PARENT_THESIS_ASSETS",
+            ("BTC", "GOLD_PAXG", "GOLD_HL", "SILVER_SLVON", "SILVER_XAG", "SILVER_HL", "OIL"),
+        )
         parent_assets = {str(x).upper() for x in (parent_assets_raw if isinstance(parent_assets_raw, (tuple, list, set)) else str(parent_assets_raw).split(","))}
         parent_model_enabled = bool(_cfg("INSTITUTIONAL_PARENT_THESIS_EXECUTION_MODEL_ENABLED", True)) and self._asset_id.upper() in parent_assets
         if parent_model_enabled:
@@ -3143,6 +3159,8 @@ class InstitutionalStrategy:
         asset = self._asset_id.upper()
         if asset.startswith("GOLD") or asset.startswith("SILVER") or any(x in instrument.upper() for x in ("PAXG", "XAUT", "SLV", "XAG", "SILVER", "GOLD")):
             return DeskId.METALS.value
+        if asset == "OIL" or any(x in instrument.upper() for x in ("CL", "WTI", "OIL", "CRUDE")):
+            return DeskId.COMMODITIES.value
         return DeskId.BTC.value
 
     def _venue(self, order_manager) -> str:

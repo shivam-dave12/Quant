@@ -301,11 +301,14 @@ INSTITUTIONAL_MARKET_STATE_PARAMETERS = {
     "OIL": {"capture_rate": 0.22, "max_alpha_bps": 32.0, "acceptance_weight": 0.30, "live_impulse_weight": 0.15, "min_confidence": 0.30},
 }
 INSTITUTIONAL_MICROSTRUCTURE_ALPHA_CAP_BPS = {"BTC": 22.0, "GOLD_PAXG": 18.0, "GOLD_HL": 18.0, "SILVER_SLVON": 15.0, "SILVER_XAG": 18.0, "SILVER_HL": 18.0, "OIL": 18.0}
-# BTC parent/child signal hierarchy: closed-candle structural state originates
-# trades; order-book/tape flow may improve timing but cannot originate or flip
-# a directional thesis. This is a signal model, not an added retail veto layer.
+# Parent/child signal hierarchy for every live directional underlying desk.
+# Closed-candle structural state originates or reverses a position; order-book /
+# tape flow may time execution only in that parent direction. This is not a veto
+# layer: it defines the investable thesis and prevents microstructure-only churn.
 INSTITUTIONAL_PARENT_THESIS_EXECUTION_MODEL_ENABLED = True
-INSTITUTIONAL_PARENT_THESIS_ASSETS = ("BTC",)
+INSTITUTIONAL_PARENT_THESIS_ASSETS = (
+    "BTC", "GOLD_PAXG", "GOLD_HL", "SILVER_SLVON", "SILVER_XAG", "SILVER_HL", "OIL",
+)
 INSTITUTIONAL_PARENT_TIMING_CONTRIBUTION_CAP_FRACTION = 0.35
 # Venue disagreement raises uncertainty and scales confidence continuously. A
 # leader venue may still trade a genuine impulse before followers converge.
@@ -485,6 +488,10 @@ DYNAMIC_EXIT_AUTOMATED_EARLY_LIQUIDATION_ENABLED = True
 DYNAMIC_EXIT_CLOCK_HORIZON_IS_REASSESSMENT_ONLY = True
 DYNAMIC_EXIT_REQUIRE_LIVE_THESIS_CONFIRMATION = True
 DYNAMIC_EXIT_PARENT_STRUCTURE_ONLY = True
+# Dynamic discretionary exits follow the same parent-thesis authority as entry.
+# Options retain their separate Greek/volatility lifecycle; every directional
+# underlying desk below requires distinct closed-state structural invalidation.
+DYNAMIC_EXIT_PARENT_STRUCTURE_ASSETS = INSTITUTIONAL_PARENT_THESIS_ASSETS
 DYNAMIC_EXIT_ALLOW_MICROSTRUCTURE_ONLY_INVALIDATION = False
 DYNAMIC_EXIT_ALLOW_RESIDUAL_ALPHA_PROFIT_CAPTURE = False
 # Each confirmation must represent a distinct closed parent-state observation,
