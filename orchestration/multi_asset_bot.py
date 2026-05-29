@@ -78,6 +78,7 @@ class AssetContext:
     start_attempt_count: int = 0
     start_state: str = ""
     startup_exposure_verified: bool = False
+    startup_exposure_reason: str = ""
 
     @property
     def phase_name(self) -> str:
@@ -107,6 +108,10 @@ class MultiAssetInstitutionalBot:
         self.registry: Optional[InstrumentRegistry] = None
         self.trading_enabled = True
         self.trading_pause_reason = ""
+        # Execution quarantine must never suppress market intelligence. Existing
+        # broker exposure can pause fresh submissions while calculations continue.
+        self._startup_preflight_lock = threading.RLock()
+        self._last_startup_exposure_recheck_sec = 0.0
         self._last_scan_report = 0.0
         self._lock = threading.RLock()
         self._market_wakeup = threading.Event()
@@ -271,68 +276,105 @@ class MultiAssetInstitutionalBot:
 
 
     def _startup_external_exposure_preflight(self) -> bool:
-        """Block fresh entries when externally existing exposure is not reconciled.
+        """Reconcile external exposure without suppressing market calculations.
 
-        Market observation remains live, but existing positions, open orders or
-        unexplained Hyperliquid locked collateral cannot be treated as free risk
-        capacity after a restart. Adoption can be added only with exact native
-        protection reconciliation.
+        Fresh order submission can be quarantined while exposure is unresolved,
+        but every desk must continue evaluating and logging its calculations.
+        When the broker later verifies flat/open-order-free state, the quarantine
+        is automatically released.
         """
         if not bool(getattr(config, "STARTUP_EXTERNAL_EXPOSURE_PREFLIGHT_ENABLED", True)):
+            self.trading_enabled = True
+            self.trading_pause_reason = ""
             return True
-        tolerance = max(0.0, float(getattr(config, "STARTUP_UNKNOWN_LOCKED_COLLATERAL_TOLERANCE_USD", 0.01) or 0.01))
-        violations: list[str] = []
-        checked_managers: set[tuple[str, str]] = set()
-        checked_hl_dex: set[str] = set()
-        for ctx in self.contexts:
-            if not ctx.ready or self._is_indian_options_context(ctx):
-                continue
-            ctx.startup_exposure_verified = False
-            for venue in ctx.execution_router.available_exchanges():
-                manager = ctx.execution_router.manager_for(venue)
-                symbol = str(getattr(manager, "symbol", "") or ctx.instrument.display_symbol)
-                key = (str(venue).lower(), symbol.upper())
-                if key in checked_managers:
+        with self._startup_preflight_lock:
+            tolerance = max(0.0, float(getattr(config, "STARTUP_UNKNOWN_LOCKED_COLLATERAL_TOLERANCE_USD", 0.01) or 0.01))
+            violations: list[str] = []
+            checked_managers: set[tuple[str, str]] = set()
+            checked_hl_dex: set[str] = set()
+            previously_paused = not bool(self.trading_enabled)
+            for ctx in self.contexts:
+                if not ctx.ready or self._is_indian_options_context(ctx):
                     continue
-                checked_managers.add(key)
-                try:
-                    position = manager.get_open_position()
-                    if position is None:
-                        violations.append(f"{venue}:{symbol}:position_state_unverified")
-                    else:
-                        qty = abs(float(position.get("size", 0.0) or 0.0))
-                        if qty > 0.0:
-                            side = str(position.get("side") or position.get("direction") or "UNKNOWN")
-                            violations.append(f"{venue}:{symbol}:existing_position:{side}:{qty:.8g}")
-                    orders = manager.get_open_orders(symbol=symbol)
-                    if orders is None:
-                        violations.append(f"{venue}:{symbol}:open_orders_unverified")
-                    elif len(orders) > 0:
-                        violations.append(f"{venue}:{symbol}:existing_open_orders:{len(orders)}")
-                    if str(venue).lower() == "hyperliquid":
-                        dex = symbol.split(":", 1)[0].lower() if ":" in symbol else "main"
-                        if dex not in checked_hl_dex:
-                            checked_hl_dex.add(dex)
-                            bal = manager.get_balance() or {}
-                            locked = float(bal.get("locked", 0.0) or 0.0) if isinstance(bal, dict) else 0.0
-                            if locked > tolerance:
-                                violations.append(f"hyperliquid:{dex}:locked_collateral_unreconciled:${locked:.4f}")
-                except Exception as exc:
-                    violations.append(f"{venue}:{symbol}:preflight_error:{type(exc).__name__}")
-            if not violations:
-                ctx.startup_exposure_verified = True
-        if violations:
-            if bool(getattr(config, "STARTUP_EXTERNAL_EXPOSURE_BLOCK_ALL_NEW_ENTRIES", True)):
-                self.trading_enabled = False
-                self.trading_pause_reason = "STARTUP_EXTERNAL_EXPOSURE_RECONCILIATION_REQUIRED"
-            logger.critical(
-                "STARTUP EXPOSURE PREFLIGHT BLOCKED NEW ENTRIES | reason=%s violations=%s",
-                self.trading_pause_reason or "UNRECONCILED_EXTERNAL_EXPOSURE",
-                ";".join(violations),
-            )
-            return False
-        logger.info("✅ STARTUP EXPOSURE PREFLIGHT verified flat/open-order-free executable universe")
-        return True
+                local_violations: list[str] = []
+                ctx.startup_exposure_verified = False
+                ctx.startup_exposure_reason = ""
+                for venue in ctx.execution_router.available_exchanges():
+                    manager = ctx.execution_router.manager_for(venue)
+                    symbol = str(getattr(manager, "symbol", "") or ctx.instrument.display_symbol)
+                    key = (str(venue).lower(), symbol.upper())
+                    if key in checked_managers:
+                        continue
+                    checked_managers.add(key)
+                    try:
+                        position = manager.get_open_position()
+                        if position is None:
+                            local_violations.append(f"{venue}:{symbol}:position_state_unverified")
+                        else:
+                            qty = abs(float(position.get("size", 0.0) or 0.0))
+                            if qty > 0.0:
+                                side = str(position.get("side") or position.get("direction") or "UNKNOWN")
+                                local_violations.append(f"{venue}:{symbol}:existing_position:{side}:{qty:.8g}")
+                        orders = manager.get_open_orders(symbol=symbol)
+                        if orders is None:
+                            local_violations.append(f"{venue}:{symbol}:open_orders_unverified")
+                        elif len(orders) > 0:
+                            local_violations.append(f"{venue}:{symbol}:existing_open_orders:{len(orders)}")
+                        if str(venue).lower() == "hyperliquid":
+                            dex = symbol.split(":", 1)[0].lower() if ":" in symbol else "main"
+                            if dex not in checked_hl_dex:
+                                checked_hl_dex.add(dex)
+                                bal = manager.get_balance() or {}
+                                locked = float(bal.get("locked", 0.0) or 0.0) if isinstance(bal, dict) else 0.0
+                                if locked > tolerance:
+                                    local_violations.append(f"hyperliquid:{dex}:locked_collateral_unreconciled:${locked:.4f}")
+                    except Exception as exc:
+                        local_violations.append(f"{venue}:{symbol}:preflight_error:{type(exc).__name__}")
+                if local_violations:
+                    ctx.startup_exposure_reason = ";".join(local_violations)
+                    violations.extend(local_violations)
+                else:
+                    ctx.startup_exposure_verified = True
+            if violations:
+                if bool(getattr(config, "STARTUP_EXTERNAL_EXPOSURE_BLOCK_ALL_NEW_ENTRIES", True)):
+                    self.trading_enabled = False
+                    self.trading_pause_reason = "STARTUP_EXTERNAL_EXPOSURE_RECONCILIATION_REQUIRED"
+                logger.critical(
+                    "STARTUP EXPOSURE PREFLIGHT QUARANTINED NEW ENTRIES; ANALYTICS REMAIN ACTIVE | reason=%s violations=%s",
+                    self.trading_pause_reason or "UNRECONCILED_EXTERNAL_EXPOSURE",
+                    ";".join(violations),
+                )
+                return False
+            self.trading_enabled = True
+            self.trading_pause_reason = ""
+            if previously_paused:
+                logger.info("✅ STARTUP EXPOSURE RECONCILED — fresh entries re-enabled; market calculations remained active during quarantine")
+            else:
+                logger.info("✅ STARTUP EXPOSURE PREFLIGHT verified flat/open-order-free executable universe")
+            return True
+
+    def _maybe_recheck_external_exposure_pause(self) -> None:
+        """Periodically release a startup execution quarantine after exposure clears."""
+        if self.trading_enabled or not bool(getattr(config, "STARTUP_EXTERNAL_EXPOSURE_PREFLIGHT_ENABLED", True)):
+            return
+        now = time.time()
+        interval = max(1.0, float(getattr(config, "STARTUP_EXTERNAL_EXPOSURE_RECHECK_SEC", 10.0) or 10.0))
+        if now - self._last_startup_exposure_recheck_sec < interval:
+            return
+        self._last_startup_exposure_recheck_sec = now
+        self._startup_external_exposure_preflight()
+
+    def _submission_gate_for_context(self, ctx: AssetContext) -> tuple[bool, str]:
+        """Atomic order gate; analytics and shadow labelling are never gated here."""
+        if not self.trading_enabled:
+            return False, self.trading_pause_reason or "STARTUP_EXTERNAL_EXPOSURE_RECONCILIATION_REQUIRED"
+        if (
+            bool(getattr(config, "STARTUP_EXTERNAL_EXPOSURE_PREFLIGHT_ENABLED", True))
+            and not self._is_indian_options_context(ctx)
+            and not bool(ctx.startup_exposure_verified)
+        ):
+            return False, f"startup_context_exposure_unverified:{ctx.instrument.asset_id}:{ctx.startup_exposure_reason or 'unknown'}"
+        return self.guard.can_evaluate_entry(ctx, self.contexts)
 
     def _instrument_leverage(self, inst: TradableInstrument) -> int:
         configured = max(1, int(getattr(config, "LEVERAGE", 1)))
@@ -1159,7 +1201,7 @@ class MultiAssetInstitutionalBot:
         ctx_holder["ctx"] = ctx
         strategy.bind_portfolio_submission_guard(
             self._submission_arbitration_lock,
-            lambda: self.guard.can_evaluate_entry(ctx, self.contexts),
+            lambda: self._submission_gate_for_context(ctx),
         )
         return ctx
 
@@ -1384,9 +1426,9 @@ class MultiAssetInstitutionalBot:
                     self._log_throttled_asset(ctx, f"Portfolio exposure gate: {reason}")
                     next_due = time.time() + interval
                     continue
-                if not self.trading_enabled and not ctx.has_position:
-                    next_due = time.time() + interval
-                    continue
+                # Execution may be quarantined after startup reconciliation, but
+                # calculation/telemetry/shadow labelling must remain live. Any
+                # approved submission is rejected atomically by the submission gate.
                 now_ms = int(time.time() * 1000)
                 with instrument_scope(ctx.instrument):
                     t0 = time.time()
@@ -1415,6 +1457,7 @@ class MultiAssetInstitutionalBot:
         while self.running:
             try:
                 self._maybe_groww_premarket_refresh()
+                self._maybe_recheck_external_exposure_pause()
                 self._market_wakeup.wait(timeout=1.0)
                 self._market_wakeup.clear()
             except KeyboardInterrupt:
@@ -1462,10 +1505,11 @@ class MultiAssetInstitutionalBot:
             with instrument_scope(inst):
                 selected_venue = str(getattr(decision, "venue", "") or inst.primary_exchange.value).upper()
                 selected_symbol = str(getattr(decision, "instrument", "") or inst.display_symbol)
+                submission_state = "ENABLED" if self.trading_enabled else f"PAUSED:{self.trading_pause_reason or 'STARTUP_PREFLIGHT'}"
                 logger.info(
-                    "🩺 DESK_HEALTH asset=%s decision_venue=%s decision_symbol=%s context_bootstrap=%s:%s state=%s block=%s mark=%.4f eval_ms=%.1f slots=%d/%d %s",
+                    "🩺 DESK_HEALTH asset=%s decision_venue=%s decision_symbol=%s context_bootstrap=%s:%s state=%s block=%s submission=%s mark=%.4f eval_ms=%.1f slots=%d/%d %s",
                     inst.asset_id, selected_venue, selected_symbol, inst.primary_exchange.value.upper(), inst.display_symbol,
-                    state, block, price, dt_ms, self.guard.count_open(self.contexts), self.guard.max_open_positions,
+                    state, block, submission_state, price, dt_ms, self.guard.count_open(self.contexts), self.guard.max_open_positions,
                     self.guard.report_line(ctx),
                 )
         except Exception as e:

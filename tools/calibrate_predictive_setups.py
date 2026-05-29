@@ -18,7 +18,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-MODEL_VERSION = "pre_move_orderflow_hazard_v1+predictive_protected_barrier_outcome_v2"
+MODEL_VERSION = "pre_move_orderflow_hazard_v1+predictive_bracket_viability_v3"
 
 
 def wilson_lower(wins: int, total: int, z: float = 1.96) -> float:
@@ -41,7 +41,7 @@ def run(labels_path: Path, min_obs: int, max_brier: float, min_lower: float, hol
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         groups[str(row.get("model_key") or "UNSPECIFIED")].append(row)
-    report: dict[str, Any] = {"model_version": MODEL_VERSION, "labels_path": str(labels_path), "approved_registry": {}, "groups": {}}
+    report: dict[str, Any] = {"model_version": MODEL_VERSION, "labels_path": str(labels_path), "prediction_authority": "analytic_bracket_score_calibrated_against_independent_tp_sl_outcomes", "approved_registry": {}, "groups": {}}
     for key, group in sorted(groups.items()):
         group.sort(key=lambda r: int(r.get("observation_ts_ns", 0)))
         cut = max(1, int(len(group) * (1.0 - holdout_fraction)))
@@ -54,7 +54,7 @@ def run(labels_path: Path, min_obs: int, max_brier: float, min_lower: float, hol
         brier = sum((p - y) ** 2 for p, y in zip(probs, targets)) / n if n else None
         lower = wilson_lower(wins, n)
         approved = bool(n >= min_obs and brier is not None and brier <= max_brier and lower >= min_lower)
-        row = {"model_version": MODEL_VERSION, "out_of_sample_observations": n, "walk_forward_validated": approved, "brier_score": brier, "lower_confidence_tp_before_sl": lower, "observed_tp_before_sl": wins / n if n else None, "approved": approved}
+        row = {"model_version": MODEL_VERSION, "prediction_authority": "analytic_bracket_score_calibrated_against_independent_tp_sl_outcomes", "out_of_sample_observations": n, "walk_forward_validated": approved, "brier_score": brier, "lower_confidence_tp_before_sl": lower, "observed_tp_before_sl": wins / n if n else None, "approved": approved}
         report["groups"][key] = row
         if approved:
             report["approved_registry"][key] = row

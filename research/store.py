@@ -84,6 +84,8 @@ class PredictiveBarrierLabel:
     resolution_price: float
     favorable_excursion_bps: float
     adverse_excursion_bps: float
+    parent_state_id: str = ""
+    prediction_authority: str = "uncalibrated_analytic_score_shadow_only"
 
 
 class JsonlResearchStore:
@@ -163,6 +165,9 @@ class _PendingPredictiveBarrier:
     predicted_target_before_stop_probability: float
     predicted_directional_move_probability: float
     timeout_s: int
+    parent_state_id: str = ""
+    prediction_authority: str = "uncalibrated_analytic_score_shadow_only"
+    event_key: str = ""
     favorable_bps: float = 0.0
     adverse_bps: float = 0.0
 
@@ -175,24 +180,36 @@ class PredictiveBarrierLabelWriter:
         self.timeout_s = max(1, int(timeout_s))
         self._pending: list[_PendingPredictiveBarrier] = []
         self._last_key_ts_ns: dict[str, int] = {}
+        self._active_event_keys: set[str] = set()
 
-    def record_candidate(self, *, observation_ts_ns: int, asset_id: str, venue: str, instrument: str, candidate_id: str, model_key: str, setup_family: str, side: str, entry_price: float, stop_price: float, target_price: float, estimated_round_trip_cost_bps: float, predicted_target_before_stop_probability: float, predicted_directional_move_probability: float) -> bool:
+    def record_candidate(self, *, observation_ts_ns: int, asset_id: str, venue: str, instrument: str, candidate_id: str, model_key: str, setup_family: str, side: str, entry_price: float, stop_price: float, target_price: float, estimated_round_trip_cost_bps: float, predicted_target_before_stop_probability: float, predicted_directional_move_probability: float, parent_state_id: str = "", prediction_authority: str = "uncalibrated_analytic_score_shadow_only", event_key: str = "") -> bool:
         if float(entry_price) <= 0 or float(stop_price) <= 0 or float(target_price) <= 0:
             return False
-        key = f"{model_key}:{side}"
-        last = int(self._last_key_ts_ns.get(key, 0))
+        resolved_event_key = str(event_key or parent_state_id or candidate_id)
+        key = f"{model_key}:{str(side).lower()}:{resolved_event_key}"
+        if key in self._active_event_keys:
+            return False
+        spacing_key = f"{model_key}:{str(side).lower()}"
+        last = int(self._last_key_ts_ns.get(spacing_key, 0))
         if last and (int(observation_ts_ns) - last) / 1_000_000_000.0 < self.min_spacing_sec:
             return False
-        self._last_key_ts_ns[key] = int(observation_ts_ns)
-        self._pending.append(_PendingPredictiveBarrier(int(observation_ts_ns), str(asset_id), str(venue), str(instrument), str(candidate_id), str(model_key), str(setup_family), str(side).lower(), float(entry_price), float(stop_price), float(target_price), float(estimated_round_trip_cost_bps), float(predicted_target_before_stop_probability), float(predicted_directional_move_probability), self.timeout_s))
+        self._last_key_ts_ns[spacing_key] = int(observation_ts_ns)
+        self._active_event_keys.add(key)
+        self._pending.append(_PendingPredictiveBarrier(int(observation_ts_ns), str(asset_id), str(venue).lower(), str(instrument), str(candidate_id), str(model_key), str(setup_family), str(side).lower(), float(entry_price), float(stop_price), float(target_price), float(estimated_round_trip_cost_bps), float(predicted_target_before_stop_probability), float(predicted_directional_move_probability), self.timeout_s, str(parent_state_id), str(prediction_authority), key))
         return True
 
-    def observe(self, *, now_ts_ns: int, current_price: float) -> list[Path]:
+    def observe(self, *, now_ts_ns: int, current_price: float, venue: str | None = None, instrument: str | None = None) -> list[Path]:
         if float(current_price) <= 0:
             return []
         written: list[Path] = []
         remaining: list[_PendingPredictiveBarrier] = []
         for obs in self._pending:
+            if venue is not None and str(venue).lower() != str(obs.venue).lower():
+                remaining.append(obs)
+                continue
+            if instrument is not None and str(instrument) != str(obs.instrument):
+                remaining.append(obs)
+                continue
             sign = 1.0 if obs.side in {"buy", "long"} else -1.0
             move_bps = (float(current_price) / obs.entry_price - 1.0) * 10_000.0 * sign
             obs.favorable_bps = max(obs.favorable_bps, move_bps, 0.0)
@@ -205,8 +222,10 @@ class PredictiveBarrierLabelWriter:
                 remaining.append(obs)
                 continue
             written.append(self.store.append_predictive_barrier_label(PredictiveBarrierLabel(
-                observation_ts_ns=obs.observation_ts_ns, resolved_ts_ns=int(now_ts_ns), asset_id=obs.asset_id, venue=obs.venue, instrument=obs.instrument, candidate_id=obs.candidate_id, model_key=obs.model_key, setup_family=obs.setup_family, side=obs.side, reference_entry_price=obs.entry_price, stop_price=obs.stop_price, target_price=obs.target_price, estimated_round_trip_cost_bps=obs.estimated_round_trip_cost_bps, predicted_target_before_stop_probability=obs.predicted_target_before_stop_probability, predicted_directional_move_probability=obs.predicted_directional_move_probability, outcome=outcome, resolution_price=float(current_price), favorable_excursion_bps=obs.favorable_bps, adverse_excursion_bps=obs.adverse_bps,
+                observation_ts_ns=obs.observation_ts_ns, resolved_ts_ns=int(now_ts_ns), asset_id=obs.asset_id, venue=obs.venue, instrument=obs.instrument, candidate_id=obs.candidate_id, model_key=obs.model_key, setup_family=obs.setup_family, side=obs.side, reference_entry_price=obs.entry_price, stop_price=obs.stop_price, target_price=obs.target_price, estimated_round_trip_cost_bps=obs.estimated_round_trip_cost_bps, predicted_target_before_stop_probability=obs.predicted_target_before_stop_probability, predicted_directional_move_probability=obs.predicted_directional_move_probability, outcome=outcome, resolution_price=float(current_price), favorable_excursion_bps=obs.favorable_bps, adverse_excursion_bps=obs.adverse_bps, parent_state_id=obs.parent_state_id, prediction_authority=obs.prediction_authority,
             )))
+            if obs.event_key:
+                self._active_event_keys.discard(obs.event_key)
         self._pending = remaining
         return written
 

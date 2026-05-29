@@ -23,6 +23,7 @@ import time
 from typing import Any, Iterable, Mapping
 
 from strategy.domain import Direction, ProtectionPlan
+from strategy.liquidity_map import select_protection_pools
 
 try:
     import config
@@ -377,24 +378,39 @@ class DynamicProtectionPlanBuilder:
         base_stop_distance = base_stop * stop_mult * regime_stop_mult * expansion_mult
         structural_anchor = None
         structural_anchor_role = "unavailable"
+        structural_target_pool = None
+        liquidity_map_present = "liquidity_pools" in market
+        liquidity_pools = list(market.get("liquidity_pools") or []) if isinstance(market.get("liquidity_pools"), list) else []
         structural_clearance = max(
             float(volatility_price) * float(_cfg("ADAPTIVE_PROTECTION_STRUCTURAL_CLEARANCE_VOL_MULT", 0.35)),
             price * float(_cfg("ADAPTIVE_PROTECTION_STRUCTURAL_CLEARANCE_MIN_BPS", 2.0)) / 10000.0,
             tick_size * float(_cfg("ADAPTIVE_PROTECTION_STRUCTURAL_CLEARANCE_TICKS", 2.0)),
         ) if bool(_cfg("ADAPTIVE_PROTECTION_STRUCTURAL_ANCHORS_ENABLED", True)) else 0.0
+        require_mtf_pools = bool(market.get("venue_market_state_ready", False)) and liquidity_map_present and bool(_cfg("ADAPTIVE_PROTECTION_REQUIRE_MTF_INVALIDATION_POOL", True))
+        require_mtf_objective = bool(market.get("venue_market_state_ready", False)) and liquidity_map_present and bool(_cfg("ADAPTIVE_PROTECTION_REQUIRE_MTF_OBJECTIVE_POOL", True))
         if asset_class != "option" and bool(_cfg("ADAPTIVE_PROTECTION_STRUCTURAL_ANCHORS_ENABLED", True)):
-            if direction in {Direction.LONG, Direction.BULLISH}:
-                candidates = [v for v in (_num(market.get("last_closed_low"), 0.0), _num(market.get("prior_range_low"), 0.0)) if 0.0 < v < price]
-                if candidates:
-                    structural_anchor = max(candidates)
-                    structural_anchor_role = "support_invalidation_below_closed_anchor"
+            preliminary_min_objective = max(base_stop_distance, price * max(total_exit_cost_bps, 1.0) / 10000.0)
+            stop_pool, _ = select_protection_pools(liquidity_pools, direction=direction.value, entry_price=price, min_objective_distance=preliminary_min_objective)
+            if stop_pool is not None:
+                structural_anchor = float(stop_pool["price"])
+                structural_anchor_role = f"mtf_{str(stop_pool.get('side','')).lower()}_invalidation:{stop_pool.get('max_timeframe','unknown')}"
+                if direction in {Direction.LONG, Direction.BULLISH}:
                     base_stop_distance = max(base_stop_distance, price - (structural_anchor - structural_clearance))
-            elif direction in {Direction.SHORT, Direction.BEARISH}:
-                candidates = [v for v in (_num(market.get("last_closed_high"), 0.0), _num(market.get("prior_range_high"), 0.0)) if v > price]
-                if candidates:
-                    structural_anchor = min(candidates)
-                    structural_anchor_role = "resistance_invalidation_above_closed_anchor"
+                elif direction in {Direction.SHORT, Direction.BEARISH}:
                     base_stop_distance = max(base_stop_distance, (structural_anchor + structural_clearance) - price)
+            elif require_mtf_pools:
+                return ProtectionPlan(price, price, price, protection_type, False, ["no_mtf_liquidity_invalidation_pool_for_setup"], diagnostics={"liquidity_pools": liquidity_pools})
+            elif not liquidity_map_present:
+                # Compatibility/research fallback only. Live V23 venue states export
+                # a multi-timeframe pool map and therefore cannot use this path.
+                support_or_resistance = max(_num(market.get("last_closed_low"), 0.0), _num(market.get("prior_range_low"), 0.0)) if direction in {Direction.LONG, Direction.BULLISH} else min(v for v in (_num(market.get("last_closed_high"), 0.0), _num(market.get("prior_range_high"), 0.0)) if v > price) if any(v > price for v in (_num(market.get("last_closed_high"), 0.0), _num(market.get("prior_range_high"), 0.0))) else 0.0
+                if support_or_resistance > 0.0:
+                    structural_anchor = support_or_resistance
+                    structural_anchor_role = "compatibility_closed_range_invalidation"
+                    if direction in {Direction.LONG, Direction.BULLISH} and support_or_resistance < price:
+                        base_stop_distance = max(base_stop_distance, price - (support_or_resistance - structural_clearance))
+                    elif direction in {Direction.SHORT, Direction.BEARISH} and support_or_resistance > price:
+                        base_stop_distance = max(base_stop_distance, (support_or_resistance + structural_clearance) - price)
         stop_distance = base_stop_distance
         floor_rr = float(_cfg("DYNAMIC_PROTECTION_OPTION_RR_FLOOR", 1.10) if asset_class == "option" else _cfg("DYNAMIC_PROTECTION_RR_FLOOR", 1.15))
         policy_min_rr = _num(market.get("policy_min_rr"), 0.0)
@@ -410,33 +426,43 @@ class DynamicProtectionPlanBuilder:
         min_target_rr = (price * min_target_bps / 10000.0) / max(stop_distance, 1e-9) if min_target_bps > 0 else 0.0
         target_rr = _clamp(max(edge_scalar, min_target_rr), floor_rr, ceiling_rr)
         model_target_distance = stop_distance * target_rr
-        # Front-run a reachable closed structural objective when it is visible.
-        # If it is too close to justify the risk, keep the smaller real objective
-        # and allow the barrier-EV gate to reject the trade; do not fabricate a TP
-        # beyond nearby opposing liquidity merely to make RR look attractive.
+        # A TP is selected from an adequate multi-timeframe liquidity objective.
+        # The prior one-minute-nearest-objective shortcut generated 0.03x RR trades;
+        # it is retired.  A too-near pool is skipped in favour of the next reachable
+        # pool, and the trade fails closed when no objective funds its protection.
         target_buffer = max(
             float(volatility_price) * float(_cfg("ADAPTIVE_PROTECTION_TARGET_FRONT_RUN_VOL_MULT", 0.20)),
             price * float(_cfg("ADAPTIVE_PROTECTION_TARGET_FRONT_RUN_MIN_BPS", 1.0)) / 10000.0,
             tick_size * float(_cfg("ADAPTIVE_PROTECTION_TARGET_FRONT_RUN_TICKS", 1.0)),
         ) if bool(_cfg("ADAPTIVE_PROTECTION_STRUCTURAL_TARGETS_ENABLED", True)) else 0.0
         structural_objective = None
-        target_source = "projected_edge_volatility_objective_no_closed_pool_ahead"
+        target_source = "projected_edge_volatility_objective_no_mtf_pool_ahead"
         target_distance = model_target_distance
+        minimum_net_payout_bps = float(_cfg("ADAPTIVE_PROTECTION_MIN_NET_TARGET_AFTER_COST_BPS", 2.0))
+        minimum_objective_distance = max(
+            stop_distance * floor_rr + target_buffer,
+            price * (total_exit_cost_bps + minimum_net_payout_bps) / 10000.0 + target_buffer,
+            price * min_target_bps / 10000.0 + target_buffer if min_target_bps > 0 else 0.0,
+        )
         if asset_class != "option" and bool(_cfg("ADAPTIVE_PROTECTION_STRUCTURAL_TARGETS_ENABLED", True)):
-            if direction in {Direction.LONG, Direction.BULLISH}:
-                objectives = [v for v in (_num(market.get("last_closed_high"), 0.0), _num(market.get("prior_range_high"), 0.0)) if v > price]
-                if objectives:
-                    structural_objective = min(objectives)
-                    objective_distance = max(tick_size, (structural_objective - target_buffer) - price)
-                    target_distance = min(model_target_distance, objective_distance)
-                    target_source = "front_run_nearest_closed_sell_side_objective"
-            elif direction in {Direction.SHORT, Direction.BEARISH}:
-                objectives = [v for v in (_num(market.get("last_closed_low"), 0.0), _num(market.get("prior_range_low"), 0.0)) if 0.0 < v < price]
-                if objectives:
-                    structural_objective = max(objectives)
-                    objective_distance = max(tick_size, price - (structural_objective + target_buffer))
-                    target_distance = min(model_target_distance, objective_distance)
-                    target_source = "front_run_nearest_closed_buy_side_objective"
+            _, structural_target_pool = select_protection_pools(liquidity_pools, direction=direction.value, entry_price=price, min_objective_distance=minimum_objective_distance)
+            if structural_target_pool is None and require_mtf_objective:
+                return ProtectionPlan(price, price, price, protection_type, False, ["no_reachable_mtf_liquidity_objective_with_economic_bracket"], diagnostics={"liquidity_pools": liquidity_pools, "minimum_objective_distance": minimum_objective_distance, "stop_distance": stop_distance})
+            if structural_target_pool is not None:
+                structural_objective = float(structural_target_pool["price"])
+                if direction in {Direction.LONG, Direction.BULLISH}:
+                    target_distance = max(tick_size, (structural_objective - target_buffer) - price)
+                    target_source = f"front_run_mtf_bsl_objective:{structural_target_pool.get('max_timeframe','unknown')}"
+                elif direction in {Direction.SHORT, Direction.BEARISH}:
+                    target_distance = max(tick_size, price - (structural_objective + target_buffer))
+                    target_source = f"front_run_mtf_ssl_objective:{structural_target_pool.get('max_timeframe','unknown')}"
+            elif not liquidity_map_present:
+                values = (_num(market.get("last_closed_high"), 0.0), _num(market.get("prior_range_high"), 0.0)) if direction in {Direction.LONG, Direction.BULLISH} else (_num(market.get("last_closed_low"), 0.0), _num(market.get("prior_range_low"), 0.0))
+                valid = [v for v in values if (v > price if direction in {Direction.LONG, Direction.BULLISH} else 0 < v < price)]
+                if valid:
+                    structural_objective = min(valid) if direction in {Direction.LONG, Direction.BULLISH} else max(valid)
+                    target_distance = max(tick_size, (structural_objective - target_buffer) - price if direction in {Direction.LONG, Direction.BULLISH} else price - (structural_objective + target_buffer))
+                    target_source = "front_run_nearest_closed_sell_side_objective" if direction in {Direction.LONG, Direction.BULLISH} else "front_run_nearest_closed_buy_side_objective"
         realised_target_rr = target_distance / max(stop_distance, 1e-9)
         if direction in {Direction.LONG, Direction.BULLISH}:
             stop_price = price - stop_distance
@@ -487,9 +513,12 @@ class DynamicProtectionPlanBuilder:
                 "target_rr_before_structural_objective": target_rr,
                 "realised_target_rr": realised_target_rr,
                 "structural_objective_price": structural_objective,
+                "liquidity_pool_count": len(liquidity_pools),
+                "structural_target_pool": structural_target_pool,
                 "target_source": target_source,
                 "target_front_run_buffer_distance": target_buffer,
                 "closed_anchor_source": str(market.get("closed_anchor_source") or "unavailable"),
+                "liquidity_pools": liquidity_pools,
                 "volatility_source": str(market.get("volatility_source") or "unknown"),
                 "venue_local_robust_vol_bps": market.get("venue_local_robust_vol_bps"),
             },

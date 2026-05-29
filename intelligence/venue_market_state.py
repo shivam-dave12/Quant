@@ -22,6 +22,7 @@ except Exception:  # pragma: no cover
     config = None  # type: ignore
 
 from market_data.normalizer import VenueMicrostate
+from strategy.liquidity_map import build_liquidity_pools
 
 
 def _cfg(name: str, default: Any) -> Any:
@@ -214,10 +215,14 @@ class VenueMarketStateEngine:
             live = self._observe_live(venue_key, float(state.mid or 0.0))
             raw_1m = self._candles(data_manager, venue_key, "1m", 81)
             raw_5m = self._candles(data_manager, venue_key, "5m", 41)
-            raw_15m = self._candles(data_manager, venue_key, "15m", 25)
+            raw_15m = self._candles(data_manager, venue_key, "15m", 80)
+            raw_1h = self._candles(data_manager, venue_key, "1h", 80)
+            raw_4h = self._candles(data_manager, venue_key, "4h", 60)
             candles_1m = self._closed_candles(raw_1m)
             candles_5m = self._closed_candles(raw_5m)
             candles_15m = self._closed_candles(raw_15m)
+            candles_1h = self._closed_candles(raw_1h)
+            candles_4h = self._closed_candles(raw_4h)
             closes_1m = [_close(row) for row in candles_1m if _close(row) > 0]
             if len(closes_1m) < 20:
                 results[venue_key] = VenueMarketState(
@@ -280,6 +285,11 @@ class VenueMarketStateEngine:
             else:
                 regime = "BALANCE"
             uncertainty = max(0.0, (1.0 - confidence) * robust_vol * 0.35)
+            liquidity_pools = build_liquidity_pools(
+                {"1m": candles_1m, "5m": candles_5m, "15m": candles_15m, "1h": candles_1h, "4h": candles_4h},
+                reference_price=float(state.mid or confirmed_parent_close or 0.0),
+                merge_bps=float(_cfg("LIQUIDITY_POOL_CLUSTER_MERGE_BPS", 2.0)),
+            )
             results[venue_key] = VenueMarketState(
                 venue=venue_key, symbol=symbol, ready=True, reason="venue_local_structural_state_ready",
                 signed_alpha_bps=alpha, confidence=confidence, uncertainty_bps=uncertainty,
@@ -298,8 +308,9 @@ class VenueMarketStateEngine:
                              "last_closed_low": _low(candles_1m[-1]) if candles_1m else 0.0,
                              "prior_range_high": prior_high,
                              "prior_range_low": prior_low,
-                             "closed_anchor_source": "venue_local_closed_1m_range",
-                             "closed_candle_counts": {"1m": len(candles_1m), "5m": len(candles_5m), "15m": len(candles_15m)}},
+                             "closed_anchor_source": "venue_local_multi_timeframe_liquidity_pools",
+                             "liquidity_pools": liquidity_pools,
+                             "closed_candle_counts": {"1m": len(candles_1m), "5m": len(candles_5m), "15m": len(candles_15m), "1h": len(candles_1h), "4h": len(candles_4h)}},
             )
         return results
 

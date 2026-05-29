@@ -53,7 +53,7 @@ class HyperliquidReferenceDataManager:
         execution_enabled: bool = False,
         instrument=None,
         canonical_underlying: str | None = None,
-        price_tick: float = 0.01,
+        price_tick: float = 0.0,
         qty_step: float = 0.00001,
         api=None,
     ) -> None:
@@ -72,7 +72,7 @@ class HyperliquidReferenceDataManager:
             venue="hyperliquid", venue_symbol=self.coin,
             canonical_underlying=str(canonical_underlying or getattr(instrument, "asset_id", self.coin)).upper(),
             product_class="linear_perp", quote_currency="USD", contract_multiplier=1.0,
-            settlement_currency="USDC", price_tick=float(price_tick or 0.01), qty_step=float(qty_step or 0.00001),
+            settlement_currency="USDC", price_tick=float(price_tick or 0.0), qty_step=float(qty_step or 0.00001),
             execution_enabled=bool(execution_enabled), notional_model="linear",
         )
         self._tracker = MicrostructureTracker(self._mapping)
@@ -437,7 +437,7 @@ class HyperliquidDataManager(HyperliquidReferenceDataManager):
             symbol, instrument=instrument,
             canonical_underlying=str(getattr(instrument, "asset_id", symbol)).upper(),
             execution_enabled=bool(kwargs.pop("execution_enabled", True)),
-            price_tick=float(getattr(ex_inst, "tick_size", 0.01) or 0.01),
+            price_tick=float(getattr(ex_inst, "tick_size", 0.0) or 0.0),
             qty_step=float(getattr(ex_inst, "lot_step", 0.00001) or 0.00001),
             **kwargs,
         )

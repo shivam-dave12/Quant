@@ -90,6 +90,11 @@ class BarrierOutcomeAssessment:
         out["drift_after_absorption_bps"] = self.drift_after_predictive_timing_bps
         out["entry_authority"] = "pre_move_orderflow_hazard_not_realised_price_confirmation"
         out["flow_response_role"] = "post_entry_toxicity_and_calibration_only"
+        out["score_authority"] = "analytic_bracket_viability_score_not_calibrated_probability"
+        out["live_permission_authority"] = "walk_forward_calibration_gate"
+        out["cost_authority"] = "route_total_already_includes_round_trip_fee_plus_explicit_tail_reserve"
+        out["analytic_bracket_score"] = self.target_before_stop_probability
+        out["required_analytic_bracket_score"] = self.required_target_before_stop_probability
         return out
 
 
@@ -176,20 +181,6 @@ class ProtectedBarrierOutcomeEngine:
         continuation = _clamp(0.05 + 0.90 * (1.0 - absorption) * (1.0 - math.exp(-max(effectiveness, 0.0) / scale)), 0.05, 0.95)
         return FlowResponseEstimate(True, len(rows), direction.value, effectiveness, continuation, _clamp(absorption, 0.0, 1.0), aligned_count, sign * (rows[-1].mid / rows[0].mid - 1.0) * 10_000.0, sign * rows[-1].flow_bps, "realised_price_response_telemetry_only")
 
-    @staticmethod
-    def _first_passage_probability(*, lower_distance_bps: float, upper_distance_bps: float, drift_bps: float, variance_bps2: float) -> float:
-        lower = max(1e-9, float(lower_distance_bps))
-        upper = max(1e-9, float(upper_distance_bps))
-        variance = max(1e-9, float(variance_bps2))
-        mu = float(drift_bps)
-        if abs(mu) <= 1e-9:
-            return lower / (lower + upper)
-        a = _clamp(-2.0 * mu * lower / variance, -700.0, 700.0)
-        b = _clamp(-2.0 * mu * (lower + upper) / variance, -700.0, 700.0)
-        numerator = 1.0 - math.exp(a)
-        denominator = 1.0 - math.exp(b)
-        return lower / (lower + upper) if abs(denominator) <= 1e-12 else _clamp(numerator / denominator, 0.0, 1.0)
-
     def assess(
         self,
         *,
@@ -205,52 +196,64 @@ class ProtectedBarrierOutcomeEngine:
         execution_quality: float,
         predictive_flow: PredictiveFlowAssessment | None = None,
     ) -> BarrierOutcomeAssessment:
+        """Evaluate bracket economics without inventing calibrated probabilities.
+
+        V22 mixed a one-second hazard score, multi-minute structural drift and
+        one-minute volatility inside a first-passage equation and emitted 99%
+        probabilities.  V23 preserves the predictive hazard as an *analytic
+        score* and leaves win-rate authority exclusively to walk-forward
+        calibration on exact bracket outcomes.
+        """
         sign = _direction_sign(direction)
         entry = float(protection.entry_price or 0.0)
         realised = self.flow_response(venue=venue, direction=direction)
+        model = "predictive_bracket_viability_v3_uncalibrated_score"
         if sign == 0 or entry <= 0.0:
-            return BarrierOutcomeAssessment(False, False, "predictive_protected_barrier_outcome_v2", direction.value, 0.0, 0.0, route_cost_bps, 0.0, parent_alpha_bps, child_timing_contribution_bps, uncertainty_bps, robust_volatility_bps, 0.0, 0.0, 0.0, 1.0, -math.inf, predictive_flow, realised, ("barrier_geometry_unavailable",))
+            return BarrierOutcomeAssessment(False, False, model, direction.value, 0.0, 0.0, route_cost_bps, 0.0, parent_alpha_bps, child_timing_contribution_bps, uncertainty_bps, robust_volatility_bps, 0.0, 0.0, 0.0, 1.0, -math.inf, predictive_flow, realised, ("barrier_geometry_unavailable",))
         stop_bps = sign * (entry - float(protection.stop_price)) / entry * 10_000.0
         target_bps = sign * (float(protection.target_price) - entry) / entry * 10_000.0
-        round_trip_mult = max(1.0, float(_cfg("BARRIER_OUTCOME_ROUND_TRIP_COST_MULTIPLIER", 2.0)))
-        all_in_cost = max(0.0, float(route_cost_bps)) * round_trip_mult
+        tails = _cfg("BARRIER_OUTCOME_EXIT_TAIL_RESERVE_BPS_BY_ASSET", {})
+        tail_reserve = _num(tails.get(self.asset_id), _num(_cfg("BARRIER_OUTCOME_EXIT_TAIL_RESERVE_BPS", 1.0), 1.0)) if isinstance(tails, Mapping) else _num(_cfg("BARRIER_OUTCOME_EXIT_TAIL_RESERVE_BPS", 1.0), 1.0)
+        all_in_cost = max(0.0, float(route_cost_bps)) + max(0.0, tail_reserve)
         signed_parent = sign * float(parent_alpha_bps)
         signed_child = sign * float(child_timing_contribution_bps)
-        structural_drift = max(0.0, signed_parent + max(-signed_parent * 0.35, signed_child) - max(0.0, float(uncertainty_bps)))
-        timing_probability = float(getattr(predictive_flow, "directional_move_probability", 0.5) if predictive_flow is not None else 0.5)
-        timing_alpha = max(0.0, float(getattr(predictive_flow, "predictive_alpha_bps", 0.0) if predictive_flow is not None else 0.0))
-        timing_multiplier = _clamp(0.40 + max(0.0, timing_probability - 0.50) * 2.0, 0.40, 1.25)
-        drift = (structural_drift + 0.35 * timing_alpha) * timing_multiplier
-        volatility = max(float(robust_volatility_bps or 0.0), float(_cfg("BARRIER_OUTCOME_MIN_VOLATILITY_BPS", 2.0)))
-        raw_probability = self._first_passage_probability(lower_distance_bps=stop_bps, upper_distance_bps=target_bps, drift_bps=drift, variance_bps2=volatility * volatility) if stop_bps > 0.0 and target_bps > 0.0 else 0.0
-        quality_haircut = float(_cfg("BARRIER_OUTCOME_LOW_QUALITY_PROBABILITY_HAIRCUT", 0.08)) * max(0.0, 1.0 - min(liquidity_score, execution_quality))
-        probability = _clamp(raw_probability - quality_haircut, 0.0, 1.0)
-        break_even_probability = (stop_bps + all_in_cost) / max(stop_bps + target_bps, 1e-9) if stop_bps > 0.0 and target_bps > 0.0 else 1.0
+        structural_support = max(0.0, signed_parent + max(-signed_parent * 0.35, signed_child) - max(0.0, float(uncertainty_bps)))
+        analytic_score = float(getattr(predictive_flow, "directional_move_probability", 0.0) if predictive_flow is not None else 0.0)
+        quality_haircut = float(_cfg("BARRIER_OUTCOME_LOW_QUALITY_PROBABILITY_HAIRCUT", 0.08)) * max(0.0, 1.0 - min(float(liquidity_score or 0.0), float(execution_quality or 0.0)))
+        analytic_score = _clamp(analytic_score - quality_haircut, 0.0, 1.0)
+        net_target_bps = target_bps - all_in_cost
+        net_stop_bps = stop_bps + all_in_cost
+        break_even_score = net_stop_bps / max(net_stop_bps + net_target_bps, 1e-9) if stop_bps > 0.0 and net_target_bps > 0.0 else 1.0
         per_asset = _cfg("BARRIER_OUTCOME_MIN_TARGET_BEFORE_STOP_PROBABILITY_BY_ASSET", {})
         asset_floor = _num(per_asset.get(self.asset_id), _num(_cfg("BARRIER_OUTCOME_MIN_TARGET_BEFORE_STOP_PROBABILITY", 0.58), 0.58)) if isinstance(per_asset, Mapping) else _num(_cfg("BARRIER_OUTCOME_MIN_TARGET_BEFORE_STOP_PROBABILITY", 0.58), 0.58)
-        required_probability = _clamp(max(asset_floor, break_even_probability + max(0.0, float(_cfg("BARRIER_OUTCOME_BREAK_EVEN_PROBABILITY_RESERVE", 0.03)))), 0.0, 0.999)
-        expected_value = probability * target_bps - (1.0 - probability) * stop_bps - all_in_cost
+        required_score = _clamp(max(asset_floor, break_even_score + max(0.0, float(_cfg("BARRIER_OUTCOME_BREAK_EVEN_PROBABILITY_RESERVE", 0.03)))), 0.0, 0.98)
+        expected_value = analytic_score * net_target_bps - (1.0 - analytic_score) * net_stop_bps
         minimum_ev = max(0.0, float(_cfg("BARRIER_OUTCOME_MIN_EXPECTED_VALUE_BPS", 1.0)))
         reasons: list[str] = []
         if stop_bps <= 0.0 or target_bps <= 0.0:
             reasons.append("barrier_geometry_invalid")
+        if net_target_bps <= minimum_ev:
+            reasons.append(f"bracket_target_does_not_cover_all_in_cost:{net_target_bps:.3f}<={minimum_ev:.3f}")
         if bool(_cfg("PREDICTIVE_FLOW_REQUIRE_READY_FOR_ENTRY", True)) and (predictive_flow is None or not predictive_flow.ready):
             reasons.append("pre_move_predictive_timing_unavailable")
         if predictive_flow is not None and predictive_flow.ready and not predictive_flow.approved:
             reasons.extend(list(predictive_flow.reasons))
-        if probability < required_probability:
-            reasons.append(f"target_before_stop_probability_insufficient:{probability:.4f}<{required_probability:.4f}")
+        if structural_support <= 0.0:
+            reasons.append("structural_support_not_positive_after_uncertainty")
+        if analytic_score < required_score:
+            reasons.append(f"analytic_bracket_score_insufficient:{analytic_score:.4f}<{required_score:.4f}")
         if expected_value < minimum_ev:
             reasons.append(f"barrier_expected_value_insufficient:{expected_value:.3f}<{minimum_ev:.3f}")
         approved = not reasons
         return BarrierOutcomeAssessment(
             ready=bool(predictive_flow is not None and predictive_flow.ready and stop_bps > 0.0 and target_bps > 0.0),
-            approved=approved, model="predictive_protected_barrier_outcome_v2", direction=direction.value,
+            approved=approved, model=model, direction=direction.value,
             stop_distance_bps=stop_bps, target_distance_bps=target_bps, route_cost_bps=float(route_cost_bps),
             round_trip_cost_reserve_bps=all_in_cost, parent_alpha_bps=float(parent_alpha_bps),
             child_timing_contribution_bps=float(child_timing_contribution_bps), uncertainty_bps=float(uncertainty_bps),
-            robust_volatility_bps=volatility, drift_after_predictive_timing_bps=drift,
-            raw_target_before_stop_probability=raw_probability, target_before_stop_probability=probability,
-            required_target_before_stop_probability=required_probability, expected_value_bps=expected_value,
+            robust_volatility_bps=float(robust_volatility_bps or 0.0), drift_after_predictive_timing_bps=structural_support,
+            raw_target_before_stop_probability=analytic_score, target_before_stop_probability=analytic_score,
+            required_target_before_stop_probability=required_score, expected_value_bps=expected_value,
             predictive_flow=predictive_flow, flow_response=realised, reasons=tuple(reasons),
         )
+

@@ -1964,7 +1964,9 @@ class _HyperliquidAdapter:
         self.exchange_instrument = exchange_instrument
         self.symbol = (exchange_instrument.symbol if exchange_instrument is not None else "BTC")
         self.display_symbol = (exchange_instrument.display_symbol if exchange_instrument is not None else self.symbol)
-        self.tick_size = float(getattr(exchange_instrument, "tick_size", 0.0) or 0.01) if exchange_instrument is not None else 0.01
+        # Hyperliquid prices are rounded by API.round_price using official dynamic
+        # significant-figure/size-decimal rules; never inject a fixed 0.01 tick.
+        self.tick_size = float(getattr(exchange_instrument, "tick_size", 0.0) or 0.0) if exchange_instrument is not None else 0.0
         self.lot_step = float(getattr(exchange_instrument, "lot_step", 0.0) or 0.00001) if exchange_instrument is not None else 0.00001
         self.min_qty = float(getattr(exchange_instrument, "min_qty", 0.0) or 0.0) if exchange_instrument is not None else 0.0
         self.max_qty = float(getattr(exchange_instrument, "max_qty", 0.0) or 0.0) if exchange_instrument is not None else 0.0

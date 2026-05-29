@@ -534,12 +534,16 @@ class InstrumentRegistry:
                     base_asset=base,
                     contract_type="linear_perp",
                     status="active",
-                    tick_size=first_positive(_safe_float(row.get("tick_size")), 0.01),
+                    # Hyperliquid price precision is dynamic (five significant figures,
+                    # additionally bounded by 6 - szDecimals for perps), not a
+                    # static 0.01 tick.  The strategy/execution adapter computes
+                    # the current valid increment from price and szDecimals.
+                    tick_size=first_positive(_safe_float(row.get("tick_size")), 0.0),
                     lot_step=lot_step,
                     min_qty=lot_step,
                     max_qty=0.0,
                     max_leverage=max_leverage,
-                    raw={**row, "perp_dex": dex, "settlement_currency": "USDC", "verified_margin_mode": capability.get("margin_mode", ""), "verified_capability_source": capability.get("capability_source", ""), "verified_max_leverage": verified_max_leverage},
+                    raw={**row, "perp_dex": dex, "settlement_currency": "USDC", "sz_decimals": sz_decimals, "price_precision_rule": "hyperliquid_5_significant_figures_and_perp_decimal_cap", "verified_margin_mode": capability.get("margin_mode", ""), "verified_capability_source": capability.get("capability_source", ""), "verified_max_leverage": verified_max_leverage},
                 )
                 keys = [normalise_symbol(name), normalise_symbol(base)]
                 for key in keys:

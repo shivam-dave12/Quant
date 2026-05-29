@@ -5092,7 +5092,7 @@ def test_predictive_calibration_missing_model_is_shadow_only(monkeypatch):
     monkeypatch.setattr("strategy.calibration_gate.config.PREDICTIVE_CALIBRATED_LIVE_MODELS", {}, raising=False)
     assessed = PredictiveCalibrationAuthority("OIL").assess(
         venue="hyperliquid", setup_family="PREMOVE_QUEUE_DEPLETION_INITIATION",
-        model_version="pre_move_orderflow_hazard_v1+predictive_protected_barrier_outcome_v2",
+        model_version="pre_move_orderflow_hazard_v1+predictive_bracket_viability_v3",
     )
     assert assessed.authorised_for_live is False
     assert assessed.authority == "shadow_only_until_walk_forward_calibrated"
@@ -5101,7 +5101,7 @@ def test_predictive_calibration_missing_model_is_shadow_only(monkeypatch):
 
 def test_predictive_calibration_allows_only_approved_walk_forward_model(monkeypatch):
     key = "OIL:hyperliquid:PREMOVE_QUEUE_DEPLETION_INITIATION"
-    version = "pre_move_orderflow_hazard_v1+predictive_protected_barrier_outcome_v2"
+    version = "pre_move_orderflow_hazard_v1+predictive_bracket_viability_v3"
     monkeypatch.setattr("strategy.calibration_gate.config.PREDICTIVE_CALIBRATION_REQUIRE_FOR_LIVE", True, raising=False)
     monkeypatch.setattr("strategy.calibration_gate.config.PREDICTIVE_CALIBRATION_MIN_OUT_OF_SAMPLE_OBSERVATIONS", 100, raising=False)
     monkeypatch.setattr("strategy.calibration_gate.config.PREDICTIVE_CALIBRATION_MIN_LOWER_CONFIDENCE_BY_ASSET", {"OIL": 0.60}, raising=False)
@@ -5310,3 +5310,186 @@ def test_groww_bearish_thesis_long_put_uses_long_premium_protection_geometry(mon
     assert plan.stop_price < plan.entry_price < plan.target_price
     assert plan.diagnostics["option_state_at_entry"]["underlying_thesis_direction"] == "BEARISH"
     assert plan.diagnostics["option_state_at_entry"]["premium_position_side"] == "LONG_PREMIUM_BUY_ONLY"
+
+# ── V22 exposure quarantine observability / re-authorisation regressions ──────
+def test_external_exposure_quarantine_does_not_suppress_market_calculations(monkeypatch):
+    from orchestration.multi_asset_bot import MultiAssetInstitutionalBot
+    calls = []
+    class _Strategy:
+        def on_tick(self, data, router, risk, now_ms, event_driven=False):
+            calls.append((now_ms, event_driven))
+            bot.running = False
+        def get_position(self):
+            return None
+    instrument = SimpleNamespace(asset_id="OIL", primary_exchange=SimpleNamespace(value="hyperliquid"), display_symbol="xyz:CL")
+    ctx = SimpleNamespace(
+        ready=True, instrument=instrument, strategy=_Strategy(), data_manager=SimpleNamespace(get_last_price=lambda: 90.0),
+        execution_router=SimpleNamespace(), risk_manager=SimpleNamespace(), has_position=False,
+        last_tick_time=0.0, last_analysis_sec=time.time(), last_heartbeat_sec=time.time(),
+    )
+    bot = MultiAssetInstitutionalBot()
+    bot.contexts = [ctx]
+    bot.running = True
+    bot.trading_enabled = False
+    bot.trading_pause_reason = "STARTUP_EXTERNAL_EXPOSURE_RECONCILIATION_REQUIRED"
+    bot.guard = SimpleNamespace(
+        evaluation_interval=lambda _ctx: 0.01,
+        can_evaluate_entry=lambda _ctx, _contexts: (True, "portfolio slot available"),
+        count_open=lambda _contexts: 0, max_open_positions=5,
+        report_line=lambda _ctx: "policy=test",
+    )
+    monkeypatch.setattr(bot, "_is_indian_options_context", lambda _ctx: False)
+    bot._run_context_worker(ctx)
+    assert calls and calls[0][1] is True
+
+
+def test_external_exposure_quarantine_blocks_submission_not_analytics(monkeypatch):
+    from orchestration.multi_asset_bot import MultiAssetInstitutionalBot
+    ctx = SimpleNamespace(
+        instrument=SimpleNamespace(asset_id="GOLD_PAXG"), startup_exposure_verified=False,
+        startup_exposure_reason="delta:PAXGUSD:existing_position:SHORT:0.048",
+    )
+    bot = MultiAssetInstitutionalBot()
+    bot.trading_enabled = False
+    bot.trading_pause_reason = "STARTUP_EXTERNAL_EXPOSURE_RECONCILIATION_REQUIRED"
+    allowed, reason = bot._submission_gate_for_context(ctx)
+    assert allowed is False
+    assert reason == "STARTUP_EXTERNAL_EXPOSURE_RECONCILIATION_REQUIRED"
+
+
+def test_external_exposure_recheck_reauthorises_submissions_after_position_closes(monkeypatch):
+    from orchestration.multi_asset_bot import MultiAssetInstitutionalBot
+    live = {"position": {"size": 0.048, "side": "SHORT"}, "orders": [{"id": "sl"}, {"id": "tp"}]}
+    manager = SimpleNamespace(
+        symbol="PAXGUSD",
+        get_open_position=lambda: dict(live["position"]),
+        get_open_orders=lambda symbol=None: list(live["orders"]),
+    )
+    router = SimpleNamespace(available_exchanges=lambda: ("delta",), manager_for=lambda venue: manager)
+    ctx = SimpleNamespace(
+        ready=True, execution_router=router,
+        instrument=SimpleNamespace(asset_id="GOLD_PAXG", display_symbol="PAXGUSD"),
+        startup_exposure_verified=False, startup_exposure_reason="",
+    )
+    bot = MultiAssetInstitutionalBot(); bot.contexts = [ctx]
+    monkeypatch.setattr(bot, "_is_indian_options_context", lambda _ctx: False)
+    assert bot._startup_external_exposure_preflight() is False
+    assert bot.trading_enabled is False
+    live["position"] = {"size": 0.0}
+    live["orders"] = []
+    bot._last_startup_exposure_recheck_sec = 0.0
+    bot._maybe_recheck_external_exposure_pause()
+    assert bot.trading_enabled is True
+    assert bot.trading_pause_reason == ""
+    assert ctx.startup_exposure_verified is True
+
+# ── V23 calculation-integrity rebuild regressions ────────────────────────────
+from strategy.liquidity_map import select_protection_pools
+
+
+def test_v23_hyperliquid_hip3_precision_does_not_default_to_one_cent():
+    report = InstrumentRegistry(execution_preference="").discover(
+        hyperliquid_api=_FakeHyperCatalog(), requested=config.MULTI_ASSET_REQUESTS,
+        include_exchanges=("hyperliquid",), require_primary=False, max_active=20,
+    )
+    natgas = next(inst for inst in report.matched if inst.asset_id == "NATGAS")
+    assert natgas.primary.tick_size == pytest.approx(0.0)
+    assert _hyperliquid_price_increment(3.2765, 0.01) == pytest.approx(0.0001)
+    assert _hyperliquid_price_increment(90.1265, 0.01) == pytest.approx(0.001)
+    from execution.order_manager import _HyperliquidAdapter
+    adapter = _HyperliquidAdapter(SimpleNamespace(), SimpleNamespace(symbol="xyz:NATGAS", display_symbol="xyz:NATGAS", tick_size=0.0, lot_step=0.01, min_qty=0.0, max_qty=0.0))
+    assert adapter.tick_size == pytest.approx(0.0)
+
+
+def test_v23_multitimeframe_liquidity_selector_skips_too_close_tp_pool():
+    pools = [
+        {"side": "BSL", "price": 100.02, "strength": 2.0, "max_timeframe": "5m"},
+        {"side": "BSL", "price": 101.20, "strength": 4.0, "max_timeframe": "1h"},
+        {"side": "SSL", "price": 99.30, "strength": 4.0, "max_timeframe": "1h"},
+    ]
+    stop, target = select_protection_pools(pools, direction="LONG", entry_price=100.0, min_objective_distance=0.50)
+    assert stop["price"] == pytest.approx(99.30)
+    assert target["price"] == pytest.approx(101.20)
+
+
+def test_v23_live_market_adaptive_protection_requires_mtf_economic_objective(monkeypatch):
+    _relax_adaptive_protection_warmup(monkeypatch)
+    monkeypatch.setattr(dp.config, "ADAPTIVE_PROTECTION_REQUIRE_MTF_INVALIDATION_POOL", True, raising=False)
+    monkeypatch.setattr(dp.config, "ADAPTIVE_PROTECTION_REQUIRE_MTF_OBJECTIVE_POOL", True, raising=False)
+    engine = DynamicProtectionPlanBuilder("NATGAS")
+    plan = engine.build_plan(
+        direction=Direction.SHORT, entry_price=3.2765, volatility_price=0.0030,
+        gross_edge_bps=90.0, execution_cost_bps=8.0,
+        protection_type="VENUE_NATIVE_BRACKET", asset_class="commodity",
+        position_notional=10.0, quantity=3.0,
+        market_state={
+            "asset_id": "NATGAS", "venue": "hyperliquid", "regime": "TREND",
+            "venue_market_state_ready": True, "spread_bps": 1.0, "price_tick": 0.0001,
+            "near_touch_depth_usd": 100000.0, "volatility_expansion_ratio": 1.0,
+            "liquidity_pools": [
+                {"side": "BSL", "price": 3.2900, "strength": 4.0, "max_timeframe": "1h"},
+                {"side": "SSL", "price": 3.2500, "strength": 4.0, "max_timeframe": "1h"},
+            ],
+        },
+    )
+    assert plan.protection_feasible is True
+    geom = plan.diagnostics["market_geometry"]
+    assert geom["price_tick"] == pytest.approx(0.0001)
+    assert geom["target_source"].startswith("front_run_mtf_ssl_objective")
+    assert plan.stop_price > plan.entry_price > plan.target_price
+    assert geom["realised_target_rr"] > 1.0
+
+
+def test_v23_barrier_cost_authority_does_not_double_round_trip_route_cost(monkeypatch):
+    import strategy.barrier_outcome as bo
+    monkeypatch.setattr(bo.config, "BARRIER_OUTCOME_EXIT_TAIL_RESERVE_BPS_BY_ASSET", {"OIL": 1.25}, raising=False)
+    monkeypatch.setattr(bo.config, "BARRIER_OUTCOME_MIN_TARGET_BEFORE_STOP_PROBABILITY_BY_ASSET", {"OIL": 0.55}, raising=False)
+    monkeypatch.setattr(bo.config, "BARRIER_OUTCOME_MIN_EXPECTED_VALUE_BPS", 0.0, raising=False)
+    engine = ProtectedBarrierOutcomeEngine("OIL")
+    plan = ProtectionPlan(100.0, 100.4, 99.0, "VENUE_NATIVE_BRACKET", True, [])
+    assessed = engine.assess(
+        venue="hyperliquid", direction=Direction.SHORT, protection=plan,
+        parent_alpha_bps=-20.0, child_timing_contribution_bps=-2.0,
+        uncertainty_bps=1.0, route_cost_bps=7.114, robust_volatility_bps=5.0,
+        liquidity_score=1.0, execution_quality=1.0,
+        predictive_flow=_approved_predictive_flow(probability=0.80),
+    )
+    assert assessed.round_trip_cost_reserve_bps == pytest.approx(8.364)
+    payload = assessed.as_dict()
+    assert payload["cost_authority"] == "route_total_already_includes_round_trip_fee_plus_explicit_tail_reserve"
+    assert payload["score_authority"] == "analytic_bracket_viability_score_not_calibrated_probability"
+    assert assessed.target_before_stop_probability == pytest.approx(0.80)
+
+
+def test_v23_shadow_label_is_one_event_and_resolves_on_selected_venue_only(tmp_path):
+    store = JsonlResearchStore(tmp_path)
+    writer = PredictiveBarrierLabelWriter(store, min_spacing_sec=0.0, timeout_s=30)
+    common = dict(
+        observation_ts_ns=1_000_000_000, asset_id="BTC", venue="hyperliquid", instrument="BTC",
+        model_key="BTC:hyperliquid:PREMOVE_QUEUE_DEPLETION_INITIATION", setup_family="PREMOVE_QUEUE_DEPLETION_INITIATION",
+        side="long", entry_price=100.0, stop_price=99.0, target_price=102.0,
+        estimated_round_trip_cost_bps=8.0, predicted_target_before_stop_probability=0.70,
+        predicted_directional_move_probability=0.70, parent_state_id="state-1", event_key="state-1",
+        prediction_authority="uncalibrated_analytic_bracket_score_shadow_only",
+    )
+    assert writer.record_candidate(candidate_id="c1", **common) is True
+    assert writer.record_candidate(candidate_id="c2", **common) is False
+    assert writer.observe(now_ts_ns=2_000_000_000, current_price=103.0, venue="delta", instrument="BTCUSD") == []
+    paths = writer.observe(now_ts_ns=2_000_000_000, current_price=102.1, venue="hyperliquid", instrument="BTC")
+    assert len(paths) == 1
+    row = store.read_records("predictive_barrier_labels.jsonl")[0]
+    assert row["outcome"] == "TP_FIRST"
+    assert row["parent_state_id"] == "state-1"
+    assert row["prediction_authority"] == "uncalibrated_analytic_bracket_score_shadow_only"
+
+
+def test_v23_route_telemetry_declares_full_cycle_cost_authority(monkeypatch):
+    monkeypatch.setattr("execution.venue_selection._cfg", lambda name, default: {
+        "VENUE_ROUND_TRIP_FEE_BPS": {"hyperliquid": 7.0},
+        "VENUE_SLIPPAGE_IMPACT_MULTIPLIER": 0.0,
+    }.get(name, default))
+    state = _state__test_institutional_v6_exposure_feed_execution_fixes("hyperliquid", "xyz:CL", 90.0)
+    est = estimate_venue_cost(state=state, direction="SHORT", asset_id="OIL", reference_mid=90.0, notional_usd=10.0, routeable=True)
+    payload = est.as_dict()
+    assert payload["round_trip_fee_included"] is True
+    assert payload["cost_authority"] == "full_cycle_route_reserve_round_trip_fee_included"

@@ -121,7 +121,10 @@ class VenueCostEstimate:
     reason: str = "ok"
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        out = asdict(self)
+        out["cost_authority"] = "full_cycle_route_reserve_round_trip_fee_included"
+        out["round_trip_fee_included"] = True
+        return out
 
 
 @dataclass(frozen=True)

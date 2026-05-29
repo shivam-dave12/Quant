@@ -1014,7 +1014,6 @@ class InstitutionalStrategy:
         if price > 0:
             now_ts_ns = time.time_ns()
             self._forward_labels.observe(now_ts_ns=now_ts_ns, current_price=price)
-            self._barrier_candidate_labels.observe(now_ts_ns=now_ts_ns, current_price=price)
         if feed_health.quality_score <= 0:
             return self._decision(
                 desk=desk,
@@ -1041,6 +1040,15 @@ class InstitutionalStrategy:
             )
 
         states = self._venue_states(data_manager)
+        # Candidate barrier labels must be resolved from the selected execution
+        # venue's own price, never from a bootstrap/reference venue.
+        for observed_venue, observed_state in states.items():
+            observed_mid = float(getattr(observed_state, "mid", 0.0) or 0.0)
+            if observed_mid > 0.0:
+                self._barrier_candidate_labels.observe(
+                    now_ts_ns=time.time_ns(), current_price=observed_mid,
+                    venue=str(observed_venue).lower(), instrument=str(getattr(observed_state, "symbol", "") or ""),
+                )
         # Observe market state without broker I/O. The predictive engine uses only
         # current/prior queue state available before displacement; the barrier
         # engine retains realised response for post-entry toxicity/calibration.
@@ -1665,13 +1673,16 @@ class InstitutionalStrategy:
                         instrument=instrument, candidate_id=candidate_id, model_key=model_key,
                         setup_family=setup_assessment.setup_family, side=side_label,
                         entry_price=float(protection.entry_price), stop_price=float(protection.stop_price),
-                        target_price=float(protection.target_price), estimated_round_trip_cost_bps=float(costs_bps) * 2.0,
+                        target_price=float(protection.target_price), estimated_round_trip_cost_bps=float(barrier_outcome.round_trip_cost_reserve_bps),
                         predicted_target_before_stop_probability=float(barrier_outcome.target_before_stop_probability),
                         predicted_directional_move_probability=float(predictive_flow.directional_move_probability),
+                        parent_state_id=str(signal_breakdown.get("parent_state_id") or ""),
+                        event_key=str(signal_breakdown.get("parent_state_id") or candidate_id),
+                        prediction_authority="uncalibrated_analytic_bracket_score_shadow_only",
                     )
                     calibration = self._predictive_calibration.assess(
                         venue=venue, setup_family=setup_assessment.setup_family,
-                        model_version="pre_move_orderflow_hazard_v1+predictive_protected_barrier_outcome_v2",
+                        model_version="pre_move_orderflow_hazard_v1+predictive_bracket_viability_v3",
                     )
                     model_values["predictive_calibration_authority"] = calibration.as_dict()
                     live_candidate, _ = _live_routing_permission(venue)
@@ -3274,7 +3285,10 @@ class InstitutionalStrategy:
             policy = None
         executable_price_tick = float(mapping.price_tick or 0.0)
         if str(venue or "").lower() == "hyperliquid":
-            executable_price_tick = max(executable_price_tick, _hyperliquid_price_increment(price, mapping.qty_step))
+            # Official Hyperliquid perps use dynamic price precision: <=5
+            # significant figures and <=(6 - szDecimals) decimal places.
+            # A catalogue fallback such as 0.01 must never widen HIP-3 stops.
+            executable_price_tick = _hyperliquid_price_increment(price, mapping.qty_step)
         market_state = {
             "asset_id": self._asset_id,
             "venue": str(venue or "").lower(),
@@ -3299,6 +3313,8 @@ class InstitutionalStrategy:
                 "closed_anchor_source": str(venue_market_state.diagnostics.get("closed_anchor_source") or ""),
                 "volatility_expansion_ratio": float(venue_market_state.volatility_expansion_ratio or 1.0),
             })
+            if "liquidity_pools" in venue_market_state.diagnostics:
+                market_state["liquidity_pools"] = list(venue_market_state.diagnostics.get("liquidity_pools") or [])
         if venue_market_state is not None and venue_market_state.ready:
             volatility_price = max(price * float(venue_market_state.robust_one_minute_vol_bps) / 10_000.0, executable_price_tick)
             market_state["volatility_source"] = f"venue_local_confirmed_candles:{str(venue or '').lower()}"
@@ -3389,11 +3405,11 @@ class InstitutionalStrategy:
         )
         vol_scalar = min(1.0, float(_cfg("INSTITUTIONAL_TARGET_OBSERVATION_VOL_BPS", 10.0)) / max(observation_vol_bps, 1e-6))
         risk_limited_notional = risk_budget / max(stop_distance_pct, 1e-9)
-        kelly_fraction = float(_cfg("INSTITUTIONAL_FRACTIONAL_KELLY", _cfg("INSTITUTIONAL_QUARTER_KELLY", 0.25)))
-        edge_to_stop = edge_pct / max(stop_distance_pct, 1e-9)
-        min_kelly_scalar = max(0.0, float(_cfg("INSTITUTIONAL_MIN_KELLY_DEPLOYMENT_SCALAR", 0.0)))
-        max_kelly_scalar = max(min_kelly_scalar, float(_cfg("INSTITUTIONAL_MAX_KELLY_DEPLOYMENT_SCALAR", 1.0)))
-        kelly_scalar = min(max_kelly_scalar, max(min_kelly_scalar, edge_to_stop * max(0.0, kelly_fraction)))
+        # V23: no Kelly claim is made until an exact bracket-outcome model has
+        # approved out-of-sample calibration. Live/shadow sizing is strict fixed
+        # dollar invalidation-risk sizing, optionally reduced for observed vol.
+        deployment_scalar = min(1.0, max(0.0, float(_cfg("INSTITUTIONAL_FIXED_RISK_DEPLOYMENT_SCALAR", 1.0))))
+        deployment_method = str(_cfg("INSTITUTIONAL_SIZING_METHOD", "fixed_dollar_invalidation_risk_until_calibrated_barrier_model"))
         if desk == DeskId.INDIA_OPTIONS.value:
             # Never size NFO options from a configured/default lot.  The lot
             # must be the exact value joined from Groww's official instrument
@@ -3401,8 +3417,8 @@ class InstitutionalStrategy:
             leverage = None
             margin_cap_notional = margin_budget
             liquidity_cap = max(0.0, margin_cap_notional * min(1.0, max(0.0, liquidity_score)))
-            kelly_notional = margin_cap_notional * kelly_scalar * vol_scalar
-            target_notional = min(liquidity_cap, risk_limited_notional, kelly_notional)
+            risk_deployment_notional = risk_limited_notional * deployment_scalar * vol_scalar
+            target_notional = min(liquidity_cap, risk_limited_notional, risk_deployment_notional)
             raw = getattr(getattr(self._instrument, "primary", None), "raw", {}) if self._instrument is not None else {}
             selected = raw.get("selected_option_contract") if isinstance(raw, dict) else None
             selected_raw = selected.get("raw") if isinstance(selected, dict) and isinstance(selected.get("raw"), dict) else {}
@@ -3422,7 +3438,7 @@ class InstitutionalStrategy:
             margin_cap_notional = max(0.0, margin_budget * leverage)
             liquidity_scalar = min(1.0, max(0.0, liquidity_score))
             liquidity_cap = max(0.0, margin_cap_notional * liquidity_scalar)
-            kelly_notional = margin_cap_notional * kelly_scalar * vol_scalar
+            risk_deployment_notional = risk_limited_notional * deployment_scalar * vol_scalar
             hard_cap_notional = min(margin_cap_notional, liquidity_cap, risk_limited_notional)
             min_order_notional = self._venue_min_order_notional_usd(capital_venue)
             exchange_instrument = self._exchange_instrument(venue)
@@ -3443,7 +3459,7 @@ class InstitutionalStrategy:
                 0.0,
             ))
             min_executable_notional = max(min_order_notional, min_qty * unit_notional)
-            target_notional = min(liquidity_cap, risk_limited_notional, kelly_notional)
+            target_notional = min(liquidity_cap, risk_limited_notional, risk_deployment_notional)
             if (
                 min_executable_notional > 0.0
                 and target_notional + 1e-9 < min_executable_notional
@@ -3487,7 +3503,7 @@ class InstitutionalStrategy:
             and net_edge > 0
             and risk_after <= risk_budget + 1e-9
         )
-        reasons = ([f"broker_local_cash_sizing_approved:{capital_venue or 'single_venue'}"] if approved
+        reasons = ([f"broker_local_cash_sizing_approved:{capital_venue or 'single_venue'}", f"sizing_authority:{deployment_method}"] if approved
                    else [])
         if not approved:
             if qty <= 0:
