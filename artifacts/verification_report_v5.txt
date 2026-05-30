@@ -1,0 +1,43 @@
+BTC HFT Live-Learning Bot v5 Verification
+=========================================
+
+Build date: 2026-05-30 IST
+Package: btc_hft_live_learning_v5
+
+Controls run:
+- Python compileall: PASS
+- pytest institutional controls: 6/6 PASS
+- Trade-flow inspection: PASS
+- Bootstrap trade-flow model training: PASS (real data only)
+
+Uploaded trade-flow file:
+- File: futures-trades-monthly-BTCUSD-2026-05.csv.zip
+- SHA256: fa9db48486f9f0df385f0d31313f50c081f702277ef86fd5c8bdc497197df39f
+- Rows: 2,437,598 after parsing
+- Coverage: 2026-05-01 00:00:03.945561+00:00 to 2026-05-10 23:59:58.546213+00:00
+- Data class: public trades/order-flow, not L2 order book
+- buyer_role present: yes
+
+Bootstrap model:
+- Type: real_tradeflow_bootstrap_return_model_v5
+- Horizon: 5 seconds
+- Feature schema: v5 live FEATURE_COLUMNS with L2 fields zero-filled for trade-only history
+- Rows: 863,991 one-second observations
+- Train rows: 647,993
+- Test rows: 215,998
+- Test directional accuracy: 56.45%
+- Test pseudo-net return after 15.8 bps hurdle: 0.0%
+- Live approved: NO
+- Reason: public-trade data lacks L2 spread/depth/fills/funding validation
+
+Safety controls:
+- Delta checksum algorithm test: PASS
+- Sequence-gap sticky halt: PASS
+- Label maturity/no lookahead: PASS
+- Synthetic bootstrap rejection: PASS
+- REST-fill cost ledger update: PASS
+- LIVE gate blocks unpromoted model: PASS
+
+Operational note:
+This is a complete live-learning bot. It captures, trains and scores immediately.
+It will not submit LIVE orders under default settings until model/cost/bracket gates pass using real production data.
