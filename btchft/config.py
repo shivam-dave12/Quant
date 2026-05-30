@@ -46,7 +46,7 @@ class Settings:
 
     # Venue / instrument.
     delta_symbol: str = "BTCUSD"
-    delta_testnet: bool = True
+    delta_testnet: bool = False
 
     # Journals, state and model artefacts.
     raw_event_journal: Path = Path("artifacts/live/raw_delta_events.jsonl.gz")
