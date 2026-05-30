@@ -54,7 +54,7 @@ RUN python -m pip install --no-index --find-links=/wheels btc-hft-live-learning 
 
 # Ship only non-secret static artefacts. Runtime journals/fills/models are mounted
 # through /app/artifacts/live and should not be baked into the image.
-COPY --chown=botuser:botuser README.md .env.example ./
+COPY --chown=botuser:botuser README.md .env
 COPY --chown=botuser:botuser artifacts/bootstrap_tradeflow_model.joblib artifacts/bootstrap_tradeflow_manifest.json artifacts/tradeflow_inspection.json ./artifacts/
 
 USER botuser
