@@ -89,6 +89,14 @@ class FullBTCStrategyEngine:
         self.contract_value_btc = 0.001
         self.private_fill_seq: int | None = None
         self.sticky_halt_reason: str | None = None
+        self.started_ns = time.time_ns()
+        self.last_public_event_ns: int | None = None
+        self.last_book_event_ns: int | None = None
+        self.last_ob_update_ns: int | None = None
+        self.last_trade_event_ns: int | None = None
+        self.public_event_count = 0
+        self.book_event_count = 0
+        self.trade_event_count = 0
         if self.s.trading_mode == "PAPER" or self.s.trading_mode == "SHADOW":
             self.executor = PaperExecutor()
         else:
@@ -104,15 +112,23 @@ class FullBTCStrategyEngine:
 
     def on_public_message(self, msg: dict[str, Any]) -> None:
         receive_ns = time.time_ns()
+        self.last_public_event_ns = receive_ns
+        self.public_event_count += 1
         self.raw_recorder.write({"stream": "public", "raw": msg})
         typ = msg.get("type")
         if typ == "ob_updates":
+            if str(msg.get("action", "")).lower() == "update":
+                self.last_ob_update_ns = receive_ns
             book = self.book.apply(msg, receive_ns)
             if self.book.state.halted:
                 self._halt(f"book_integrity:{self.book.state.halt_reason}")
             if book is not None:
+                self.last_book_event_ns = receive_ns
+                self.book_event_count += 1
                 self.on_book(book)
         elif typ == "trades":
+            self.last_trade_event_ns = receive_ns
+            self.trade_event_count += 1
             self.on_trade_message(msg, receive_ns)
         elif typ in {"funding_rate", "mark_price"}:
             # Stored raw. Funding/mark are intentionally not guessed into labels until modelled explicitly.
@@ -204,6 +220,9 @@ class FullBTCStrategyEngine:
     def _live_gate_reason(self) -> str | None:
         if self.sticky_halt_reason:
             return self.sticky_halt_reason
+        feed_reason = self._feed_gate_reason()
+        if feed_reason and self.s.trading_mode == "LIVE":
+            return feed_reason
         if self.s.trading_mode != "LIVE":
             return None
         if not self.models.promoted and not self.s.allow_unvalidated_bootstrap_live:
@@ -220,6 +239,42 @@ class FullBTCStrategyEngine:
             self.account.halted_reason = reason
             log.critical("STICKY HALT: %s", reason)
 
+    def _age_seconds(self, ts_ns: int | None) -> float | None:
+        if ts_ns is None:
+            return None
+        return max(0.0, (time.time_ns() - ts_ns) / 1e9)
+
+    def _feed_gate_reason(self) -> str | None:
+        # Once a snapshot is received, BTCUSD should normally produce continuous update/trade flow.
+        # A stalled feed means live labels cannot mature and signals/cost estimates are unsafe.
+        if self.book.state.snapshots > 0:
+            age_update = self._age_seconds(self.last_ob_update_ns)
+            age_book = self._age_seconds(self.last_book_event_ns)
+            if self.book.state.updates == 0 and self._age_seconds(self.last_book_event_ns) is not None:
+                if self._age_seconds(self.last_book_event_ns) > self.s.feed_stall_seconds:
+                    return "orderbook_feed_stalled_no_incremental_updates"
+            if age_update is not None and age_update > self.s.feed_stall_seconds:
+                return "orderbook_incremental_updates_stale"
+            if age_book is not None and age_book > self.s.feed_stall_seconds:
+                return "book_feature_stream_stale"
+        elif self._age_seconds(self.started_ns) is not None and self._age_seconds(self.started_ns) > self.s.feed_stall_seconds:
+            return "no_orderbook_snapshot_received"
+        return None
+
+    def feed_health(self) -> dict[str, Any]:
+        reason = self._feed_gate_reason()
+        return {
+            "public_event_count": self.public_event_count,
+            "book_event_count": self.book_event_count,
+            "trade_event_count": self.trade_event_count,
+            "seconds_since_public_event": self._age_seconds(self.last_public_event_ns),
+            "seconds_since_book_event": self._age_seconds(self.last_book_event_ns),
+            "seconds_since_incremental_update": self._age_seconds(self.last_ob_update_ns),
+            "seconds_since_trade_event": self._age_seconds(self.last_trade_event_ns),
+            "stalled": reason is not None,
+            "stall_reason": reason,
+        }
+
     def status(self) -> dict[str, Any]:
         return {
             "mode": self.s.trading_mode,
@@ -227,6 +282,7 @@ class FullBTCStrategyEngine:
             "sticky_halt_reason": self.sticky_halt_reason,
             "account": self.account.__dict__.copy(),
             "book_integrity": self.book.integrity(),
+            "feed_health": self.feed_health(),
             "models": self.models.status(),
             "costs": self.costs.snapshot(self.last_book.spread_bps if self.last_book else 0.0),
             "recorders": {"raw": self.raw_recorder.stats(), "features": self.feature_recorder.stats()},

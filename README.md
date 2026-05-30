@@ -153,3 +153,19 @@ Models only accept real data. The shipped bootstrap model is trained from the up
 ## Important venue/data caveat
 
 The uploaded trade file is public trade/order-flow data, not full L2. True HFT alpha requires Delta `ob_updates` plus trades, private fills and REST commissions. This package captures and learns from all of them once running.
+
+
+## v5.3 feed-health note
+
+Default `Settings.delta_testnet` is now `False` so SHADOW mode captures the real production BTCUSD public feed. Live orders still require `trading_mode="LIVE"` and `allow_live=True`. Runtime status includes `feed_health` and blocks live mode if the book stream stalls.
+
+## v5.4 feed/cost audit patch
+
+The runtime feed in `quant-20260530-065610.log` is healthy: `ob_updates` and features are flowing and online labels are maturing. This patch fixes a separate cost-model issue found in that same log: product metadata had reduced the scheduled one-way taker+GST fee floor to 1.18 bps. Product metadata may now only raise the configured scheduled fee floor; it cannot reduce it. Any lower realised cost can be adopted only from REST-reconciled real fills after the configured minimum fill count.
+
+Expected no-fill cost floor:
+
+```text
+one_way_fee_bps >= 5.9
+round_trip_bps >= 15.8
+```

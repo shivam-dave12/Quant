@@ -63,6 +63,38 @@ def test_cost_model_uses_rest_fill_fee(tmp_path):
     assert c.one_way_fee_bps() >= 5.9
 
 
+
+def test_product_fee_metadata_cannot_weaken_configured_fee_floor(tmp_path):
+    c = CostModel(
+        taker_fee_bps_pre_gst=5,
+        maker_fee_bps_pre_gst=2,
+        gst_rate=0.18,
+        impact_floor_bps=2,
+        min_real_fills=30,
+        ledger_path=tmp_path/"fills.jsonl",
+    )
+    # Product metadata from a wrong endpoint/tier may advertise 1 bps.
+    # It must not reduce the conservative India futures floor of 5 bps pre-GST.
+    c.configure_from_product({"taker_commission_rate": "0.0001", "maker_commission_rate": "0.0001"})
+    snap = c.snapshot()
+    assert round(snap["scheduled_one_way_taker_fee_bps_with_gst"], 6) == 5.9
+    assert round(snap["round_trip_bps"], 6) == 15.8
+
+
+def test_product_fee_metadata_can_raise_configured_fee_floor(tmp_path):
+    c = CostModel(
+        taker_fee_bps_pre_gst=5,
+        maker_fee_bps_pre_gst=2,
+        gst_rate=0.18,
+        impact_floor_bps=2,
+        min_real_fills=30,
+        ledger_path=tmp_path/"fills.jsonl",
+    )
+    # If exchange metadata reports a higher fee, use it immediately.
+    c.configure_from_product({"taker_commission_rate": "0.0007"})
+    assert round(c.snapshot()["scheduled_one_way_taker_fee_bps_with_gst"], 6) == 8.26
+
+
 def test_engine_live_gate_blocks_without_real_labels(tmp_path):
     s = Settings(
         trading_mode="LIVE",

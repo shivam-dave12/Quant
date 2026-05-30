@@ -1,0 +1,19 @@
+BTC HFT live-learning bot v5.4 fee-floor verification
+
+Patch reason:
+- Live log quant-20260530-065610.log showed production feed was healthy but cost model reduced scheduled taker+GST fee to 1.18 bps one-way, producing only 6.36 bps round-trip cost.
+- For Delta India BTCUSD futures, configured conservative floor is 5.0 bps taker pre-GST, 5.9 bps one-way after 18% GST, plus 2.0 bps impact per side = 15.8 bps round trip.
+
+Code change:
+- CostModel.configure_from_product now treats product metadata as a fee-floor raiser only.
+- Product metadata cannot weaken configured cost assumptions.
+- Lower actual fees may only be learned from REST-reconciled real fills after min_real_fill_count_for_cost_model is met.
+
+Controls added:
+- product fee metadata cannot weaken configured fee floor.
+- product fee metadata can raise configured fee floor.
+
+Expected healthy status after patch:
+- costs.scheduled_one_way_taker_fee_bps_with_gst >= 5.9
+- costs.round_trip_bps >= 15.8 when no real fill/slippage evidence is available
+- live feed counters should continue increasing as observed in quant-20260530-065610.log

@@ -1,0 +1,15 @@
+BTC HFT live-learning bot v5.3 feed-health patch
+
+Changes:
+- Settings.delta_testnet defaults to False so SHADOW mode captures the production BTCUSD public feed by default.
+- Added Settings.feed_stall_seconds = 30.0.
+- Added feed_health telemetry to runtime status: public events, book events, trade events, age of last event/update/trade, stalled flag and stall reason.
+- Live mode now blocks if the order-book stream is stalled or no snapshot is received.
+- Existing trading safety gates remain unchanged; LIVE still requires Settings.trading_mode="LIVE" and Settings.allow_live=True.
+
+Verification:
+- python -m compileall btchft: PASS
+- PYTHONPATH=. pytest -q tests/test_controls.py: 6 passed
+
+Reason for patch:
+- The supplied runtime log showed one snapshot, zero incremental order-book updates, one feature row, zero matured labels, and no model training progress. This patch makes that feed-stall condition visible and blocks live orders if it occurs.

@@ -46,7 +46,7 @@ class Settings:
 
     # Venue / instrument.
     delta_symbol: str = "BTCUSD"
-    delta_testnet: bool = False
+    delta_testnet: bool = False  # production public feed by default; SHADOW mode still prevents orders
 
     # Journals, state and model artefacts.
     raw_event_journal: Path = Path("artifacts/live/raw_delta_events.jsonl.gz")
@@ -78,6 +78,7 @@ class Settings:
     label_horizons_ms: tuple[int, ...] = (1_000, 3_000, 5_000, 15_000)
     max_feed_latency_ms: float = 250.0
     max_decision_latency_ms: float = 10.0
+    feed_stall_seconds: float = 30.0
 
     # Risk.
     starting_equity_usd: float = 10_000.0

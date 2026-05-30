@@ -41,15 +41,34 @@ class CostModel:
         return self.taker_fee_bps_pre_gst * (1.0 + self.gst_rate)
 
     def configure_from_product(self, product: dict[str, Any]) -> None:
-        def rate(key: str, cur: float) -> float:
+        """Ingest exchange product fee metadata without ever weakening the configured fee floor.
+
+        Delta product payloads can differ across India/global/testnet/account tiers and may
+        express fee rates as decimals such as 0.0005 (=5 bps). For institutional risk,
+        product metadata is allowed to *raise* scheduled costs, not reduce them. Actual
+        lower realised fees may later be learned only from REST-reconciled fill records.
+        This prevents a wrong endpoint/product tier from silently turning a 5 bps taker
+        schedule into a 1 bps live hurdle.
+        """
+        def product_rate_bps(key: str) -> float | None:
             try:
-                x = float(product.get(key))
-                return x * 1e4 if 0 < x < 1 else cur
+                raw = product.get(key)
+                if raw is None:
+                    return None
+                x = float(raw)
+                if not (x > 0):
+                    return None
+                return x * 1e4 if x < 1 else x
             except Exception:
-                return cur
+                return None
+
         with self.lock:
-            self.taker_fee_bps_pre_gst = rate("taker_commission_rate", self.taker_fee_bps_pre_gst)
-            self.maker_fee_bps_pre_gst = rate("maker_commission_rate", self.maker_fee_bps_pre_gst)
+            taker = product_rate_bps("taker_commission_rate")
+            maker = product_rate_bps("maker_commission_rate")
+            if taker is not None:
+                self.taker_fee_bps_pre_gst = max(self.taker_fee_bps_pre_gst, taker)
+            if maker is not None:
+                self.maker_fee_bps_pre_gst = max(self.maker_fee_bps_pre_gst, maker)
 
     def observe_fill(self, fill: FillRecord) -> bool:
         with self.lock:
