@@ -1,0 +1,11 @@
+BTC HFT live-learning bot v5.6 observability cost-hurdle fix
+Created: 2026-05-30
+
+Fixes:
+- models.status(cost_bps=...) now reports active current_cost_hurdle_bps instead of 0.0.
+- engine.status() passes the same active round-trip cost used by decision scoring.
+- Decision records in v5.5 already used active cost via model_tests; this fixes misleading top-level status only.
+
+Verification:
+- compileall: PASS
+- pytest: 8 passed

@@ -332,7 +332,7 @@ class FullBTCStrategyEngine:
             "account": self.account.__dict__.copy(),
             "book_integrity": self.book.integrity(),
             "feed_health": self.feed_health(),
-            "models": self.models.status(),
+            "models": self.models.status(cost_bps=self.costs.round_trip_bps(self.last_book.spread_bps if self.last_book else 0.0)),
             "costs": self.costs.snapshot(self.last_book.spread_bps if self.last_book else 0.0),
             "recorders": {"raw": self.raw_recorder.stats(), "features": self.feature_recorder.stats(), "decisions": self.decision_recorder.stats()},
             "live_gate_reason": self._live_gate_reason(),

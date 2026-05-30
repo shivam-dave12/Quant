@@ -293,7 +293,7 @@ class LiveLearningModelStack:
         (self.model_dir / "model_stack_state.json").write_text(json.dumps(self.status(), indent=2), encoding="utf-8")
         self.last_checkpoint_labels = self.matured_labels
 
-    def status(self) -> dict[str, Any]:
+    def status(self, cost_bps: float = 0.0) -> dict[str, Any]:
         return {
             "type": "real_live_learning_model_stack_v5",
             "feature_columns": FEATURE_COLUMNS,
@@ -306,5 +306,5 @@ class LiveLearningModelStack:
             "prequential_count": len(self.prequential),
             "prequential_mean_return": float(np.mean(self.prequential)) if self.prequential else 0.0,
             "promotion_test": self._promotion_diagnostics(),
-            "tests_running": self.test_matrix(cost_bps=0.0),
+            "tests_running": self.test_matrix(cost_bps=cost_bps),
         }

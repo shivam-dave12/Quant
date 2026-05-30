@@ -223,7 +223,7 @@
           }
         }
       },
-      "current_cost_hurdle_bps": 0.0,
+      "current_cost_hurdle_bps": 15.799999999999999,
       "promotion_test": {
         "prequential_evals": 0,
         "prequential_mean_return": 0.0,
