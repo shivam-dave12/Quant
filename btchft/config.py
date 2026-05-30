@@ -51,6 +51,8 @@ class Settings:
     # Journals, state and model artefacts.
     raw_event_journal: Path = Path("artifacts/live/raw_delta_events.jsonl.gz")
     feature_journal: Path = Path("artifacts/live/features.jsonl.gz")
+    decision_journal: Path = Path("artifacts/live/decisions.jsonl.gz")
+    telemetry_snapshot: Path = Path("artifacts/live/ml_telemetry_snapshot.json")
     model_dir: Path = Path("artifacts/live/models")
     execution_ledger: Path = Path("artifacts/live/rest_fills.jsonl")
     state_path: Path = Path("artifacts/live/runtime_state.json")

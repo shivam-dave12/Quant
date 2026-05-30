@@ -169,3 +169,66 @@ Expected no-fill cost floor:
 one_way_fee_bps >= 5.9
 round_trip_bps >= 15.8
 ```
+
+## v5.5 ML observability: know exactly what is training and tested
+
+The runtime now writes a third journal in addition to raw events and features:
+
+```text
+artifacts/live/decisions.jsonl.gz
+```
+
+This file records every book-decision cycle with:
+
+- active model tests by horizon
+- return-regressor samples and residual error
+- event-classifier samples and accuracy
+- current cost hurdle
+- chosen signal, if any
+- risk/bracket/live gate reason
+- shadow plan, if a signal passed in SHADOW/PAPER
+
+Use the built-in control-room command:
+
+```bash
+btc-live-hft inspect-live --live-dir artifacts/live
+```
+
+For JSON output:
+
+```bash
+btc-live-hft inspect-live --live-dir artifacts/live --json > artifacts/live/ml_control_room.json
+```
+
+On EC2/Podman anonymous volume:
+
+```bash
+ACTIVE="/home/ec2-user/.local/share/containers/storage/volumes/<volume_id>/_data"
+podman run --rm \
+  -v "$ACTIVE:/app/artifacts/live:ro" \
+  btc-live-hft:v5.5 inspect-live --live-dir /app/artifacts/live
+```
+
+Healthy ML training means:
+
+```text
+raw events increasing
+features increasing
+decisions increasing
+matured_labels increasing
+regressor/classifier samples increasing
+prequential_count increasing
+checksum_failures = 0
+sequence_gaps = 0
+recorders dropped = 0
+```
+
+A tradable model needs more than healthy training. It needs:
+
+```text
+prequential_mean_return > 0 after costs
+promotion_test.passed = true
+promoted_horizon_ms != null
+real_fill_count above gate for LIVE
+live_gate_reason = null in LIVE mode
+```

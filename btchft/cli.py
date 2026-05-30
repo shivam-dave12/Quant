@@ -14,6 +14,7 @@ from .delta_ws import DeltaWebSocketRuntime
 from .engine import FullBTCStrategyEngine
 from .execution import DeltaRestClient
 from .offline import train_bootstrap_tradeflow, inspect_tradeflow_file
+from .telemetry import summarize_live_dir, print_human
 
 
 def main() -> None:
@@ -36,6 +37,11 @@ def main() -> None:
     run.add_argument("--status-every", type=int, default=None, help="Optional override; default comes from btchft/config.py")
     run.add_argument("--offline-replay-trades", help="Optional public trade CSV/ZIP replay for test/training without websocket")
 
+    mon = sub.add_parser("inspect-live", help="Explain what data, models, tests, signals and gates are active in a live artifacts directory")
+    mon.add_argument("--live-dir", default="artifacts/live")
+    mon.add_argument("--tail-rows", type=int, default=5000)
+    mon.add_argument("--json", action="store_true")
+
     args = p.parse_args()
     s = Settings(); s.validate()
     if args.cmd == "inspect-tradeflow":
@@ -51,6 +57,13 @@ def main() -> None:
         horizon_seconds = int(args.horizon_seconds or s.bootstrap_horizon_seconds)
         report = train_bootstrap_tradeflow(args.file, out_model, out_manifest, horizon_seconds=horizon_seconds)
         print(json.dumps(report, indent=2, default=str))
+        return
+    if args.cmd == "inspect-live":
+        summary = summarize_live_dir(args.live_dir, tail_rows=args.tail_rows)
+        if args.json:
+            print(json.dumps(summary, indent=2, default=str))
+        else:
+            print(print_human(summary))
         return
     if args.cmd == "run":
         engine = FullBTCStrategyEngine(s)

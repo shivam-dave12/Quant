@@ -212,15 +212,76 @@ class LiveLearningModelStack:
         confidence = float(min(0.995, max(0.5, 0.5 + min(abs(pred) / (4 * std), 0.495))))
         return {"horizon_ms": h, "side": side, "expected_net_edge_bps": edge, "forecast_move_bps": pred, "confidence": confidence}
 
+    def _promotion_diagnostics(self) -> dict[str, Any]:
+        arr = np.asarray(self.prequential, dtype=float) if self.prequential else np.asarray([], dtype=float)
+        mean = float(arr.mean()) if len(arr) else 0.0
+        std = float(arr.std(ddof=1)) if len(arr) > 1 else 0.0
+        sharpe_like = float(mean / (std or 1e-12) * math.sqrt(365 * 24 * 3600)) if len(arr) > 1 else 0.0
+        return {
+            "prequential_evals": int(len(self.prequential)),
+            "prequential_mean_return": mean,
+            "prequential_sharpe_like": sharpe_like,
+            "required_min_evals": 5000,
+            "required_positive_mean": True,
+            "required_sharpe_like_gt": 1.0,
+            "passed": bool(len(self.prequential) >= 5000 and mean > 0 and sharpe_like > 1.0),
+        }
+
     def _maybe_promote(self) -> None:
-        if len(self.prequential) < 5000:
+        d = self._promotion_diagnostics()
+        if not d["passed"]:
             return
-        arr = np.asarray(self.prequential, dtype=float)
-        mean = float(arr.mean()); std = float(arr.std(ddof=1) or 1e-12)
-        sharpe_like = mean / std * math.sqrt(365 * 24 * 3600)  # per-decision approximation, diagnostic only
-        if mean > 0 and sharpe_like > 1.0:
-            # choose horizon with most labels and best absolute edge capability
-            self.promoted_horizon_ms = max(self.horizons_ms, key=lambda h: self.regressors[h].samples)
+        # choose horizon with most labels. This is a shadow promotion until actual fills validate costs.
+        self.promoted_horizon_ms = max(self.horizons_ms, key=lambda h: self.regressors[h].samples)
+
+    def no_signal_reason(self, cost_bps: float) -> str:
+        ready = [h for h, reg in self.regressors.items() if reg.samples >= self.min_labels_to_score and reg.initialized]
+        if not ready:
+            if self.bootstrap_model is not None:
+                return "bootstrap_or_live_models_edge_below_current_cost_hurdle"
+            return "cold_start_insufficient_labels_for_any_horizon"
+        best_edge = None
+        # Predictions are not kept here after observe_decision; this reason is intentionally conservative.
+        if best_edge is None:
+            return "trained_models_available_but_no_prediction_exceeded_cost_hurdle"
+        return "no_signal"
+
+    def test_matrix(self, cost_bps: float) -> dict[str, Any]:
+        promotion = self._promotion_diagnostics()
+        horizons: dict[str, Any] = {}
+        for h in self.horizons_ms:
+            reg = self.regressors[h]
+            clf = self.classifiers[h]
+            horizons[str(h)] = {
+                "return_regressor": {
+                    "model": "SGDRegressor(loss=huber, penalty=elasticnet, average=True)",
+                    "target": f"future_mid_return_bps_after_{h}ms",
+                    "training_status": "TRAINING" if reg.samples > 0 else "WAITING_FOR_MATURED_LABELS",
+                    "samples": reg.samples,
+                    "residual_std_bps": reg.residual_std_bps,
+                    "ready_to_score": reg.samples >= self.min_labels_to_score,
+                },
+                "event_classifier": {
+                    "model": "SGDClassifier(loss=log_loss, penalty=elasticnet, average=True)",
+                    "target": f"short_neutral_long_after_{h}ms_vs_cost_hurdle",
+                    "training_status": "TRAINING" if clf.samples > 0 else "WAITING_FOR_MATURED_LABELS",
+                    "samples": clf.samples,
+                    "accuracy": clf.accuracy,
+                    "ready_to_score": clf.samples >= self.min_labels_to_score,
+                },
+            }
+        return {
+            "horizons": horizons,
+            "current_cost_hurdle_bps": float(cost_bps),
+            "promotion_test": promotion,
+            "promoted_horizon_ms": self.promoted_horizon_ms,
+            "bootstrap_model": {
+                "loaded": self.bootstrap_model is not None,
+                "live_approved": bool((self.bootstrap_manifest or {}).get("live_approved", False)),
+                "data_class": (self.bootstrap_manifest or {}).get("data_class"),
+                "reason_not_live_approved": (self.bootstrap_manifest or {}).get("reason_not_live_approved"),
+            },
+        }
 
     @property
     def promoted(self) -> bool:
@@ -244,4 +305,6 @@ class LiveLearningModelStack:
             "classifiers": {str(h): {"samples": m.samples, "accuracy": m.accuracy} for h, m in self.classifiers.items()},
             "prequential_count": len(self.prequential),
             "prequential_mean_return": float(np.mean(self.prequential)) if self.prequential else 0.0,
+            "promotion_test": self._promotion_diagnostics(),
+            "tests_running": self.test_matrix(cost_bps=0.0),
         }

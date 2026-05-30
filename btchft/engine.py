@@ -49,7 +49,7 @@ class FullBTCStrategyEngine:
     def __init__(self, settings: Settings) -> None:
         settings.validate()
         self.s = settings
-        for p in [self.s.raw_event_journal, self.s.feature_journal, self.s.model_dir, self.s.execution_ledger, self.s.state_path]:
+        for p in [self.s.raw_event_journal, self.s.feature_journal, self.s.decision_journal, self.s.model_dir, self.s.execution_ledger, self.s.state_path, self.s.telemetry_snapshot]:
             Path(p).parent.mkdir(parents=True, exist_ok=True)
         self.raw_recorder = AsyncJsonlRecorder(self.s.raw_event_journal, {
             "source": "delta_live_websocket_raw_capture", "venue": "DELTA", "symbol": self.s.delta_symbol,
@@ -57,6 +57,10 @@ class FullBTCStrategyEngine:
         })
         self.feature_recorder = AsyncJsonlRecorder(self.s.feature_journal, {
             "source": "causal_live_features_from_delta_l2_trades", "venue": "DELTA", "symbol": self.s.delta_symbol,
+            "is_synthetic": False, "schema_version": 5,
+        })
+        self.decision_recorder = AsyncJsonlRecorder(self.s.decision_journal, {
+            "source": "model_signal_and_gate_audit", "venue": "DELTA", "symbol": self.s.delta_symbol,
             "is_synthetic": False, "schema_version": 5,
         })
         self.book = DeltaOrderBook(self.s.delta_symbol)
@@ -187,8 +191,25 @@ class FullBTCStrategyEngine:
         self.models.learn_matured(book.receive_ts_ns, book.mid)
         pred = self.models.observe_decision(book.receive_ts_ns, book.mid, feature_row, spread_cost)
         signal = pred.get("signal")
-        self.feature_recorder.write({"book_seq": book.seq, "mid": book.mid, "spread_bps": book.spread_bps, "features": feature_row, "prediction": pred, "costs": self.costs.snapshot(book.spread_bps)})
+        costs_snapshot = self.costs.snapshot(book.spread_bps)
+        model_status = self.models.status()
+        feature_payload = {"book_seq": book.seq, "mid": book.mid, "spread_bps": book.spread_bps, "features": feature_row, "prediction": pred, "costs": costs_snapshot}
+        self.feature_recorder.write(feature_payload)
+
+        decision_audit: dict[str, Any] = {
+            "book_seq": book.seq,
+            "mid": book.mid,
+            "spread_bps": book.spread_bps,
+            "model_tests": self.models.test_matrix(cost_bps=spread_cost),
+            "prediction": pred,
+            "chosen_signal": signal,
+            "gate_reason": None,
+            "plan": None,
+            "action": "NO_SIGNAL",
+        }
         if signal is None:
+            decision_audit["gate_reason"] = self.models.no_signal_reason(cost_bps=spread_cost)
+            self.decision_recorder.write(decision_audit)
             return None
         decision = AlphaDecision(
             ts_ns=book.receive_ts_ns,
@@ -197,21 +218,49 @@ class FullBTCStrategyEngine:
             confidence=float(signal["confidence"]),
             source="live_learning_l2_tradeflow_stack_v5",
             features=feature_row,
-            diagnostics={"model_signal": signal, "costs": self.costs.snapshot(book.spread_bps), "models": self.models.status()},
+            diagnostics={"model_signal": signal, "costs": costs_snapshot, "models": model_status},
         )
-        if self._live_gate_reason() is not None:
+        live_gate = self._live_gate_reason()
+        if live_gate is not None:
+            decision_audit["action"] = "SIGNAL_BLOCKED_BY_LIVE_GATE"
+            decision_audit["gate_reason"] = live_gate
+            self.decision_recorder.write(decision_audit)
             return None
         allow_cold_bracket = self.s.trading_mode != "LIVE" or self.s.allow_unvalidated_bootstrap_live or self.models.promoted
         plan = self.risk.build_bracket_plan(decision, book, self.account, spread_cost, allow_cold_start_bracket=allow_cold_bracket)
         if plan is None:
+            decision_audit["action"] = "SIGNAL_BLOCKED_BY_RISK_OR_BRACKET"
+            decision_audit["gate_reason"] = "risk_sizing_bracket_or_min_edge_rejected"
+            self.decision_recorder.write(decision_audit)
             return None
+        decision_audit["plan"] = {
+            "side": plan.side.value,
+            "entry_price": plan.entry_price,
+            "stop_price": plan.stop_price,
+            "take_profit_price": plan.take_profit_price,
+            "quantity_contracts": plan.quantity_contracts,
+            "risk_usd": plan.risk_usd,
+            "expected_net_edge_bps": plan.expected_net_edge_bps,
+            "confidence": plan.confidence,
+            "rationale": plan.rationale,
+        }
         latency_ms = (time.perf_counter_ns() - start) / 1e6
         if latency_ms > self.s.max_decision_latency_ms:
+            decision_audit["action"] = "SIGNAL_BLOCKED_BY_LATENCY"
+            decision_audit["gate_reason"] = f"decision_latency_ms={latency_ms:.3f}"
+            self.decision_recorder.write(decision_audit)
             return None
         if self.s.trading_mode == "SHADOW":
+            decision_audit["action"] = "SHADOW_SIGNAL_TESTED"
+            decision_audit["latency_ms"] = latency_ms
+            self.decision_recorder.write(decision_audit)
             return {"mode": "SHADOW_SIGNAL_ONLY", "decision": decision, "plan": plan, "latency_ms": latency_ms}
         client_order_id = f"hftv5{int(time.time()*1000)%10**20}"
         result = self.executor.place_atomic_bracket_market(self.s.delta_symbol, self.product_id, plan, client_order_id)
+        decision_audit["action"] = "ORDER_SUBMITTED"
+        decision_audit["execution"] = result
+        decision_audit["latency_ms"] = latency_ms
+        self.decision_recorder.write(decision_audit)
         if result.get("success"):
             self.account.open_contracts += plan.quantity_contracts if plan.side is Side.LONG else -plan.quantity_contracts
             self.account.gross_notional_usd += plan.quantity_contracts * self.contract_value_btc * book.mid
@@ -285,11 +334,12 @@ class FullBTCStrategyEngine:
             "feed_health": self.feed_health(),
             "models": self.models.status(),
             "costs": self.costs.snapshot(self.last_book.spread_bps if self.last_book else 0.0),
-            "recorders": {"raw": self.raw_recorder.stats(), "features": self.feature_recorder.stats()},
+            "recorders": {"raw": self.raw_recorder.stats(), "features": self.feature_recorder.stats(), "decisions": self.decision_recorder.stats()},
             "live_gate_reason": self._live_gate_reason(),
         }
 
     def close(self) -> None:
         self.models.checkpoint()
         self.s.state_path.write_text(json.dumps(self.status(), indent=2, default=str), encoding="utf-8")
-        self.raw_recorder.close(); self.feature_recorder.close()
+        self.s.telemetry_snapshot.write_text(json.dumps(self.status(), indent=2, default=str), encoding="utf-8")
+        self.raw_recorder.close(); self.feature_recorder.close(); self.decision_recorder.close()
