@@ -1,0 +1,60 @@
+BTC HFT live-learning bot v5.7 verification
+===========================================
+
+Patch objective
+---------------
+Fix the opaque promotion/evaluation behaviour observed in v5.6:
+- 25k rolling prequential cap looked like a frozen total counter.
+- Decision logs did not explain whether predictions were blocked by cost, cold-start, neutral/non-eligible behaviour, risk/bracket, or live gate.
+- Promotion test did not expose eligible prediction counts/rates or per-horizon prequential P&L.
+- Cost model could not compare Delta and Hyperliquid-style cost assumptions in SHADOW.
+
+Implemented
+-----------
+1. Total + rolling prequential telemetry:
+   - prequential_count_total
+   - prequential_window_count
+   - total mean/sharpe-like
+   - rolling mean/sharpe-like
+   - explicit rolling_window
+
+2. Promotion failure reasons:
+   - rolling_evals_below_min
+   - rolling_mean_return_not_positive
+   - rolling_sharpe_like_not_above_1
+   - eligible_predictions_below_min
+   - eligible_rate_below_min
+
+3. Eligibility diagnostics:
+   - eligible_prediction_total
+   - noneligible_prediction_total
+   - eligible_rate
+   - eligible_winner_total
+   - eligible_loser_total
+   - per-horizon eligible count/rate/mean/sharpe/wins/losses
+
+4. Decision-level diagnostics:
+   - signal_diagnostics attached to every decision row
+   - best forecast move
+   - best expected net edge
+   - ready/cold horizons
+   - per-horizon edges
+   - exact reason when no signal is generated
+
+5. Venue/cost profile diagnostics:
+   - Settings.execution_venue
+   - Settings.execution_cost_profile
+   - DELTA_TAKER / DELTA_MAKER / HYPERLIQUID_TAKER / HYPERLIQUID_MAKER scenario round trips
+   - Hyperliquid profile guarded as shadow-only until real Hyperliquid L2/fill/funding/execution adapters exist
+
+Verification
+------------
+compileall: PASS
+pytest: 10 passed
+
+Important operational note
+--------------------------
+This patch does not fake a profitable strategy or lower costs silently.
+The default remains DELTA_TAKER at the existing conservative hurdle.
+To compare Hyperliquid-style costs, edit btchft/config.py and run SHADOW/PAPER only.
+LIVE Hyperliquid execution is intentionally blocked until a real execution/fill adapter is implemented.

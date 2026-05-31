@@ -70,6 +70,10 @@ class FullBTCStrategyEngine:
             min_labels_to_score=self.s.min_labels_to_score,
             model_dir=self.s.model_dir,
             auto_promote=self.s.auto_promote_model,
+            rolling_window=self.s.promotion_rolling_window,
+            min_promotion_evals=self.s.min_promotion_evals,
+            min_eligible_predictions_for_promotion=self.s.min_eligible_predictions_for_promotion,
+            min_eligible_rate_for_promotion=self.s.min_eligible_rate_for_promotion,
         )
         self.models.maybe_load_bootstrap(self.s.bootstrap_tradeflow_model, self.s.bootstrap_tradeflow_manifest)
         self.costs = CostModel(
@@ -79,6 +83,10 @@ class FullBTCStrategyEngine:
             impact_floor_bps=self.s.impact_floor_bps,
             min_real_fills=self.s.min_real_fill_count_for_cost_model,
             ledger_path=self.s.execution_ledger,
+            execution_cost_profile=self.s.execution_cost_profile,
+            hyperliquid_taker_fee_bps=self.s.hyperliquid_taker_fee_bps,
+            hyperliquid_maker_fee_bps=self.s.hyperliquid_maker_fee_bps,
+            hyperliquid_impact_floor_bps=self.s.hyperliquid_impact_floor_bps,
         )
         self.risk = RiskEngine(
             max_risk_per_trade=self.s.max_risk_per_trade,
@@ -192,7 +200,7 @@ class FullBTCStrategyEngine:
         pred = self.models.observe_decision(book.receive_ts_ns, book.mid, feature_row, spread_cost)
         signal = pred.get("signal")
         costs_snapshot = self.costs.snapshot(book.spread_bps)
-        model_status = self.models.status()
+        model_status = self.models.status(cost_bps=spread_cost)
         feature_payload = {"book_seq": book.seq, "mid": book.mid, "spread_bps": book.spread_bps, "features": feature_row, "prediction": pred, "costs": costs_snapshot}
         self.feature_recorder.write(feature_payload)
 
@@ -200,7 +208,10 @@ class FullBTCStrategyEngine:
             "book_seq": book.seq,
             "mid": book.mid,
             "spread_bps": book.spread_bps,
+            "execution_cost_profile": self.s.execution_cost_profile,
+            "costs": costs_snapshot,
             "model_tests": self.models.test_matrix(cost_bps=spread_cost),
+            "signal_diagnostics": self.models.last_signal_diagnostics,
             "prediction": pred,
             "chosen_signal": signal,
             "gate_reason": None,
@@ -330,6 +341,7 @@ class FullBTCStrategyEngine:
             "symbol": self.s.delta_symbol,
             "sticky_halt_reason": self.sticky_halt_reason,
             "account": self.account.__dict__.copy(),
+            "execution": {"venue": self.s.execution_venue, "cost_profile": self.s.execution_cost_profile},
             "book_integrity": self.book.integrity(),
             "feed_health": self.feed_health(),
             "models": self.models.status(cost_bps=self.costs.round_trip_bps(self.last_book.spread_bps if self.last_book else 0.0)),

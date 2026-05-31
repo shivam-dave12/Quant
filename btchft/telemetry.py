@@ -67,6 +67,16 @@ def summarize_live_dir(live_dir: str | Path, *, tail_rows: int = 5000) -> dict[s
     signals = [r for r in dec_tail if r.get("chosen_signal")]
     sig_by_side = Counter(str((r.get("chosen_signal") or {}).get("side", "unknown")) for r in signals)
     sig_by_horizon = Counter(str((r.get("chosen_signal") or {}).get("horizon_ms", "unknown")) for r in signals)
+    diag_reasons = Counter(str(((r.get("signal_diagnostics") or {}).get("reason")) or "NONE") for r in dec_tail if r.get("type") != "metadata")
+    best_edge_values = []
+    for r in dec_tail:
+        diag = r.get("signal_diagnostics") or {}
+        edge = diag.get("best_expected_net_edge_bps")
+        try:
+            if edge is not None:
+                best_edge_values.append(float(edge))
+        except Exception:
+            pass
 
     last_feature = next((r for r in reversed(feat_tail) if r.get("type") != "metadata"), None)
     last_decision = next((r for r in reversed(dec_tail) if r.get("type") != "metadata"), None)
@@ -108,6 +118,14 @@ def summarize_live_dir(live_dir: str | Path, *, tail_rows: int = 5000) -> dict[s
             "signals_seen": len(signals),
             "signals_by_side": dict(sig_by_side),
             "signals_by_horizon": dict(sig_by_horizon),
+            "signal_diagnostic_reasons": dict(diag_reasons),
+            "best_edge_bps_tail": {
+                "count": len(best_edge_values),
+                "min": min(best_edge_values) if best_edge_values else None,
+                "max": max(best_edge_values) if best_edge_values else None,
+                "mean": sum(best_edge_values) / len(best_edge_values) if best_edge_values else None,
+                "positive_count": sum(1 for x in best_edge_values if x > 0),
+            },
             "last_decision": last_decision,
         },
         "latest_runtime_state": latest_state,
@@ -135,9 +153,11 @@ def print_human(summary: dict[str, Any]) -> str:
     lines.append(f"  snapshots={book.get('snapshots')} updates={book.get('updates')} checksum_failures={book.get('checksum_failures')} sequence_gaps={book.get('sequence_gaps')}")
     lines.append("")
     lines.append("TRAINING")
-    lines.append(f"  matured_labels={models.get('matured_labels')} pending_labels={models.get('pending_labels')} prequential_count={models.get('prequential_count')}")
-    lines.append(f"  prequential_mean_return={models.get('prequential_mean_return')} promoted_horizon_ms={models.get('promoted_horizon_ms')}")
-    lines.append(f"  round_trip_cost_bps={costs.get('round_trip_bps')} real_fill_count={costs.get('real_fill_count')}")
+    promo = models.get("promotion_test") or {}
+    lines.append(f"  matured_labels={models.get('matured_labels')} pending_labels={models.get('pending_labels')} total_prequential={models.get('prequential_count_total', models.get('prequential_count'))} rolling_prequential={models.get('prequential_window_count')}")
+    lines.append(f"  total_mean_return={models.get('prequential_mean_return')} rolling_mean_return={models.get('rolling_prequential_mean_return')} promoted_horizon_ms={models.get('promoted_horizon_ms')}")
+    lines.append(f"  eligible_predictions={models.get('eligible_prediction_total')} eligible_rate={models.get('eligible_rate')} promotion_passed={promo.get('passed')} failure_reasons={promo.get('failure_reasons')}")
+    lines.append(f"  round_trip_cost_bps={costs.get('round_trip_bps')} cost_profile={costs.get('execution_cost_profile')} scenarios={costs.get('scenario_round_trip_bps')} real_fill_count={costs.get('real_fill_count')}")
     lines.append("")
     lines.append("MODELS")
     regs = models.get("regressors") or {}
@@ -152,4 +172,6 @@ def print_human(summary: dict[str, Any]) -> str:
     lines.append(f"  actions={dec.get('actions')}")
     lines.append(f"  signals_seen={dec.get('signals_seen')} by_side={dec.get('signals_by_side')} by_horizon={dec.get('signals_by_horizon')}")
     lines.append(f"  gate_reasons={dec.get('gate_reasons')}")
+    lines.append(f"  signal_diagnostic_reasons={dec.get('signal_diagnostic_reasons')}")
+    lines.append(f"  best_edge_bps_tail={dec.get('best_edge_bps_tail')}")
     return "\n".join(lines)

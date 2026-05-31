@@ -1,6 +1,40 @@
-# BTC HFT Live-Learning Bot v5.1 — Delta BTCUSD
+# BTC HFT Live-Learning Bot v5.7 — Promotion Diagnostics + Venue Cost Profiles
 
 This package is a complete event-driven BTCUSD microstructure trading system designed for Delta India. It does not claim that an unvalidated strategy is already profitable. It runs the whole stack immediately: raw data capture, order-book reconstruction, trade-flow features, online model training, fee/fill reconciliation, dynamic bracket learning, shadow/PAPER scoring, and guarded LIVE execution.
+
+
+## v5.7 fixes: promotion transparency and cost profiles
+
+This build fixes the opaque promotion behaviour seen in v5.6:
+
+- `prequential_count` now reports the **total** evaluation count instead of looking frozen at the 25,000 rolling window cap.
+- Promotion diagnostics now separately report:
+  - total prequential count,
+  - rolling-window count,
+  - total mean return,
+  - rolling mean return,
+  - eligible prediction count,
+  - eligible rate,
+  - eligible winners/losers,
+  - per-horizon prequential stats,
+  - explicit `failure_reasons`.
+- Decision records now include `signal_diagnostics`, so you can see whether the model failed because of cold start, cost hurdle, neutral/non-eligible predictions, risk/bracket, or live gate.
+- Cost scenarios are now reported for:
+  - `DELTA_TAKER`,
+  - `DELTA_MAKER`,
+  - `HYPERLIQUID_TAKER`,
+  - `HYPERLIQUID_MAKER`.
+- `execution_cost_profile` can be changed in `btchft/config.py` for SHADOW/PAPER comparison. Hyperliquid cost mode is shadow-only until a real Hyperliquid L2/fill/funding/execution adapter is added.
+
+Example config-only cost comparison:
+
+```python
+execution_venue: str = "DELTA"
+execution_cost_profile: str = "DELTA_TAKER"
+# or, for shadow-cost testing only:
+execution_venue: str = "HYPERLIQUID"
+execution_cost_profile: str = "HYPERLIQUID_TAKER"
+```
 
 ## Configuration rule
 
@@ -69,7 +103,7 @@ class Settings:
     trading_mode: str = "SHADOW"   # SHADOW, PAPER, or LIVE
     allow_live: bool = False
     allow_unvalidated_bootstrap_live: bool = False
-    delta_testnet: bool = True
+    delta_testnet: bool = False
 ```
 
 For live production with safety gates enabled:
@@ -232,3 +266,8 @@ promoted_horizon_ms != null
 real_fill_count above gate for LIVE
 live_gate_reason = null in LIVE mode
 ```
+
+
+## v5.6 observability fix
+
+Top-level status now passes the active round-trip cost hurdle into `models.tests_running.current_cost_hurdle_bps`. Earlier v5.5 decision records used the correct live cost during signal scoring, but the status summary displayed `0.0`, which was misleading.

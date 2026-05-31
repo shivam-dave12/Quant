@@ -13,13 +13,36 @@ from .types import FillRecord
 
 
 class CostModel:
-    """Fee/slippage model: scheduled taker+GST floor, upgraded by REST-reconciled fills."""
+    """Venue-aware fee/slippage model.
 
-    def __init__(self, *, taker_fee_bps_pre_gst: float, maker_fee_bps_pre_gst: float, gst_rate: float, impact_floor_bps: float, min_real_fills: int, ledger_path: str | Path) -> None:
+    The active profile controls the *model hurdle* used for shadow scoring.
+    REST-reconciled fills are still required before any live cost is trusted.
+    Hyperliquid profiles are shadow-cost profiles only unless a real Hyperliquid
+    execution/fill adapter is wired in.
+    """
+
+    def __init__(
+        self,
+        *,
+        taker_fee_bps_pre_gst: float,
+        maker_fee_bps_pre_gst: float,
+        gst_rate: float,
+        impact_floor_bps: float,
+        min_real_fills: int,
+        ledger_path: str | Path,
+        execution_cost_profile: str = "DELTA_TAKER",
+        hyperliquid_taker_fee_bps: float = 4.5,
+        hyperliquid_maker_fee_bps: float = 1.5,
+        hyperliquid_impact_floor_bps: float = 2.0,
+    ) -> None:
         self.taker_fee_bps_pre_gst = float(taker_fee_bps_pre_gst)
         self.maker_fee_bps_pre_gst = float(maker_fee_bps_pre_gst)
         self.gst_rate = float(gst_rate)
         self.impact_floor_bps = float(impact_floor_bps)
+        self.execution_cost_profile = str(execution_cost_profile).upper()
+        self.hyperliquid_taker_fee_bps = float(hyperliquid_taker_fee_bps)
+        self.hyperliquid_maker_fee_bps = float(hyperliquid_maker_fee_bps)
+        self.hyperliquid_impact_floor_bps = float(hyperliquid_impact_floor_bps)
         self.min_real_fills = int(min_real_fills)
         self.fees: deque[float] = deque(maxlen=5000)
         self.slippages: deque[float] = deque(maxlen=5000)
@@ -39,6 +62,33 @@ class CostModel:
     @property
     def scheduled_one_way_taker_fee_bps_with_gst(self) -> float:
         return self.taker_fee_bps_pre_gst * (1.0 + self.gst_rate)
+
+    @property
+    def scheduled_one_way_maker_fee_bps_with_gst(self) -> float:
+        return self.maker_fee_bps_pre_gst * (1.0 + self.gst_rate)
+
+    def scheduled_one_way_fee_for_profile(self, profile: str | None = None) -> float:
+        profile = (profile or self.execution_cost_profile).upper()
+        if profile == "DELTA_TAKER":
+            return self.scheduled_one_way_taker_fee_bps_with_gst
+        if profile == "DELTA_MAKER":
+            return self.scheduled_one_way_maker_fee_bps_with_gst
+        if profile == "HYPERLIQUID_TAKER":
+            return self.hyperliquid_taker_fee_bps
+        if profile == "HYPERLIQUID_MAKER":
+            return self.hyperliquid_maker_fee_bps
+        raise ValueError(f"unsupported cost profile: {profile}")
+
+    def impact_floor_for_profile(self, profile: str | None = None) -> float:
+        profile = (profile or self.execution_cost_profile).upper()
+        if profile.startswith("HYPERLIQUID"):
+            return self.hyperliquid_impact_floor_bps
+        return self.impact_floor_bps
+
+    def scenario_round_trip_bps(self, profile: str, spread_bps: float = 0.0) -> float:
+        fee = self.scheduled_one_way_fee_for_profile(profile)
+        impact = max(self.impact_floor_for_profile(profile), max(0.0, spread_bps) / 2.0)
+        return 2.0 * (fee + impact)
 
     def configure_from_product(self, product: dict[str, Any]) -> None:
         """Ingest exchange product fee metadata without ever weakening the configured fee floor.
@@ -84,13 +134,16 @@ class CostModel:
         return True
 
     def one_way_fee_bps(self) -> float:
+        scheduled = self.scheduled_one_way_fee_for_profile(self.execution_cost_profile)
+        # Only the real Delta profile can be upgraded from Delta REST fills.
+        # Shadow Hyperliquid costs must not be "validated" by Delta fills.
         with self.lock:
-            if len(self.fees) >= self.min_real_fills:
-                return max(self.scheduled_one_way_taker_fee_bps_with_gst, float(np.quantile(np.asarray(self.fees), 0.95)))
-            return self.scheduled_one_way_taker_fee_bps_with_gst
+            if self.execution_cost_profile.startswith("DELTA") and len(self.fees) >= self.min_real_fills:
+                return max(scheduled, float(np.quantile(np.asarray(self.fees), 0.95)))
+            return scheduled
 
     def one_way_impact_bps(self, spread_bps: float = 0.0) -> float:
-        floor = max(self.impact_floor_bps, max(0.0, spread_bps) / 2.0)
+        floor = max(self.impact_floor_for_profile(self.execution_cost_profile), max(0.0, spread_bps) / 2.0)
         with self.lock:
             if len(self.slippages) >= self.min_real_fills:
                 return max(floor, float(np.quantile(np.asarray(self.slippages), 0.95)))
@@ -100,15 +153,20 @@ class CostModel:
         return 2.0 * (self.one_way_fee_bps() + self.one_way_impact_bps(spread_bps))
 
     def snapshot(self, spread_bps: float = 0.0) -> dict[str, Any]:
+        profiles = ["DELTA_TAKER", "DELTA_MAKER", "HYPERLIQUID_TAKER", "HYPERLIQUID_MAKER"]
         with self.lock:
             return {
+                "execution_cost_profile": self.execution_cost_profile,
                 "real_fill_count": len(self.fees),
                 "scheduled_one_way_taker_fee_bps_with_gst": self.scheduled_one_way_taker_fee_bps_with_gst,
+                "scheduled_one_way_maker_fee_bps_with_gst": self.scheduled_one_way_maker_fee_bps_with_gst,
                 "one_way_fee_bps": self.one_way_fee_bps(),
                 "one_way_impact_bps": self.one_way_impact_bps(spread_bps),
                 "round_trip_bps": self.round_trip_bps(spread_bps),
-                "fee_basis": "rest_fill_p95_floor" if len(self.fees) >= self.min_real_fills else "scheduled_taker_plus_gst",
-                "impact_basis": "real_slippage_p95" if len(self.slippages) >= self.min_real_fills else "spread_half_plus_floor",
+                "scenario_round_trip_bps": {p: self.scenario_round_trip_bps(p, spread_bps) for p in profiles},
+                "fee_basis": "rest_fill_p95_floor" if self.execution_cost_profile.startswith("DELTA") and len(self.fees) >= self.min_real_fills else f"scheduled_{self.execution_cost_profile.lower()}",
+                "impact_basis": "real_slippage_p95" if self.execution_cost_profile.startswith("DELTA") and len(self.slippages) >= self.min_real_fills else "spread_half_plus_floor",
+                "cost_warning": None if self.execution_cost_profile.startswith("DELTA") else "Hyperliquid cost profile is shadow-only until Hyperliquid L2/fill/funding adapter is wired.",
             }
 
 
