@@ -43,6 +43,7 @@ class Settings:
     allow_live: bool = False
     allow_unvalidated_bootstrap_live: bool = False
     auto_promote_model: bool = True
+    auto_restore_model_checkpoint: bool = True
 
     # Venue / instrument.
     delta_symbol: str = "BTCUSD"

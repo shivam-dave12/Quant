@@ -10,6 +10,7 @@ import time
 
 import joblib
 import numpy as np
+import pandas as pd
 from sklearn.linear_model import SGDClassifier, SGDRegressor
 from sklearn.preprocessing import StandardScaler
 
@@ -285,7 +286,7 @@ class LiveLearningModelStack:
         if x is None:
             self.last_signal_diagnostics = {"reason": "bootstrap_available_but_no_feature_vector", "cost_bps": float(cost_bps)}
             return None
-        pred = float(self.bootstrap_model.predict(x)[0])
+        pred = float(self.bootstrap_model.predict(pd.DataFrame([self.pending[-1].x], columns=FEATURE_COLUMNS))[0])
         edge = abs(pred) - float(cost_bps)
         self.last_signal_diagnostics = {
             "reason": "bootstrap_edge_positive" if edge > 0 else "bootstrap_edge_below_current_cost_hurdle",
@@ -425,16 +426,44 @@ class LiveLearningModelStack:
     def promoted(self) -> bool:
         return self.promoted_horizon_ms is not None
 
+    def checkpoint_path(self) -> Path:
+        return self.model_dir / "model_stack_checkpoint.joblib"
+
+    def restore_checkpoint(self, path: str | Path | None = None) -> bool:
+        ckpt = Path(path) if path is not None else self.checkpoint_path()
+        if not ckpt.exists():
+            return False
+        artifact = joblib.load(ckpt)
+        if artifact.get("type") not in {"live_learning_model_stack_v5_8", "live_learning_model_stack_v5_7"}:
+            raise RuntimeError(f"Model checkpoint rejected: unexpected type={artifact.get('type')}")
+        restored = artifact.get("model")
+        if not isinstance(restored, LiveLearningModelStack):
+            raise RuntimeError("Model checkpoint rejected: missing LiveLearningModelStack payload")
+        # Preserve current deployment path, but restore learned model state.
+        model_dir = self.model_dir
+        self.__dict__.update(restored.__dict__)
+        self.model_dir = model_dir
+        return True
+
     def checkpoint(self) -> None:
+        self.model_dir.mkdir(parents=True, exist_ok=True)
         for h, model in self.regressors.items():
             model.save(self.model_dir / f"return_{h}ms_shadow.joblib", {"horizon_ms": h, "matured_labels": self.matured_labels, "live_promoted_shadow": self.promoted_horizon_ms == h})
+        joblib.dump({
+            "type": "live_learning_model_stack_v5_8",
+            "saved_at_ns": time.time_ns(),
+            "matured_labels": self.matured_labels,
+            "prequential_count_total": self.prequential_total_count,
+            "feature_columns": FEATURE_COLUMNS,
+            "model": self,
+        }, self.checkpoint_path())
         (self.model_dir / "model_stack_state.json").write_text(json.dumps(self.status(), indent=2), encoding="utf-8")
         self.last_checkpoint_labels = self.matured_labels
 
     def status(self, cost_bps: float = 0.0) -> dict[str, Any]:
         promotion = self._promotion_diagnostics()
         return {
-            "type": "real_live_learning_model_stack_v5_7",
+            "type": "real_live_learning_model_stack_v5_8",
             "feature_columns": FEATURE_COLUMNS,
             "matured_labels": self.matured_labels,
             "pending_labels": len(self.pending),

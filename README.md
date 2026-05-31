@@ -271,3 +271,14 @@ live_gate_reason = null in LIVE mode
 ## v5.6 observability fix
 
 Top-level status now passes the active round-trip cost hurdle into `models.tests_running.current_cost_hurdle_bps`. Earlier v5.5 decision records used the correct live cost during signal scoring, but the status summary displayed `0.0`, which was misleading.
+
+
+## v5.8 warm-start from existing live artifacts
+
+If you already collected real live data in `/app/artifacts/live/features.jsonl.gz`, replay it into the online learner before starting the bot:
+
+```bash
+btc-live-hft warmstart-live --live-dir /app/artifacts/live --reset
+```
+
+This creates `/app/artifacts/live/models/model_stack_checkpoint.joblib`. On normal `btc-live-hft run`, the bot auto-restores that checkpoint and continues training from the preserved real artifact history instead of starting from zero.

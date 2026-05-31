@@ -75,6 +75,12 @@ class FullBTCStrategyEngine:
             min_eligible_predictions_for_promotion=self.s.min_eligible_predictions_for_promotion,
             min_eligible_rate_for_promotion=self.s.min_eligible_rate_for_promotion,
         )
+        if self.s.auto_restore_model_checkpoint:
+            try:
+                if self.models.restore_checkpoint():
+                    log.info("Restored live-learning model stack from %s", self.models.checkpoint_path())
+            except Exception as e:
+                log.warning("Model checkpoint restore failed; starting fresh: %s", e)
         self.models.maybe_load_bootstrap(self.s.bootstrap_tradeflow_model, self.s.bootstrap_tradeflow_manifest)
         self.costs = CostModel(
             taker_fee_bps_pre_gst=self.s.taker_fee_bps_pre_gst,

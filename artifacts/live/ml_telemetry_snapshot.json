@@ -9,6 +9,10 @@
     "gross_notional_usd": 0.0,
     "halted_reason": null
   },
+  "execution": {
+    "venue": "DELTA",
+    "cost_profile": "DELTA_TAKER"
+  },
   "book_integrity": {
     "snapshots": 0,
     "updates": 0,
@@ -31,7 +35,7 @@
     "stall_reason": null
   },
   "models": {
-    "type": "real_live_learning_model_stack_v5",
+    "type": "real_live_learning_model_stack_v5_8",
     "feature_columns": [
       "spread_bps",
       "imbalance_1",
@@ -138,15 +142,40 @@
       }
     },
     "prequential_count": 0,
+    "prequential_count_total": 0,
+    "prequential_window_count": 0,
     "prequential_mean_return": 0.0,
+    "rolling_prequential_mean_return": 0.0,
+    "eligible_prediction_total": 0,
+    "noneligible_prediction_total": 0,
+    "eligible_rate": 0.0,
     "promotion_test": {
       "prequential_evals": 0,
       "prequential_mean_return": 0.0,
       "prequential_sharpe_like": 0.0,
+      "rolling_window": 25000,
+      "rolling_prequential_evals": 0,
+      "rolling_prequential_mean_return": 0.0,
+      "rolling_prequential_sharpe_like": 0.0,
       "required_min_evals": 5000,
       "required_positive_mean": true,
       "required_sharpe_like_gt": 1.0,
-      "passed": false
+      "eligible_prediction_total": 0,
+      "noneligible_prediction_total": 0,
+      "eligible_rate": 0.0,
+      "eligible_winner_total": 0,
+      "eligible_loser_total": 0,
+      "required_min_eligible_predictions": 100,
+      "required_min_eligible_rate": 0.001,
+      "evaluation_basis": "rolling_window_for_promotion_total_for_reporting",
+      "passed": false,
+      "failure_reasons": [
+        "rolling_evals_below_min:0/5000",
+        "rolling_mean_return_not_positive",
+        "rolling_sharpe_like_not_above_1",
+        "eligible_predictions_below_min:0/100",
+        "eligible_rate_below_min:0.000000/0.001"
+      ]
     },
     "tests_running": {
       "horizons": {
@@ -166,6 +195,15 @@
             "samples": 0,
             "accuracy": 0.0,
             "ready_to_score": false
+          },
+          "prequential_by_horizon": {
+            "count": 0,
+            "eligible": 0,
+            "eligible_rate": 0.0,
+            "mean_return": 0.0,
+            "sharpe_like": 0.0,
+            "wins": 0,
+            "losses": 0
           }
         },
         "3000": {
@@ -184,6 +222,15 @@
             "samples": 0,
             "accuracy": 0.0,
             "ready_to_score": false
+          },
+          "prequential_by_horizon": {
+            "count": 0,
+            "eligible": 0,
+            "eligible_rate": 0.0,
+            "mean_return": 0.0,
+            "sharpe_like": 0.0,
+            "wins": 0,
+            "losses": 0
           }
         },
         "5000": {
@@ -202,6 +249,15 @@
             "samples": 0,
             "accuracy": 0.0,
             "ready_to_score": false
+          },
+          "prequential_by_horizon": {
+            "count": 0,
+            "eligible": 0,
+            "eligible_rate": 0.0,
+            "mean_return": 0.0,
+            "sharpe_like": 0.0,
+            "wins": 0,
+            "losses": 0
           }
         },
         "15000": {
@@ -220,6 +276,15 @@
             "samples": 0,
             "accuracy": 0.0,
             "ready_to_score": false
+          },
+          "prequential_by_horizon": {
+            "count": 0,
+            "eligible": 0,
+            "eligible_rate": 0.0,
+            "mean_return": 0.0,
+            "sharpe_like": 0.0,
+            "wins": 0,
+            "losses": 0
           }
         }
       },
@@ -228,12 +293,34 @@
         "prequential_evals": 0,
         "prequential_mean_return": 0.0,
         "prequential_sharpe_like": 0.0,
+        "rolling_window": 25000,
+        "rolling_prequential_evals": 0,
+        "rolling_prequential_mean_return": 0.0,
+        "rolling_prequential_sharpe_like": 0.0,
         "required_min_evals": 5000,
         "required_positive_mean": true,
         "required_sharpe_like_gt": 1.0,
-        "passed": false
+        "eligible_prediction_total": 0,
+        "noneligible_prediction_total": 0,
+        "eligible_rate": 0.0,
+        "eligible_winner_total": 0,
+        "eligible_loser_total": 0,
+        "required_min_eligible_predictions": 100,
+        "required_min_eligible_rate": 0.001,
+        "evaluation_basis": "rolling_window_for_promotion_total_for_reporting",
+        "passed": false,
+        "failure_reasons": [
+          "rolling_evals_below_min:0/5000",
+          "rolling_mean_return_not_positive",
+          "rolling_sharpe_like_not_above_1",
+          "eligible_predictions_below_min:0/100",
+          "eligible_rate_below_min:0.000000/0.001"
+        ]
       },
       "promoted_horizon_ms": null,
+      "last_signal_diagnostics": {
+        "reason": "no_predictions_seen_yet"
+      },
       "bootstrap_model": {
         "loaded": true,
         "live_approved": false,
@@ -243,23 +330,32 @@
     }
   },
   "costs": {
+    "execution_cost_profile": "DELTA_TAKER",
     "real_fill_count": 0,
     "scheduled_one_way_taker_fee_bps_with_gst": 5.8999999999999995,
+    "scheduled_one_way_maker_fee_bps_with_gst": 2.36,
     "one_way_fee_bps": 5.8999999999999995,
     "one_way_impact_bps": 2.0,
     "round_trip_bps": 15.799999999999999,
-    "fee_basis": "scheduled_taker_plus_gst",
-    "impact_basis": "spread_half_plus_floor"
+    "scenario_round_trip_bps": {
+      "DELTA_TAKER": 15.799999999999999,
+      "DELTA_MAKER": 8.719999999999999,
+      "HYPERLIQUID_TAKER": 13.0,
+      "HYPERLIQUID_MAKER": 7.0
+    },
+    "fee_basis": "scheduled_delta_taker",
+    "impact_basis": "spread_half_plus_floor",
+    "cost_warning": null
   },
   "recorders": {
     "raw": {
-      "path": "/tmp/pytest-of-root/pytest-0/test_engine_live_gate_blocks_w0/raw.jsonl.gz",
+      "path": "/tmp/pytest-of-root/pytest-1/test_engine_live_gate_blocks_w0/raw.jsonl.gz",
       "written": 0,
       "dropped": 0,
       "queue_size": 0
     },
     "features": {
-      "path": "/tmp/pytest-of-root/pytest-0/test_engine_live_gate_blocks_w0/feat.jsonl.gz",
+      "path": "/tmp/pytest-of-root/pytest-1/test_engine_live_gate_blocks_w0/feat.jsonl.gz",
       "written": 0,
       "dropped": 0,
       "queue_size": 0
