@@ -42,7 +42,7 @@ def resolve_expiry(args, cfg) -> str:
     if cfg.nse_contract_file.exists():
         df = load_nifty_options_contracts(cfg.nse_contract_file, cfg.underlying)
         return str(nearest_expiry(df, cfg.expiry_index))
-    raise ValueError("Pass --expiry YYYY-MM-DD or provide NSE_CONTRACT_FILE")
+    raise ValueError("Pass --expiry YYYY-MM-DD or provide cfg.nse_contract_file")
 
 
 def cmd_collect_once(args) -> None:
@@ -146,7 +146,7 @@ def cmd_data_audit(args) -> None:
 def cmd_live_once(args) -> None:
     cfg = load_config()
     if args.live:
-        # Two-key live switch: CLI --live + env BOT_LIVE_TRADING_ENABLED=true.
+        # Two-key live switch: CLI --live + live_trading_enabled=True in bot/config.py.
         object.__setattr__(cfg, "paper_trading", False)
     store = Store(cfg.db_path)
     adapter = GrowwAdapter(cfg.groww_token)
@@ -193,7 +193,7 @@ def main() -> None:
     p.set_defaults(func=cmd_inspect_contracts)
 
     p = sub.add_parser("collect-once")
-    p.add_argument("--expiry", default=None, help="YYYY-MM-DD. If omitted, uses nearest expiry from NSE_CONTRACT_FILE.")
+    p.add_argument("--expiry", default=None, help="YYYY-MM-DD. If omitted, uses nearest expiry from cfg.nse_contract_file.")
     p.set_defaults(func=cmd_collect_once)
 
     p = sub.add_parser("collect-loop")
@@ -219,12 +219,12 @@ def main() -> None:
 
     p = sub.add_parser("live-once")
     p.add_argument("--expiry", default=None)
-    p.add_argument("--live", action="store_true", help="Requires BOT_LIVE_TRADING_ENABLED=true too.")
+    p.add_argument("--live", action="store_true", help="Requires live_trading_enabled=True in bot/config.py too.")
     p.set_defaults(func=cmd_live_once)
 
     p = sub.add_parser("live-loop")
     p.add_argument("--expiry", default=None)
-    p.add_argument("--live", action="store_true", help="Requires BOT_LIVE_TRADING_ENABLED=true too.")
+    p.add_argument("--live", action="store_true", help="Requires live_trading_enabled=True in bot/config.py too.")
     p.set_defaults(func=cmd_live_loop)
 
     p = sub.add_parser("metrics")

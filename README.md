@@ -31,10 +31,10 @@ fake rows
 untagged manual inserts
 ```
 
-The enforcement flag is:
+The enforcement setting is in `bot/config.py`:
 
-```bash
-BOT_REQUIRE_GROWW_SOURCE=true
+```python
+require_groww_source: bool = True
 ```
 
 Keep this enabled. Disabling it is only for migration/debugging of older real databases.
@@ -75,11 +75,13 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Put your Groww token in `.env`:
+Put only your Groww secret in `.env`:
 
 ```bash
 GROWW_API_AUTH_TOKEN=your_token
 ```
+
+Change all non-secret runtime/model/risk settings in `bot/config.py`, not in `.env`.
 
 ## Inspect your NSE contract file
 
@@ -95,7 +97,7 @@ python -m bot.cli inspect-contracts
 python -m bot.cli collect-loop --expiry 2026-06-02
 ```
 
-Or omit expiry to use nearest expiry from `NSE_CONTRACT_FILE`:
+Or omit expiry to use nearest expiry from `cfg.nse_contract_file`:
 
 ```bash
 python -m bot.cli collect-loop
@@ -130,12 +132,12 @@ IV expansion classifier
 cost/liquidity estimator
 ```
 
-Live trading gates use real labelled data only:
+Live trading gates use real labelled data only. The thresholds are configured in `bot/config.py`:
 
 ```text
-top1_per_snapshot_count >= BOT_MIN_BACKTEST_TRADES
-top1_per_snapshot_win_rate >= BOT_MIN_MODEL_WIN_RATE
-top1_per_snapshot_sharpe >= BOT_MIN_MODEL_SHARPE
+top1_per_snapshot_count >= min_backtest_trades
+top1_per_snapshot_win_rate >= min_model_win_rate
+top1_per_snapshot_sharpe >= min_model_sharpe
 top1_per_snapshot_mean_return > 0
 top1_per_snapshot_alpha_vs_universe > 0
 ```
@@ -160,9 +162,16 @@ paper-buys only after gates pass
 
 There is a two-key safety switch. You need both:
 
+1. Edit `bot/config.py`:
+
+```python
+live_trading_enabled: bool = True
+paper_trading: bool = False
+```
+
+2. Run with the live CLI flag:
+
 ```bash
-BOT_LIVE_TRADING_ENABLED=true
-BOT_PAPER_TRADING=false
 python -m bot.cli live-loop --live
 ```
 
@@ -178,11 +187,13 @@ A good win rate, Sharpe, and alpha cannot be guaranteed. This build enforces the
 
 ## Docker .env handling
 
+`.env` is secrets-only. It should contain only API keys/secrets such as `GROWW_API_AUTH_TOKEN`. All runtime/model/risk settings are in `bot/config.py`.
+
 This package Dockerfile copies `.env` into `/app/.env` when `.env` exists in the build context. Create it before building:
 
 ```bash
 cp .env.example .env
-# edit .env and add GROWW_API_AUTH_TOKEN
+# edit .env and add only GROWW_API_AUTH_TOKEN
 
 docker build -t groww-nifty-option-bot:latest .
 docker run --rm groww-nifty-option-bot:latest

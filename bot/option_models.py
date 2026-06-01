@@ -343,7 +343,7 @@ def train_model_suite_from_store(bot_cfg: BotConfig, store: Store) -> ModelTrain
 def load_option_model_raw_data(cfg: BotConfig, store: Store) -> pd.DataFrame:
     """Load only real market snapshots collected by the Groww collector.
 
-    Synthetic/sample rows are deliberately not supported. With BOT_REQUIRE_GROWW_SOURCE=true
+    Synthetic/sample rows are deliberately not supported. With require_groww_source=True in bot/config.py
     the trainer accepts only rows tagged by the live collector as groww_option_chain/groww_quote.
     """
     chain_source_clause = "AND source = 'groww_option_chain'" if cfg.require_groww_source else ""

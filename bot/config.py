@@ -3,79 +3,88 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+
 from dotenv import load_dotenv
 
+# .env is intentionally secrets-only. Do not put runtime knobs in .env.
+# Runtime/model/risk settings live in this file so Docker/runtime behavior is explicit and auditable.
 load_dotenv()
-
-
-def _bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, default))
-    except Exception:
-        return default
-
-
-def _int(name: str, default: int) -> int:
-    try:
-        return int(float(os.getenv(name, default)))
-    except Exception:
-        return default
 
 
 @dataclass(frozen=True)
 class BotConfig:
+    # ──────────────────────────────────────────────────────────────────────
+    # Secrets / credentials: keep these in .env or runtime secret injection.
+    # ──────────────────────────────────────────────────────────────────────
     groww_token: str = os.getenv("GROWW_API_AUTH_TOKEN", "")
-    live_trading_enabled: bool = _bool("BOT_LIVE_TRADING_ENABLED", False)
-    paper_trading: bool = _bool("BOT_PAPER_TRADING", True)
 
-    db_path: Path = Path(os.getenv("BOT_DB_PATH", "data/nifty_option_bot.duckdb"))
-    nse_contract_file: Path = Path(os.getenv("NSE_CONTRACT_FILE", "data/raw/NSE_FO_contract_29052026.csv.gz"))
-    groww_instruments_csv: Path = Path(os.getenv("GROWW_INSTRUMENTS_CSV", "data/raw/groww_instruments.csv"))
-    model_path: Path = Path(os.getenv("MODEL_PATH", "models/option_return_model.joblib"))
-    model_meta_path: Path = Path(os.getenv("MODEL_META_PATH", "models/model_meta.json"))
-    model_suite_path: Path = Path(os.getenv("MODEL_SUITE_PATH", "models/option_model_suite.joblib"))
-    model_suite_meta_path: Path = Path(os.getenv("MODEL_SUITE_META_PATH", "models/model_suite_meta.json"))
+    # ──────────────────────────────────────────────────────────────────────
+    # Runtime mode
+    # Live trading still requires the CLI flag: python -m bot.cli live-loop --live
+    # plus live_trading_enabled=True here. Keep disabled until real-data gates pass.
+    # ──────────────────────────────────────────────────────────────────────
+    live_trading_enabled: bool = False
+    paper_trading: bool = True
 
-    underlying: str = os.getenv("BOT_UNDERLYING", "NIFTY").upper()
-    max_strikes_each_side: int = _int("BOT_MAX_STRIKES_EACH_SIDE", 12)
-    expiry_index: int = _int("BOT_EXPIRY_INDEX", 0)
-    min_ltp: float = _float("BOT_MIN_LTP", 3.0)
-    max_ltp: float = _float("BOT_MAX_LTP", 450.0)
-    min_volume: float = _float("BOT_MIN_VOLUME", 20.0)
-    min_oi: float = _float("BOT_MIN_OI", 100.0)
+    # ──────────────────────────────────────────────────────────────────────
+    # Files / artifacts
+    # ──────────────────────────────────────────────────────────────────────
+    db_path: Path = Path("data/nifty_option_bot.duckdb")
+    nse_contract_file: Path = Path("data/raw/NSE_FO_contract_29052026.csv.gz")
+    groww_instruments_csv: Path = Path("data/raw/groww_instruments.csv")
+    model_path: Path = Path("models/option_return_model.joblib")
+    model_meta_path: Path = Path("models/model_meta.json")
+    model_suite_path: Path = Path("models/option_model_suite.joblib")
+    model_suite_meta_path: Path = Path("models/model_suite_meta.json")
 
-    option_chain_interval_seconds: int = _int("BOT_OPTION_CHAIN_INTERVAL_SECONDS", 5)
-    max_quote_symbols: int = _int("BOT_MAX_QUOTE_SYMBOLS", 40)
+    # ──────────────────────────────────────────────────────────────────────
+    # Universe
+    # ──────────────────────────────────────────────────────────────────────
+    underlying: str = "NIFTY"
+    max_strikes_each_side: int = 12
+    expiry_index: int = 0
+    min_ltp: float = 3.0
+    max_ltp: float = 450.0
+    min_volume: float = 20.0
+    min_oi: float = 100.0
 
-    label_horizon_rows: int = _int("BOT_LABEL_HORIZON_ROWS", 12)
-    estimated_round_trip_cost_bps: float = _float("BOT_ESTIMATED_ROUND_TRIP_COST_BPS", 35.0)
-    min_train_rows: int = _int("BOT_MIN_TRAIN_ROWS", 5000)
-    test_fraction: float = _float("BOT_TEST_FRACTION", 0.25)
+    # ──────────────────────────────────────────────────────────────────────
+    # Data collection
+    # ──────────────────────────────────────────────────────────────────────
+    option_chain_interval_seconds: int = 5
+    max_quote_symbols: int = 40
 
-    min_edge_return: float = _float("BOT_MIN_EDGE_RETURN", 0.006)
-    uncertainty_buffer: float = _float("BOT_UNCERTAINTY_BUFFER", 0.003)
-    min_model_win_rate: float = _float("BOT_MIN_MODEL_WIN_RATE", 0.54)
-    min_model_sharpe: float = _float("BOT_MIN_MODEL_SHARPE", 0.60)
-    min_backtest_trades: int = _int("BOT_MIN_BACKTEST_TRADES", 80)
-    auto_train_enabled: bool = _bool("BOT_AUTO_TRAIN_ENABLED", True)
-    require_groww_source: bool = _bool("BOT_REQUIRE_GROWW_SOURCE", True)
-    live_train_min_rows: int = _int("BOT_LIVE_TRAIN_MIN_ROWS", _int("BOT_MIN_TRAIN_ROWS", 5000))
+    # ──────────────────────────────────────────────────────────────────────
+    # Training / labels
+    # ──────────────────────────────────────────────────────────────────────
+    label_horizon_rows: int = 12
+    estimated_round_trip_cost_bps: float = 35.0
+    min_train_rows: int = 5000
+    test_fraction: float = 0.25
 
-    account_capital: float = _float("BOT_ACCOUNT_CAPITAL", 100000.0)
-    risk_per_trade_pct: float = _float("BOT_RISK_PER_TRADE_PCT", 0.005)
-    max_premium_value_per_trade: float = _float("BOT_MAX_PREMIUM_VALUE_PER_TRADE", 10000.0)
-    max_open_positions: int = _int("BOT_MAX_OPEN_POSITIONS", 1)
-    entry_order_type: str = os.getenv("BOT_ENTRY_ORDER_TYPE", "LIMIT").upper()
-    product: str = os.getenv("BOT_PRODUCT", "MIS").upper()
-    tp_pct: float = _float("BOT_TP_PCT", 0.18)
-    sl_pct: float = _float("BOT_SL_PCT", 0.09)
+    # ──────────────────────────────────────────────────────────────────────
+    # Live edge/model gates
+    # ──────────────────────────────────────────────────────────────────────
+    min_edge_return: float = 0.006
+    uncertainty_buffer: float = 0.003
+    min_model_win_rate: float = 0.54
+    min_model_sharpe: float = 0.60
+    min_backtest_trades: int = 80
+    auto_train_enabled: bool = True
+    require_groww_source: bool = True
+    live_train_min_rows: int = 5000
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Risk / execution
+    # ──────────────────────────────────────────────────────────────────────
+    account_capital: float = 100000.0
+    risk_per_trade_pct: float = 0.005
+    max_premium_value_per_trade: float = 10000.0
+    max_open_positions: int = 1
+    entry_order_type: str = "LIMIT"
+    product: str = "MIS"
+    tp_pct: float = 0.18
+    sl_pct: float = 0.09
 
     def ensure_dirs(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)

@@ -2,7 +2,7 @@
 
 This project separates **models** from **strategy**. The model suite predicts and ranks NIFTY option contracts. Strategy thresholds, exits, SL/TP, sizing, and risk policy sit on top.
 
-This build has **no synthetic training path**. The trainer loads only rows recorded by the live Groww collector when `BOT_REQUIRE_GROWW_SOURCE=true`.
+This build has **no synthetic training path**. The trainer loads only rows recorded by the live Groww collector when `require_groww_source=True` in `bot/config.py`.
 
 ## Accepted training sources
 
