@@ -84,6 +84,8 @@ class BotConfig:
     max_open_positions: int = 1
     entry_order_type: str = "LIMIT"
     product: str = "MIS"
+    max_spread_pct: float = 0.025
+    entry_tick_buffer: int = 1
     tp_pct: float = 0.18
     sl_pct: float = 0.09
 

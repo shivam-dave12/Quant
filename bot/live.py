@@ -206,14 +206,14 @@ class LiveOptionBot:
             tick_size = float(meta.get("tick_size") or tick_size)
 
         quote = self.adapter.get_quote(sym)
-        ok, reason = quote_is_executable(quote)
+        ok, reason = quote_is_executable(quote, max_spread_pct=self.cfg.max_spread_pct)
         if not ok:
             log.warning("🛑 execution blocked | symbol=%s reason=%s", sym, reason)
             decision["decision"] = "NO_TRADE"
             decision["reason"] = reason
             return decision
 
-        price = limit_price_from_quote(quote, tick_size=tick_size)
+        price = limit_price_from_quote(quote, tick_size=tick_size, max_cross_ticks=self.cfg.entry_tick_buffer)
         if price is None:
             decision["decision"] = "NO_TRADE"
             decision["reason"] = "no_limit_price"
