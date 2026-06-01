@@ -27,9 +27,14 @@ if grep -q 'replace_me' "$ENV_FILE"; then
   exit 1
 fi
 
-if [[ ! -f data/raw/NSE_FO_contract_29052026.csv.gz ]]; then
-  echo "ERROR: missing data/raw/NSE_FO_contract_29052026.csv.gz"
-  echo "Put the NSE F&O contract file there, then rerun."
+# Keep an operator-visible copy in mounted data/raw as well, but the image also
+# contains assets/NSE_FO_contract_29052026.csv.gz so bind mounts cannot hide it.
+if [[ ! -f data/raw/NSE_FO_contract_29052026.csv.gz && -f assets/NSE_FO_contract_29052026.csv.gz ]]; then
+  cp assets/NSE_FO_contract_29052026.csv.gz data/raw/NSE_FO_contract_29052026.csv.gz
+fi
+
+if [[ ! -f assets/NSE_FO_contract_29052026.csv.gz && ! -f data/raw/NSE_FO_contract_29052026.csv.gz ]]; then
+  echo "ERROR: missing NSE_FO_contract_29052026.csv.gz in assets/ or data/raw/."
   exit 1
 fi
 

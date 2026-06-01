@@ -36,13 +36,52 @@ def cmd_inspect_contracts(args) -> None:
     print(df.head(20).to_string(index=False))
 
 
+def _candidate_contract_files(cfg) -> list[Path]:
+    """Return contract-file candidates in safe precedence order.
+
+    Important for Docker/Podman: /app/data is often a bind mount, so a contract
+    file bundled under /app/data/raw can be hidden by the host mount. Therefore
+    the release bundle keeps a copy under /app/assets and this resolver also
+    scans the mounted data/raw directory for operator-provided files.
+    """
+    candidates: list[Path] = []
+    cfg_path = Path(cfg.nse_contract_file) if cfg.nse_contract_file else None
+    if cfg_path is not None:
+        candidates.append(cfg_path)
+    candidates.extend([
+        Path("assets/NSE_FO_contract_29052026.csv.gz"),
+        Path("/app/assets/NSE_FO_contract_29052026.csv.gz"),
+        Path("data/raw/NSE_FO_contract_29052026.csv.gz"),
+        Path("/app/data/raw/NSE_FO_contract_29052026.csv.gz"),
+    ])
+    for base in (Path("data/raw"), Path("/app/data/raw"), Path("assets"), Path("/app/assets")):
+        if base.exists():
+            candidates.extend(sorted(base.glob("NSE_FO_contract*.csv*")))
+    out: list[Path] = []
+    seen: set[str] = set()
+    for c in candidates:
+        key = str(c)
+        if key not in seen:
+            seen.add(key)
+            out.append(c)
+    return out
+
+
 def resolve_expiry(args, cfg) -> str:
     if args.expiry:
         return args.expiry
-    if cfg.nse_contract_file.exists():
-        df = load_nifty_options_contracts(cfg.nse_contract_file, cfg.underlying)
-        return str(nearest_expiry(df, cfg.expiry_index))
-    raise ValueError("Pass --expiry YYYY-MM-DD or provide cfg.nse_contract_file")
+    checked: list[str] = []
+    for path in _candidate_contract_files(cfg):
+        checked.append(str(path))
+        if path.exists():
+            df = load_nifty_options_contracts(path, cfg.underlying)
+            exp = str(nearest_expiry(df, cfg.expiry_index))
+            log.info("auto_resolved_expiry=%s from_contract_file=%s", exp, path)
+            return exp
+    raise ValueError(
+        "Pass --expiry YYYY-MM-DD or provide a readable NSE contract file. "
+        f"Checked: {checked}"
+    )
 
 
 def cmd_collect_once(args) -> None:

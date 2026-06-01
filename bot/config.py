@@ -31,7 +31,7 @@ class BotConfig:
     # Files / artifacts
     # ──────────────────────────────────────────────────────────────────────
     db_path: Path = Path("data/nifty_option_bot.duckdb")
-    nse_contract_file: Path = Path("data/raw/NSE_FO_contract_29052026.csv.gz")
+    nse_contract_file: Path = Path("assets/NSE_FO_contract_29052026.csv.gz")
     groww_instruments_csv: Path = Path("data/raw/groww_instruments.csv")
     model_path: Path = Path("models/option_return_model.joblib")
     model_meta_path: Path = Path("models/model_meta.json")
