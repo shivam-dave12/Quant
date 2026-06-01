@@ -6,21 +6,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Create runtime user before COPY --chown
-RUN groupadd -r botuser \
-    && useradd -r -g botuser -d /app -s /usr/sbin/nologin botuser
-
 COPY requirements.txt ./
+RUN pip install --upgrade pip && pip install -r requirements.txt
 
-RUN pip install --upgrade pip \
-    && pip install -r requirements.txt
+# Copy project files first.
+COPY . .
 
-# Copies code + .env if .env exists inside the build context
-COPY --chown=botuser:botuser . .
+# Copy local environment file into the image when present in the build context.
+# The glob keeps docker build working even before you create .env, because .env.example exists.
+COPY .env* ./
 
-RUN mkdir -p /app/data /app/models /app/logs \
-    && chown -R botuser:botuser /app
-
-USER botuser
-
-CMD ["python", "-m", "bot.cli", "live-loop"]
+CMD ["python", "-m", "bot.cli", "metrics"]

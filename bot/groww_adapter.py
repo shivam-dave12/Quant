@@ -16,16 +16,28 @@ class GrowwUnavailable(RuntimeError):
 
 @dataclass
 class GrowwAdapter:
-    token: str
+    totp_token: str
+    totp_secret: str
 
     def __post_init__(self) -> None:
-        if not self.token:
-            raise GrowwUnavailable("GROWW_API_AUTH_TOKEN is missing")
+        if not self.totp_token:
+            raise GrowwUnavailable("GROWW_TOTP_TOKEN is missing")
+        if not self.totp_secret:
+            raise GrowwUnavailable("GROWW_TOTP_SECRET is missing")
         try:
             from growwapi import GrowwAPI  # type: ignore
         except Exception as exc:  # pragma: no cover
             raise GrowwUnavailable("growwapi package is not installed. Run: pip install -r requirements.txt") from exc
-        self.groww = GrowwAPI(self.token)
+        try:
+            import pyotp  # type: ignore
+        except Exception as exc:  # pragma: no cover
+            raise GrowwUnavailable("pyotp package is not installed. Run: pip install -r requirements.txt") from exc
+
+        # Groww TOTP flow: generate the current one-time password locally,
+        # exchange it for an access token, then initialise the SDK with that access token.
+        totp = pyotp.TOTP(self.totp_secret).now()
+        access_token = GrowwAPI.get_access_token(api_key=self.totp_token, totp=totp)
+        self.groww = GrowwAPI(access_token)
 
     def c(self, name: str, fallback: str) -> str:
         return getattr(self.groww, name, fallback)

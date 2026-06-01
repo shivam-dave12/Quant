@@ -75,10 +75,11 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Put only your Groww secret in `.env`:
+Put only your Groww TOTP credentials in `.env`:
 
 ```bash
-GROWW_API_AUTH_TOKEN=your_token
+GROWW_TOTP_TOKEN=your_totp_token
+GROWW_TOTP_SECRET=your_totp_secret
 ```
 
 Change all non-secret runtime/model/risk settings in `bot/config.py`, not in `.env`.
@@ -187,13 +188,13 @@ A good win rate, Sharpe, and alpha cannot be guaranteed. This build enforces the
 
 ## Docker .env handling
 
-`.env` is secrets-only. It should contain only API keys/secrets such as `GROWW_API_AUTH_TOKEN`. All runtime/model/risk settings are in `bot/config.py`.
+`.env` is secrets-only. It should contain only Groww TOTP credentials: `GROWW_TOTP_TOKEN` and `GROWW_TOTP_SECRET`. All runtime/model/risk settings are in `bot/config.py`.
 
 This package Dockerfile copies `.env` into `/app/.env` when `.env` exists in the build context. Create it before building:
 
 ```bash
 cp .env.example .env
-# edit .env and add only GROWW_API_AUTH_TOKEN
+# edit .env and add only GROWW_TOTP_TOKEN and GROWW_TOTP_SECRET
 
 docker build -t groww-nifty-option-bot:latest .
 docker run --rm groww-nifty-option-bot:latest

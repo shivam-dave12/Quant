@@ -16,7 +16,8 @@ class BotConfig:
     # ──────────────────────────────────────────────────────────────────────
     # Secrets / credentials: keep these in .env or runtime secret injection.
     # ──────────────────────────────────────────────────────────────────────
-    groww_token: str = os.getenv("GROWW_API_AUTH_TOKEN", "")
+    groww_totp_token: str = os.getenv("GROWW_TOTP_TOKEN", "")
+    groww_totp_secret: str = os.getenv("GROWW_TOTP_SECRET", "")
 
     # ──────────────────────────────────────────────────────────────────────
     # Runtime mode

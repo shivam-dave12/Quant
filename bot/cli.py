@@ -48,7 +48,7 @@ def resolve_expiry(args, cfg) -> str:
 def cmd_collect_once(args) -> None:
     cfg = load_config()
     store = Store(cfg.db_path)
-    adapter = GrowwAdapter(cfg.groww_token)
+    adapter = GrowwAdapter(cfg.groww_totp_token, cfg.groww_totp_secret)
     expiry = resolve_expiry(args, cfg)
     collector = OptionDataCollector(cfg, store, adapter)
     collector.collect_option_chain_once(expiry)
@@ -57,7 +57,7 @@ def cmd_collect_once(args) -> None:
 def cmd_collect_loop(args) -> None:
     cfg = load_config()
     store = Store(cfg.db_path)
-    adapter = GrowwAdapter(cfg.groww_token)
+    adapter = GrowwAdapter(cfg.groww_totp_token, cfg.groww_totp_secret)
     expiry = resolve_expiry(args, cfg)
     OptionDataCollector(cfg, store, adapter).collect_loop(expiry, quote_top_symbols=not args.no_quotes)
 
@@ -149,7 +149,7 @@ def cmd_live_once(args) -> None:
         # Two-key live switch: CLI --live + live_trading_enabled=True in bot/config.py.
         object.__setattr__(cfg, "paper_trading", False)
     store = Store(cfg.db_path)
-    adapter = GrowwAdapter(cfg.groww_token)
+    adapter = GrowwAdapter(cfg.groww_totp_token, cfg.groww_totp_secret)
     expiry = resolve_expiry(args, cfg)
     bot = LiveOptionBot(cfg, store, adapter)
     result = bot.trade_once(expiry)
@@ -161,7 +161,7 @@ def cmd_live_loop(args) -> None:
     if args.live:
         object.__setattr__(cfg, "paper_trading", False)
     store = Store(cfg.db_path)
-    adapter = GrowwAdapter(cfg.groww_token)
+    adapter = GrowwAdapter(cfg.groww_totp_token, cfg.groww_totp_secret)
     expiry = resolve_expiry(args, cfg)
     bot = LiveOptionBot(cfg, store, adapter)
     while True:
