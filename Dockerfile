@@ -14,6 +14,6 @@ COPY . .
 
 # Copy local environment file into the image when present in the build context.
 # The glob keeps docker build working even before you create .env, because .env.example exists.
-COPY --chown=botuser:botuser .env
+COPY --chown=botuser:botuser README.md .env
 
 CMD ["python", "-m", "bot.cli", "metrics"]
