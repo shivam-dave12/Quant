@@ -492,12 +492,14 @@ def cmd_groww_preflight(args) -> None:
         for attr in (
             "get_quote",
             "place_buy_option_limit",
+            "place_sell_option_limit",
             "get_order_detail",
             "get_order_list",
             "get_positions_for_user",
             "get_available_margin_details",
             "get_order_margin_details",
             "create_exit_oco",
+            "create_short_exit_oco",
         ):
             ok = hasattr(adapter, attr)
             checks[f"adapter_{attr}"] = ok

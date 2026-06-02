@@ -168,6 +168,29 @@ class GrowwAdapter:
             order_reference_id=ref,
         )
 
+    def place_sell_option_limit(
+        self,
+        trading_symbol: str,
+        quantity: int,
+        price: float,
+        product: str = "MIS",
+        exchange: str | None = None,
+        segment: str | None = None,
+    ) -> dict[str, Any]:
+        ref = f"NOS{uuid.uuid4().hex[:12]}"[:20]
+        return self.groww.place_order(
+            trading_symbol=trading_symbol,
+            quantity=int(quantity),
+            validity=self.VALIDITY_DAY,
+            exchange=self.exchange_const(exchange),
+            segment=self.segment_const(segment),
+            product=self.product_const(product),
+            order_type=self.ORDER_TYPE_LIMIT,
+            transaction_type=self.TRANSACTION_TYPE_SELL,
+            price=float(price),
+            order_reference_id=ref,
+        )
+
     def get_order_detail(self, groww_order_id: str, segment: str | None = None) -> dict[str, Any]:
         return self.groww.get_order_detail(groww_order_id=groww_order_id, segment=self.segment_const(segment))
 
@@ -224,6 +247,45 @@ class GrowwAdapter:
             duration=self.VALIDITY_DAY,
             net_position_quantity=int(quantity),
             transaction_type=self.TRANSACTION_TYPE_SELL,
+            target={
+                "trigger_price": f"{target_trigger:.2f}",
+                "order_type": self.ORDER_TYPE_LIMIT,
+                "price": f"{target_limit:.2f}",
+            },
+            stop_loss={
+                "trigger_price": f"{stop_trigger:.2f}",
+                "order_type": self.ORDER_TYPE_STOP_LOSS_MARKET,
+                "price": None,
+            },
+        )
+
+    def create_short_exit_oco(
+        self,
+        trading_symbol: str,
+        quantity: int,
+        fill_price: float,
+        tp_pct: float,
+        sl_pct: float,
+        product: str = "MIS",
+        exchange: str | None = None,
+        segment: str | None = None,
+        tick_size: float = 0.05,
+    ) -> dict[str, Any]:
+        target_trigger = _round_to_tick(max(tick_size, float(fill_price) * (1 - tp_pct)), tick_size)
+        target_limit = _round_to_tick(max(tick_size, target_trigger - tick_size), tick_size)
+        stop_trigger = _round_to_tick(float(fill_price) * (1 + sl_pct), tick_size)
+        ref = f"SOC{uuid.uuid4().hex[:12]}"[:20]
+        return self.groww.create_smart_order(
+            smart_order_type=self.SMART_ORDER_TYPE_OCO,
+            reference_id=ref,
+            segment=self.segment_const(segment),
+            trading_symbol=trading_symbol,
+            quantity=int(quantity),
+            product_type=self.product_const(product),
+            exchange=self.exchange_const(exchange),
+            duration=self.VALIDITY_DAY,
+            net_position_quantity=-int(quantity),
+            transaction_type=self.TRANSACTION_TYPE_BUY,
             target={
                 "trigger_price": f"{target_trigger:.2f}",
                 "order_type": self.ORDER_TYPE_LIMIT,

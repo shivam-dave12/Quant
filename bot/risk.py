@@ -159,11 +159,30 @@ def limit_price_from_quote(quote: dict, tick_size: float = 0.05, max_cross_ticks
     return round_to_tick(px + tick_size * max_cross_ticks, tick_size)
 
 
-def quote_is_executable(quote: dict, max_spread_pct: float = 0.025, min_offer_qty: float = 1) -> tuple[bool, str]:
+def limit_price_from_quote_for_side(quote: dict, side: str = "BUY", tick_size: float = 0.05, max_cross_ticks: int = 1) -> float | None:
     normalized = normalize_quote(quote)
+    side = str(side or "BUY").upper()
+    if side == "SELL":
+        bid = _as_positive_float(normalized.get("bid_price"))
+        ltp = _as_positive_float(normalized.get("last_price") or normalized.get("ltp"))
+        px = bid if bid is not None else ltp
+        if px is None:
+            return None
+        return round_to_tick(max(tick_size, px - tick_size * max_cross_ticks), tick_size)
+    return limit_price_from_quote(normalized, tick_size=tick_size, max_cross_ticks=max_cross_ticks)
+
+
+def quote_is_executable(quote: dict, max_spread_pct: float = 0.025, min_offer_qty: float = 1) -> tuple[bool, str]:
+    return quote_is_executable_for_side(quote, side="BUY", max_spread_pct=max_spread_pct, min_qty=min_offer_qty)
+
+
+def quote_is_executable_for_side(quote: dict, side: str = "BUY", max_spread_pct: float = 0.025, min_qty: float = 1) -> tuple[bool, str]:
+    normalized = normalize_quote(quote)
+    side = str(side or "BUY").upper()
     bid = _as_positive_float(normalized.get("bid_price"))
     ask = _as_positive_float(normalized.get("offer_price"))
     offer_qty = _as_positive_float(normalized.get("offer_quantity")) or 0.0
+    bid_qty = _as_positive_float(normalized.get("bid_quantity")) or 0.0
     if bid is None or ask is None:
         return False, "missing_bid_or_offer"
     if ask < bid:
@@ -172,6 +191,8 @@ def quote_is_executable(quote: dict, max_spread_pct: float = 0.025, min_offer_qt
     spread_pct = (ask - bid) / mid if mid > 0 else 999
     if spread_pct > max_spread_pct:
         return False, f"spread_too_wide:{spread_pct:.4f}"
-    if offer_qty < min_offer_qty:
+    if side == "SELL" and bid_qty < min_qty:
+        return False, "insufficient_bid_qty"
+    if side != "SELL" and offer_qty < min_qty:
         return False, "insufficient_offer_qty"
     return True, "ok"

@@ -20,7 +20,7 @@ from .option_models import (
     train_model_suite_from_store,
     training_readiness_from_store,
 )
-from .risk import limit_price_from_quote, normalize_quote, option_buy_quantity, quote_is_executable
+from .risk import limit_price_from_quote_for_side, normalize_quote, option_buy_quantity, quote_is_executable_for_side
 from .session import is_session_open
 from .storage import Store
 from .strategy import InstitutionalOptionStrategy
@@ -96,6 +96,7 @@ def _strategy_log_summary(decision: dict[str, Any]) -> str:
         f"passed_gate_rows={diag.get('passed_gate_rows', 'NA')} "
         f"gate_pass_counts={gate_text} "
         f"symbol={focus.get('trading_symbol', 'NA')} "
+        f"entry_side={focus.get('entry_side', top.get('entry_side', 'BUY'))} "
         f"edge={_fmt_metric(focus.get('edge_score'))} "
         f"pred_return={_fmt_metric(focus.get('predicted_return'))} "
         f"prob_profit={_fmt_metric(focus.get('prob_profit'))} "
@@ -665,13 +666,14 @@ class LiveOptionBot:
             return None
         return out if pd.notna(out) else None
 
-    def _live_margin_guard(self, trading_symbol: str, quantity: int, price: float) -> tuple[bool, str]:
+    def _live_margin_guard(self, trading_symbol: str, quantity: int, price: float, entry_side: str = "BUY") -> tuple[bool, str]:
         if not self.cfg.require_live_margin_check:
             return True, "ok"
+        entry_side = str(entry_side or "BUY").upper()
         try:
             order_req = {
                 "trading_symbol": trading_symbol,
-                "transaction_type": self.adapter.TRANSACTION_TYPE_BUY,
+                "transaction_type": self.adapter.TRANSACTION_TYPE_SELL if entry_side == "SELL" else self.adapter.TRANSACTION_TYPE_BUY,
                 "quantity": int(quantity),
                 "price": float(price),
                 "order_type": self.adapter.ORDER_TYPE_LIMIT,
@@ -697,6 +699,8 @@ class LiveOptionBot:
         return True, "ok"
 
     def _adaptive_exit_pcts(self, row: dict[str, Any]) -> tuple[float, float]:
+        entry_side = str(row.get("entry_side") or "BUY").upper()
+
         def pct(name: str, fallback: float, lo: float, hi: float) -> float:
             try:
                 value = float(row.get(name))
@@ -706,6 +710,11 @@ class LiveOptionBot:
                 value = fallback
             return float(min(max(value, lo), hi))
 
+        if entry_side == "SELL":
+            return (
+                pct("adaptive_tp_pct", self.asset.short_tp_pct, 0.001, 0.20),
+                pct("adaptive_sl_pct", self.asset.short_sl_pct, 0.002, 0.30),
+            )
         return (
             pct("adaptive_tp_pct", self.asset.tp_pct, 0.03, 0.65),
             pct("adaptive_sl_pct", self.asset.sl_pct, 0.02, 0.40),
@@ -742,28 +751,37 @@ class LiveOptionBot:
 
         top = decision["top"]
         sym = str(top["trading_symbol"])
+        entry_side = str(top.get("entry_side") or "BUY").upper()
+        if entry_side not in {"BUY", "SELL"}:
+            entry_side = "BUY"
+        decision["entry_side"] = entry_side
         lot_size = 50
         tick_size = 0.05
         if self.contract_meta is not None and sym in self.contract_meta.index:
             meta = self.contract_meta.loc[sym]
             if isinstance(meta, pd.DataFrame):
                 meta = meta.iloc[0]
-            if pd.to_numeric(meta.get("buy_allowed"), errors="coerce") == 0:
+            if entry_side == "BUY" and pd.to_numeric(meta.get("buy_allowed"), errors="coerce") == 0:
                 decision["decision"] = "NO_TRADE"
                 decision["reason"] = "contract_buy_not_allowed"
+                return decision
+            sell_allowed = pd.to_numeric(meta.get("sell_allowed"), errors="coerce")
+            if entry_side == "SELL" and pd.notna(sell_allowed) and float(sell_allowed) == 0:
+                decision["decision"] = "NO_TRADE"
+                decision["reason"] = "contract_sell_not_allowed"
                 return decision
             lot_size = int(float(meta.get("lot_size") or lot_size))
             tick_size = float(meta.get("tick_size") or tick_size)
 
         quote = normalize_quote(self._get_quote_with_backoff(sym))
-        ok, reason = quote_is_executable(quote, max_spread_pct=self.asset.max_spread_pct)
+        ok, reason = quote_is_executable_for_side(quote, side=entry_side, max_spread_pct=self.asset.max_spread_pct)
         if not ok:
             log.warning("execution blocked | asset=%s symbol=%s reason=%s", self.asset.asset_id, sym, reason)
             decision["decision"] = "NO_TRADE"
             decision["reason"] = reason
             return decision
 
-        price = limit_price_from_quote(quote, tick_size=tick_size, max_cross_ticks=self.cfg.entry_tick_buffer)
+        price = limit_price_from_quote_for_side(quote, side=entry_side, tick_size=tick_size, max_cross_ticks=self.cfg.entry_tick_buffer)
         if price is None:
             decision["decision"] = "NO_TRADE"
             decision["reason"] = "no_limit_price"
@@ -787,7 +805,8 @@ class LiveOptionBot:
 
         if self.cfg.paper_trading or not self.cfg.live_trading_enabled:
             log.info(
-                "paper buy | asset=%s symbol=%s qty=%s limit=%.2f edge=%.4f adaptive_tp=%.4f adaptive_sl=%.4f",
+                "paper %s | asset=%s symbol=%s qty=%s limit=%.2f edge=%.4f adaptive_tp=%.4f adaptive_sl=%.4f",
+                entry_side.lower(),
                 self.asset.asset_id,
                 sym,
                 qty,
@@ -796,8 +815,8 @@ class LiveOptionBot:
                 tp_pct,
                 sl_pct,
             )
-            self._save_order("PAPER", sym, "BUY", qty, price, None, None, "PAPER", {"signal": top, "quote": quote, "adaptive_tp_pct": tp_pct, "adaptive_sl_pct": sl_pct})
-            decision["decision"] = "PAPER_BUY"
+            self._save_order("PAPER", sym, entry_side, qty, price, None, None, "PAPER", {"signal": top, "quote": quote, "adaptive_tp_pct": tp_pct, "adaptive_sl_pct": sl_pct})
+            decision["decision"] = f"PAPER_{entry_side}"
             decision["qty"] = qty
             decision["limit_price"] = price
             return decision
@@ -809,17 +828,26 @@ class LiveOptionBot:
             decision["reason"] = reason
             return decision
 
-        ok, reason = self._live_margin_guard(sym, qty, price)
+        ok, reason = self._live_margin_guard(sym, qty, price, entry_side=entry_side)
         if not ok:
             log.warning("live margin guard blocked | symbol=%s reason=%s", sym, reason)
             decision["decision"] = "NO_TRADE"
             decision["reason"] = reason
             return decision
 
-        log.warning("live buy | asset=%s symbol=%s qty=%s limit=%.2f", self.asset.asset_id, sym, qty, price)
-        order = self.adapter.place_buy_option_limit(sym, qty, price, product=self.asset.product, exchange=self.asset.exchange, segment=self.asset.segment)
+        log.warning("live %s | asset=%s symbol=%s qty=%s limit=%.2f", entry_side.lower(), self.asset.asset_id, sym, qty, price)
+        try:
+            if entry_side == "SELL":
+                order = self.adapter.place_sell_option_limit(sym, qty, price, product=self.asset.product, exchange=self.asset.exchange, segment=self.asset.segment)
+            else:
+                order = self.adapter.place_buy_option_limit(sym, qty, price, product=self.asset.product, exchange=self.asset.exchange, segment=self.asset.segment)
+        except Exception as exc:
+            log.exception("live order submit failed | asset=%s symbol=%s side=%s", self.asset.asset_id, sym, entry_side)
+            decision["decision"] = "ORDER_SUBMIT_FAILED"
+            decision["reason"] = str(exc)
+            return decision
         oid = order.get("groww_order_id")
-        self._save_order("LIVE", sym, "BUY", qty, price, oid, order.get("order_reference_id"), order.get("order_status"), order)
+        self._save_order("LIVE", sym, entry_side, qty, price, oid, order.get("order_reference_id"), order.get("order_status"), order)
         if not oid:
             decision["decision"] = "ORDER_SUBMIT_FAILED"
             decision["order"] = order
@@ -833,18 +861,32 @@ class LiveOptionBot:
             decision["order"] = fill
             return decision
 
-        oco = self.adapter.create_exit_oco(
-            sym,
-            filled_qty,
-            float(avg_fill),
-            tp_pct,
-            sl_pct,
-            self.asset.product,
-            exchange=self.asset.exchange,
-            segment=self.asset.segment,
-            tick_size=tick_size,
-        )
-        decision["decision"] = "LIVE_BUY_WITH_OCO"
+        if entry_side == "SELL":
+            oco = self.adapter.create_short_exit_oco(
+                sym,
+                filled_qty,
+                float(avg_fill),
+                tp_pct,
+                sl_pct,
+                self.asset.product,
+                exchange=self.asset.exchange,
+                segment=self.asset.segment,
+                tick_size=tick_size,
+            )
+            decision["decision"] = "LIVE_SELL_WITH_OCO"
+        else:
+            oco = self.adapter.create_exit_oco(
+                sym,
+                filled_qty,
+                float(avg_fill),
+                tp_pct,
+                sl_pct,
+                self.asset.product,
+                exchange=self.asset.exchange,
+                segment=self.asset.segment,
+                tick_size=tick_size,
+            )
+            decision["decision"] = "LIVE_BUY_WITH_OCO"
         decision["entry_order"] = fill
         decision["oco"] = oco
         return decision

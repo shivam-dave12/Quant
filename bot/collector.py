@@ -213,8 +213,12 @@ class OptionDataCollector:
         expiry_date = pd.to_datetime(expiry).date()
         contracts = contracts[pd.to_datetime(contracts["expiry"]).dt.date.eq(expiry_date)].copy()
         if "buy_allowed" in contracts.columns:
-            buyable = contracts[pd.to_numeric(contracts["buy_allowed"], errors="coerce").fillna(0).gt(0)].copy()
-            contracts = buyable
+            buy_allowed = pd.to_numeric(contracts["buy_allowed"], errors="coerce").fillna(0).gt(0)
+            if self.asset.allow_short_option_entries and "sell_allowed" in contracts.columns:
+                sell_allowed = pd.to_numeric(contracts["sell_allowed"], errors="coerce").fillna(0).gt(0)
+                contracts = contracts[buy_allowed | sell_allowed].copy()
+            else:
+                contracts = contracts[buy_allowed].copy()
         if contracts.empty:
             reason = f"no_buyable_instrument_contracts:{self.asset.exchange}:{self.asset.underlying}:{expiry_date}"
             self.last_status = {"collected": False, "blocking": True, "reason": reason}

@@ -32,6 +32,10 @@ class AssetProfile:
     min_edge_return: float = 0.006
     risk_per_trade_pct: float = 0.005
     max_premium_value_per_trade: float = 10000.0
+    min_backtest_trades: int | None = None
+    allow_short_option_entries: bool = False
+    short_tp_pct: float = 0.01
+    short_sl_pct: float = 0.025
     tp_pct: float = 0.18
     sl_pct: float = 0.09
     session_timezone: str = "Asia/Kolkata"
@@ -154,11 +158,15 @@ class BotConfig:
             max_ltp=500.0,
             min_volume=0.0,
             min_oi=0.0,
-            max_quote_symbols=30,
+            max_quote_symbols=60,
             max_spread_pct=0.045,
             min_edge_return=0.010,
             risk_per_trade_pct=0.003,
             max_premium_value_per_trade=5000.0,
+            min_backtest_trades=75,
+            allow_short_option_entries=True,
+            short_tp_pct=0.010,
+            short_sl_pct=0.025,
             tp_pct=0.22,
             sl_pct=0.11,
             session_open="09:00",

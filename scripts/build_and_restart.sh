@@ -9,6 +9,7 @@ BACKUP_DIR="$BASE_DIR/backups"
 IMAGE="localhost/quant:latest"
 LOCK_FILE="$HOME/.quant-deploy.lock"
 GROWW_INSTRUMENTS_URL="${GROWW_INSTRUMENTS_URL:-https://growwapi-assets.groww.in/instruments/instrument.csv}"
+REMOTE_STATE_BACKUP="${REMOTE_STATE_BACKUP:-0}"
 
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
@@ -27,7 +28,7 @@ if [[ -d .git ]]; then
   git pull --ff-only
 fi
 
-mkdir -p "$STATE_DIR/data/raw" "$STATE_DIR/models" "$STATE_DIR/logs" "$BACKUP_DIR"
+mkdir -p "$STATE_DIR/data/raw" "$STATE_DIR/models" "$STATE_DIR/logs"
 
 refresh_groww_instruments() {
   local dst="$STATE_DIR/data/raw/groww_instruments.csv"
@@ -58,10 +59,13 @@ PY
   mv "$tmp" "$dst"
 }
 
-if compgen -G "$STATE_DIR/data/*" >/dev/null || compgen -G "$STATE_DIR/models/*" >/dev/null; then
+if [[ "$REMOTE_STATE_BACKUP" == "1" ]] && { compgen -G "$STATE_DIR/data/*" >/dev/null || compgen -G "$STATE_DIR/models/*" >/dev/null; }; then
+  mkdir -p "$BACKUP_DIR"
   TS="$(date -u +%Y%m%d-%H%M%S)"
   tar -czf "$BACKUP_DIR/quant_state_before_restart_$TS.tar.gz" -C "$BASE_DIR" state
   echo "==> Backed up persistent state to $BACKUP_DIR/quant_state_before_restart_$TS.tar.gz"
+else
+  echo "==> VM tar backup skipped. Run scripts/aws_pull_state_backup.ps1 on the laptop for local backups."
 fi
 
 if [[ ! -f "$STATE_DIR/data/raw/NSE_FO_contract_29052026.csv.gz" && -f assets/NSE_FO_contract_29052026.csv.gz ]]; then

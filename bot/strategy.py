@@ -171,6 +171,8 @@ def _pct_rank(series: pd.Series) -> pd.Series:
 def _compact_strategy_row(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "trading_symbol": row.get("trading_symbol"),
+        "entry_side": row.get("entry_side", "BUY"),
+        "exit_side": row.get("exit_side", "SELL"),
         "conviction_score": row.get("conviction_score"),
         "edge_score": row.get("edge_score"),
         "predicted_return": row.get("predicted_return"),
@@ -205,9 +207,12 @@ def _current_execution_candidates(rows: pd.DataFrame, asset: AssetProfile) -> pd
     executable = data[
         data["bid_price"].fillna(0).gt(0)
         & data["offer_price"].fillna(0).gt(0)
+        & data["bid_quantity"].fillna(0).gt(0)
         & data["ask_quantity"].fillna(0).gt(0)
         & data["spread_pct"].fillna(999).le(asset.max_spread_pct)
     ].copy()
     if executable.empty:
         return executable
+    if "entry_side" in executable.columns and executable["entry_side"].astype(str).str.upper().eq("SELL").any():
+        return executable.sort_values(["model_score", "spread_pct", "book_pressure_score"], ascending=[True, True, False])
     return executable.sort_values(["policy_raw_ev", "model_score", "edge_score"], ascending=False)

@@ -10,11 +10,12 @@ SERVICE_DIR="/home/ec2-user/.config/systemd/user"
 SERVICE_FILE="$SERVICE_DIR/quant.service"
 IMAGE="localhost/quant:latest"
 GROWW_INSTRUMENTS_URL="${GROWW_INSTRUMENTS_URL:-https://growwapi-assets.groww.in/instruments/instrument.csv}"
+REMOTE_STATE_BACKUP="${REMOTE_STATE_BACKUP:-0}"
 
 echo "==> Project: $PROJECT_DIR"
 cd "$PROJECT_DIR"
 
-mkdir -p "$STATE_DIR/data/raw" "$STATE_DIR/models" "$STATE_DIR/logs" "$BACKUP_DIR" "$SERVICE_DIR"
+mkdir -p "$STATE_DIR/data/raw" "$STATE_DIR/models" "$STATE_DIR/logs" "$SERVICE_DIR"
 
 refresh_groww_instruments() {
   local dst="$STATE_DIR/data/raw/groww_instruments.csv"
@@ -81,10 +82,13 @@ copy_existing_state "$PROJECT_DIR/data" "$STATE_DIR/data"
 copy_existing_state "$PROJECT_DIR/models" "$STATE_DIR/models"
 copy_existing_state "$PROJECT_DIR/logs" "$STATE_DIR/logs"
 
-if compgen -G "$STATE_DIR/data/*" >/dev/null || compgen -G "$STATE_DIR/models/*" >/dev/null; then
+if [[ "$REMOTE_STATE_BACKUP" == "1" ]] && { compgen -G "$STATE_DIR/data/*" >/dev/null || compgen -G "$STATE_DIR/models/*" >/dev/null; }; then
+  mkdir -p "$BACKUP_DIR"
   TS="$(date -u +%Y%m%d-%H%M%S)"
   tar -czf "$BACKUP_DIR/quant_state_before_deploy_$TS.tar.gz" -C "$BASE_DIR" state
   echo "==> Backed up persistent state to $BACKUP_DIR/quant_state_before_deploy_$TS.tar.gz"
+else
+  echo "==> VM tar backup skipped. Run scripts/aws_pull_state_backup.ps1 on the laptop for local backups."
 fi
 
 if [[ ! -f "$STATE_DIR/data/raw/NSE_FO_contract_29052026.csv.gz" && -f assets/NSE_FO_contract_29052026.csv.gz ]]; then

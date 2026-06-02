@@ -288,6 +288,9 @@ class ModelSuiteConfig:
     min_meta_policy_ev: float = 0.0
     min_meta_policy_candidates: int = 200
     min_meta_policy_class_count: int = 25
+    allow_short_option_entries: bool = False
+    short_tp_pct: float = 0.01
+    short_sl_pct: float = 0.025
 
     @classmethod
     def from_bot_config(cls, cfg: BotConfig, asset: AssetProfile | None = None) -> "ModelSuiteConfig":
@@ -303,7 +306,7 @@ class ModelSuiteConfig:
             min_rows=cfg.model_suite_shadow_min_rows,
             min_live_rows=cfg.live_train_min_rows,
             test_fraction=cfg.test_fraction,
-            min_live_trades=cfg.min_backtest_trades,
+            min_live_trades=profile.min_backtest_trades or cfg.min_backtest_trades,
             min_live_win_rate=cfg.min_model_win_rate,
             min_live_sharpe=cfg.min_model_sharpe,
             require_groww_source=cfg.require_groww_source,
@@ -316,6 +319,9 @@ class ModelSuiteConfig:
             min_meta_policy_ev=cfg.min_meta_policy_ev,
             min_meta_policy_candidates=cfg.min_meta_policy_candidates,
             min_meta_policy_class_count=cfg.min_meta_policy_class_count,
+            allow_short_option_entries=profile.allow_short_option_entries,
+            short_tp_pct=profile.short_tp_pct,
+            short_sl_pct=profile.short_sl_pct,
         )
 
 
@@ -1663,7 +1669,7 @@ def _selection_metrics(sel: pd.DataFrame, universe_y: pd.Series, prefix: str) ->
             f"{prefix}_sharpe": 0.0,
             f"{prefix}_alpha_vs_universe": 0.0,
         }
-    r = sel["future_return_after_costs"].astype(float)
+    r = _close_returns_for_entry_side(sel)
     return {
         f"{prefix}_count": int(len(sel)),
         f"{prefix}_mean_return": float(r.mean()),
@@ -1674,6 +1680,22 @@ def _selection_metrics(sel: pd.DataFrame, universe_y: pd.Series, prefix: str) ->
         f"{prefix}_avg_mfe": float(sel["future_mfe_after_costs"].mean()) if "future_mfe_after_costs" in sel else None,
         f"{prefix}_avg_mae": float(sel["future_mae_after_costs"].mean()) if "future_mae_after_costs" in sel else None,
     }
+
+
+def _entry_side_mask(sel: pd.DataFrame) -> pd.Series:
+    if "entry_side" not in sel.columns:
+        return pd.Series(False, index=sel.index)
+    side = sel["entry_side"].astype(str).str.upper()
+    return side.eq("SELL") | side.eq("SHORT")
+
+
+def _close_returns_for_entry_side(sel: pd.DataFrame) -> pd.Series:
+    close_ret = pd.to_numeric(sel["future_return_after_costs"], errors="coerce").fillna(0.0)
+    short_mask = _entry_side_mask(sel)
+    if bool(short_mask.any()):
+        close_ret = close_ret.copy()
+        close_ret.loc[short_mask] = -close_ret.loc[short_mask]
+    return close_ret.astype(float)
 
 
 def _adaptive_exit_returns(sel: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
@@ -1705,6 +1727,51 @@ def _adaptive_exit_returns(sel: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.
     return ret.astype(float), target_hit.astype(bool), stop_hit.astype(bool)
 
 
+def _short_exit_returns(sel: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
+    if sel.empty:
+        empty = pd.Series(dtype=float)
+        return empty, empty.astype(bool), empty.astype(bool)
+
+    def col(name: str, default: float) -> pd.Series:
+        if name in sel.columns:
+            return pd.to_numeric(sel[name], errors="coerce").fillna(default)
+        return pd.Series(default, index=sel.index, dtype=float)
+
+    close_ret = -pd.to_numeric(sel["future_return_after_costs"], errors="coerce").fillna(0.0)
+    long_mfe = pd.to_numeric(sel["future_mfe_after_costs"], errors="coerce").fillna(sel["future_return_after_costs"]) if "future_mfe_after_costs" in sel.columns else -close_ret
+    long_mae = pd.to_numeric(sel["future_mae_after_costs"], errors="coerce").fillna(sel["future_return_after_costs"]) if "future_mae_after_costs" in sel.columns else -close_ret
+    tp = col("adaptive_tp_pct", 0.01).clip(0.001, 0.20)
+    sl = col("adaptive_sl_pct", 0.025).clip(0.002, 0.30)
+    cost = col("estimated_cost", 0.0).clip(0.0, 0.30)
+
+    net_tp = (tp - cost).clip(lower=0.001)
+    net_sl = (sl + cost).clip(lower=0.001)
+    target_hit = (-long_mae) >= net_tp
+    stop_hit = long_mfe >= net_sl
+
+    # Conservative sequencing: if premium both drops to target and spikes to stop,
+    # count the stop first because the dataset is snapshot-level, not tick-level.
+    ret = close_ret.copy()
+    ret[target_hit & ~stop_hit] = net_tp[target_hit & ~stop_hit]
+    ret[stop_hit] = -net_sl[stop_hit]
+    return ret.astype(float), target_hit.astype(bool), stop_hit.astype(bool)
+
+
+def _policy_exit_returns(sel: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
+    long_ret, long_target, long_stop = _adaptive_exit_returns(sel)
+    short_mask = _entry_side_mask(sel)
+    if not bool(short_mask.any()):
+        return long_ret, long_target, long_stop
+    short_ret, short_target, short_stop = _short_exit_returns(sel)
+    ret = long_ret.copy()
+    target = long_target.copy()
+    stop = long_stop.copy()
+    ret.loc[short_mask] = short_ret.loc[short_mask]
+    target.loc[short_mask] = short_target.loc[short_mask]
+    stop.loc[short_mask] = short_stop.loc[short_mask]
+    return ret.astype(float), target.astype(bool), stop.astype(bool)
+
+
 def _mean_col(df: pd.DataFrame, name: str) -> float:
     if name not in df.columns:
         return 0.0
@@ -1726,7 +1793,7 @@ def _adaptive_selection_metrics(sel: pd.DataFrame, universe_y: pd.Series, prefix
             f"{prefix}_avg_sl_pct": 0.0,
             f"{prefix}_avg_rr": 0.0,
         }
-    ret, target_hit, stop_hit = _adaptive_exit_returns(sel)
+    ret, target_hit, stop_hit = _policy_exit_returns(sel)
     return {
         f"{prefix}_count": int(len(ret)),
         f"{prefix}_mean_return": float(ret.mean()),
@@ -1927,12 +1994,33 @@ def _historical_execution_mask(data: pd.DataFrame, cfg: ModelSuiteConfig) -> pd.
     )
 
 
+def _historical_short_execution_mask(data: pd.DataFrame, cfg: ModelSuiteConfig) -> pd.Series:
+    return (
+        data["spread_pct"].fillna(999).le(cfg.max_spread_pct)
+        & data["bid_quantity"].fillna(0).gt(0)
+        & data["ask_quantity"].fillna(0).gt(0)
+        & data["volume"].fillna(0).ge(cfg.min_volume)
+        & data["open_interest"].fillna(0).ge(cfg.min_oi)
+    )
+
+
 def _quote_guard_research_mask(data: pd.DataFrame, cfg: ModelSuiteConfig) -> pd.Series:
     return (
         data["edge_score"].fillna(-999).gt(0)
         & data["predicted_return"].fillna(-999).gt(0)
         & data["adaptive_rr"].fillna(0).ge(1.05)
         & data["minutes_to_session_close"].fillna(999).gt(cfg.session_close_buffer_minutes)
+    )
+
+
+def _naturalgas_short_decay_mask(data: pd.DataFrame, cfg: ModelSuiteConfig) -> pd.Series:
+    group_cols = _snapshot_group_cols(data)
+    low_model_rank = _pct_rank_by_group(data, data["model_score"], group_cols, ascending=True).le(0.35)
+    return (
+        low_model_rank
+        & data["minutes_to_session_close"].fillna(999).gt(cfg.session_close_buffer_minutes)
+        & data["volume"].fillna(0).ge(cfg.min_volume)
+        & data["open_interest"].fillna(0).ge(cfg.min_oi)
     )
 
 
@@ -1952,12 +2040,68 @@ def _select_research_strategy_policy(joined: pd.DataFrame, cfg: ModelSuiteConfig
         meta_active = bool(data["meta_policy_active"].fillna(0).gt(0).any())
         eligible, gate_counts = _strategy_policy_candidate_frame(data, cfg, mode="live_meta" if meta_active else "live")
         selected = _select_policy_per_snapshot(eligible, group_cols, use_meta=meta_active)
+        if not selected.empty:
+            selected = selected.copy()
+            selected["entry_side"] = "BUY"
+            selected["exit_side"] = "SELL"
         return eligible, selected, {
             "policy_id": policy_id,
             "selection": "legacy_conviction_gate",
+            "entry_side": "BUY",
+            "exit_side": "SELL",
             "historical_execution_filter": True,
             "live_execution_guard": True,
             "gate_counts": gate_counts,
+        }
+
+    if policy_id.startswith("naturalgas_short_decay"):
+        if not cfg.allow_short_option_entries:
+            empty = data.iloc[0:0].copy()
+            return empty, empty, {
+                "policy_id": policy_id,
+                "selection": "short_premium_decay_disabled",
+                "entry_side": "SELL",
+                "exit_side": "BUY",
+                "historical_execution_filter": False,
+                "live_execution_guard": True,
+            }
+        mask = _naturalgas_short_decay_mask(data, cfg)
+        historical_execution_filter = policy_id.endswith("_executable")
+        if historical_execution_filter:
+            mask &= _historical_short_execution_mask(data, cfg)
+        candidates = data[mask].copy()
+        if not candidates.empty:
+            candidates["entry_side"] = "SELL"
+            candidates["exit_side"] = "BUY"
+            candidates["adaptive_tp_pct"] = float(cfg.short_tp_pct)
+            candidates["adaptive_sl_pct"] = float(cfg.short_sl_pct)
+            candidates["adaptive_rr"] = _safe_div(candidates["adaptive_tp_pct"], candidates["adaptive_sl_pct"]).fillna(0.0)
+            candidates["short_decay_score"] = (
+                -candidates["model_score"].fillna(0.0)
+                - candidates["spread_pct"].fillna(cfg.max_spread_pct).clip(lower=0.0)
+                + 0.05 * candidates["book_pressure_score"].fillna(0.0)
+            )
+            selected = (
+                candidates.sort_values(
+                    group_cols + ["model_score", "spread_pct", "book_pressure_score"],
+                    ascending=[True] * len(group_cols) + [True, True, False],
+                )
+                .groupby(group_cols, as_index=False)
+                .head(1)
+            )
+        else:
+            selected = candidates.copy()
+        return candidates, selected, {
+            "policy_id": policy_id,
+            "selection": "naturalgas_low_long_score_short_premium_decay",
+            "entry_side": "SELL",
+            "exit_side": "BUY",
+            "sort_cols": ["model_score", "spread_pct", "book_pressure_score"],
+            "short_tp_pct": float(cfg.short_tp_pct),
+            "short_sl_pct": float(cfg.short_sl_pct),
+            "historical_execution_filter": historical_execution_filter,
+            "live_execution_guard": True,
+            "base_mask_rows": int(mask.sum()),
         }
 
     mask = _quote_guard_research_mask(data, cfg)
@@ -1990,9 +2134,15 @@ def _select_research_strategy_policy(joined: pd.DataFrame, cfg: ModelSuiteConfig
             .groupby(group_cols, as_index=False)
             .head(1)
         )
+    if not selected.empty:
+        selected = selected.copy()
+        selected["entry_side"] = "BUY"
+        selected["exit_side"] = "SELL"
     return candidates, selected, {
         "policy_id": policy_id,
         "selection": "top1_per_snapshot",
+        "entry_side": "BUY",
+        "exit_side": "SELL",
         "sort_cols": sort_cols,
         "historical_execution_filter": historical_execution_filter,
         "live_execution_guard": True,
@@ -2058,6 +2208,12 @@ def _research_strategy_policy_candidates(joined: pd.DataFrame, universe_y: pd.Se
         "raw_ev_top1_executable",
         "raw_ev_model_top1_executable",
     ]
+    if cfg.asset_id == "naturalgas" and cfg.allow_short_option_entries:
+        policy_ids = [
+            "naturalgas_short_decay_executable",
+            "naturalgas_short_decay_quote_guard",
+            *policy_ids,
+        ]
     research: list[dict[str, Any]] = []
     selected_by_id: dict[str, pd.DataFrame] = {}
     candidates_by_id: dict[str, pd.DataFrame] = {}
