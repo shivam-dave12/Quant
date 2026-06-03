@@ -1,0 +1,33 @@
+[Unit]
+Description=Quant Trading Bot - Rootless Podman
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ec2-user/quant/Quant
+
+ExecStartPre=/usr/bin/mkdir -p /home/ec2-user/quant/state/data /home/ec2-user/quant/state/models /home/ec2-user/quant/state/logs
+ExecStartPre=-/usr/bin/podman rm -f quant
+
+ExecStart=/usr/bin/podman run \
+  --name quant \
+  --replace \
+  --stop-timeout=30 \
+  --dns 172.31.0.2 \
+  --dns 1.1.1.1 \
+  --dns 8.8.8.8 \
+  --env-file /home/ec2-user/quant/.env \
+  --env TZ=Asia/Kolkata \
+  -v /home/ec2-user/quant/state/data:/app/data:z \
+  -v /home/ec2-user/quant/state/models:/app/models:z \
+  -v /home/ec2-user/quant/state/logs:/app/logs:z \
+  localhost/quant:latest \
+  python -m bot.cli live-loop
+
+ExecStop=/usr/bin/podman stop -t 30 quant
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

@@ -183,12 +183,69 @@ class OptionDataCollector:
         indexes = {round(i * last / (max_count - 1)) for i in range(max_count)}
         return {strikes[i] for i in sorted(indexes)}
 
-    def _select_contracts_for_quote_scan(self, contracts: pd.DataFrame) -> pd.DataFrame:
+    def _historical_active_strikes(self, expiry: str, limit: int) -> list[float]:
+        if limit <= 0:
+            return []
+        try:
+            rows = self.store.query_df(
+                """
+                SELECT c.strike,
+                       count(*) AS executable_rows,
+                       max(c.ts) AS last_ts,
+                       avg(c.ltp) AS avg_ltp
+                FROM option_chain_snapshots c
+                JOIN quote_snapshots q
+                  ON c.trading_symbol = q.trading_symbol
+                 AND c.asset_id = q.asset_id
+                WHERE c.asset_id = ?
+                  AND c.expiry = ?
+                  AND c.ltp BETWEEN ? AND ?
+                  AND q.bid_price > 0
+                  AND q.offer_price > 0
+                  AND q.spread_pct <= ?
+                GROUP BY c.strike
+                ORDER BY last_ts DESC, executable_rows DESC
+                LIMIT ?
+                """,
+                (
+                    self.asset.asset_id,
+                    str(pd.to_datetime(expiry).date()),
+                    float(self.asset.min_ltp),
+                    float(self.asset.max_ltp),
+                    float(self.asset.max_spread_pct),
+                    int(limit),
+                ),
+            )
+        except Exception:
+            return []
+        if rows.empty or "strike" not in rows.columns:
+            return []
+        return pd.to_numeric(rows["strike"], errors="coerce").dropna().astype(float).tolist()
+
+    @staticmethod
+    def _neighbor_strikes(strikes: list[float], anchors: list[float], max_count: int) -> set[float]:
+        if not strikes or not anchors or max_count <= 0:
+            return set()
+        selected: set[float] = set()
+        for anchor in anchors:
+            nearest = min(range(len(strikes)), key=lambda idx: abs(strikes[idx] - anchor))
+            for radius in range(0, len(strikes)):
+                for idx in (nearest - radius, nearest + radius):
+                    if 0 <= idx < len(strikes):
+                        selected.add(strikes[idx])
+                        if len(selected) >= max_count:
+                            return selected
+        return selected
+
+    def _select_contracts_for_quote_scan(self, contracts: pd.DataFrame, expiry: str | None = None) -> pd.DataFrame:
         if contracts.empty or len(contracts) <= self.asset.max_quote_symbols:
             return contracts
         max_strikes = max(1, self.asset.max_quote_symbols // 2)
         strikes = sorted(pd.to_numeric(contracts["strike"], errors="coerce").dropna().unique().tolist())
-        keep_strikes = self._evenly_spaced_strikes(strikes, max_strikes)
+        active = self._historical_active_strikes(expiry, max_strikes) if expiry else []
+        keep_strikes = self._neighbor_strikes(strikes, active, max_strikes)
+        if len(keep_strikes) < max_strikes:
+            keep_strikes |= self._evenly_spaced_strikes(strikes, max_strikes - len(keep_strikes))
         selected = contracts[contracts["strike"].isin(keep_strikes)].copy()
         return selected.sort_values(["strike", "option_type", "trading_symbol"]).head(self.asset.max_quote_symbols)
 
@@ -245,7 +302,7 @@ class OptionDataCollector:
         contracts = self._instrument_contracts_for_expiry(expiry)
         if contracts.empty:
             return 0
-        selected = self._select_contracts_for_quote_scan(contracts)
+        selected = self._select_contracts_for_quote_scan(contracts, expiry)
         scan_ts = now_utc()
         quote_frames: list[pd.DataFrame] = []
         chain_frames: list[pd.DataFrame] = []
@@ -355,7 +412,45 @@ class OptionDataCollector:
                 self.asset.max_quote_symbols,
             ),
         )
-        return latest["trading_symbol"].dropna().astype(str).tolist()
+        symbols = latest["trading_symbol"].dropna().astype(str).tolist()
+        if symbols:
+            return symbols
+
+        # Some Groww option-chain snapshots have usable LTP/strike data but blank
+        # volume/OI. Still quote the near-ATM book so live scoring can use the
+        # executable quote payload instead of getting stuck on stale snapshots.
+        fallback = self.store.query_df(
+            """
+            SELECT trading_symbol
+            FROM option_chain_snapshots
+            WHERE asset_id = ?
+              AND expiry = ?
+              AND ts = (SELECT max(ts) FROM option_chain_snapshots WHERE asset_id = ? AND expiry = ?)
+              AND trading_symbol IS NOT NULL
+              AND ltp BETWEEN ? AND ?
+            ORDER BY abs(coalesce(strike, 0) - coalesce(underlying_ltp, strike, 0)) ASC,
+                     ltp DESC
+            LIMIT ?
+            """,
+            (
+                self.asset.asset_id,
+                expiry_date,
+                self.asset.asset_id,
+                expiry_date,
+                self.asset.min_ltp,
+                self.asset.max_ltp,
+                self.asset.max_quote_symbols,
+            ),
+        )
+        symbols = fallback["trading_symbol"].dropna().astype(str).tolist()
+        if symbols:
+            log.info(
+                "quote symbol fallback used | asset=%s expiry=%s symbols=%s reason=missing_chain_liquidity_fields",
+                self.asset.asset_id,
+                expiry,
+                len(symbols),
+            )
+        return symbols
 
     def collect_expiries_once(self, expiries: list[str], quote_top_symbols: bool = True) -> dict[str, int]:
         session = is_session_open(self.asset)

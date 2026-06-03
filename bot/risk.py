@@ -149,6 +149,35 @@ def option_buy_quantity(
     return max(0, lots * lot_size)
 
 
+def option_trade_quantity(
+    premium: float,
+    lot_size: int,
+    account_capital: float,
+    risk_pct: float,
+    max_premium_value: float,
+    sl_pct: float | None = None,
+    side: str = "BUY",
+) -> int:
+    side = str(side or "BUY").upper()
+    if side != "SELL":
+        return option_buy_quantity(
+            premium,
+            lot_size,
+            account_capital,
+            risk_pct,
+            max_premium_value,
+            sl_pct=sl_pct,
+        )
+    if premium <= 0 or lot_size <= 0:
+        return 0
+    risk_rupees = account_capital * risk_pct
+    premium_per_lot = premium * lot_size
+    stop_pct = sl_pct if sl_pct is not None and sl_pct > 0 else 1.0
+    loss_per_lot = premium_per_lot * stop_pct
+    lots = math.floor(risk_rupees / loss_per_lot) if loss_per_lot > 0 else 0
+    return max(0, lots * lot_size)
+
+
 def limit_price_from_quote(quote: dict, tick_size: float = 0.05, max_cross_ticks: int = 1) -> float | None:
     normalized = normalize_quote(quote)
     ask = _as_positive_float(normalized.get("offer_price"))

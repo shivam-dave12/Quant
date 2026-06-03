@@ -20,6 +20,29 @@ class GrowwUnavailable(RuntimeError):
     pass
 
 
+def _iter_dicts(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        out = [payload]
+        for value in payload.values():
+            out.extend(_iter_dicts(value))
+        return out
+    if isinstance(payload, list):
+        out: list[dict[str, Any]] = []
+        for item in payload:
+            out.extend(_iter_dicts(item))
+        return out
+    return []
+
+
+def _first_value(payload: dict[str, Any], *keys: str) -> Any:
+    lowered = {str(key).lower(): key for key in keys}
+    for obj in _iter_dicts(payload):
+        for key, value in obj.items():
+            if str(key).lower() in lowered and value not in (None, ""):
+                return value
+    return None
+
+
 @dataclass
 class GrowwAdapter:
     totp_token: str
@@ -166,6 +189,7 @@ class GrowwAdapter:
             transaction_type=self.TRANSACTION_TYPE_BUY,
             price=float(price),
             order_reference_id=ref,
+            timeout=15,
         )
 
     def place_sell_option_limit(
@@ -189,6 +213,7 @@ class GrowwAdapter:
             transaction_type=self.TRANSACTION_TYPE_SELL,
             price=float(price),
             order_reference_id=ref,
+            timeout=15,
         )
 
     def get_order_detail(self, groww_order_id: str, segment: str | None = None) -> dict[str, Any]:
@@ -211,14 +236,53 @@ class GrowwAdapter:
         last: dict[str, Any] = {}
         while time.time() < deadline:
             last = self.get_order_detail(groww_order_id, segment=segment)
-            status = str(last.get("order_status", "")).upper()
-            filled = int(float(last.get("filled_quantity") or last.get("filledQty") or 0))
+            status = self.extract_order_status(last)
+            filled = self.extract_filled_quantity(last)
             if status in {"EXECUTED", "COMPLETE", "COMPLETED"} and filled > 0:
                 return last
             if status in {"REJECTED", "CANCELLED", "FAILED"}:
                 return last
             time.sleep(0.75)
         return last
+
+    @staticmethod
+    def extract_order_id(payload: dict[str, Any]) -> str | None:
+        value = _first_value(
+            payload,
+            "groww_order_id",
+            "growwOrderId",
+            "order_id",
+            "orderId",
+            "id",
+        )
+        return str(value) if value not in (None, "") else None
+
+    @staticmethod
+    def extract_order_reference_id(payload: dict[str, Any]) -> str | None:
+        value = _first_value(payload, "order_reference_id", "orderReferenceId", "reference_id", "referenceId")
+        return str(value) if value not in (None, "") else None
+
+    @staticmethod
+    def extract_order_status(payload: dict[str, Any]) -> str:
+        value = _first_value(payload, "order_status", "orderStatus", "status")
+        return str(value or "").upper()
+
+    @staticmethod
+    def extract_filled_quantity(payload: dict[str, Any]) -> int:
+        value = _first_value(payload, "filled_quantity", "filledQty", "filled_qty", "filledQuantity", "executed_quantity", "executedQty")
+        try:
+            return int(float(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def extract_average_fill_price(payload: dict[str, Any], fallback: float) -> float:
+        value = _first_value(payload, "average_fill_price", "avgFillPrice", "averagePrice", "avg_price", "traded_price")
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return float(fallback)
+        return out if out > 0 else float(fallback)
 
     def create_exit_oco(
         self,
@@ -257,6 +321,7 @@ class GrowwAdapter:
                 "order_type": self.ORDER_TYPE_STOP_LOSS_MARKET,
                 "price": None,
             },
+            timeout=15,
         )
 
     def create_short_exit_oco(
@@ -296,6 +361,7 @@ class GrowwAdapter:
                 "order_type": self.ORDER_TYPE_STOP_LOSS_MARKET,
                 "price": None,
             },
+            timeout=15,
         )
 
     def subscribe_depth_forever(self, instruments: list[dict[str, str]], on_update: Callable[[dict[str, Any]], None]) -> None:

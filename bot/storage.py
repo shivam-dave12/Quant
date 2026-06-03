@@ -19,6 +19,7 @@ class Store:
                 self.db_path = self.db_path.with_suffix(".sqlite")
             self.con = sqlite3.connect(str(self.db_path))
         self.init_schema()
+        self._maybe_import_sqlite_fallback()
 
     def execute(self, sql: str, params: tuple | list | None = None):
         if params is None:
@@ -118,6 +119,36 @@ class Store:
         );
         """)
         self.execute("""
+        CREATE TABLE IF NOT EXISTS managed_positions (
+            ts TIMESTAMP,
+            updated_ts TIMESTAMP,
+            mode VARCHAR,
+            asset_id VARCHAR,
+            underlying VARCHAR,
+            exchange VARCHAR,
+            segment VARCHAR,
+            trading_symbol VARCHAR,
+            entry_side VARCHAR,
+            exit_side VARCHAR,
+            quantity INTEGER,
+            entry_price DOUBLE,
+            tp_pct DOUBLE,
+            sl_pct DOUBLE,
+            target_price DOUBLE,
+            stop_price DOUBLE,
+            tick_size DOUBLE,
+            product VARCHAR,
+            entry_order_id VARCHAR,
+            entry_order_reference_id VARCHAR,
+            status VARCHAR,
+            exit_reason VARCHAR,
+            exit_order_id VARCHAR,
+            exit_order_reference_id VARCHAR,
+            exit_order_status VARCHAR,
+            raw_json VARCHAR
+        );
+        """)
+        self.execute("""
         CREATE TABLE IF NOT EXISTS backtest_metrics (
             ts TIMESTAMP,
             asset_id VARCHAR,
@@ -139,6 +170,7 @@ class Store:
             "quote_snapshots": ["asset_id", "underlying", "exchange", "segment", "source"],
             "model_signals": ["asset_id", "underlying", "exchange", "segment"],
             "orders": ["asset_id", "underlying", "exchange", "segment"],
+            "managed_positions": ["asset_id", "underlying", "exchange", "segment"],
             "backtest_metrics": ["asset_id", "underlying", "exchange", "segment"],
         }
         for table, columns in table_columns.items():
@@ -170,6 +202,43 @@ class Store:
             pass
         if self.backend == "sqlite":
             self.con.commit()
+
+    def _table_row_count(self, table: str) -> int:
+        try:
+            row = self.query_df(f"SELECT count(*) AS rows FROM {table}").iloc[0]
+            return int(row.get("rows") or 0)
+        except Exception:
+            return 0
+
+    def _maybe_import_sqlite_fallback(self) -> None:
+        if self.backend != "duckdb" or self.db_path.suffix != ".duckdb":
+            return
+        sqlite_path = self.db_path.with_suffix(".sqlite")
+        if not sqlite_path.exists() or sqlite_path.resolve() == self.db_path.resolve():
+            return
+        tables = [
+            "option_chain_snapshots",
+            "quote_snapshots",
+            "model_signals",
+            "orders",
+            "backtest_metrics",
+        ]
+        if any(self._table_row_count(table) > 0 for table in tables):
+            return
+
+        sqlite_con = sqlite3.connect(str(sqlite_path))
+        try:
+            existing = {
+                row[0]
+                for row in sqlite_con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            }
+            for table in tables:
+                if table not in existing:
+                    continue
+                for chunk in pd.read_sql_query(f"SELECT * FROM {table}", sqlite_con, chunksize=50000):
+                    self.append_df(table, chunk)
+        finally:
+            sqlite_con.close()
 
     def _table_columns(self, table: str) -> list[str]:
         if self.backend == "duckdb":

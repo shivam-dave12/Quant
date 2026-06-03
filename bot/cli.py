@@ -3,10 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import threading
 import time
+import webbrowser
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 
@@ -28,6 +32,8 @@ from .risk import normalize_quote, quote_is_executable
 from .run_state import build_rundown, compact_startup_summary, load_rundown, save_rundown, utc_now_iso
 from .storage import Store
 from .live import LiveOptionBot
+from .zerodha_adapter import ZerodhaAdapter
+from .zerodha_instruments import ensure_zerodha_instruments_csv, load_zerodha_mcx_options
 
 log = logging.getLogger(__name__)
 
@@ -411,6 +417,7 @@ def cmd_groww_preflight(args) -> None:
         "contract_file_exists": cfg.nse_contract_file.exists(),
         "paper_trading": cfg.paper_trading,
         "live_trading_enabled": cfg.live_trading_enabled,
+        "allow_groww_commodity_live_orders": cfg.allow_groww_commodity_live_orders,
         "max_open_positions": cfg.max_open_positions,
         "assets": [asset.asset_id for asset in assets],
         "asset_checks": {},
@@ -428,10 +435,21 @@ def cmd_groww_preflight(args) -> None:
             "exchange": asset.exchange,
             "segment": asset.segment,
             "option_chain_mode": asset.option_chain_mode,
+            "broker_order_supported": asset.broker_order_supported,
             "model_suite_path": str(cfg.model_suite_path_for(asset.asset_id)),
             "model_suite_exists": cfg.model_suite_path_for(asset.asset_id).exists(),
             "configured_expiries": list(asset.expiry_dates),
         }
+        if args.for_live and asset.segment.upper() == "COMMODITY":
+            detail["groww_commodity_live_order_override"] = cfg.allow_groww_commodity_live_orders
+            detail["groww_commodity_standard_orders_supported_by_docs"] = True
+            detail["groww_commodity_smart_orders_supported"] = False
+            detail["commodity_exit_management"] = "bot_managed_standard_exit_orders"
+            detail["groww_commodity_live_note"] = "COMMODITY uses standard Groww orders; Smart Orders/OCO are not used for MCX."
+            if not cfg.allow_groww_commodity_live_orders:
+                errors.append(f"groww_commodity_live_orders_disabled:{asset.asset_id}:{asset.segment}")
+        elif args.for_live and not asset.broker_order_supported:
+            errors.append(f"broker_order_unsupported:{asset.asset_id}:{asset.exchange}_{asset.segment}")
         if asset.option_chain_mode.lower() == "instrument_quotes":
             detail["instrument_master_path"] = str(cfg.groww_instruments_csv)
             try:
@@ -586,6 +604,8 @@ def cmd_live_once(args) -> None:
     if args.live:
         # Two-key live switch: CLI --live + live_trading_enabled=True in bot/config.py.
         object.__setattr__(cfg, "paper_trading", False)
+    else:
+        object.__setattr__(cfg, "paper_trading", True)
     assets = resolve_assets(args, cfg)
     store = Store(cfg.db_path)
     adapter = GrowwAdapter(cfg.groww_totp_token, cfg.groww_totp_secret)
@@ -614,6 +634,8 @@ def cmd_live_loop(args) -> None:
     cfg = load_config()
     if args.live:
         object.__setattr__(cfg, "paper_trading", False)
+    else:
+        object.__setattr__(cfg, "paper_trading", True)
     assets = resolve_assets(args, cfg)
     store = Store(cfg.db_path)
     adapter = GrowwAdapter(cfg.groww_totp_token, cfg.groww_totp_secret)
@@ -656,6 +678,284 @@ def cmd_metrics(args) -> None:
         print("No model meta found. Run train first.")
         return
     print(cfg.model_meta_path.read_text())
+
+
+def _write_env_value(path: Path, key: str, value: str) -> None:
+    path = Path(path)
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    prefix = f"{key}="
+    updated = False
+    out: list[str] = []
+    for line in lines:
+        if line.startswith(prefix):
+            out.append(f"{key}={value}")
+            updated = True
+        else:
+            out.append(line)
+    if not updated:
+        out.append(f"{key}={value}")
+    path.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
+
+
+def cmd_zerodha_login_url(args) -> None:
+    cfg = load_config()
+    adapter = ZerodhaAdapter(cfg.zerodha_api_key, cfg.zerodha_api_secret, cfg.zerodha_access_token)
+    print(json.dumps({
+        "login_url": adapter.login_url(),
+        "access_token_loaded": bool(cfg.zerodha_access_token),
+        "next_step": "After login, copy request_token from the redirect URL and run zerodha-generate-session.",
+    }, indent=2))
+
+
+def cmd_zerodha_generate_session(args) -> None:
+    cfg = load_config()
+    request_token = str(args.request_token or cfg.zerodha_request_token or "").strip()
+    if not request_token:
+        raise ValueError("Missing request token. Pass --request-token or set ZERODHA_REQUEST_TOKEN.")
+    adapter = ZerodhaAdapter(cfg.zerodha_api_key, cfg.zerodha_api_secret, cfg.zerodha_access_token)
+    session = adapter.generate_session(request_token)
+    access_token = str(session.get("access_token") or "").strip()
+    if not access_token:
+        raise ValueError("Zerodha session response did not include access_token.")
+    env_written = False
+    if args.write_env:
+        _write_env_value(Path(args.env_file), "ZERODHA_ACCESS_TOKEN", access_token)
+        env_written = True
+    print(json.dumps({
+        "session_generated": True,
+        "access_token_loaded": True,
+        "access_token_written": env_written,
+        "env_file": str(Path(args.env_file)) if env_written else None,
+        "user_id": session.get("user_id"),
+        "user_name": session.get("user_name"),
+        "email_present": bool(session.get("email")),
+        "note": "Access token is intentionally not printed.",
+    }, indent=2, default=str))
+
+
+def _capture_zerodha_request_token(login_url: str, host: str, port: int, path: str, timeout_seconds: int, open_browser: bool) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    ready = threading.Event()
+
+    callback_path = "/" + str(path or "zerodha/callback").strip("/")
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: Any) -> None:
+            return
+
+        def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            token = (params.get("request_token") or [""])[0]
+            status = (params.get("status") or [""])[0]
+            error = (params.get("error") or params.get("error_type") or [""])[0]
+            if parsed.path.rstrip("/") != callback_path.rstrip("/"):
+                self.send_response(404)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(f"Unexpected callback path. Expected {callback_path}".encode("utf-8"))
+                return
+            result.update({
+                "request_token": token,
+                "status": status,
+                "error": error,
+                "query_keys": sorted(params.keys()),
+            })
+            ready.set()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            body = """
+<!doctype html>
+<html>
+  <head><title>Zerodha token captured</title></head>
+  <body style="font-family: system-ui, sans-serif; margin: 40px;">
+    <h2>Zerodha request token captured.</h2>
+    <p>You can close this tab and return to the bot terminal.</p>
+  </body>
+</html>
+"""
+            self.wfile.write(body.encode("utf-8"))
+
+    server = ThreadingHTTPServer((host, int(port)), Handler)
+    server.timeout = 1
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        if open_browser:
+            webbrowser.open(login_url)
+        if not ready.wait(max(1, int(timeout_seconds))):
+            raise TimeoutError(
+                f"Timed out waiting for Zerodha redirect at http://{host}:{port}{callback_path}. "
+                "Make sure the Kite app redirect URL is set to that exact callback URL, or use --request-token."
+            )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+    if result.get("error"):
+        raise ValueError(f"Zerodha callback returned error={result.get('error')} status={result.get('status')}")
+    if not result.get("request_token"):
+        raise ValueError(f"Zerodha callback did not include request_token. Query keys={result.get('query_keys')}")
+    return result
+
+
+def cmd_zerodha_auto_session(args) -> None:
+    cfg = load_config()
+    adapter = ZerodhaAdapter(cfg.zerodha_api_key, cfg.zerodha_api_secret, cfg.zerodha_access_token)
+    request_token = str(args.request_token or cfg.zerodha_request_token or "").strip()
+    capture: dict[str, Any] | None = None
+    if not request_token:
+        capture = _capture_zerodha_request_token(
+            adapter.login_url(),
+            args.callback_host,
+            int(args.callback_port),
+            args.callback_path,
+            int(args.timeout_seconds),
+            bool(args.open_browser),
+        )
+        request_token = str(capture["request_token"])
+    session = adapter.generate_session(request_token)
+    access_token = str(session.get("access_token") or "").strip()
+    if not access_token:
+        raise ValueError("Zerodha session response did not include access_token.")
+    env_written = False
+    if args.write_env:
+        _write_env_value(Path(args.env_file), "ZERODHA_ACCESS_TOKEN", access_token)
+        env_written = True
+    print(json.dumps({
+        "session_generated": True,
+        "request_token_captured": capture is not None,
+        "access_token_loaded": True,
+        "access_token_written": env_written,
+        "env_file": str(Path(args.env_file)) if env_written else None,
+        "callback_url": f"http://{args.callback_host}:{int(args.callback_port)}/" + str(args.callback_path or "zerodha/callback").strip("/"),
+        "user_id": session.get("user_id"),
+        "user_name": session.get("user_name"),
+        "email_present": bool(session.get("email")),
+        "note": "Access token and request token are intentionally not printed.",
+    }, indent=2, default=str))
+
+
+def cmd_zerodha_preflight(args) -> None:
+    cfg = load_config()
+    assets = [asset for asset in resolve_assets(args, cfg) if asset.segment.upper() == "COMMODITY"]
+    report: dict[str, Any] = {
+        "commodity_execution_broker": cfg.commodity_execution_broker,
+        "zerodha_commodity_product": cfg.zerodha_commodity_product,
+        "zerodha_commodity_max_lots": cfg.zerodha_commodity_max_lots,
+        "paper_trading": cfg.paper_trading,
+        "live_trading_enabled": cfg.live_trading_enabled,
+        "assets": [asset.asset_id for asset in assets],
+        "checks": {},
+        "asset_checks": {},
+        "errors": [],
+    }
+    checks = report["checks"]
+    errors = report["errors"]
+    try:
+        __import__("kiteconnect")
+        checks["kiteconnect_import"] = True
+    except Exception as exc:
+        checks["kiteconnect_import"] = False
+        errors.append(f"kiteconnect_import_failed:{exc}")
+
+    checks["zerodha_api_key_present"] = bool(cfg.zerodha_api_key)
+    checks["zerodha_api_secret_present"] = bool(cfg.zerodha_api_secret)
+    checks["zerodha_access_token_present"] = bool(cfg.zerodha_access_token)
+    if args.for_live:
+        if cfg.commodity_execution_broker != "zerodha":
+            errors.append(f"commodity_execution_broker_not_zerodha:{cfg.commodity_execution_broker}")
+        if not cfg.live_trading_enabled:
+            errors.append("live_trading_enabled_false")
+        if not cfg.zerodha_api_key:
+            errors.append("zerodha_api_key_missing")
+        if not cfg.zerodha_api_secret:
+            errors.append("zerodha_api_secret_missing")
+        if not cfg.zerodha_access_token:
+            errors.append("zerodha_access_token_missing")
+
+    try:
+        path, refreshed, reason = ensure_zerodha_instruments_csv(
+            cfg.zerodha_instruments_csv,
+            cfg.zerodha_instruments_url,
+            cfg.zerodha_instruments_max_age_hours,
+            force=bool(args.refresh_instruments),
+        )
+        report["zerodha_instrument_master"] = {
+            "path": str(path),
+            "refreshed": refreshed,
+            "refresh_reason": reason,
+            "exists": path.exists(),
+        }
+        for asset in assets:
+            detail: dict[str, Any] = {
+                "underlying": asset.underlying,
+                "exchange": asset.exchange,
+                "segment": asset.segment,
+                "configured_expiries": list(asset.expiry_dates),
+            }
+            contracts = load_zerodha_mcx_options(path, asset)
+            by_expiry = (
+                contracts.groupby(contracts["expiry"].astype(str))["tradingsymbol"]
+                .nunique()
+                .astype(int)
+                .to_dict()
+            )
+            detail["contracts"] = int(len(contracts))
+            detail["contracts_by_expiry"] = by_expiry
+            detail["lot_sizes"] = sorted({int(x) for x in contracts["lot_size"].dropna().unique()})[:10]
+            detail["tick_sizes"] = sorted({float(x) for x in contracts["tick_size"].dropna().unique()})[:10]
+            for expiry in asset.expiry_dates:
+                expiry_key = str(pd.to_datetime(expiry).date())
+                if int(by_expiry.get(expiry_key, 0)) <= 0:
+                    errors.append(f"zerodha_instrument_expiry_missing:{asset.asset_id}:{expiry_key}")
+            report["asset_checks"][asset.asset_id] = detail
+    except Exception as exc:
+        errors.append(f"zerodha_instrument_master_failed:{exc}")
+
+    if args.online:
+        try:
+            adapter = ZerodhaAdapter(cfg.zerodha_api_key, cfg.zerodha_api_secret, cfg.zerodha_access_token)
+            checks["zerodha_adapter"] = True
+        except Exception as exc:
+            checks["zerodha_adapter"] = False
+            errors.append(f"zerodha_adapter_failed:{exc}")
+            print(json.dumps(report, indent=2, default=str))
+            raise SystemExit(1)
+        if cfg.zerodha_access_token:
+            try:
+                profile = adapter.profile()
+                checks["zerodha_profile"] = True
+                report["profile"] = {
+                    "user_id": profile.get("user_id"),
+                    "user_name": profile.get("user_name"),
+                    "email_present": bool(profile.get("email")),
+                    "broker": profile.get("broker"),
+                }
+            except Exception as exc:
+                checks["zerodha_profile"] = False
+                errors.append(f"zerodha_profile_failed:{exc}")
+            try:
+                margins = adapter.margins()
+                checks["zerodha_margins"] = True
+                report["margin_segments"] = sorted(margins.keys()) if isinstance(margins, dict) else str(type(margins))
+            except Exception as exc:
+                checks["zerodha_margins"] = False
+                errors.append(f"zerodha_margins_failed:{exc}")
+            try:
+                orders = adapter.orders()
+                checks["zerodha_orders"] = True
+                report["orders_count"] = len(orders)
+            except Exception as exc:
+                checks["zerodha_orders"] = False
+                errors.append(f"zerodha_orders_failed:{exc}")
+        else:
+            checks["zerodha_online_skipped"] = "access_token_missing"
+
+    print(json.dumps(report, indent=2, default=str))
+    if errors:
+        raise SystemExit(1)
 
 
 def main() -> None:
@@ -714,6 +1014,33 @@ def main() -> None:
     p.add_argument("--refresh-instruments", action="store_true", help="Force refresh Groww's public instrument master before checks.")
     p.set_defaults(func=cmd_groww_preflight)
 
+    p = sub.add_parser("zerodha-login-url", help="Print Zerodha Kite login URL for generating the daily request token.")
+    p.set_defaults(func=cmd_zerodha_login_url)
+
+    p = sub.add_parser("zerodha-generate-session", help="Exchange Zerodha request_token for the daily access token.")
+    p.add_argument("--request-token", default=None, help="request_token from the Zerodha redirect URL.")
+    p.add_argument("--write-env", action="store_true", help="Write ZERODHA_ACCESS_TOKEN into the env file.")
+    p.add_argument("--env-file", default=".env", help="Env file to update when --write-env is set.")
+    p.set_defaults(func=cmd_zerodha_generate_session)
+
+    p = sub.add_parser("zerodha-auto-session", help="Open Kite login, capture request_token callback, and write the daily access token.")
+    p.add_argument("--request-token", default=None, help="Optional request_token override; skips callback capture when provided.")
+    p.add_argument("--callback-host", default="127.0.0.1")
+    p.add_argument("--callback-port", type=int, default=8765)
+    p.add_argument("--callback-path", default="/zerodha/callback")
+    p.add_argument("--timeout-seconds", type=int, default=180)
+    p.add_argument("--open-browser", action="store_true", help="Open the Kite login URL in the default browser.")
+    p.add_argument("--write-env", action="store_true", help="Write ZERODHA_ACCESS_TOKEN into the env file.")
+    p.add_argument("--env-file", default=".env", help="Env file to update when --write-env is set.")
+    p.set_defaults(func=cmd_zerodha_auto_session)
+
+    p = sub.add_parser("zerodha-preflight", help="Check Zerodha MCX execution readiness without placing an order.")
+    p.add_argument("--asset", action="append", default=None, help="Commodity asset id. Repeat or comma-separate. Defaults to active commodity assets.")
+    p.add_argument("--online", action="store_true", help="Call read-only Zerodha account APIs when an access token is loaded.")
+    p.add_argument("--for-live", action="store_true", help="Fail unless commodity live execution prerequisites are enabled.")
+    p.add_argument("--refresh-instruments", action="store_true", help="Force refresh Zerodha MCX instrument master before checks.")
+    p.set_defaults(func=cmd_zerodha_preflight)
+
     p = sub.add_parser("refresh-instruments", help="Download or refresh Groww's public instrument master CSV.")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_refresh_instruments)
@@ -741,7 +1068,7 @@ def main() -> None:
     args = parser.parse_args()
     try:
         args.func(args)
-    except ValueError as exc:
+    except (ValueError, TimeoutError) as exc:
         parser.exit(2, f"ERROR: {exc}\n")
 
 

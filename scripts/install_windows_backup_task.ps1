@@ -21,6 +21,7 @@ if ($EveryMinutes -lt 5) {
 $backupScript = Resolve-Path (Join-Path $PSScriptRoot "aws_pull_state_backup.ps1")
 $argList = @(
     "-NoProfile",
+    "-WindowStyle", "Hidden",
     "-ExecutionPolicy", "Bypass",
     "-File", "`"$backupScript`"",
     "-Ec2Host", "`"$Ec2Host`"",
@@ -41,4 +42,4 @@ Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Se
 
 Write-Output "TASK_INSTALLED name=$TaskName every_minutes=$EveryMinutes"
 Write-Output "Run once now with:"
-Write-Output "powershell -NoProfile -ExecutionPolicy Bypass -File `"$backupScript`" -Ec2Host `"$Ec2Host`" -Ec2User `"$Ec2User`" -KeyPath `"$KeyPath`" -LocalBackupRoot `"$LocalBackupRoot`" -Once"
+Write-Output "powershell -NoProfile -ExecutionPolicy Bypass -File `"$backupScript`" -Ec2Host `"$Ec2Host`" -Ec2User `"$Ec2User`" -KeyPath `"$KeyPath`" -RemoteStateDir `"$RemoteStateDir`" -LocalBackupRoot `"$LocalBackupRoot`" -Once"

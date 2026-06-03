@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
 set -Eeuo pipefail
 
-BASE_DIR="/home/ec2-user/quant"
-PROJECT_DIR="$BASE_DIR/Quant"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="${QUANT_PROJECT_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+BASE_DIR="${QUANT_BASE_DIR:-$(dirname "$PROJECT_DIR")}"
 STATE_DIR="$BASE_DIR/state"
 ENV_FILE="$BASE_DIR/.env"
 BACKUP_DIR="$BASE_DIR/backups"
@@ -11,6 +15,8 @@ SERVICE_FILE="$SERVICE_DIR/quant.service"
 IMAGE="localhost/quant:latest"
 GROWW_INSTRUMENTS_URL="${GROWW_INSTRUMENTS_URL:-https://growwapi-assets.groww.in/instruments/instrument.csv}"
 REMOTE_STATE_BACKUP="${REMOTE_STATE_BACKUP:-0}"
+START_SERVICE="${START_SERVICE:-1}"
+LIVE_ARGS="${LIVE_ARGS:-}"
 
 echo "==> Project: $PROJECT_DIR"
 cd "$PROJECT_DIR"
@@ -102,24 +108,79 @@ fi
 
 refresh_groww_instruments
 
-cp deploy/quant.service "$SERVICE_FILE"
+write_service_file() {
+  cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Quant Trading Bot - Rootless Podman
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$PROJECT_DIR
+
+ExecStartPre=/usr/bin/mkdir -p $STATE_DIR/data $STATE_DIR/models $STATE_DIR/logs
+ExecStartPre=-/usr/bin/podman rm -f quant
+
+ExecStart=/usr/bin/podman run \\
+  --name quant \\
+  --replace \\
+  --stop-timeout=30 \\
+  --dns 172.31.0.2 \\
+  --dns 1.1.1.1 \\
+  --dns 8.8.8.8 \\
+  --env-file $ENV_FILE \\
+  --env TZ=Asia/Kolkata \\
+  -v $STATE_DIR/data:/app/data:z \\
+  -v $STATE_DIR/models:/app/models:z \\
+  -v $STATE_DIR/logs:/app/logs:z \\
+  $IMAGE \\
+  python -m bot.cli live-loop $LIVE_ARGS
+
+ExecStop=/usr/bin/podman stop -t 30 quant
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+}
+
+if [[ -f deploy/quant.service ]]; then
+  cp deploy/quant.service "$SERVICE_FILE"
+  sed -i \
+    -e "s#WorkingDirectory=/home/ec2-user/quant/Quant#WorkingDirectory=$PROJECT_DIR#g" \
+    -e "s#/home/ec2-user/quant/.env#$ENV_FILE#g" \
+    -e "s#/home/ec2-user/quant/state#$STATE_DIR#g" \
+    "$SERVICE_FILE"
+  if [[ -n "$LIVE_ARGS" ]]; then
+    sed -i -e "s#python -m bot.cli live-loop\$#python -m bot.cli live-loop $LIVE_ARGS#g" "$SERVICE_FILE"
+  fi
+else
+  write_service_file
+fi
 
 podman build -t "$IMAGE" .
 
 podman run --rm \
   --env-file "$ENV_FILE" \
-  -v "$STATE_DIR/data:/app/data:Z" \
-  -v "$STATE_DIR/models:/app/models:Z" \
-  -v "$STATE_DIR/logs:/app/logs:Z" \
+  --env TZ=Asia/Kolkata \
+  -v "$STATE_DIR/data:/app/data:z" \
+  -v "$STATE_DIR/models:/app/models:z" \
+  -v "$STATE_DIR/logs:/app/logs:z" \
   "$IMAGE" \
   python -m bot.cli repair-db
 
 systemctl --user daemon-reload
 systemctl --user enable quant.service
-systemctl --user restart quant.service
-
-loginctl enable-linger ec2-user || true
-
-echo "==> Started quant.service"
-systemctl --user --no-pager status quant.service || true
-echo "==> Logs: podman logs -f quant"
+if [[ "$START_SERVICE" == "1" ]]; then
+  systemctl --user restart quant.service
+  loginctl enable-linger ec2-user || true
+  echo "==> Started quant.service"
+  systemctl --user --no-pager status quant.service || true
+  echo "==> Logs: podman logs -f quant"
+else
+  systemctl --user stop quant.service >/dev/null 2>&1 || true
+  echo "==> quant.service installed but not started because START_SERVICE=0"
+  echo "==> Start later with: systemctl --user start quant.service"
+fi

@@ -11,6 +11,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class AssetProfile:
     asset_id: str
@@ -23,11 +30,14 @@ class AssetProfile:
     option_chain_mode: str = "groww_option_chain"
     product: str = "MIS"
     enabled: bool = True
+    broker_order_supported: bool = True
     min_ltp: float = 1.0
     max_ltp: float = 5000.0
     min_volume: float = 1.0
     min_oi: float = 1.0
     max_quote_symbols: int = 40
+    default_lot_size: int = 0
+    default_tick_size: float = 0.05
     max_spread_pct: float = 0.025
     min_edge_return: float = 0.006
     risk_per_trade_pct: float = 0.005
@@ -50,6 +60,12 @@ class BotConfig:
     # Secrets / credentials.
     groww_totp_token: str = os.getenv("GROWW_TOTP_TOKEN", "")
     groww_totp_secret: str = os.getenv("GROWW_TOTP_SECRET", "")
+    telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
+    zerodha_api_key: str = os.getenv("ZERODHA_API_KEY", "")
+    zerodha_api_secret: str = os.getenv("ZERODHA_API_SECRET", "")
+    zerodha_access_token: str = os.getenv("ZERODHA_ACCESS_TOKEN", "")
+    zerodha_request_token: str = os.getenv("ZERODHA_REQUEST_TOKEN", "")
 
     # Runtime mode. Live orders still require CLI --live plus this switch.
     live_trading_enabled: bool = True
@@ -61,6 +77,9 @@ class BotConfig:
     groww_instruments_csv: Path = Path("data/raw/groww_instruments.csv")
     groww_instruments_url: str = "https://growwapi-assets.groww.in/instruments/instrument.csv"
     groww_instruments_max_age_hours: float = 24.0
+    zerodha_instruments_csv: Path = Path("data/raw/zerodha_mcx_instruments.csv")
+    zerodha_instruments_url: str = "https://api.kite.trade/instruments/MCX"
+    zerodha_instruments_max_age_hours: float = 24.0
     run_rundown_path: Path = Path("data/runtime/run_rundown.json")
     model_path: Path = Path("models/option_return_model.joblib")
     model_meta_path: Path = Path("models/model_meta.json")
@@ -107,7 +126,7 @@ class BotConfig:
     live_train_min_rows: int = 5000
 
     # Risk / execution.
-    account_capital: float = 100000.0
+    account_capital: float = 50000.0
     risk_per_trade_pct: float = 0.005
     max_premium_value_per_trade: float = 10000.0
     max_open_positions: int = 3
@@ -117,6 +136,14 @@ class BotConfig:
     entry_tick_buffer: int = 1
     require_live_margin_check: bool = True
     live_margin_buffer_pct: float = 0.05
+    allow_groww_commodity_live_orders: bool = _env_bool("GROWW_ALLOW_COMMODITY_LIVE_ORDERS", True)
+    commodity_execution_broker: str = os.getenv("COMMODITY_EXECUTION_BROKER", "zerodha").strip().lower()
+    zerodha_commodity_product: str = os.getenv("ZERODHA_COMMODITY_PRODUCT", "MIS").strip().upper() or "MIS"
+    zerodha_commodity_max_lots: int = int(os.getenv("ZERODHA_COMMODITY_MAX_LOTS", "1") or "1")
+    commodity_single_lot_risk_tolerance: float = 1.10
+    telegram_alerts_enabled: bool = _env_bool("TELEGRAM_ALERTS_ENABLED", True)
+    telegram_manual_commodity_signals: bool = _env_bool("TELEGRAM_MANUAL_COMMODITY_SIGNALS", True)
+    telegram_signal_cooldown_seconds: int = int(os.getenv("TELEGRAM_SIGNAL_COOLDOWN_SECONDS", "300") or "300")
     tp_pct: float = 0.18
     sl_pct: float = 0.09
 
@@ -133,13 +160,15 @@ class BotConfig:
             model_strategy="index_cross_sectional_premium_expansion",
             min_ltp=3.0,
             max_ltp=450.0,
-            min_volume=20.0,
-            min_oi=100.0,
+            min_volume=0.0,
+            min_oi=0.0,
             max_quote_symbols=40,
+            default_lot_size=65,
+            default_tick_size=0.05,
             max_spread_pct=0.025,
             min_edge_return=0.006,
             risk_per_trade_pct=0.005,
-            max_premium_value_per_trade=10000.0,
+            max_premium_value_per_trade=5000.0,
             session_open="09:15",
             session_close="15:30",
             late_session_start="15:30",
@@ -154,15 +183,18 @@ class BotConfig:
             model_strategy="energy_volatility_liquidity_breakout",
             option_chain_mode="instrument_quotes",
             product="MIS",
+            broker_order_supported=True,
             min_ltp=0.5,
             max_ltp=500.0,
             min_volume=0.0,
             min_oi=0.0,
             max_quote_symbols=60,
+            default_lot_size=1250,
+            default_tick_size=0.05,
             max_spread_pct=0.045,
             min_edge_return=0.010,
             risk_per_trade_pct=0.003,
-            max_premium_value_per_trade=5000.0,
+            max_premium_value_per_trade=8000.0,
             min_backtest_trades=75,
             allow_short_option_entries=True,
             short_tp_pct=0.010,
@@ -183,15 +215,18 @@ class BotConfig:
             model_strategy="energy_trend_vol_premium_expansion",
             option_chain_mode="instrument_quotes",
             product="MIS",
+            broker_order_supported=True,
             min_ltp=1.0,
             max_ltp=7000.0,
             min_volume=0.0,
             min_oi=0.0,
-            max_quote_symbols=30,
+            max_quote_symbols=60,
+            default_lot_size=100,
+            default_tick_size=0.10,
             max_spread_pct=0.040,
             min_edge_return=0.010,
-            risk_per_trade_pct=0.005,
-            max_premium_value_per_trade=15000.0,
+            risk_per_trade_pct=0.010,
+            max_premium_value_per_trade=25000.0,
             tp_pct=0.20,
             sl_pct=0.10,
             session_open="09:00",
@@ -211,6 +246,7 @@ class BotConfig:
             self.model_suite_meta_path_for(profile.asset_id).parent.mkdir(parents=True, exist_ok=True)
         Path("logs").mkdir(parents=True, exist_ok=True)
         Path("data/raw").mkdir(parents=True, exist_ok=True)
+        self.zerodha_instruments_csv.parent.mkdir(parents=True, exist_ok=True)
         self.run_rundown_path.parent.mkdir(parents=True, exist_ok=True)
 
     def asset_profile_map(self) -> dict[str, AssetProfile]:

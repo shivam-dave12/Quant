@@ -71,7 +71,7 @@ function Invoke-TarFallbackBackup {
     $remoteArchive = "/tmp/quant_state_$stamp.tar.gz"
     $sshArgs = New-SshArgs
     $scpArgs = New-SshArgs
-    $remoteCmd = "set -Eeuo pipefail; rm -f '$remoteArchive'; tar -czf '$remoteArchive' -C '$RemoteStateDir' data models logs; ls -lh '$remoteArchive'"
+    $remoteCmd = "set -Eeuo pipefail; rm -f '$remoteArchive'; tar -czf '$remoteArchive' -C '$RemoteStateDir' data models logs"
 
     & ssh @sshArgs $Remote $remoteCmd
     if ($LASTEXITCODE -ne 0) {
@@ -82,7 +82,7 @@ function Invoke-TarFallbackBackup {
         throw "scp download failed with exit code $LASTEXITCODE"
     }
     & ssh @sshArgs $Remote "rm -f '$remoteArchive'"
-    return $archive
+    return (Resolve-Path $archive).Path
 }
 
 function Invoke-QuantStateBackup {

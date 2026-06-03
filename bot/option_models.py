@@ -29,7 +29,7 @@ from .storage import Store
 
 log = logging.getLogger(__name__)
 
-MODEL_VERSION = "option_model_suite_v6_shadow_meta_policy"
+MODEL_VERSION = "option_model_suite_v7_budget_buy_policy_research"
 GROWW_CHAIN_SOURCES = ("groww_option_chain", "groww_instrument_quote_chain")
 
 
@@ -281,6 +281,12 @@ class ModelSuiteConfig:
     max_spread_pct: float = 0.025
     min_volume: float = 1.0
     min_oi: float = 1.0
+    account_capital: float = 50000.0
+    risk_per_trade_pct: float = 0.005
+    max_premium_value_per_trade: float = 10000.0
+    default_lot_size: int = 0
+    buy_tp_pct: float = 0.18
+    buy_sl_pct: float = 0.09
     session_close_buffer_minutes: float = 12.0
     max_model_rank: int = 5
     calibration_fraction: float = 0.20
@@ -315,6 +321,12 @@ class ModelSuiteConfig:
             max_spread_pct=profile.max_spread_pct,
             min_volume=profile.min_volume,
             min_oi=profile.min_oi,
+            account_capital=cfg.account_capital,
+            risk_per_trade_pct=profile.risk_per_trade_pct,
+            max_premium_value_per_trade=profile.max_premium_value_per_trade,
+            default_lot_size=profile.default_lot_size,
+            buy_tp_pct=profile.tp_pct,
+            buy_sl_pct=profile.sl_pct,
             min_meta_policy_prob=cfg.min_meta_policy_prob,
             min_meta_policy_ev=cfg.min_meta_policy_ev,
             min_meta_policy_candidates=cfg.min_meta_policy_candidates,
@@ -797,15 +809,13 @@ def load_option_model_raw_data(cfg: BotConfig, store: Store, asset: AssetProfile
           AND asset_id = ?
           AND ltp IS NOT NULL
           AND ltp BETWEEN ? AND ?
-          AND coalesce(volume, 0) >= ?
-          AND coalesce(open_interest, 0) >= ?
           {chain_source_clause}
           AND lower(coalesce(raw_json, '')) NOT LIKE '%synthetic%'
           AND lower(coalesce(raw_json, '')) NOT LIKE '%dummy%'
           AND lower(coalesce(raw_json, '')) NOT LIKE '%fake%'
         ORDER BY trading_symbol, ts
         """,
-        (profile.asset_id, profile.min_ltp, profile.max_ltp, profile.min_volume, profile.min_oi),
+        (profile.asset_id, profile.min_ltp, profile.max_ltp),
     )
     if chain.empty:
         return chain
@@ -828,9 +838,15 @@ def load_option_model_raw_data(cfg: BotConfig, store: Store, asset: AssetProfile
     except Exception:
         quotes = pd.DataFrame()
 
-    if quotes.empty:
-        return chain
-    return merge_chain_quotes(chain, quotes)
+    raw = chain if quotes.empty else merge_chain_quotes(chain, quotes)
+    for col in ["volume", "open_interest"]:
+        if col not in raw.columns:
+            raw[col] = 0.0
+        raw[col] = pd.to_numeric(raw[col], errors="coerce").fillna(0.0)
+    return raw[
+        raw["volume"].ge(profile.min_volume)
+        & raw["open_interest"].ge(profile.min_oi)
+    ].copy()
 
 
 def merge_chain_quotes(chain: pd.DataFrame, quotes: pd.DataFrame, tolerance_seconds: int = 90) -> pd.DataFrame:
@@ -849,6 +865,9 @@ def merge_chain_quotes(chain: pd.DataFrame, quotes: pd.DataFrame, tolerance_seco
         "offer_quantity",
         "spread",
         "spread_pct",
+        "open_interest",
+        "volume",
+        "implied_volatility",
         "total_buy_quantity",
         "total_sell_quantity",
         "last_trade_quantity",
@@ -868,6 +887,20 @@ def merge_chain_quotes(chain: pd.DataFrame, quotes: pd.DataFrame, tolerance_seco
             tolerance=pd.Timedelta(seconds=tolerance_seconds),
             suffixes=("", "_quote"),
         )
+        for col in ["open_interest", "volume"]:
+            quote_col = f"{col}_quote"
+            if quote_col in merged.columns:
+                merged[col] = pd.to_numeric(merged[col], errors="coerce").where(
+                    pd.to_numeric(merged[col], errors="coerce").notna(),
+                    pd.to_numeric(merged[quote_col], errors="coerce"),
+                )
+        if "implied_volatility" in merged.columns:
+            if "iv" not in merged.columns:
+                merged["iv"] = pd.NA
+            merged["iv"] = pd.to_numeric(merged["iv"], errors="coerce").where(
+                pd.to_numeric(merged["iv"], errors="coerce").notna(),
+                pd.to_numeric(merged["implied_volatility"], errors="coerce"),
+            )
         frames.append(merged)
     return pd.concat(frames, ignore_index=True) if frames else chain
 
@@ -1842,6 +1875,10 @@ def _normalise_policy_frame(joined: pd.DataFrame, cfg: ModelSuiteConfig) -> pd.D
         "policy_calibrated_ev": 0.0,
         "policy_raw_ev": 0.0,
         "policy_score_rank_pct": 0.0,
+        "ltp": np.nan,
+        "quoted_entry_price": np.nan,
+        "premium_range_pos_20": 0.5,
+        "premium_return_3": 0.0,
     }
     for col, default in numeric_defaults.items():
         if col not in data.columns:
@@ -2013,6 +2050,41 @@ def _quote_guard_research_mask(data: pd.DataFrame, cfg: ModelSuiteConfig) -> pd.
     )
 
 
+def _entry_price_for_budget(data: pd.DataFrame) -> pd.Series:
+    if "quoted_entry_price" in data.columns:
+        entry = pd.to_numeric(data["quoted_entry_price"], errors="coerce")
+    else:
+        entry = pd.Series(np.nan, index=data.index)
+    return entry.where(entry.gt(0), pd.to_numeric(data.get("ltp"), errors="coerce"))
+
+
+def _budget_buy_mask(data: pd.DataFrame, cfg: ModelSuiteConfig, sl_pct: float | None = None) -> pd.Series:
+    entry = _entry_price_for_budget(data)
+    mask = entry.gt(0)
+    if cfg.default_lot_size > 0:
+        premium_per_lot = entry * float(cfg.default_lot_size)
+        if cfg.max_premium_value_per_trade > 0:
+            mask &= premium_per_lot.le(float(cfg.max_premium_value_per_trade))
+        risk_budget = float(cfg.account_capital) * float(cfg.risk_per_trade_pct)
+        stop = float(sl_pct if sl_pct is not None else cfg.buy_sl_pct)
+        if risk_budget > 0 and stop > 0:
+            mask &= (premium_per_lot * stop).le(risk_budget)
+    return mask.fillna(False)
+
+
+def _nifty_budget_range_contrarian_mask(data: pd.DataFrame, cfg: ModelSuiteConfig, sl_pct: float) -> pd.Series:
+    return (
+        _budget_buy_mask(data, cfg, sl_pct=sl_pct)
+        & data["spread_pct"].fillna(999).le(cfg.max_spread_pct)
+        & data["ask_quantity"].fillna(0).gt(0)
+        & data["volume"].fillna(0).ge(cfg.min_volume)
+        & data["open_interest"].fillna(0).ge(cfg.min_oi)
+        & data["minutes_to_session_close"].fillna(999).gt(cfg.session_close_buffer_minutes)
+        & data["premium_range_pos_20"].fillna(0.5).le(0.45)
+        & data["return_q80"].fillna(-999).gt(0)
+    )
+
+
 def _naturalgas_short_decay_mask(data: pd.DataFrame, cfg: ModelSuiteConfig) -> pd.Series:
     group_cols = _snapshot_group_cols(data)
     low_model_rank = _pct_rank_by_group(data, data["model_score"], group_cols, ascending=True).le(0.35)
@@ -2052,6 +2124,63 @@ def _select_research_strategy_policy(joined: pd.DataFrame, cfg: ModelSuiteConfig
             "historical_execution_filter": True,
             "live_execution_guard": True,
             "gate_counts": gate_counts,
+        }
+
+    if policy_id.startswith("nifty_budget_range_contrarian"):
+        if cfg.asset_id != "nifty":
+            empty = data.iloc[0:0].copy()
+            return empty, empty, {
+                "policy_id": policy_id,
+                "selection": "nifty_budget_range_contrarian_wrong_asset",
+                "entry_side": "BUY",
+                "exit_side": "SELL",
+                "historical_execution_filter": False,
+                "live_execution_guard": True,
+            }
+        fixed_tp = 0.12
+        fixed_sl = 0.04
+        mask = _nifty_budget_range_contrarian_mask(data, cfg, sl_pct=fixed_sl)
+        historical_execution_filter = policy_id.endswith("_executable")
+        if historical_execution_filter:
+            mask &= _historical_execution_mask(data, cfg)
+        candidates = data[mask].copy()
+        if not candidates.empty:
+            candidates["entry_side"] = "BUY"
+            candidates["exit_side"] = "SELL"
+            candidates["adaptive_tp_pct"] = fixed_tp
+            candidates["adaptive_sl_pct"] = fixed_sl
+            candidates["adaptive_rr"] = _safe_div(candidates["adaptive_tp_pct"], candidates["adaptive_sl_pct"]).fillna(0.0)
+            group_rank = _pct_rank_by_group(candidates, candidates["policy_raw_ev"], group_cols, ascending=True)
+            candidates["conviction_score"] = (
+                0.45 * (1.0 - group_rank)
+                + 0.25 * _pct_rank_by_group(candidates, candidates["return_q80"], group_cols)
+                + 0.15 * _pct_rank_by_group(candidates, candidates["book_pressure_score"], group_cols)
+                + 0.15 * (1.0 - _pct_rank_by_group(candidates, _entry_price_for_budget(candidates), group_cols))
+            )
+            selected = (
+                candidates.sort_values(
+                    group_cols + ["conviction_score", "policy_raw_ev", "return_q80"],
+                    ascending=[True] * len(group_cols) + [False, True, False],
+                )
+                .groupby(group_cols, as_index=False)
+                .head(1)
+            )
+        else:
+            selected = candidates.copy()
+        return candidates, selected, {
+            "policy_id": policy_id,
+            "selection": "budgeted_range_low_contrarian_buy",
+            "entry_side": "BUY",
+            "exit_side": "SELL",
+            "sort_cols": ["conviction_score", "policy_raw_ev", "return_q80"],
+            "fixed_tp_pct": fixed_tp,
+            "fixed_sl_pct": fixed_sl,
+            "budget_lot_size": int(cfg.default_lot_size),
+            "max_premium_value_per_trade": float(cfg.max_premium_value_per_trade),
+            "risk_per_trade_pct": float(cfg.risk_per_trade_pct),
+            "historical_execution_filter": historical_execution_filter,
+            "live_execution_guard": True,
+            "base_mask_rows": int(mask.sum()),
         }
 
     if policy_id.startswith("naturalgas_short_decay"):
@@ -2208,6 +2337,12 @@ def _research_strategy_policy_candidates(joined: pd.DataFrame, universe_y: pd.Se
         "raw_ev_top1_executable",
         "raw_ev_model_top1_executable",
     ]
+    if cfg.asset_id == "nifty":
+        policy_ids = [
+            "nifty_budget_range_contrarian_executable",
+            "nifty_budget_range_contrarian_quote_guard",
+            *policy_ids,
+        ]
     if cfg.asset_id == "naturalgas" and cfg.allow_short_option_entries:
         policy_ids = [
             "naturalgas_short_decay_executable",
